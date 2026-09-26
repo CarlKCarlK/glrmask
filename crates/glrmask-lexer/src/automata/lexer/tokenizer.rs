@@ -1603,6 +1603,41 @@ pub(super) struct PackedCompressedTransitionSegment {
 }
 
 impl PackedCompressedTransitionSegment {
+    /// Re-encode each class row, not its expanded byte row. TKS2 can represent
+    /// separated compressed regions that the contiguous-suffix TKS3 wire
+    /// deliberately declines. Packed deltas are relative to the current row;
+    /// the older segment wire stores targets relative to the component base.
+    fn to_compressed_segment(&self) -> CompressedTransitionSegment {
+        let mut offsets = Vec::with_capacity(self.state_count as usize + 1);
+        let mut classes = Vec::new();
+        let mut targets = Vec::new();
+        offsets.push(0);
+        for local_state in 0..self.state_count {
+            let state = self.state_offset + local_state;
+            let (begin, end) = self.row_range(state)
+                .expect("validated packed segment covers every state");
+            for index in begin..end {
+                let target = i64::from(local_state) + i64::from(
+                    self.delta(index).expect("validated packed segment has every delta"),
+                );
+                assert!(target >= 0 && target < i64::from(self.state_count),
+                    "packed segment target must remain in its component");
+                classes.push(self.classes.as_slice()[index]);
+                targets.push(target as u32);
+            }
+            offsets.push(u32::try_from(classes.len()).expect("compressed segment entry count exceeds u32"));
+        }
+        CompressedTransitionSegment {
+            state_offset: self.state_offset,
+            state_count: self.state_count,
+            byte_to_class: Arc::from(self.byte_to_class.as_slice()),
+            class_members: Arc::clone(&self.class_members),
+            row_offsets: Arc::from(offsets.into_boxed_slice()),
+            entries: CompressedTransitionEntries::from_parts(classes, targets),
+            expanded_transition_count: self.expanded_transition_count,
+        }
+    }
+
     #[inline]
     fn contains_state(&self, state: u32) -> bool {
         state >= self.state_offset && state - self.state_offset < self.state_count
@@ -2644,6 +2679,30 @@ pub mod artifact_serde {
     /// fast tokenizer wire, while only transition rows outside compressed
     /// segments are stored explicitly.
     pub fn to_segment_bytes(tokenizer: &Tokenizer) -> Vec<u8> {
+        // Runtime compaction removes owned compressed rows. If those packed
+        // regions are not one contiguous suffix, TKS3 declines and this is the
+        // authoritative fallback. Reading only `dfa`/owned segments here would
+        // silently save empty byte rows while retaining live finalizer/future
+        // metadata. Materialize only metadata and noncompressed rows, retaining
+        // compressed regions as class rows rather than expanding their bytes.
+        if !tokenizer.packed_compressed_transition_segments.is_empty()
+            || tokenizer.packed_runtime_transitions.is_some()
+            || !tokenizer.packed_runtime_transition_segments.is_empty()
+            || tokenizer.packed_runtime_metadata.is_some()
+            || !tokenizer.packed_runtime_metadata_segments.is_empty()
+        {
+            let mut segments = tokenizer.compressed_transition_segments.to_vec();
+            segments.extend(tokenizer.packed_compressed_transition_segments.iter()
+                .map(PackedCompressedTransitionSegment::to_compressed_segment));
+            segments.sort_unstable_by_key(|segment| segment.state_offset);
+            let physical = Tokenizer::from_parts_with_compressed_transitions(
+                tokenizer.materialized_noncompressed_dfa(),
+                tokenizer.num_terminals,
+                None,
+                segments,
+            );
+            return to_segment_bytes(&physical);
+        }
         const HEADER_LEN: usize = 36;
         let states = tokenizer.dfa.states();
         let state_count = states.len();
@@ -8802,7 +8861,10 @@ impl Tokenizer {
         }
     }
 
-    fn materialized_dfa(&self) -> DFA {
+    /// Restore physical state metadata and ordinary rows only. Compressed
+    /// regions are left in their sidecars so serializers need not expand a
+    /// small class alphabet into hundreds of byte transitions per state.
+    fn materialized_noncompressed_dfa(&self) -> DFA {
         let mut dfa = self.dfa.clone();
         while dfa.num_states() < self.num_states() as usize {
             dfa.add_state();
@@ -8878,6 +8940,11 @@ impl Tokenizer {
                 }
             }
         }
+        dfa
+    }
+
+    fn materialized_dfa(&self) -> DFA {
+        let mut dfa = self.materialized_noncompressed_dfa();
         for segment in self.compressed_transition_segments.iter() {
             for local_state in 0..segment.state_count {
                 let state = segment.state_offset + local_state;
@@ -15281,6 +15348,75 @@ mod tests {
             }
         });
 
+        // TKS2 is also the fallback for packed sources whose compressed
+        // components are separated by ordinary states. It must not rely on
+        // the loaded tokenizer retaining either owned rows or owned metadata.
+        let fallback_wire = artifact_serde::to_segment_bytes(&huge_loaded);
+        let fallback = artifact_serde::from_fast_bytes(&fallback_wire).unwrap();
+        assert_eq!(fallback.num_states(), original.num_states());
+        assert_eq!(fallback.compressed_transition_segments.len(), 1);
+        enumerate_bytes(b"abx", 3, |input| {
+            for state in 0..original.num_states() {
+                assert_eq!(normalized_exec(&fallback, input, state),
+                           normalized_exec(&original, input, state),
+                           "packed-to-TKS2 mismatch state={state} input={input:?}");
+            }
+        });
+
+    }
+
+    #[test]
+    fn segment_fallback_preserves_packed_overflow_deltas_and_ordinary_tail() {
+        const COMPRESSED_STATES: u32 = 70_000;
+        let mut dfa = DFA::new(COMPRESSED_STATES as usize + 1);
+        dfa.ensure_group_capacity(1);
+        let mut live = BitSet::new(1);
+        live.set(0);
+        for state in 0..=COMPRESSED_STATES {
+            dfa.overwrite_state_metadata(state,
+                if state == COMPRESSED_STATES { live.clone() } else { BitSet::new(1) },
+                live.clone());
+        }
+        dfa.add_epsilon_transition(0, 1);
+        let mut byte_to_class = vec![u8::MAX; 256];
+        for byte in b'a'..=b'z' { byte_to_class[byte as usize] = 0; }
+        let targets = (0..COMPRESSED_STATES).map(|state| {
+            if state == 0 { COMPRESSED_STATES - 1 }
+            else if state == COMPRESSED_STATES - 1 { 0 }
+            else { state }
+        }).collect();
+        let original = Tokenizer::from_parts_with_compressed_transitions(dfa, 1, None,
+            vec![CompressedTransitionSegment {
+                state_offset: 1, state_count: COMPRESSED_STATES,
+                byte_to_class: Arc::from(byte_to_class.into_boxed_slice()),
+                class_members: Arc::from([Vec::from_iter(b'a'..=b'z').into_boxed_slice()]),
+                row_offsets: Arc::from(Vec::from_iter(0..=COMPRESSED_STATES).into_boxed_slice()),
+                entries: CompressedTransitionEntries::from_parts(vec![0; COMPRESSED_STATES as usize], targets),
+                expanded_transition_count: COMPRESSED_STATES as usize * 26,
+            }]);
+        let wire = Arc::new(artifact_serde::build_huge_bytes(&original).unwrap());
+        let mut packed = artifact_serde::from_fast_bytes_backed(&wire, Arc::clone(&wire), 0).unwrap();
+        assert!(!packed.packed_compressed_transition_segments[0].overflow_indices.is_empty());
+        packed.materialize_runtime_metadata_for_structural_mutation();
+        let tail = packed.dfa.add_state();
+        packed.dfa.overwrite_state_metadata(tail, live.clone(), live);
+        packed.dfa.add_transition(tail, b'!', 0);
+        assert!(artifact_serde::build_huge_bytes(&packed).is_none(),
+            "an ordinary tail must exercise the non-suffix fallback");
+        let fallback_wire = artifact_serde::to_segment_bytes(&packed);
+        assert!(fallback_wire.len() < 40 * COMPRESSED_STATES as usize,
+            "class rows must not expand into 26 byte edges each");
+        let loaded = artifact_serde::from_fast_bytes(&fallback_wire).unwrap();
+        assert_eq!(loaded.num_states(), packed.num_states());
+        assert!(loaded.has_compressed_transition_segments());
+        for state in [0, 1, 2, COMPRESSED_STATES, tail] {
+            assert_eq!(loaded.possible_future_terminals(state), packed.possible_future_terminals(state));
+            assert_eq!(loaded.matched_terminal_bitset(state), packed.matched_terminal_bitset(state));
+            for byte in 0..=255 {
+                assert_eq!(loaded.step(state, byte), packed.step(state, byte),
+                    "packed overflow/tail mismatch state={state} byte={byte}");
+            }
+        }
     }
 
     #[test]

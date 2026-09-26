@@ -8400,6 +8400,47 @@ mod tests {
     use std::sync::Arc;
 
     #[test]
+    fn loaded_partitioned_bounded_strings_keep_first_key_prefix_live() {
+        use crate::automata::lexer::Lexer;
+        let vocab = Vocab::new(
+            [b"{\"".as_slice(), b"{", b"\"", b"a", b"b", b"\": \"", b"\", \"", b"\"}", b"x", b" ", b"xx"]
+                .into_iter().enumerate().map(|(id, bytes)| (id as u32, bytes.to_vec())).collect(),
+        );
+        let schema = r#"{
+            "type":"object",
+            "properties":{
+                "a":{"type":"string","minLength":1,"maxLength":200,
+                     "pattern":"^(?:\\S+\\s+){0,19}\\S+$"},
+                "b":{"type":"string","minLength":1,"maxLength":100}
+            },
+            "required":["a","b"],"additionalProperties":false
+        }"#;
+        let original = Constraint::compile(crate::Grammar::json_schema(schema), &vocab).unwrap();
+        let loaded = Constraint::load(original.save()).unwrap();
+        assert!(original.tokenizer.has_compressed_transition_segments());
+        assert!(loaded.tokenizer.has_compressed_transition_segments());
+        assert_eq!(original.tokenizer.num_states(), loaded.tokenizer.num_states());
+        for state in 0..original.tokenizer.num_states().min(20) {
+            assert_eq!(original.tokenizer.step(state, b'"'), loaded.tokenizer.step(state, b'"'),
+                "opening-quote transition differs at tokenizer state {state}");
+        }
+        assert_eq!(original.start().mask(), loaded.start().mask());
+        let mut expected = original.start();
+        let mut actual = loaded.start();
+        expected.commit_token(0).expect("compiled key prefix must commit");
+        actual.commit_token(0).expect("loaded key prefix admitted by the mask must commit");
+        assert_eq!(expected.mask(), actual.mask());
+        // Complete {"a": "x", "b": "x"}, checking every next-token mask.
+        for token in [3, 5, 8, 6, 4, 5, 8, 7] {
+            expected.commit_token(token).unwrap();
+            actual.commit_token(token).unwrap();
+            assert_eq!(expected.mask(), actual.mask());
+        }
+        assert!(expected.is_accepting());
+        assert!(actual.is_accepting());
+    }
+
+    #[test]
     fn packed_reencode_preserves_non_dwa_ids_after_cache_invalidation() {
         let vocab = Vocab::new(vec![
             (0, b"x".to_vec()), (1, b"a".to_vec()), (2, b"b".to_vec()),
