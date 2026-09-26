@@ -12,7 +12,7 @@ use range_set_blaze::RangeSetBlaze;
 use rustc_hash::{FxHashMap, FxHashSet};
 use smallvec::SmallVec;
 
-use crate::automata::weighted::determinize::determinize;
+use crate::automata::weighted::determinize::{determinize, normalize_direct_singletons_enabled};
 use crate::automata::weighted::equivalence::find_difference;
 use crate::automata::weighted::dwa::{DWA, DWAState};
 use crate::automata::weighted::minimize::minimize_owned;
@@ -949,14 +949,14 @@ fn try_graft_immediate_parser_dwa(immediate: &DWA, mut other: DWA) -> Option<DWA
 
 /// Exact weighted union specialized for two deterministic, epsilon-free DWAs.
 ///
-/// A singleton determinized subset `(q, w)` is normalized by its incoming edge
-/// to `(q, all)`, so it has exactly the same continuation language as the
-/// original source state `q`. Reuse those source rows directly and construct
-/// only states where both inputs remain simultaneously live. This is the same
-/// weighted subset construction as the generic NWA determinizer, specialized to
-/// the invariant that a subset contains at most one state from each input.
+/// When generic determinization normalizes singleton subsets `(q, w)` to
+/// `(q, all)`, their source rows can be moved directly. Otherwise singleton
+/// residuals remain explicit. This distinction preserves structural fallback
+/// row selection, not just raw weighted language. Paired subsets always retain
+/// at most one state from each input.
 fn union_two_parser_dwas_direct(mut left: DWA, mut right: DWA) -> DWA {
     type PairKey = (u32, u32, Weight, Weight);
+    const ABSENT: u32 = u32::MAX;
 
     fn intern_pair(
         left_state: u32,
@@ -992,10 +992,18 @@ fn union_two_parser_dwas_direct(mut left: DWA, mut right: DWA) -> DWA {
 
     let left_start = left.start_state();
     let right_start = right.start_state();
-    let left_states = std::mem::take(left.states_mut());
+    let mut left_states = std::mem::take(left.states_mut());
     let mut right_states = std::mem::take(right.states_mut());
     let right_offset = left_states.len() as u32;
     let source_state_count = right_offset + right_states.len() as u32;
+    // NWA::union_in_place appends each source without adding states. Use the
+    // same size and override policy as the reference path.
+    let normalize_singletons = normalize_direct_singletons_enabled(source_state_count as usize);
+    // Generic expansion omits empty-weight edges. Copied singleton rows must
+    // do the same, since an explicit empty edge would shadow DEFAULT_LABEL.
+    for row in left_states.iter_mut().chain(right_states.iter_mut()) {
+        row.transitions.retain(|_, (_, weight)| !weight.is_empty());
+    }
     let mut pair_states = Vec::<DWAState>::new();
 
     let mut pairs = FxHashMap::<PairKey, u32>::default();
@@ -1015,17 +1023,17 @@ fn union_two_parser_dwas_direct(mut left: DWA, mut right: DWA) -> DWA {
     while let Some((out_state, left_id, right_id, left_residual, right_residual)) =
         worklist.pop_front()
     {
-        let left_state = &left_states[left_id as usize];
-        let right_state = &right_states[right_id as usize];
+        let left_state = (left_id != ABSENT).then(|| &left_states[left_id as usize]);
+        let right_state = (right_id != ABSENT).then(|| &right_states[right_id as usize]);
         let mut output = DWAState::default();
 
-        if let Some(final_weight) = &left_state.final_weight {
+        if let Some(final_weight) = left_state.and_then(|state| state.final_weight.as_ref()) {
             let contribution = weight_ops.intersection(&left_residual, final_weight);
             if !contribution.is_empty() {
                 output.final_weight = Some(contribution);
             }
         }
-        if let Some(final_weight) = &right_state.final_weight {
+        if let Some(final_weight) = right_state.and_then(|state| state.final_weight.as_ref()) {
             let contribution = weight_ops.intersection(&right_residual, final_weight);
             if !contribution.is_empty() {
                 output.final_weight = Some(match output.final_weight.take() {
@@ -1035,8 +1043,8 @@ fn union_two_parser_dwas_direct(mut left: DWA, mut right: DWA) -> DWA {
             }
         }
 
-        let mut left_transitions = left_state.transitions.iter().peekable();
-        let mut right_transitions = right_state.transitions.iter().peekable();
+        let mut left_transitions = left_state.into_iter().flat_map(|state| state.transitions.iter()).peekable();
+        let mut right_transitions = right_state.into_iter().flat_map(|state| state.transitions.iter()).peekable();
         loop {
             let label = match (left_transitions.peek(), right_transitions.peek()) {
                 (Some((left_label, _)), Some((right_label, _))) => {
@@ -1076,8 +1084,20 @@ fn union_two_parser_dwas_direct(mut left: DWA, mut right: DWA) -> DWA {
 
             let transition = match (left_contribution, right_contribution) {
                 (None, None) => None,
-                (Some((target, weight)), None) => Some((target, weight)),
-                (None, Some((target, weight))) => Some((right_offset + target, weight)),
+                (Some((target, weight)), None) => {
+                    let out_target = if normalize_singletons { target } else {
+                        intern_pair(target, ABSENT, weight.clone(), Weight::empty(),
+                            source_state_count, &mut pair_states, &mut pairs, &mut worklist)
+                    };
+                    Some((out_target, weight))
+                }
+                (None, Some((target, weight))) => {
+                    let out_target = if normalize_singletons { right_offset + target } else {
+                        intern_pair(ABSENT, target, Weight::empty(), weight.clone(),
+                            source_state_count, &mut pair_states, &mut pairs, &mut worklist)
+                    };
+                    Some((out_target, weight))
+                }
                 (Some((left_target, left_weight)), Some((right_target, right_weight))) => {
                     let edge_weight = weight_ops.union(&left_weight, &right_weight);
                     let target = intern_pair(
@@ -1202,7 +1222,16 @@ pub fn merge_mapped_parser_dwas(
         let reconcile_ms = reconcile_started_at.elapsed().as_secs_f64() * 1000.0;
         let (dwas, common_id_map) = reconciled.into_parts();
 
-        if std::env::var_os("GLRMASK_EXPERIMENTAL_DIRECT_TWO_PARSER_UNION").is_some() {
+        let source_states: usize = dwas.iter().map(|dwa| dwa.states().len()).sum();
+        // Large normalized unions are dominated by copying and re-expanding
+        // singleton rows. Small unions keep the existing builder unless an
+        // explicit diagnostic asks for the residual-aware direct path.
+        let direct_by_default = source_states >= 16_384
+            && normalize_direct_singletons_enabled(source_states);
+        let use_direct = std::env::var_os("GLRMASK_DISABLE_DIRECT_TWO_PARSER_UNION").is_none()
+            && (direct_by_default
+                || std::env::var_os("GLRMASK_EXPERIMENTAL_DIRECT_TWO_PARSER_UNION").is_some());
+        if use_direct {
             let reference = if std::env::var_os("GLRMASK_VALIDATE_DIRECT_TWO_PARSER_UNION").is_some() {
                 let mut reference_nwa = NWA::new(
                     common_id_map.num_tsids(),
@@ -3509,6 +3538,140 @@ mod tests {
         }
         nwa.set_start_states(body.start_states);
         determinize(&nwa).expect("test NWA should determinize")
+    }
+
+    #[test]
+    fn direct_two_parser_union_keeps_correlated_residuals_and_singleton_rows() {
+        let mut left = DWA::new(1, 2);
+        let l1 = left.add_state();
+        let l2 = left.add_state();
+        left.add_transition(0, 7, l1, token_range_weight(0, 1));
+        left.add_transition(l1, 8, l2, token_range_weight(0, 2));
+        left.set_final_weight(l1, singleton_weight(0));
+        left.set_final_weight(l2, singleton_weight(0));
+        let mut right = DWA::new(1, 2);
+        let r1 = right.add_state();
+        let r2 = right.add_state();
+        right.add_transition(0, 7, r1, token_range_weight(1, 2));
+        right.add_transition(r1, 9, r2, token_range_weight(0, 2));
+        right.set_final_weight(0, singleton_weight(1));
+        right.set_final_weight(r1, singleton_weight(2));
+        right.set_final_weight(r2, singleton_weight(2));
+
+        let direct = union_two_parser_dwas_direct(left.clone(), right.clone());
+        let generic = generic_union(&[left.clone(), right.clone()]);
+        for word in all_words(&[7, 8, 9, DEFAULT_LABEL], 5) {
+            let expected = left.eval_word(&word).union(&right.eval_word(&word));
+            assert_eq!(direct.eval_word(&word), expected, "direct word={word:?}");
+            assert_eq!(generic.eval_word(&word), expected, "generic word={word:?}");
+        }
+        assert!(find_difference(&direct, &generic).unwrap().is_none());
+    }
+
+    #[test]
+    fn direct_two_parser_union_matches_generated_weighted_automata() {
+        // All operations are exact finite-set union/intersection. Include
+        // start finality, empty/full weights, and the raw fallback label used
+        // by the existing generic parser-family union. Its input contract is
+        // acyclic: the generic determinizer explicitly rejects cyclic NWAs.
+        fn next(seed: &mut u64) -> u64 {
+            *seed ^= *seed << 13;
+            *seed ^= *seed >> 7;
+            *seed ^= *seed << 17;
+            *seed
+        }
+        fn weight(seed: &mut u64) -> Weight {
+            let bits = next(seed);
+            if bits % 11 == 0 { return Weight::all(); }
+            Weight::from_per_tsid_token_sets((0..2).map(|tsid| {
+                let tokens = (0..3).filter(|token| bits & (1 << (tsid * 3 + token)) != 0);
+                (tsid, RangeSetBlaze::from_iter(tokens))
+            }))
+        }
+        fn machine(seed: &mut u64) -> DWA {
+            let mut result = DWA::new(2, 2);
+            for _ in 1..4 { result.add_state(); }
+            for state in 0..4 {
+                if next(seed) & 1 != 0 { result.set_final_weight(state, weight(seed)); }
+                for label in [0, 7, 8, DEFAULT_LABEL] {
+                    if state == 3 { continue; }
+                    if next(seed) % 3 == 0 { continue; }
+                    let target = state + 1 + (next(seed) % u64::from(3 - state)) as u32;
+                    result.add_transition(state, label, target, weight(seed));
+                }
+            }
+            result
+        }
+        let words = all_words(&[0, 7, 8, DEFAULT_LABEL], 4);
+        for case in 1..=96 {
+            let mut seed = 0x9e3779b97f4a7c15_u64.wrapping_mul(case);
+            let left = machine(&mut seed);
+            let right = machine(&mut seed);
+            let direct = union_two_parser_dwas_direct(left.clone(), right.clone());
+            let mut nwa = NWA::new(2, 2);
+            let mut body = nwa.body();
+            for source in [&left, &right] {
+                body = nwa.union_in_place(&source.to_nwa(), &body);
+            }
+            nwa.set_start_states(body.start_states);
+            let generic = determinize(&nwa).expect("finite test weights must determinize");
+            for word in &words {
+                let expected = left.eval_word(word).union(&right.eval_word(word));
+                assert_eq!(direct.eval_word(word), expected, "case={case} word={word:?}");
+                assert_eq!(generic.eval_word(word), expected, "generic case={case} word={word:?}");
+            }
+            assert!(find_difference(&direct, &generic).unwrap().is_none(), "case={case}");
+        }
+    }
+
+    #[test]
+    fn direct_two_parser_union_preserves_generic_fallback_row_selection() {
+        fn fallback_eval(dwa: &DWA, word: &[i32]) -> Weight {
+            let mut state = dwa.start_state();
+            let mut path = Weight::all();
+            for label in word {
+                let row = &dwa.states()[state as usize];
+                let Some((target, weight)) = row.transitions.get(label)
+                    .or_else(|| row.transitions.get(&DEFAULT_LABEL)) else {
+                        return Weight::empty();
+                    };
+                path = path.intersection(weight);
+                state = *target;
+            }
+            dwa.states()[state as usize].final_weight.as_ref()
+                .map(|weight| path.intersection(weight)).unwrap_or_else(Weight::empty)
+        }
+        for padded in [false, true] {
+        for boundary in 0..32 {
+            let mut left = DWA::new(1, 2);
+            let l1 = left.add_state();
+            let l2 = left.add_state();
+            left.add_transition(0, 7, l1, token_range_weight(0, 1));
+            left.add_transition(l1, DEFAULT_LABEL, l2, token_range_weight(0, 1));
+            if boundary & 1 != 0 { left.add_transition(l1, 8, l2, singleton_weight(2)); }
+            if boundary & 16 != 0 { left.add_transition(l1, 8, l2, Weight::empty()); }
+            left.set_final_weight(l2, token_range_weight(0, 2));
+            let mut right = DWA::new(1, 2);
+            let r1 = right.add_state();
+            let r2 = right.add_state();
+            right.add_transition(0, if boundary & 8 == 0 { 7 } else { 10 }, r1,
+                token_range_weight(1, 2));
+            if boundary & 2 != 0 { right.add_transition(r1, 8, r2, singleton_weight(1)); }
+            if boundary & 4 != 0 { right.add_transition(r1, DEFAULT_LABEL, r2, singleton_weight(2)); }
+            right.set_final_weight(r2, Weight::all());
+            // Exercise both sides of the generic singleton normalization
+            // threshold without mutating process-wide environment variables.
+            if padded {
+                while left.num_states() < 16_384 { left.add_state(); }
+            }
+            let direct = union_two_parser_dwas_direct(left.clone(), right.clone());
+            let generic = generic_union(&[left, right]);
+            for word in all_words(&[7, 8, 9], 3) {
+                assert_eq!(fallback_eval(&direct, &word), fallback_eval(&generic, &word),
+                    "padded={padded} boundary={boundary} word={word:?}");
+            }
+        }
+        }
     }
 
     fn all_words(labels: &[i32], max_len: usize) -> Vec<Vec<i32>> {
