@@ -896,6 +896,7 @@ fn install_segmented_boundary_shards(
             .and_then(|rows| rows.get(component_index))
             .map(|tokens| Arc::<[u32]>::from(tokens.clone()));
         let shard = crate::runtime::SegmentedBoundaryShard {
+            mask_vocabulary: Default::default(),
             start_component: component_index as u32,
             start_parser_states,
             accepts_empty_stack: component_index == 0,
@@ -929,6 +930,7 @@ pub(crate) fn install_published_static_boundary_shards(
                 )
             })?;
         let runtime_shard = crate::runtime::SegmentedBoundaryShard {
+            mask_vocabulary: Default::default(),
             start_component: shard.start_component,
             start_parser_states: segmented_boundary_start_parser_states(component),
             accepts_empty_stack: component_index == 0,
@@ -951,6 +953,7 @@ fn install_dynamic_direct_boundary_shards(
     }
     for component_index in 0..overlay.segmented_parser_components.len() {
         let shard = crate::runtime::SegmentedBoundaryShard {
+            mask_vocabulary: Default::default(),
             start_component: component_index as u32,
             start_parser_states: segmented_boundary_start_parser_states(
                 &overlay.segmented_parser_components[component_index],
@@ -976,6 +979,7 @@ fn append_dynamic_direct_boundary_shards_for_unselected(
             continue;
         }
         let shard = crate::runtime::SegmentedBoundaryShard {
+            mask_vocabulary: Default::default(),
             start_component: component_index as u32,
             start_parser_states: segmented_boundary_start_parser_states(
                 &overlay.segmented_parser_components[component_index],
@@ -19228,6 +19232,9 @@ fn build_composed_constraint_unfinalized(
         special_token_terminals,
         dynamic_mask_vocab,
         lazy_dynamic_mask_vocab: OnceLock::new(),
+        empty_byte_token_ids: vocab.entries_map().iter()
+            .filter_map(|(&id, bytes)| bytes.is_empty().then_some(id))
+            .collect::<Vec<u32>>().into(),
         // Constraint composition is not allowed to rely on the legacy dynamic
         // possible-matches fallback. This is the exact transported and
         // reconciled table from every compiled component.
@@ -19621,6 +19628,34 @@ fn compose_dynamic_recursive_shared_fast(
     }
     let terminal_checks_ms = terminal_checks_started_at.elapsed().as_secs_f64() * 1000.0;
 
+    // Reuse checked component-prepared proper-prefix vocabularies. Unknown
+    // metadata stays unknown: never run the static boundary compiler here and
+    // never treat an unavailable proof as an empty candidate set.
+    let candidate_started = Instant::now();
+    let mut dynamic_candidate_ids = components.iter().map(|component| {
+        if component.boundary_candidate_summary.get().is_some_and(|summary| summary.is_known()) {
+            crate::compiler::boundary_candidates::boundary_candidate_ids(component, vocab).0
+        } else { None }
+    }).collect::<Vec<_>>();
+    let no_ignores = components.iter().all(|component| component.ignore_terminal.is_none()
+        && component.table.skip_terminals.is_empty());
+    if (!global_ignores || no_ignores) && dynamic_candidate_ids[0].is_some() {
+        let entered = children.iter().map(|child| child.constraint).collect::<Vec<_>>();
+        let calls = children.iter().flat_map(|child| std::iter::once(child.placeholder_terminal)
+            .chain(child.additional_placeholder_terminals.iter().copied())).collect::<Vec<_>>();
+        if let Ok(refined) = crate::compiler::boundary_tail::build_root_call_candidates(
+            &parent, &entered, &calls, vocab,
+        ) {
+            dynamic_candidate_ids[0].as_mut().expect("checked above")
+                .retain(|id| refined.candidate_ids.binary_search(id).is_ok());
+        }
+    }
+    if compose_profile_enabled() {
+        eprintln!("[glrmask/profile][dynamic_prepared_boundary_vocabularies] counts={:?} total_ms={:.3}",
+            dynamic_candidate_ids.iter().map(|ids| ids.as_ref().map(Vec::len)).collect::<Vec<_>>(),
+            candidate_started.elapsed().as_secs_f64()*1000.0);
+    }
+
     let tokenizer_span_started_at = Instant::now();
     let mut tokenizer_state_offsets = Vec::with_capacity(components.len());
     let mut next_tokenizer_state = 0u32;
@@ -19780,6 +19815,14 @@ fn compose_dynamic_recursive_shared_fast(
     overlay.segmented_boundary_parser = None;
     overlay.segmented_boundary_terminal_trie = None;
     install_dynamic_direct_boundary_shards(overlay, None);
+    for (component, ids) in overlay.segmented_parser_components.iter_mut().zip(dynamic_candidate_ids) {
+        if let Some(shard) = component.boundary.as_mut() {
+            shard.candidate_tokens = ids.map(Arc::<[u32]>::from);
+        }
+    }
+    overlay.segmented_boundary_shards = overlay.segmented_parser_components.iter()
+        .filter_map(|component| component.boundary.clone()).collect();
+
     // Empty bytes are an explicit "provider-native only" marker. Dynamic
     // recomposition consumes the retained component tree directly. Static or
     // legacy compiler views may reconstruct from the provider in a later path.

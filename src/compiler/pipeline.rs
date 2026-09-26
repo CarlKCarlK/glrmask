@@ -6108,6 +6108,9 @@ fn compile_prepared_with_profile_and_table_construction(
             special_token_terminals,
             dynamic_mask_vocab,
             lazy_dynamic_mask_vocab: std::sync::OnceLock::new(),
+            empty_byte_token_ids: vocab.entries_map().iter()
+                .filter_map(|(&id, bytes)| bytes.is_empty().then_some(id))
+                .collect::<Vec<u32>>().into(),
             possible_matches: possible_matches.into_artifact(),
             possible_matches_complete,
             state_to_internal_tsid: runtime_tokenizer_state_map.original_to_internal.clone(),

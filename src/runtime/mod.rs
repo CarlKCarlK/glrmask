@@ -1,3 +1,5 @@
+#[cfg(any(test, feature = "internal-api"))]
+pub(crate) mod boundary_cpu_profile;
 mod artifact;
 mod commit;
 mod constraint;
