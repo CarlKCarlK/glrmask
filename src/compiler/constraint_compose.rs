@@ -27853,6 +27853,10 @@ table: &child.table,
 
     #[test]
     fn hybrid_boundary_policy_is_per_component_and_roundtrips() {
+        // This fixture deliberately executes DynamicDirect shards. Other
+        // tests temporarily arm the process-wide strict-static trap, so its
+        // readers must share the writers' lock as well.
+        let _env_lock = crate::TEST_ENV_LOCK.lock().unwrap();
         let vocab = Vocab::new(vec![
             (0, b"x".to_vec()),
             (1, b"y".to_vec()),
