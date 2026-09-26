@@ -29,8 +29,6 @@ use crate::automata::weighted_u32::dwa::{DWA, DWAState};
 use crate::automata::weighted_u32::nwa::{NWA, NWAState};
 use crate::automata::weighted_u32::terminal_automaton::TerminalAutomaton;
 use crate::automata::unweighted_u32::dfa::DFA as UnweightedDfa;
-use crate::automata::unweighted_u32::nfa::NFA as UnweightedNfa;
-use crate::automata::unweighted_u32::determinize::determinize as determinize_unweighted_nfa;
 use crate::automata::unweighted_u32::minimize_acyclic::minimize_acyclic as minimize_unweighted_dfa;
 use crate::compiler::glr::analysis::{AnalyzedGrammar, EOF};
 use crate::compiler::glr::labels::{
