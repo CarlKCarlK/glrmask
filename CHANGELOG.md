@@ -4,6 +4,21 @@
 
 ### Improved
 
+- Static masks bound speculative concrete-stack expansion per parser graph,
+  retaining shared-graph evaluation for wide ambiguities. Deterministic
+  reductions reuse common output prefixes, single-top commits avoid a duplicate
+  fast-path attempt, and fully accepted stack paths stop without redundant work.
+- Static compilation reuses support keys, final-weight signatures, and token
+  remaps; large two-parser unions use the exact direct construction. Token-set
+  intersections use a memoized interval sweep while preserving the previous
+  operand representative, including on reversed cache hits.
+- Dynamic compilation overlaps lexer factoring with parser-table construction.
+  Shared regex discovery traverses unique DAG nodes, and choice rewrites retain
+  already-factored children instead of recursively factoring them again.
+- Dynamic master-trie admission compares its cost with the original vocabulary
+  trie before replacing the traversal, avoiding an expanded-trie comparison that
+  could select a slower path.
+
 - Static constraint serialization now primes canonical artifact bytes during public compilation, making the first subsequent `save()` a bulk copy rather than a full re-encode. Current artifacts also persist the packed-DWA dense-mask cache needed by the runtime, substantially reducing load-time cache reconstruction. Rust now exposes one `Constraint::load(...)` entry point that automatically takes the zero-copy backing path for owned `Vec<u8>` input while continuing to accept borrowed bytes.
 
 - Direct dynamic masking now walks the vocabulary trie once with interned
@@ -66,6 +81,17 @@
   full exact tokenizer while terminal/parser DWA construction may use a
   certified smaller representative. Set
   `GLRMASK_SYNTHETIC_BOUNDED_TERMINALS=0` only for diagnostics.
+
+### Fixed
+
+- Fallback tokenizer serialization preserves packed compressed segments when
+  they cannot use the contiguous-suffix encoding. Previously affected large
+  mixed tokenizers could lose transitions after saving and loading; affected
+  artifacts written by older code must be rebuilt from their grammar.
+- Direct slice and byte-family proofs on compact loaded bounded-repeat
+  tokenizers use the retained liveness metadata rather than indexing construction
+  tables omitted from the artifact. Missing proof data declines the shortcut
+  instead of inventing liveness or panicking.
 
 ## 0.1.1 — 2026-07-19 — runtime, integration, and tail-latency update
 
