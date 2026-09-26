@@ -6748,41 +6748,10 @@ fn compile_dynamic_owned_impl(
         let direct_state_count = direct_regular_automaton
             .as_ref()
             .map(|automaton| automaton.states.len());
-        let ((prepared_expressions, factor_ms), (analyzed_grammar, analysis_ms)) = macro_join_if(
-            defer_factoring,
-            "dynamic_factor_and_analysis",
-            || {
-                let started_at = profile.then(Instant::now);
-                let expressions = prefactored_expressions
-                    .unwrap_or_else(|| prepare_factored_terminal_expressions(&prepared_grammar));
-                (expressions, started_at.map_or(0.0, elapsed_ms))
-            },
-            || {
-                let started_at = profile.then(Instant::now);
-                let analyzed_grammar = if direct_regular_automaton.is_none() {
-                    let analyzed = AnalyzedGrammar::from_grammar_def(&prepared_grammar);
-                    if let Err(message) = analyzed.check_dynamic_table_build_normal_form() {
-                        panic!("[glrmask] grammar precondition violations:\n{}", message);
-                    }
-                    Some(analyzed)
-                } else {
-                    None
-                };
-                (analyzed_grammar, started_at.map_or(0.0, elapsed_ms))
-            },
-        );
-        let prepared_has_giant_repeat = prepared_expressions
-            .iter()
-            .any(expression_contains_large_bounded_repeat);
         let num_terminals = prepared_grammar.num_terminals();
         let terminal_display_names = (0..num_terminals)
             .map(|terminal| prepared_grammar.terminal_display_name(terminal))
             .collect::<Vec<_>>();
-        if profile && defer_factoring {
-            eprintln!(
-                "[glrmask/profile][dynamic_factor_overlap] factor_ms={factor_ms:.3} analysis_ms={analysis_ms:.3}"
-            );
-        }
         // Rayon scheduling is a measurable fraction of total build time for
         // genuinely tiny dynamic grammars. Keep those cores sequential; a
         // large lexer can still arise from a compact grammar, but in that case
@@ -6801,23 +6770,49 @@ fn compile_dynamic_owned_impl(
             );
         }
 
-        let (tokenizer_result, ((table, table_ms), (dynamic_mask_vocab, dynamic_vocab_ms))) = macro_join_if(
+        // Both lanes consume the same immutable, fully normalized grammar.
+        // Regex factoring is a prerequisite of lexer construction, not of LR
+        // analysis or table construction. Keep each prerequisite in its own
+        // lane instead of joining factoring/analysis before starting the table.
+        // This avoids a serial factoring barrier for large pattern grammars
+        // without changing either compiled artifact or cloning the grammar.
+        // Tiny grammars retain their prefactored expressions and serial lane.
+        let ((tokenizer_result, factor_ms), ((table, table_ms, analysis_ms), (dynamic_mask_vocab, dynamic_vocab_ms))) = macro_join_if(
             parallel_dynamic_core,
             "dynamic_tokenizer_and_table_vocab",
             || {
-                build_dynamic_tokenizer_lane(
+                let factor_started_at = profile.then(Instant::now);
+                let prepared_expressions = prefactored_expressions
+                    .unwrap_or_else(|| prepare_factored_terminal_expressions(&prepared_grammar));
+                let factor_ms = factor_started_at.map_or(0.0, elapsed_ms);
+                let prepared_has_giant_repeat = prepared_expressions
+                    .iter()
+                    .any(expression_contains_large_bounded_repeat);
+                let result = build_dynamic_tokenizer_lane(
                     &prepared_grammar,
                     &prepared_expressions,
                     prepared_has_giant_repeat,
                     vocab,
                     finalize_runtime,
                     profile,
-                )
+                );
+                (result, factor_ms)
             },
             || macro_join_if(
                 parallel_dynamic_core,
                 "dynamic_table_and_vocab",
                 || {
+                    let analysis_started_at = profile.then(Instant::now);
+                    let analyzed_grammar = if direct_regular_automaton.is_none() {
+                        let analyzed = AnalyzedGrammar::from_grammar_def(&prepared_grammar);
+                        if let Err(message) = analyzed.check_dynamic_table_build_normal_form() {
+                            panic!("[glrmask] grammar precondition violations:\n{}", message);
+                        }
+                        Some(analyzed)
+                    } else {
+                        None
+                    };
+                    let analysis_ms = analysis_started_at.map_or(0.0, elapsed_ms);
                     let started_at = Instant::now();
                     let table = if let Some(state_count) = direct_state_count {
                     GLRTable::direct_regular_runtime_stub(
@@ -6830,7 +6825,7 @@ fn compile_dynamic_owned_impl(
                         default_table_construction,
                     )
                 };
-                    (table, elapsed_ms(started_at))
+                    (table, elapsed_ms(started_at), analysis_ms)
                 },
                 || {
                     let started_at = Instant::now();
@@ -6845,6 +6840,11 @@ fn compile_dynamic_owned_impl(
         );
         let ((tokenizer, mask_tokenizer_quotient, prebuilt_virtual_residual_projection), tokenizer_ms) =
             tokenizer_result?;
+        if profile && defer_factoring {
+            eprintln!(
+                "[glrmask/profile][dynamic_factor_overlap] factor_ms={factor_ms:.3} analysis_ms={analysis_ms:.3} table_overlap=true"
+            );
+        }
 
         let finalize_started_at = profile.then(Instant::now);
         // Build unfinalized so a mask-only finite-token quotient can be
@@ -6893,7 +6893,7 @@ fn compile_dynamic_owned_impl(
                 table_ms,
                 dynamic_vocab_ms,
                 finalize_started_at.map_or(0.0, elapsed_ms),
-                tokenizer_ms.max(table_ms.max(dynamic_vocab_ms)),
+                (factor_ms + tokenizer_ms).max((analysis_ms + table_ms).max(dynamic_vocab_ms)),
                 elapsed_ms(total_started_at),
             );
         }
