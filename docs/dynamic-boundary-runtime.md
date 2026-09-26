@@ -65,3 +65,35 @@ independent min-of-two-by-position cohorts. Raw maxima remain available. The sha
 CX33 can vary despite thread-CPU timing. Performance claims require the actual
 recorded release validation; correctness passes alone do not establish a latency
 improvement or achievement of the boundary/non-boundary parity goal.
+
+## Validation checkpoint: 27 September 2026
+
+The retained runtime was validated before merging the latest upstream boundary
+compiler improvements. The combined code commit is
+`e815c23ab0b911b99748869d32861a32a08588ee`.
+
+The combined workspace passed 1,931 library tests (54 ignored) and 170 focused
+public API tests. An independent eight-fixture finite-language oracle passed
+437,760 checks covering native/static children, nullable alternatives, aliases,
+clone/reload behavior, and concurrent cold binding initialization. Two further
+11,767-position replays checked the merged executable against the static
+reference, including a newly composed dynamic artifact.
+
+The preceding retained-runtime comparison also passed 472,248 independent word
+checks, 44 complete 11,767-position replays with cache enabled and disabled,
+four ordinary full-vocabulary comparison rounds, and a fresh-artifact replay.
+Raw runs include an identical release A/A control and preserve host variability.
+The invalid first attempt using a stale copied control binary was quarantined;
+none of its numbers are included in the validation record.
+
+The [machine-readable validation record](performance/dynamic-boundary-runtime-20260927.json)
+contains source/binary hashes, separate timing scopes, all primary cohorts,
+and matching non-boundary budgets. The old all-dynamic control bypasses the
+instrumented per-shard dispatcher, so its boundary-only times are **unavailable**,
+not zero; its whole-mask comparison remains valid.
+
+These results establish a large improvement over the old unmerged trunk path,
+not achievement of boundary/non-boundary latency parity. The remaining boundary
+p100 is still too high. Rejected parser, cache-layout, and template experiments
+are not part of this release, and the next experiments must be evaluated
+separately without weakening the correctness contract above.

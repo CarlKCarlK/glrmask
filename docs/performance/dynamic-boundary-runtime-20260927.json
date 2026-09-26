@@ -1,0 +1,675 @@
+{
+  "title": "Retained dynamic boundary runtime release validation",
+  "runtime_source_commit": "f7f4cb3fc6275c97081aeb3dc76de69395149c43",
+  "combined_source_commit": "e815c23ab0b911b99748869d32861a32a08588ee",
+  "reference_source_commit": "7e84a64c91b7eefc9a4c25fb854c9cf7a45b88b0",
+  "units": "microseconds of thread CPU",
+  "method": "At each of 11767 authentic trace positions, minimum of two independent first-mask measurements; maximum over positions. Two disjoint cohorts for cache-off, one for cache-on. Identical release A/A control and both timing orders, shuffled 16-position blocks on shared CX33 CPU2. Cold preparation is included.",
+  "scope_notes": [
+    "D includes the DynamicDirect handler but excludes ordinary component masking. B includes all boundary dispatch, including entry/exit. B contains D; do not add them.",
+    "N is whole-mask CPU minus B from the SAME measured call. Static-reference N is reported separately. The denominator is not an independently selected percentile.",
+    "The old all-dynamic 1274 artifact bypasses the instrumented per-shard dispatcher; old D/B/N are unavailable, not zero. Whole-mask measurements remain valid.",
+    "The 257 hybrid keeps the small parent boundary static. The larger configuration has dynamic component domains of 5 and 1274 original IDs.",
+    "The old trunk did not include the already-developed reduced-vocabulary runtime. Large trunk gains are not additional gains over the previous experimental checkpoint.",
+    "Shared-host A/A variability prevents a claim about small precise percentage differences. Raw runs are retained in the recovery archive."
+  ],
+  "goal_reached": false,
+  "ordinary_full_vocabulary_control": {
+    "base": {
+      "overlap": [
+        {
+          "p100_us": 6539.636,
+          "p50_us": 2248.516,
+          "mean_us": 2356.0510989583336
+        },
+        {
+          "p100_us": 7448.683,
+          "p50_us": 2329.725,
+          "mean_us": 2485.0874166666663
+        }
+      ],
+      "finite": [
+        {
+          "p100_us": 302.488,
+          "p50_us": 59.031,
+          "mean_us": 61.4515
+        },
+        {
+          "p100_us": 239.599,
+          "p50_us": 57.885,
+          "mean_us": 59.89836458333333
+        }
+      ],
+      "number": [
+        {
+          "p100_us": 304.013,
+          "p50_us": 107.719,
+          "mean_us": 122.23970625
+        },
+        {
+          "p100_us": 300.87,
+          "p50_us": 76.153,
+          "mean_us": 92.55908749999999
+        }
+      ],
+      "string": [
+        {
+          "p100_us": 360.078,
+          "p50_us": 109.067,
+          "mean_us": 118.6294765625
+        },
+        {
+          "p100_us": 516.317,
+          "p50_us": 135.561,
+          "mean_us": 168.094796875
+        }
+      ]
+    },
+    "control": {
+      "overlap": [
+        {
+          "p100_us": 7267.697,
+          "p50_us": 2411.04,
+          "mean_us": 2541.7318697916667
+        },
+        {
+          "p100_us": 5478.748,
+          "p50_us": 2349.347,
+          "mean_us": 2457.2664010416665
+        }
+      ],
+      "finite": [
+        {
+          "p100_us": 234.31,
+          "p50_us": 58.847,
+          "mean_us": 64.44927083333333
+        },
+        {
+          "p100_us": 304.819,
+          "p50_us": 58.819,
+          "mean_us": 58.861270833333336
+        }
+      ],
+      "number": [
+        {
+          "p100_us": 299.086,
+          "p50_us": 103.718,
+          "mean_us": 118.32209375
+        },
+        {
+          "p100_us": 289.057,
+          "p50_us": 67.458,
+          "mean_us": 83.35915
+        }
+      ],
+      "string": [
+        {
+          "p100_us": 381.312,
+          "p50_us": 108.662,
+          "mean_us": 119.1361015625
+        },
+        {
+          "p100_us": 673.47,
+          "p50_us": 153.836,
+          "mean_us": 182.162046875
+        }
+      ]
+    },
+    "release": {
+      "overlap": [
+        {
+          "p100_us": 7449.095,
+          "p50_us": 2341.933,
+          "mean_us": 2628.9892291666665
+        },
+        {
+          "p100_us": 5047.227,
+          "p50_us": 2399.11,
+          "mean_us": 2461.9951354166665
+        }
+      ],
+      "finite": [
+        {
+          "p100_us": 300.878,
+          "p50_us": 58.946,
+          "mean_us": 70.5865
+        },
+        {
+          "p100_us": 285.489,
+          "p50_us": 57.9,
+          "mean_us": 63.0981875
+        }
+      ],
+      "number": [
+        {
+          "p100_us": 339.138,
+          "p50_us": 108.457,
+          "mean_us": 127.8885875
+        },
+        {
+          "p100_us": 277.355,
+          "p50_us": 67.856,
+          "mean_us": 83.559525
+        }
+      ],
+      "string": [
+        {
+          "p100_us": 371.981,
+          "p50_us": 106.689,
+          "mean_us": 117.907390625
+        },
+        {
+          "p100_us": 430.351,
+          "p50_us": 131.554,
+          "mean_us": 147.795640625
+        }
+      ]
+    }
+  },
+  "measurements": {
+    "257_cache_off": {
+      "samples": 11767,
+      "rounds": 4,
+      "cohorts": [
+        {
+          "default": {
+            "whole_mask_cpu_p100_us": 1031.427,
+            "dynamic_boundary_cpu_p100_us": 783.506,
+            "complete_boundary_cpu_p100_us": 796.367,
+            "same_call_budget_at_boundary_p100": {
+              "trace": "0",
+              "step": "10",
+              "B_us": 796.367,
+              "N_us": 155.842,
+              "B_over_N": 5.110092272943109,
+              "static_N_us": 186.839
+            },
+            "boundary_span_observed": true
+          },
+          "control": {
+            "whole_mask_cpu_p100_us": 1253.559,
+            "dynamic_boundary_cpu_p100_us": 1100.726,
+            "complete_boundary_cpu_p100_us": 1110.626,
+            "same_call_budget_at_boundary_p100": {
+              "trace": "2",
+              "step": "5239",
+              "B_us": 1110.626,
+              "N_us": 131.994,
+              "B_over_N": 8.414215797687774,
+              "static_N_us": 144.311
+            },
+            "boundary_span_observed": true
+          },
+          "filtered": {
+            "whole_mask_cpu_p100_us": 1141.268,
+            "dynamic_boundary_cpu_p100_us": 983.153,
+            "complete_boundary_cpu_p100_us": 992.016,
+            "same_call_budget_at_boundary_p100": {
+              "trace": "0",
+              "step": "1804",
+              "B_us": 992.016,
+              "N_us": 149.252,
+              "B_over_N": 6.646584300377884,
+              "static_N_us": 230.062
+            },
+            "boundary_span_observed": true
+          },
+          "trunk": {
+            "whole_mask_cpu_p100_us": 161668.882,
+            "dynamic_boundary_cpu_p100_us": 161441.286,
+            "complete_boundary_cpu_p100_us": 161522.229,
+            "same_call_budget_at_boundary_p100": {
+              "trace": "0",
+              "step": "6",
+              "B_us": 161522.229,
+              "N_us": 146.653,
+              "B_over_N": 1101.3905545744035,
+              "static_N_us": 296.842
+            },
+            "boundary_span_observed": true
+          }
+        },
+        {
+          "default": {
+            "whole_mask_cpu_p100_us": 1406.005,
+            "dynamic_boundary_cpu_p100_us": 1045.122,
+            "complete_boundary_cpu_p100_us": 1052.718,
+            "same_call_budget_at_boundary_p100": {
+              "trace": "2",
+              "step": "1804",
+              "B_us": 1052.718,
+              "N_us": 132.295,
+              "B_over_N": 7.957352885596584,
+              "static_N_us": 148.637
+            },
+            "boundary_span_observed": true
+          },
+          "control": {
+            "whole_mask_cpu_p100_us": 1239.607,
+            "dynamic_boundary_cpu_p100_us": 1111.854,
+            "complete_boundary_cpu_p100_us": 1121.437,
+            "same_call_budget_at_boundary_p100": {
+              "trace": "2",
+              "step": "4194",
+              "B_us": 1121.437,
+              "N_us": 118.17,
+              "B_over_N": 9.49003131082339,
+              "static_N_us": 117.842
+            },
+            "boundary_span_observed": true
+          },
+          "filtered": {
+            "whole_mask_cpu_p100_us": 1358.561,
+            "dynamic_boundary_cpu_p100_us": 1208.684,
+            "complete_boundary_cpu_p100_us": 1221.076,
+            "same_call_budget_at_boundary_p100": {
+              "trace": "2",
+              "step": "1804",
+              "B_us": 1221.076,
+              "N_us": 137.485,
+              "B_over_N": 8.881521620540422,
+              "static_N_us": 151.141
+            },
+            "boundary_span_observed": true
+          },
+          "trunk": {
+            "whole_mask_cpu_p100_us": 179997.093,
+            "dynamic_boundary_cpu_p100_us": 179802.834,
+            "complete_boundary_cpu_p100_us": 179832.387,
+            "same_call_budget_at_boundary_p100": {
+              "trace": "0",
+              "step": "6",
+              "B_us": 179832.387,
+              "N_us": 164.706,
+              "B_over_N": 1091.8387126152052,
+              "static_N_us": 142.346
+            },
+            "boundary_span_observed": true
+          }
+        }
+      ],
+      "binary_sha256": {
+        "default": "48ae4b03829c1be35b7fd9d173effff3803631f9495348fd79a6ff5c3505b67c",
+        "control": "48ae4b03829c1be35b7fd9d173effff3803631f9495348fd79a6ff5c3505b67c",
+        "filtered": "48ae4b03829c1be35b7fd9d173effff3803631f9495348fd79a6ff5c3505b67c",
+        "trunk": "2b537642dc89b5a05fc2c76f2480b3a754084d6851e6b4ffef196d73aadd5300"
+      },
+      "raw_report_sha256": "464aa527defd07b7d3078e20d0ebca62a0571ca2f9641a80e729e8f851fa0b2f"
+    },
+    "257_cache_on": {
+      "samples": 11767,
+      "rounds": 2,
+      "cohorts": [
+        {
+          "default": {
+            "whole_mask_cpu_p100_us": 1496.921,
+            "dynamic_boundary_cpu_p100_us": 1289.452,
+            "complete_boundary_cpu_p100_us": 1304.428,
+            "same_call_budget_at_boundary_p100": {
+              "trace": "2",
+              "step": "5239",
+              "B_us": 1304.428,
+              "N_us": 192.493,
+              "B_over_N": 6.776495768677303,
+              "static_N_us": 180.716
+            },
+            "boundary_span_observed": true
+          },
+          "control": {
+            "whole_mask_cpu_p100_us": 1857.3,
+            "dynamic_boundary_cpu_p100_us": 1666.908,
+            "complete_boundary_cpu_p100_us": 1680.432,
+            "same_call_budget_at_boundary_p100": {
+              "trace": "2",
+              "step": "5239",
+              "B_us": 1680.432,
+              "N_us": 176.868,
+              "B_over_N": 9.501051631725355,
+              "static_N_us": 206.171
+            },
+            "boundary_span_observed": true
+          },
+          "trunk": {
+            "whole_mask_cpu_p100_us": 174793.955,
+            "dynamic_boundary_cpu_p100_us": 174574.343,
+            "complete_boundary_cpu_p100_us": 174647.493,
+            "same_call_budget_at_boundary_p100": {
+              "trace": "0",
+              "step": "6",
+              "B_us": 174647.493,
+              "N_us": 146.462,
+              "B_over_N": 1192.4423604757549,
+              "static_N_us": 255.116
+            },
+            "boundary_span_observed": true
+          }
+        }
+      ],
+      "binary_sha256": {
+        "default": "48ae4b03829c1be35b7fd9d173effff3803631f9495348fd79a6ff5c3505b67c",
+        "control": "48ae4b03829c1be35b7fd9d173effff3803631f9495348fd79a6ff5c3505b67c",
+        "trunk": "2b537642dc89b5a05fc2c76f2480b3a754084d6851e6b4ffef196d73aadd5300"
+      },
+      "raw_report_sha256": "2b553ab51643ab35403971e3a54b8ed2b90a9418bf2cefbaf40fd399f8c2bb0e"
+    },
+    "1274_cache_off": {
+      "samples": 11767,
+      "rounds": 4,
+      "cohorts": [
+        {
+          "default": {
+            "whole_mask_cpu_p100_us": 2413.748,
+            "dynamic_boundary_cpu_p100_us": 2226.458,
+            "complete_boundary_cpu_p100_us": 2236.552,
+            "same_call_budget_at_boundary_p100": {
+              "trace": "2",
+              "step": "1804",
+              "B_us": 2236.552,
+              "N_us": 177.196,
+              "B_over_N": 12.621910201133208,
+              "static_N_us": 154.387
+            },
+            "boundary_span_observed": true
+          },
+          "control": {
+            "whole_mask_cpu_p100_us": 2573.984,
+            "dynamic_boundary_cpu_p100_us": 2461.14,
+            "complete_boundary_cpu_p100_us": 2467.75,
+            "same_call_budget_at_boundary_p100": {
+              "trace": "2",
+              "step": "4194",
+              "B_us": 2467.75,
+              "N_us": 106.234,
+              "B_over_N": 23.229380424346253,
+              "static_N_us": 133.383
+            },
+            "boundary_span_observed": true
+          },
+          "filtered": {
+            "whole_mask_cpu_p100_us": 3276.274,
+            "dynamic_boundary_cpu_p100_us": 3131.178,
+            "complete_boundary_cpu_p100_us": 3138.133,
+            "same_call_budget_at_boundary_p100": {
+              "trace": "1",
+              "step": "1803",
+              "B_us": 3138.133,
+              "N_us": 138.141,
+              "B_over_N": 22.716883474131503,
+              "static_N_us": 168.286
+            },
+            "boundary_span_observed": true
+          },
+          "trunk": {
+            "whole_mask_cpu_p100_us": 188889.448,
+            "dynamic_boundary_cpu_p100_us": null,
+            "complete_boundary_cpu_p100_us": null,
+            "same_call_budget_at_boundary_p100": null,
+            "boundary_span_observed": false
+          }
+        },
+        {
+          "default": {
+            "whole_mask_cpu_p100_us": 2330.914,
+            "dynamic_boundary_cpu_p100_us": 2215.336,
+            "complete_boundary_cpu_p100_us": 2220.977,
+            "same_call_budget_at_boundary_p100": {
+              "trace": "2",
+              "step": "5239",
+              "B_us": 2220.977,
+              "N_us": 109.937,
+              "B_over_N": 20.202270391224065,
+              "static_N_us": 121.181
+            },
+            "boundary_span_observed": true
+          },
+          "control": {
+            "whole_mask_cpu_p100_us": 2826.599,
+            "dynamic_boundary_cpu_p100_us": 2629.252,
+            "complete_boundary_cpu_p100_us": 2638.688,
+            "same_call_budget_at_boundary_p100": {
+              "trace": "0",
+              "step": "1804",
+              "B_us": 2638.688,
+              "N_us": 187.911,
+              "B_over_N": 14.042222115788858,
+              "static_N_us": 198.018
+            },
+            "boundary_span_observed": true
+          },
+          "filtered": {
+            "whole_mask_cpu_p100_us": 3630.979,
+            "dynamic_boundary_cpu_p100_us": 3455.336,
+            "complete_boundary_cpu_p100_us": 3463.234,
+            "same_call_budget_at_boundary_p100": {
+              "trace": "1",
+              "step": "1803",
+              "B_us": 3463.234,
+              "N_us": 167.745,
+              "B_over_N": 20.64582550895705,
+              "static_N_us": 204.939
+            },
+            "boundary_span_observed": true
+          },
+          "trunk": {
+            "whole_mask_cpu_p100_us": 188207.25,
+            "dynamic_boundary_cpu_p100_us": null,
+            "complete_boundary_cpu_p100_us": null,
+            "same_call_budget_at_boundary_p100": null,
+            "boundary_span_observed": false
+          }
+        }
+      ],
+      "binary_sha256": {
+        "default": "48ae4b03829c1be35b7fd9d173effff3803631f9495348fd79a6ff5c3505b67c",
+        "control": "48ae4b03829c1be35b7fd9d173effff3803631f9495348fd79a6ff5c3505b67c",
+        "filtered": "48ae4b03829c1be35b7fd9d173effff3803631f9495348fd79a6ff5c3505b67c",
+        "trunk": "2b537642dc89b5a05fc2c76f2480b3a754084d6851e6b4ffef196d73aadd5300"
+      },
+      "raw_report_sha256": "4d406ca89554d7fbb53798df13bec9f1dc34f46d98130d023131be7d673025df"
+    },
+    "1274_cache_on": {
+      "samples": 11767,
+      "rounds": 2,
+      "cohorts": [
+        {
+          "default": {
+            "whole_mask_cpu_p100_us": 2836.275,
+            "dynamic_boundary_cpu_p100_us": 2698.307,
+            "complete_boundary_cpu_p100_us": 2705.831,
+            "same_call_budget_at_boundary_p100": {
+              "trace": "0",
+              "step": "1804",
+              "B_us": 2705.831,
+              "N_us": 130.444,
+              "B_over_N": 20.743238477814234,
+              "static_N_us": 123.178
+            },
+            "boundary_span_observed": true
+          },
+          "control": {
+            "whole_mask_cpu_p100_us": 2182.022,
+            "dynamic_boundary_cpu_p100_us": 1878.067,
+            "complete_boundary_cpu_p100_us": 1884.24,
+            "same_call_budget_at_boundary_p100": {
+              "trace": "2",
+              "step": "4194",
+              "B_us": 1884.24,
+              "N_us": 117.696,
+              "B_over_N": 16.009380097879284,
+              "static_N_us": 117.901
+            },
+            "boundary_span_observed": true
+          },
+          "trunk": {
+            "whole_mask_cpu_p100_us": 179672.314,
+            "dynamic_boundary_cpu_p100_us": null,
+            "complete_boundary_cpu_p100_us": null,
+            "same_call_budget_at_boundary_p100": null,
+            "boundary_span_observed": false
+          }
+        }
+      ],
+      "binary_sha256": {
+        "default": "48ae4b03829c1be35b7fd9d173effff3803631f9495348fd79a6ff5c3505b67c",
+        "control": "48ae4b03829c1be35b7fd9d173effff3803631f9495348fd79a6ff5c3505b67c",
+        "trunk": "2b537642dc89b5a05fc2c76f2480b3a754084d6851e6b4ffef196d73aadd5300"
+      },
+      "raw_report_sha256": "4719e3694c8a7b890a74552ee59de4476d08422b71d09d540718332d23fbcc62"
+    }
+  },
+  "correctness": {
+    "release_root_passed": 914,
+    "release_root_failed": 0,
+    "release_root_ignored": 51,
+    "combined_workspace_gate": {
+      "crates": [
+        {
+          "crate": "_glrmask",
+          "passed": 0,
+          "failed": 0,
+          "ignored": 0,
+          "filtered_out": 0
+        },
+        {
+          "crate": "glrmask",
+          "passed": 916,
+          "failed": 0,
+          "ignored": 51,
+          "filtered_out": 0
+        },
+        {
+          "crate": "glrmask_artifact",
+          "passed": 15,
+          "failed": 0,
+          "ignored": 0,
+          "filtered_out": 0
+        },
+        {
+          "crate": "glrmask_dwa_merge",
+          "passed": 13,
+          "failed": 0,
+          "ignored": 0,
+          "filtered_out": 0
+        },
+        {
+          "crate": "glrmask_finite_automata",
+          "passed": 6,
+          "failed": 0,
+          "ignored": 0,
+          "filtered_out": 0
+        },
+        {
+          "crate": "glrmask_glr",
+          "passed": 196,
+          "failed": 0,
+          "ignored": 2,
+          "filtered_out": 0
+        },
+        {
+          "crate": "glrmask_grammar",
+          "passed": 92,
+          "failed": 0,
+          "ignored": 0,
+          "filtered_out": 0
+        },
+        {
+          "crate": "glrmask_invariant",
+          "passed": 4,
+          "failed": 0,
+          "ignored": 0,
+          "filtered_out": 0
+        },
+        {
+          "crate": "glrmask_json_schema",
+          "passed": 51,
+          "failed": 0,
+          "ignored": 0,
+          "filtered_out": 0
+        },
+        {
+          "crate": "glrmask_lexer",
+          "passed": 238,
+          "failed": 0,
+          "ignored": 0,
+          "filtered_out": 0
+        },
+        {
+          "crate": "glrmask_parser_dwa",
+          "passed": 49,
+          "failed": 0,
+          "ignored": 1,
+          "filtered_out": 0
+        },
+        {
+          "crate": "glrmask_terminal_dwa",
+          "passed": 273,
+          "failed": 0,
+          "ignored": 0,
+          "filtered_out": 0
+        },
+        {
+          "crate": "glrmask_vocab",
+          "passed": 3,
+          "failed": 0,
+          "ignored": 0,
+          "filtered_out": 0
+        },
+        {
+          "crate": "glrmask_weight",
+          "passed": 21,
+          "failed": 0,
+          "ignored": 0,
+          "filtered_out": 0
+        },
+        {
+          "crate": "glrmask_weighted_automata",
+          "passed": 54,
+          "failed": 0,
+          "ignored": 0,
+          "filtered_out": 0
+        }
+      ],
+      "passed": 1931,
+      "failed": 0,
+      "ignored": 54,
+      "method": "Last summary for each top-level Cargo unit-test binary; nested child-process summaries are not counted again."
+    },
+    "fresh_combined_replay": {
+      "binary_sha256": "d199101c678fbe9e659e8f08332612733a83f072c25db7e3c29fa8d3581c85be",
+      "replays": [
+        "hybrid257",
+        "fresh-dynamic"
+      ],
+      "positions_each": 11767,
+      "exact": true,
+      "timing_claim": false
+    },
+    "public_api_suites": {
+      "passed": 170,
+      "failed": 0,
+      "ignored": 0,
+      "suites": [
+        "end_tokens",
+        "final_public_api",
+        "final_public_api_review",
+        "glrm_v1",
+        "integration"
+      ]
+    },
+    "lifecycle_oracle": {
+      "fixtures": 8,
+      "memberships": 437760,
+      "digest": "cbbf5837918ca8ae",
+      "clone_reload_concurrent_cold": true,
+      "native_candidate_witness": "Equivalent static child witnesses are counted; native private payloads are not inspected."
+    },
+    "independent_release_memberships": 472248,
+    "release_full_replays": 44,
+    "release_fresh_artifact_replays": 1,
+    "ordinary_mask_rounds": 4,
+    "ordinary_masks_per_round": 576,
+    "all_target_check": "passed; pre-existing unchanged example warnings remain",
+    "no_internal_api_check": "passed"
+  },
+  "evidence_root": "/root/glrmask-boundary-finalization-136669-evidence"
+}
