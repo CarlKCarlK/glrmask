@@ -546,7 +546,7 @@ fn factor_choice_common_prefix(options: &[Expr]) -> Option<Expr> {
 
     Some(seq_from_parts(vec![
         prefix,
-        factor_regex_expr(Expr::Choice(remainders)),
+        factor_choice_of_factored(remainders),
     ]))
 }
 
@@ -569,7 +569,7 @@ fn factor_choice_common_suffix(options: &[Expr]) -> Option<Expr> {
         .collect::<Vec<_>>();
 
     Some(seq_from_parts(vec![
-        factor_regex_expr(Expr::Choice(prefixes)),
+        factor_choice_of_factored(prefixes),
         suffix,
     ]))
 }
@@ -617,7 +617,7 @@ fn factor_choice_repeated_prefix_subset(options: &[Expr]) -> Option<Expr> {
             .collect::<Vec<_>>();
         let factored_group = seq_from_parts(vec![
             prefix,
-            factor_regex_expr(Expr::Choice(remainders)),
+            factor_choice_of_factored(remainders),
         ]);
         let mut is_matching = vec![false; options.len()];
         for &index in matching {
@@ -631,7 +631,7 @@ fn factor_choice_repeated_prefix_subset(options: &[Expr]) -> Option<Expr> {
                 rewritten.push(option.clone());
             }
         }
-        return Some(factor_regex_expr(Expr::Choice(rewritten)));
+        return Some(factor_choice_of_factored(rewritten));
     }
     None
 }
@@ -666,7 +666,7 @@ fn factor_choice_repeated_suffix_subset(options: &[Expr]) -> Option<Expr> {
             .map(|&index| choice_without_last_part(&options[index]))
             .collect::<Vec<_>>();
         let factored_group = seq_from_parts(vec![
-            factor_regex_expr(Expr::Choice(prefixes)),
+            factor_choice_of_factored(prefixes),
             suffix,
         ]);
         let mut is_matching = vec![false; options.len()];
@@ -681,7 +681,7 @@ fn factor_choice_repeated_suffix_subset(options: &[Expr]) -> Option<Expr> {
                 rewritten.push(option.clone());
             }
         }
-        return Some(factor_regex_expr(Expr::Choice(rewritten)));
+        return Some(factor_choice_of_factored(rewritten));
     }
     None
 }
@@ -790,7 +790,7 @@ fn factor_choice_literals(options: &[Expr]) -> Option<Expr> {
 
     Some(seq_from_parts(vec![
         Expr::U8Seq(vec![first_byte]),
-        factor_regex_expr(Expr::Choice(remainders)),
+        factor_choice_of_factored(remainders),
     ]))
 }
 
@@ -1208,6 +1208,41 @@ fn factor_aligned_unit_repeat_intersection(left: &Expr, right: &Expr) -> Option<
     })
 }
 
+/// Factor a newly introduced choice whose children were already recursively
+/// factored. Prefix/suffix rewrites change the union/concatenation spine, not
+/// their child languages. Restarting the entire recursive normalizer here
+/// repeats work and expands cached Shared children under a fresh empty cache.
+fn factor_choice_of_factored(mut options: Vec<Expr>) -> Expr {
+    const LARGE_PURE_LITERAL_CHOICE_NO_FACTOR: usize = 64;
+    if options.len() >= LARGE_PURE_LITERAL_CHOICE_NO_FACTOR
+        && options.iter().all(|option| matches!(unwrap_shared(option), Expr::U8Seq(_)))
+    {
+        return Expr::Choice(options);
+    }
+    if options.len() == 1 {
+        return options.pop().unwrap();
+    }
+    if let Some(factored) = factor_choice_literals(&options) {
+        return factored;
+    }
+    if let Some(factored) = factor_choice_common_prefix(&options) {
+        return factored;
+    }
+    if let Some(factored) = factor_choice_common_suffix(&options) {
+        return factored;
+    }
+    if let Some(factored) = factor_choice_repeated_exclusion_rhs(&options) {
+        return factored;
+    }
+    if let Some(factored) = factor_choice_repeated_prefix_subset(&options) {
+        return factored;
+    }
+    if let Some(factored) = factor_choice_repeated_suffix_subset(&options) {
+        return factored;
+    }
+    Expr::Choice(options)
+}
+
 fn factor_regex_expr_impl(
     expr: Expr,
     shared_cache: Option<&FxHashMap<usize, Arc<Expr>>>,
@@ -1241,38 +1276,11 @@ fn factor_regex_expr_impl(
             {
                 return Expr::Choice(options);
             }
-            let mut factored_options = options
+            let factored_options = options
                 .into_iter()
                 .map(|expr| factor_regex_expr_impl(expr, shared_cache))
                 .collect::<Vec<_>>();
-
-            if factored_options.len() == 1 {
-                return factored_options.pop().unwrap();
-            }
-
-            // Prefix first handles A B1 C | A B2 C; suffix then handles
-            // B1 C | B2 C. Each helper probes through references and only
-            // clones a choice when it actually finds a factor.
-            if let Some(factored) = factor_choice_literals(&factored_options) {
-                return factored;
-            }
-            if let Some(factored) = factor_choice_common_prefix(&factored_options) {
-                return factored;
-            }
-            if let Some(factored) = factor_choice_common_suffix(&factored_options) {
-                return factored;
-            }
-            if let Some(factored) = factor_choice_repeated_exclusion_rhs(&factored_options) {
-                return factored;
-            }
-            if let Some(factored) = factor_choice_repeated_prefix_subset(&factored_options) {
-                return factored;
-            }
-            if let Some(factored) = factor_choice_repeated_suffix_subset(&factored_options) {
-                return factored;
-            }
-
-            Expr::Choice(factored_options)
+            factor_choice_of_factored(factored_options)
         }
         Expr::Repeat { expr, min, max } => Expr::Repeat {
             expr: Box::new(factor_regex_expr_impl(*expr, shared_cache)),
@@ -16896,6 +16904,46 @@ mod tests {
         assert!(Arc::ptr_eq(first, &factored_shared));
         assert!(Arc::ptr_eq(second, &factored_shared));
         assert!(Arc::ptr_eq(first, second));
+    }
+
+    #[test]
+    fn factoring_choice_spines_does_not_rewalk_cached_children() {
+        fn contains(expr: &Expr, wanted: &Arc<Expr>) -> bool {
+            match expr {
+                Expr::Shared(inner) => Arc::ptr_eq(inner, wanted) || contains(inner, wanted),
+                Expr::Seq(parts) | Expr::Choice(parts) => parts.iter().any(|part| contains(part, wanted)),
+                Expr::Repeat { expr, .. } => contains(expr, wanted),
+                Expr::Exclude { expr, exclude } => contains(expr, wanted) || contains(exclude, wanted),
+                Expr::Intersect { expr, intersect } => contains(expr, wanted) || contains(intersect, wanted),
+                _ => false,
+            }
+        }
+        let shared = Arc::new(Expr::Repeat {
+            expr: Box::new(Expr::U8Class(U8Set::from_bytes(b"ab"))), min: 1, max: None,
+        });
+        let cached = Arc::new(factor_regex_expr((*shared).clone()));
+        let cache = rustc_hash::FxHashMap::from_iter([(Arc::as_ptr(&shared) as usize, Arc::clone(&cached))]);
+        let literal = |s: &str| Expr::U8Seq(s.as_bytes().to_vec());
+        for suffix in [false, true] {
+            for subset in [false, true] {
+                let mut options = ["a", "b"].into_iter().map(|different| {
+                    if suffix {
+                        Expr::Seq(vec![literal(different), Expr::Shared(Arc::clone(&shared)), literal("x")])
+                    } else {
+                        Expr::Seq(vec![literal("x"), Expr::Shared(Arc::clone(&shared)), literal(different)])
+                    }
+                }).collect::<Vec<_>>();
+                if subset { options.push(literal("z")); }
+                let original = Expr::Choice(options);
+                let factored = super::factor_regex_expr_with_shared_cache(original.clone(), &cache);
+                assert!(contains(&factored, &cached), "choice rewrite must retain the already factored child");
+                for input in ["", "z", "x", "xaa", "xab", "xaba", "xbab", "aax", "abx", "bax", "bbbx", "xc", "cax"] {
+                    assert_eq!(terminal_matches(original.clone(), input.as_bytes()),
+                        terminal_matches(factored.clone(), input.as_bytes()),
+                        "suffix={suffix} subset={subset} input={input}");
+                }
+            }
+        }
     }
 
     #[test]
