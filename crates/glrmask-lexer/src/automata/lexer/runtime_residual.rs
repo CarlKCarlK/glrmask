@@ -4661,6 +4661,10 @@ impl VirtualResidualRuntime {
             }
         }
 
+        // Compact loaded oracles transfer this exact backwards-liveness table
+        // instead of their relation powers. Direct-coordinate proofs must use
+        // the same representation-aware query as state-indexed slice proofs.
+        let body_boundary_future = store.body_boundary_future_by_completed.as_ref().map(Arc::clone);
         let oracle = store.liveness_oracle.as_mut()?;
         let mut future_cache = FxHashMap::<BoundedCodeOracleCoordinate, bool>::default();
         let mut seen = FxHashSet::<(u32, BoundedCodeOracleCoordinate)>::default();
@@ -4691,7 +4695,9 @@ impl VirtualResidualRuntime {
                 } else if let Some(&future) = future_cache.get(&target) {
                     future
                 } else {
-                    let future = oracle.has_future(target);
+                    let future = oracle.has_future_for_slice_proof(
+                        target, body_boundary_future.as_deref().map(Vec::as_slice),
+                    )?;
                     future_cache.insert(target, future);
                     future
                 };
@@ -5736,9 +5742,14 @@ impl VirtualResidualRuntime {
             return Some(true);
         }
         let coordinate = self.oracle_coordinate_for_state_locked(&store, state)?;
+        let body_boundary_future = store.body_boundary_future_by_completed.as_ref().map(Arc::clone);
         let result = 'proof: {
             let oracle = store.liveness_oracle.as_mut()?;
-            if oracle.coordinate_accepting(coordinate) || !oracle.has_future(coordinate) {
+            if oracle.coordinate_accepting(coordinate)
+                || !oracle.has_future_for_slice_proof(
+                    coordinate, body_boundary_future.as_deref().map(Vec::as_slice),
+                )?
+            {
                 break 'proof Some(false);
             }
 
@@ -5763,7 +5774,11 @@ impl VirtualResidualRuntime {
                     break 'proof Some(false);
                 }
                 for &target in &next {
-                    if oracle.coordinate_accepting(target) || !oracle.has_future(target) {
+                    if oracle.coordinate_accepting(target)
+                        || !oracle.has_future_for_slice_proof(
+                            target, body_boundary_future.as_deref().map(Vec::as_slice),
+                        )?
+                    {
                         break 'proof Some(false);
                     }
                 }
@@ -7355,6 +7370,37 @@ mod tests {
             );
             assert_eq!(actual, expected, "finite slice prefix={prefix:?}");
             assert_eq!(actual, Some(true));
+
+            // Dynamic joint-root and uniform-byte fast paths use different
+            // proof entry points. Exercise them against the genuinely compact
+            // oracle too, rather than accidentally retaining relation powers.
+            let old_coordinate = {
+                let store = original.store.lock().unwrap();
+                original.oracle_coordinate_for_state_locked(&store, old_state).unwrap()
+            };
+            let loaded_coordinate = {
+                let store = loaded.store.lock().unwrap();
+                loaded.oracle_coordinate_for_state_locked(&store, loaded_state).unwrap()
+            };
+            let direct_expected = original.direct_coordinate_parser_transparent_byte_dfa(
+                VirtualResidualDirectCoordinate { runtime_index: original.runtime_index, coordinate: old_coordinate },
+                0, class_count, &byte_to_class, &finite, &finite_productive, true, 10_000,
+            );
+            let direct_actual = loaded.direct_coordinate_parser_transparent_byte_dfa(
+                VirtualResidualDirectCoordinate { runtime_index: loaded.runtime_index, coordinate: loaded_coordinate },
+                0, class_count, &byte_to_class, &finite, &finite_productive, true, 10_000,
+            );
+            assert_eq!(direct_actual, direct_expected, "direct finite slice prefix={prefix:?}");
+            assert_eq!(direct_actual, Some(true));
+            for byte in [b'a', b'c'] {
+                let family = U8Set::single(byte);
+                for horizon in [1, 3] {
+                    let expected = original.parser_transparent_byte_family(old_state, family, horizon);
+                    let actual = loaded.parser_transparent_byte_family(loaded_state, family, horizon);
+                    assert!(expected.is_some());
+                    assert_eq!(actual, expected, "byte family prefix={prefix:?} byte={byte} horizon={horizon}");
+                }
+            }
         }
 
         let mut malformed = artifact;
