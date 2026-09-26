@@ -1863,11 +1863,11 @@ pub(super) fn try_scalar_dispatch(
             started.elapsed().as_secs_f64() * 1e3,
         );
     }
-    let trie = if precollapse_master_decision.is_some() {
-        vocab.llg_master_trie().map_or(trie, |slice| slice.trie())
-    } else {
-        trie
-    };
+    // Carry the certificate, not the replacement trie. The inner walk first
+    // compares the certified residual work against this ordinary trie and
+    // selects the master only if profitable. Replacing it here makes that
+    // comparison use the larger master as its own baseline and also leaves
+    // the wrong trie in place when the inner gate declines the certificate.
     let Some(reset_states) = tokenizer.sorted_deterministic_dispatch_roots() else {
         return Ok(false);
     };
@@ -2213,11 +2213,8 @@ pub(super) fn try_flat16<const HOT_SINGLE_ROOT: bool>(
             precollapse_master_decision.is_some(),
         );
     }
-    let trie = if precollapse_master_decision.is_some() {
-        vocab.llg_master_trie().map_or(trie, |slice| slice.trie())
-    } else {
-        trie
-    };
+    // Preserve the ordinary trie until the inner profitability gate accepts
+    // the pre-collapse certificate; see the scalar-dispatch path above.
     if lexer_scan_cache.subset_union_requested
         && root_branches.len() >= 2
         && root_branches.iter().all(|branch| branch.initial_prune_guard.is_passed())
