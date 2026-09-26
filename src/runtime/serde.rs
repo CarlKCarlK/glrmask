@@ -4085,6 +4085,7 @@ fn restore_segmented_runtime_v23(
                     Arc::<[u32]>::from(tokens)
                 });
                 restored_shards.push(crate::runtime::SegmentedBoundaryShard {
+            mask_vocabulary: Default::default(),
                     start_component,
                     start_parser_states,
                     accepts_empty_stack,
@@ -4476,6 +4477,7 @@ fn restore_recursive_segmented_runtime_v27(
             Arc::<[u32]>::from(tokens)
         });
         restored_shards.push(crate::runtime::SegmentedBoundaryShard {
+            mask_vocabulary: Default::default(),
             start_component: shard.start_component,
             start_parser_states: crate::ds::bitset::BitSet::new(0),
             accepts_empty_stack: shard.accepts_empty_stack,
@@ -8327,6 +8329,12 @@ impl Constraint {
                 }
             }
         }
+        // Rebuild this tiny token-domain summary from the authoritative
+        // packed/materialized inventory after all external sections load.
+        // No vocabulary trie is built and it is not serialized a second time.
+        constraint.empty_byte_token_ids = constraint.token_bytes_iter()
+            .filter_map(|(id, bytes)| bytes.is_empty().then_some(id))
+            .collect::<Vec<u32>>().into();
         let rebuild_started = profile.then(std::time::Instant::now);
         let skip_runtime_rebuild_for_profile =
             std::env::var_os("GLRMASK_SKIP_RUNTIME_REBUILD_FOR_PROFILE").is_some();

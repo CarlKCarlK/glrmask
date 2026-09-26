@@ -915,6 +915,9 @@ impl DynamicConstraint {
             special_token_terminals,
             dynamic_mask_vocab,
             lazy_dynamic_mask_vocab: std::sync::OnceLock::new(),
+            empty_byte_token_ids: payload.token_bytes.iter()
+                .filter_map(|(&id, bytes)| bytes.is_empty().then_some(id))
+                .collect::<Vec<u32>>().into(),
             possible_matches: BTreeMap::new(),
             possible_matches_complete: false,
             state_to_internal_tsid: Vec::new(),

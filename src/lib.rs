@@ -181,6 +181,9 @@ pub(crate) fn set_test_compat_mode(enabled: bool) {
 #[cfg(feature = "internal-api")]
 #[doc(hidden)]
 pub mod __private {
+    pub use crate::runtime::boundary_cpu_profile::{
+        begin as begin_boundary_cpu_profile, take as take_boundary_cpu_profile, BoundaryCpuReport,
+    };
     #[derive(Debug, Clone, Copy, Default)]
     pub struct CompilerCacheStats {
         pub token_set_entries: usize,
@@ -314,6 +317,16 @@ pub mod __private {
             self,
             children: &[(&str, std::sync::Arc<Constraint>)],
             vocab: &Vocab,
+        ) -> Result<Self>;
+        /// Measurement-only bridge: compile static boundary shards only for
+        /// the listed starting-component indices. Other components retain an
+        /// exact DynamicDirect shard with the static walk's candidate-token
+        /// domain, allowing direct static-B vs candidate-dynamic-B timing.
+        fn compose_compiled_subgrammars_hybrid(
+            self,
+            children: &[(&str, &Constraint)],
+            vocab: &Vocab,
+            static_components: &[usize],
         ) -> Result<Self>;
     }
 
@@ -577,6 +590,61 @@ pub mod __private {
                 &shared,
                 vocab,
                 SegmentedBoundaryBackend::Dynamic,
+            )
+            .map(|composition| composition.constraint)
+            .map_err(Error::Compilation)
+        }
+
+        fn compose_compiled_subgrammars_hybrid(
+            self,
+            children: &[(&str, &Constraint)],
+            vocab: &Vocab,
+            static_components: &[usize],
+        ) -> Result<Self> {
+            use crate::compiler::constraint_compose::{
+                CompiledSubgrammarInput, compose_constraints_owned_parent_segmented_hybrid,
+            };
+            use crate::ds::bitset::BitSet;
+            use std::collections::BTreeSet;
+
+            let mut inputs = Vec::with_capacity(children.len());
+            let mut seen = BTreeSet::new();
+            for &(name, child) in children {
+                let placeholder_terminal = self
+                    .terminal_display_names
+                    .iter()
+                    .position(|candidate| candidate == name)
+                    .ok_or_else(|| {
+                        Error::Compilation(format!(
+                            "parent has no subgrammar placeholder terminal {name:?}",
+                        ))
+                    })? as u32;
+                if !seen.insert(placeholder_terminal) {
+                    return Err(Error::Compilation(format!(
+                        "parent placeholder terminal {name:?} was supplied more than once",
+                    )));
+                }
+                inputs.push(CompiledSubgrammarInput {
+                    placeholder_terminal,
+                    additional_placeholder_terminals: &[],
+                    constraint: child,
+                });
+            }
+            let mut selected = BitSet::new(children.len() + 1);
+            for &component in static_components {
+                if component >= children.len() + 1 {
+                    return Err(Error::Compilation(format!(
+                        "hybrid static component {component} out of range 0..{}",
+                        children.len() + 1,
+                    )));
+                }
+                selected.set(component);
+            }
+            compose_constraints_owned_parent_segmented_hybrid(
+                self,
+                &inputs,
+                vocab,
+                &selected,
             )
             .map(|composition| composition.constraint)
             .map_err(Error::Compilation)
