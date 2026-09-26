@@ -3577,20 +3577,36 @@ fn build_experimental_core_merged_table(
 }
 
 fn refine_experimental_core_partition(table: &GLRTable, core_keys: &[Vec<Item>]) -> Vec<u32> {
-    let mut class_by_core: BTreeMap<Vec<Item>, u32> = BTreeMap::new();
+    let mut class_by_core: FxHashMap<&[Item], u32> = FxHashMap::default();
+    class_by_core.reserve(core_keys.len());
     let mut partition = Vec::with_capacity(core_keys.len());
     for key in core_keys {
         let next = class_by_core.len() as u32;
-        partition.push(*class_by_core.entry(key.clone()).or_insert(next));
+        let class = match class_by_core.get(key.as_slice()) {
+            Some(&existing) => existing,
+            None => {
+                class_by_core.insert(key.as_slice(), next);
+                next
+            }
+        };
+        partition.push(class);
     }
 
     loop {
-        let mut sig_to_class: BTreeMap<ExperimentalCoreCompatibilitySig, u32> = BTreeMap::new();
+        let mut sig_to_class: FxHashMap<ExperimentalCoreCompatibilitySig, u32> = FxHashMap::default();
+        sig_to_class.reserve(table.num_states as usize);
         let mut next_partition = Vec::with_capacity(partition.len());
         for state in 0..table.num_states as usize {
             let sig = ExperimentalCoreCompatibilitySig::new(table, state, partition[state], &partition);
             let next = sig_to_class.len() as u32;
-            next_partition.push(*sig_to_class.entry(sig).or_insert(next));
+            let class = match sig_to_class.get(&sig) {
+                Some(&existing) => existing,
+                None => {
+                    sig_to_class.insert(sig, next);
+                    next
+                }
+            };
+            next_partition.push(class);
         }
         if next_partition == partition {
             return partition;
@@ -3599,7 +3615,7 @@ fn refine_experimental_core_partition(table: &GLRTable, core_keys: &[Vec<Item>])
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
 struct ExperimentalCoreCompatibilitySig {
     core_class: u32,
     shifts: Vec<(TerminalID, u32, bool, bool)>,
@@ -3608,7 +3624,7 @@ struct ExperimentalCoreCompatibilitySig {
 
 impl ExperimentalCoreCompatibilitySig {
     fn new(table: &GLRTable, state: usize, core_class: u32, partition: &[u32]) -> Self {
-        let mut shifts = Vec::new();
+        let mut shifts = Vec::with_capacity(table.action[state].len());
         for (terminal, action) in &table.action[state] {
             if let Some((target, replace)) = action_shift(action) {
                 shifts.push((
@@ -3829,14 +3845,15 @@ fn grouped_item_lookahead_counts(grammar: &AnalyzedGrammar) -> Vec<Vec<(u32, u32
 mod tests {
     use super::{
         add_completed_lr0_reductions, build_experimental_core_merged_table, build_lalr_table,
-        build_lalr_table_impl, compute_lalr_item_lookaheads,
+        build_lalr_table_impl, build_lr1_table, compute_lalr_item_lookaheads,
         build_lr0_item_sets, build_lr1_item_sets,
         build_lr1_item_sets_with_preclosure_reuse, build_table,
         build_table_with_default_construction, grouped_item_lookahead_counts,
         finish_table_with_early_identity_quotient, initialize_pending_and_goto,
-        pending_table_has_conflict, slr_reductions_would_conflict,
-        selected_glr_table_construction, try_build_direct_regular_table,
-        try_build_direct_regular_table_reference,
+        lr1_core_key, pending_table_has_conflict, refine_experimental_core_partition,
+        selected_glr_table_construction, slr_reductions_would_conflict,
+        try_build_direct_regular_table, try_build_direct_regular_table_reference,
+        union_experimental_core_rows, ExperimentalCoreCompatibilitySig, Item,
     };
     use crate::compiler::glr::accumulator::TerminalsDisallowed;
     use crate::compiler::glr::analysis::AnalyzedGrammar;
@@ -4942,6 +4959,192 @@ mod tests {
             for (nt, (target, replace)) in row.iter() {
                 eprintln!("[GRAMMAR_SCC_PROBE] goto state={state} nt={nt} target={target} replace={replace}");
             }
+        }
+    }
+
+    fn refine_experimental_core_partition_btree_reference(
+        table: &GLRTable,
+        core_keys: &[Vec<Item>],
+    ) -> Vec<u32> {
+        let mut class_by_core: BTreeMap<Vec<Item>, u32> = BTreeMap::new();
+        let mut partition = Vec::with_capacity(core_keys.len());
+        for key in core_keys {
+            let next = class_by_core.len() as u32;
+            partition.push(*class_by_core.entry(key.clone()).or_insert(next));
+        }
+
+        loop {
+            let mut sig_to_class: BTreeMap<ExperimentalCoreCompatibilitySig, u32> = BTreeMap::new();
+            let mut next_partition = Vec::with_capacity(partition.len());
+            for state in 0..table.num_states as usize {
+                let sig = ExperimentalCoreCompatibilitySig::new(table, state, partition[state], &partition);
+                let next = sig_to_class.len() as u32;
+                next_partition.push(*sig_to_class.entry(sig).or_insert(next));
+            }
+            if next_partition == partition {
+                return partition;
+            }
+            partition = next_partition;
+        }
+    }
+
+    fn js_like_statement_grammar() -> AnalyzedGrammar {
+        analyzed(
+            vec![
+                Rule { lhs: 0, rhs: vec![Symbol::Nonterminal(1)] },
+                Rule { lhs: 1, rhs: vec![Symbol::Nonterminal(2), Symbol::Nonterminal(1)] },
+                Rule { lhs: 1, rhs: Vec::new() },
+                Rule { lhs: 2, rhs: vec![Symbol::Nonterminal(3)] },
+                Rule { lhs: 2, rhs: vec![Symbol::Nonterminal(4)] },
+                Rule { lhs: 2, rhs: vec![Symbol::Nonterminal(5)] },
+                Rule { lhs: 2, rhs: vec![Symbol::Nonterminal(6)] },
+                Rule {
+                    lhs: 3,
+                    rhs: vec![
+                        Symbol::Terminal(2),
+                        Symbol::Terminal(0),
+                        Symbol::Terminal(3),
+                        Symbol::Nonterminal(7),
+                        Symbol::Terminal(4),
+                    ],
+                },
+                Rule {
+                    lhs: 3,
+                    rhs: vec![
+                        Symbol::Terminal(2),
+                        Symbol::Terminal(0),
+                        Symbol::Terminal(4),
+                    ],
+                },
+                Rule {
+                    lhs: 4,
+                    rhs: vec![
+                        Symbol::Terminal(5),
+                        Symbol::Terminal(6),
+                        Symbol::Nonterminal(7),
+                        Symbol::Terminal(7),
+                        Symbol::Nonterminal(2),
+                    ],
+                },
+                Rule {
+                    lhs: 4,
+                    rhs: vec![
+                        Symbol::Terminal(5),
+                        Symbol::Terminal(6),
+                        Symbol::Nonterminal(7),
+                        Symbol::Terminal(7),
+                        Symbol::Nonterminal(2),
+                        Symbol::Terminal(8),
+                        Symbol::Nonterminal(2),
+                    ],
+                },
+                Rule {
+                    lhs: 5,
+                    rhs: vec![Symbol::Nonterminal(7), Symbol::Terminal(4)],
+                },
+                Rule {
+                    lhs: 5,
+                    rhs: vec![Symbol::Terminal(13), Symbol::Nonterminal(7), Symbol::Terminal(4)],
+                },
+                Rule {
+                    lhs: 5,
+                    rhs: vec![Symbol::Terminal(4)],
+                },
+                Rule {
+                    lhs: 6,
+                    rhs: vec![Symbol::Terminal(9), Symbol::Nonterminal(1), Symbol::Terminal(10)],
+                },
+                Rule { lhs: 7, rhs: vec![Symbol::Nonterminal(8)] },
+                Rule {
+                    lhs: 8,
+                    rhs: vec![Symbol::Nonterminal(8), Symbol::Terminal(11), Symbol::Nonterminal(9)],
+                },
+                Rule { lhs: 8, rhs: vec![Symbol::Nonterminal(9)] },
+                Rule {
+                    lhs: 9,
+                    rhs: vec![Symbol::Nonterminal(9), Symbol::Terminal(12), Symbol::Nonterminal(10)],
+                },
+                Rule { lhs: 9, rhs: vec![Symbol::Nonterminal(10)] },
+                Rule { lhs: 10, rhs: vec![Symbol::Terminal(0)] },
+                Rule { lhs: 10, rhs: vec![Symbol::Terminal(1)] },
+                Rule {
+                    lhs: 10,
+                    rhs: vec![Symbol::Terminal(6), Symbol::Nonterminal(7), Symbol::Terminal(7)],
+                },
+                Rule {
+                    lhs: 10,
+                    rhs: vec![
+                        Symbol::Terminal(0),
+                        Symbol::Terminal(6),
+                        Symbol::Nonterminal(7),
+                        Symbol::Terminal(7),
+                    ],
+                },
+            ],
+            0,
+            14,
+        )
+    }
+
+    #[test]
+    fn experimental_core_partition_fast_path_matches_btree_reference() {
+        let mut grammars = vec![
+            multi_lookahead_grammar(),
+            mysterious_conflict_grammar(),
+            recursive_ambiguous_grammar(),
+            template_like_grammar(),
+            large_left_linear_grammar(),
+            unit_chain_grammar(),
+            ambiguous_unit_chain_grammar(),
+            nullable_unit_chain_grammar(),
+            js_like_statement_grammar(),
+        ];
+        for n in 1..=5 {
+            for branches in 1..=3 {
+                for recursive in [false, true] {
+                    grammars.push(generated_unit_dag_grammar(n, branches, true, recursive));
+                }
+            }
+        }
+
+        for (idx, grammar) in grammars.into_iter().enumerate() {
+            let (item_sets, transitions) = build_lr1_item_sets(&grammar);
+            let canonical = build_lr1_table(&grammar, &item_sets, &transitions);
+            let core_keys = item_sets.iter().map(lr1_core_key).collect::<Vec<_>>();
+
+            let btree_partition =
+                refine_experimental_core_partition_btree_reference(&canonical, &core_keys);
+            let fast_partition = refine_experimental_core_partition(&canonical, &core_keys);
+
+            assert_eq!(
+                fast_partition, btree_partition,
+                "partition mismatch on grammar index {idx}",
+            );
+
+            let fast_table =
+                build_experimental_core_merged_table(&grammar, &item_sets, &transitions);
+            let btree_table = union_experimental_core_rows(canonical.clone(), &btree_partition);
+
+            assert_eq!(
+                fast_table.as_ref().map(|t| t.num_states),
+                btree_table.as_ref().map(|t| t.num_states),
+                "num_states mismatch on grammar index {idx}",
+            );
+            assert_eq!(
+                fast_table.as_ref().map(|t| &t.action),
+                btree_table.as_ref().map(|t| &t.action),
+                "action table mismatch on grammar index {idx}",
+            );
+            assert_eq!(
+                fast_table.as_ref().map(|t| &t.goto),
+                btree_table.as_ref().map(|t| &t.goto),
+                "goto table mismatch on grammar index {idx}",
+            );
+            assert_eq!(
+                fast_table.as_ref().map(|t| &t.forwarded_shifts),
+                btree_table.as_ref().map(|t| &t.forwarded_shifts),
+                "forwarded_shifts mismatch on grammar index {idx}",
+            );
         }
     }
 }
