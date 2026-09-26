@@ -44,6 +44,8 @@ fn run(tokenizer: &Tokenizer, vocab: &Vocab, active: &[bool], plan: Plan) {
             flat_trans: &flat,
             transitions_by_byte: None,
             initial_state_map: None,
+            // This unscoped reference supplies no restricted token-start domain.
+            initial_state_domain_is_exact: false,
             shared_generic_nfa_topology: None,
             shared_generic_nfa_trie: None,
             subset_parent_order: None,
