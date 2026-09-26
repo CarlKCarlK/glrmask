@@ -4682,12 +4682,97 @@ struct ProviderAdvanceResult {
     accepted: bool,
 }
 
+/// Transactional deterministic reduction prefix on the existing virtual stack.
+/// Only the enclosing caller's reduction case opts in. Branching, guards,
+/// acceptance, extra effects or an unknown lower floor all retain the original
+/// traversal. The budget is shared across that complete enclosing advance.
+fn try_provider_reduction_prefix<P: ParserActionProvider>(
+    provider: &P,
+    mut stack: VirtualStack<u32, TerminalsDisallowed>,
+    symbol: P::Symbol,
+    first: &ProvidedAction<'_>,
+    remaining_steps: &mut usize,
+) -> Option<ParserGSS> {
+    let allowance = *remaining_steps;
+    for step in 0..allowance {
+        *remaining_steps -= 1;
+        let top = *stack.top()?;
+        let later;
+        let provided = if step == 0 { first } else {
+            later = provider.action(top, symbol);
+            match later.as_ref() {
+                Some(action) => action,
+                None => return Some(ParserGSS::empty()),
+            }
+        };
+        if !provided.extra_stack_shifts.is_empty() { return None; }
+        match &provided.action {
+            ProvidedActionRef::Identity => return Some(stack.into_gss()),
+            ProvidedActionRef::Call { parent_target, child_start, replace } => {
+                if *replace && stack.pop(1) != 0 { return None; }
+                stack.push(*parent_target);
+                stack.push(*child_start);
+                return Some(stack.into_gss());
+            }
+            ProvidedActionRef::Return { pop } => {
+                if *pop as usize > stack.len() { return None; }
+                stack.pop(*pop as usize);
+                return Some(stack.into_gss());
+            }
+            ProvidedActionRef::Local { scope, action } => match action {
+                Action::Skip => return Some(stack.into_gss()),
+                Action::Shift(target, replace) => {
+                    let Some(target) = provider.scope_state(*scope, *target) else {
+                        return Some(ParserGSS::empty());
+                    };
+                    if *replace {
+                        if !stack.replace_top(target) { return None; }
+                    } else { stack.push(target); }
+                    return Some(stack.into_gss());
+                }
+                Action::Reduce(nonterminal, count) => {
+                    // A reduction needs the concrete predecessor for its goto.
+                    // Do not speculate across a hidden or ambiguous GSS floor.
+                    if *count as usize >= stack.len() { return None; }
+                    stack.pop(*count as usize);
+                    let predecessor = *stack.top()?;
+                    let Some((target, replace)) = provider.goto_target(
+                        provided.reduction_scope, predecessor, *nonterminal,
+                    ) else { return Some(ParserGSS::empty()); };
+                    if replace {
+                        if !stack.replace_top(target) { return None; }
+                    } else { stack.push(target); }
+                }
+                _ => return None,
+            },
+        }
+    }
+    None
+}
+
 fn advance_provider_traversal<P: ParserActionProvider>(
+    provider: &P,
+    closure: ParserGSS,
+    symbol: P::Symbol,
+    mode: ProviderAdvanceMode,
+) -> ProviderAdvanceResult {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    if mode == ProviderAdvanceMode::Advance
+        && *ENABLED.get_or_init(|| env_flag_enabled("GLRMASK_PROVIDER_REDUCTION_PREFIX"))
+    {
+        advance_provider_traversal_impl::<P, true>(provider, closure, symbol, mode)
+    } else {
+        advance_provider_traversal_impl::<P, false>(provider, closure, symbol, mode)
+    }
+}
+
+fn advance_provider_traversal_impl<P: ParserActionProvider, const REDUCTION_PREFIX: bool>(
     provider: &P,
     mut closure: ParserGSS,
     symbol: P::Symbol,
     mode: ProviderAdvanceMode,
 ) -> ProviderAdvanceResult {
+    let mut reduction_steps_remaining = 64usize;
     let mut shifted = ParserGSS::empty();
     let mut accepted = false;
     let mut visited = FxHashSet::<u32>::default();
@@ -4701,6 +4786,17 @@ fn advance_provider_traversal<P: ParserActionProvider>(
                 continue;
             };
             let isolated = closure.isolate(Some(state));
+            if REDUCTION_PREFIX && mode == ProviderAdvanceMode::Advance
+                && reduction_steps_remaining != 0 && provided.extra_stack_shifts.is_empty()
+                && matches!(&provided.action, ProvidedActionRef::Local { action: Action::Reduce(..), .. })
+                && let Some(stack) = isolated.try_virtual_stack()
+                && let Some(advanced) = try_provider_reduction_prefix(
+                    provider, stack, symbol, &provided, &mut reduction_steps_remaining,
+                )
+            {
+                merge_into(&mut shifted, advanced);
+                continue;
+            }
 
             if mode == ProviderAdvanceMode::Advance {
                 for shift in &provided.extra_stack_shifts {
@@ -5953,6 +6049,173 @@ mod tests {
     use crate::grammar::flat::TerminalID;
     use rustc_hash::FxHashSet;
     use smallvec::SmallVec;
+
+    #[test]
+    fn provider_reduction_prefix_preserves_scopes_branches_guards_and_accumulators() {
+        fn compare<P: ParserActionProvider>(provider: &P, stack: &ParserGSS, symbol: P::Symbol) {
+            for mode in [super::ProviderAdvanceMode::Advance, super::ProviderAdvanceMode::Completion] {
+                let reference = super::advance_provider_traversal_impl::<P, false>(
+                    provider, stack.clone(), symbol, mode,
+                );
+                let actual = super::advance_provider_traversal_impl::<P, true>(
+                    provider, stack.clone(), symbol, mode,
+                );
+                let mut keys = GssSemanticKeyInterner::<u32, TerminalsDisallowed>::new();
+                assert_eq!(keys.key(&actual.shifted), keys.key(&reference.shifted),
+                    "virtual prefix changed stack language or accumulator correlation");
+                assert_eq!(actual.accepted, reference.accepted);
+            }
+        }
+        struct Components<'a>(&'a GLRTable);
+        impl ParserComponentTableSource for Components<'_> {
+            fn component_count(&self) -> usize { 2 }
+            fn component_table(&self, component: u32) -> Option<&GLRTable> {
+                (component < 2).then_some(self.0)
+            }
+        }
+        for pop in [0, 1, 2, 5, 40] {
+            for replace in [false, true] {
+                let rows = [
+                    vec![(0, Action::Shift(7, replace))],
+                    vec![(0, Action::Reduce(0, pop))],
+                    vec![(0, Action::ReplaceShifts(vec![4, 5].into()))],
+                    vec![(0, Action::GuardedStackShifts(vec![GuardedStackShift {
+                        pop: 1,
+                        pushes: vec![7],
+                        guards: vec![StackShiftGuard { pop: 0, states: vec![3].into() }],
+                    }]))],
+                    vec![(0, Action::StackShifts(vec![
+                        StackShift { pop: 0, pushes: vec![7] },
+                        StackShift { pop: 1, pushes: vec![5, 7] },
+                        StackShift { pop: 20, pushes: vec![7] },
+                    ]))],
+                    vec![(0, Action::Split {
+                        shift: Some((7, replace)), reduces: vec![(0, pop)], accept: true,
+                    })],
+                    vec![(0, Action::Skip)],
+                    vec![(0, Action::Shift(7, false))],
+                ];
+                let gotos = (0..8).map(|_| vec![(0, (7, replace))]).collect::<Vec<_>>();
+                let table = build_test_table(8, 2,
+                    &rows.iter().map(Vec::as_slice).collect::<Vec<_>>(),
+                    &gotos.iter().map(Vec::as_slice).collect::<Vec<_>>());
+                let ordinary = GLRTableActionProvider::new(&table);
+                let components = Components(&table);
+                let scoped = DisjointComponentActionProvider::with_state_offsets(
+                    &components, &[], &[0, 8],
+                ).unwrap();
+                for depth in [0, 1, 2, 6, 48] {
+                    for top in 0..8 {
+                        let mut values = vec![0; depth];
+                        if let Some(last) = values.last_mut() { *last = top; }
+                        let plain = TerminalsDisallowed::new();
+                        let guarded = plain.with_insert(23, 11);
+                        let first = ParserGSS::from_single_stack(values.clone(), plain.clone());
+                        let second = ParserGSS::from_single_stack(values.iter().map(|x| (x + 1) % 8).collect(), guarded.clone());
+                        compare(&ordinary, &first, 0);
+                        compare(&ordinary, &first.merge(&second), 0);
+                        compare(&ordinary, &first, 1);
+                        let scoped_values = values.iter().map(|x| x + 8).collect();
+                        let scoped_stack = ParserGSS::from_single_stack(scoped_values, guarded);
+                        compare(&scoped, &scoped_stack, ScopedParserSymbol::Terminal { component: 1, terminal: 0 });
+                        compare(&scoped, &scoped_stack, ScopedParserSymbol::Terminal { component: 0, terminal: 0 });
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn provider_reduction_prefix_control_and_extra_effects_match_reference() {
+        struct Controls { ordinary: Action }
+        impl ParserActionProvider for Controls {
+            type Symbol = u32;
+            fn action(&self, _: u32, symbol: u32) -> Option<ProvidedAction<'_>> {
+                let action = match symbol {
+                    0 => ProvidedActionRef::Identity,
+                    1 => ProvidedActionRef::Call { parent_target: 10, child_start: 20, replace: false },
+                    2 => ProvidedActionRef::Call { parent_target: 10, child_start: 20, replace: true },
+                    3 => ProvidedActionRef::Return { pop: 1 },
+                    4 => ProvidedActionRef::Return { pop: 5 },
+                    5 => ProvidedActionRef::Local { scope: 1, action: &self.ordinary },
+                    6 => ProvidedActionRef::Local { scope: 99, action: &self.ordinary },
+                    _ => return None,
+                };
+                Some(ProvidedAction {
+                    action, reduction_scope: 1,
+                    extra_stack_shifts: if symbol == 5 {
+                        smallvec::smallvec![StackShift { pop: 0, pushes: vec![31] }]
+                    } else { SmallVec::new() },
+                })
+            }
+            fn scope_state(&self, scope: u32, state: u32) -> Option<u32> {
+                (scope == 1).then_some(state + 100)
+            }
+            fn goto_target(&self, _: u32, _: u32, _: u32) -> Option<(u32, bool)> { None }
+            fn state_count_hint(&self) -> usize { 128 }
+        }
+        let provider = Controls { ordinary: Action::Shift(5, false) };
+        for n in 0..12 {
+            let a = ParserGSS::from_single_stack((0..n).collect(), TerminalsDisallowed::new());
+            let b = ParserGSS::from_single_stack((5..n+5).collect(), TerminalsDisallowed::new().with_insert(5,7));
+            for stack in [a.clone(), a.merge(&b)] {
+                for symbol in 0..8 {
+                    let expected = super::advance_provider_traversal_impl::<_, false>(
+                        &provider, stack.clone(), symbol, super::ProviderAdvanceMode::Advance,
+                    );
+                    let actual = super::advance_provider_traversal_impl::<_, true>(
+                        &provider, stack.clone(), symbol, super::ProviderAdvanceMode::Advance,
+                    );
+                    let mut keys = GssSemanticKeyInterner::<u32, TerminalsDisallowed>::new();
+                    assert_eq!(keys.key(&actual.shifted), keys.key(&expected.shifted), "n={n} symbol={symbol}");
+                }
+            }
+        }
+    }
+
+
+    #[test]
+    fn provider_reduction_prefix_is_bounded_transactional_and_actually_runs() {
+        use std::cell::Cell;
+        struct Chain { reduce: Action, shift: Action, calls: Cell<usize> }
+        impl ParserActionProvider for Chain {
+            type Symbol = u32;
+            fn action(&self, state: u32, _: u32) -> Option<ProvidedAction<'_>> {
+                self.calls.set(self.calls.get()+1);
+                Some(ProvidedAction {
+                    action: ProvidedActionRef::Local { scope: 0,
+                        action: if state < 5 { &self.reduce } else { &self.shift } },
+                    reduction_scope: 0, extra_stack_shifts: SmallVec::new(),
+                })
+            }
+            fn scope_state(&self, scope: u32, state: u32) -> Option<u32> {
+                (scope == 0).then_some(state)
+            }
+            fn goto_target(&self, scope: u32, from: u32, _: u32) -> Option<(u32,bool)> {
+                (scope == 0).then_some((from+1,false))
+            }
+            fn state_count_hint(&self) -> usize { 32 }
+        }
+        let provider=Chain {reduce:Action::Reduce(0,0),shift:Action::Shift(9,false),calls:Cell::new(0)};
+        let original=ParserGSS::from_single_stack(vec![0],TerminalsDisallowed::new().with_insert(7,11));
+        let preserved=original.clone();
+        let first=provider.action(0,0).unwrap();
+        let mut budget=2;
+        assert!(super::try_provider_reduction_prefix(&provider,original.try_virtual_stack().unwrap(),0,&first,&mut budget).is_none());
+        assert_eq!(budget,0);
+        assert!(original.ptr_eq(&preserved),"declined prefix must not mutate its input");
+        let calls=provider.calls.get();
+        assert!(super::try_provider_reduction_prefix(&provider,original.try_virtual_stack().unwrap(),0,&first,&mut budget).is_none());
+        assert_eq!(provider.calls.get(),calls,"an exhausted budget must not restart speculation");
+        let mut enough=64;
+        let actual=super::try_provider_reduction_prefix(&provider,original.try_virtual_stack().unwrap(),0,&first,&mut enough)
+            .expect("the fixture must exercise a successful deterministic reduction prefix");
+        assert!(enough<64);
+        let reference=super::advance_provider_traversal_impl::<_,false>(
+            &provider,original,0,super::ProviderAdvanceMode::Advance);
+        let mut keys=GssSemanticKeyInterner::<u32,TerminalsDisallowed>::new();
+        assert_eq!(keys.key(&actual),keys.key(&reference.shifted));
+    }
 
     #[test]
     fn provider_may_advance_fastpath_matches_exact_reference() {
