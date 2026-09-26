@@ -2315,6 +2315,27 @@ impl BoundedCodeIntersectionOracle {
             }
         })
     }
+
+    /// Slice proofs also run on compact loaded oracles. Those intentionally
+    /// omit relation powers because the transferred backwards-DP table is an
+    /// exact replacement. Do not accidentally route such a proof through the
+    /// missing powers; unavailable proof data means decline the accelerator,
+    /// never interpret an unsupported query as a dead language.
+    fn has_future_for_slice_proof(
+        &mut self,
+        coordinate: BoundedCodeOracleCoordinate,
+        future: Option<&[BitSet]>,
+    ) -> Option<bool> {
+        if let Some(future) = future {
+            return self.has_future_with_boundary_table(coordinate, future);
+        }
+        let count = self.max.checked_add(1)?;
+        let bits = (usize::BITS - count.leading_zeros()) as usize;
+        if self.exact_powers.len() < bits || self.prefix_sums.len() < bits {
+            return None;
+        }
+        Some(self.has_future(coordinate))
+    }
 }
 
 /// Build only the finite one-token observation component for a certified
@@ -5051,6 +5072,7 @@ impl VirtualResidualRuntime {
                 representatives.push(byte);
             }
         }
+        let body_boundary_future = store.body_boundary_future_by_completed.as_ref().map(Arc::clone);
         let oracle = store.liveness_oracle.as_mut()?;
         let mut future_cache = FxHashMap::<BoundedCodeOracleCoordinate, bool>::default();
         let mut seen = FxHashSet::<(u32, BoundedCodeOracleCoordinate)>::default();
@@ -5081,7 +5103,9 @@ impl VirtualResidualRuntime {
                 } else if let Some(&future) = future_cache.get(&target) {
                     future
                 } else {
-                    let future = oracle.has_future(target);
+                    let future = oracle.has_future_for_slice_proof(
+                        target, body_boundary_future.as_deref().map(Vec::as_slice),
+                    )?;
                     future_cache.insert(target, future);
                     future
                 };
@@ -5651,17 +5675,22 @@ impl VirtualResidualRuntime {
                 }
 
                 let target = oracle.step_coordinate(coordinate, byte);
-                let target_live = target.is_some_and(|target| {
+                let target_live = if let Some(target) = target {
                     if oracle.coordinate_accepting(target) {
                         true
                     } else if let Some(&future) = future_cache.get(&target) {
                         future
                     } else {
-                        let future = oracle.has_future(target);
+                        let future = oracle.has_future_for_slice_proof(
+                            target,
+                            body_boundary_future_by_completed.as_deref().map(Vec::as_slice),
+                        )?;
                         future_cache.insert(target, future);
                         future
                     }
-                });
+                } else {
+                    false
+                };
                 if !target_live {
                     first_counterexample = first_counterexample.min(shortest_complete_word);
                     continue;
@@ -7271,6 +7300,62 @@ mod tests {
         );
         drop(loaded_store);
         drop(original_store);
+
+        // The compact load path deliberately omits relation powers. Its
+        // backwards-DP artifact must also serve the generic (non-body-equal)
+        // slice proof and the repeat-radius BFS, not only ordinary liveness.
+        let mut compact = VirtualResidualRuntime::compact_liveness_oracle_from_master_slice_artifact(&artifact)
+            .expect("valid transferred oracle");
+        assert!(compact.exact_powers.is_empty() && compact.prefix_sums.is_empty());
+        let coordinate = compact.root_coordinate();
+        assert_eq!(compact.has_future_for_slice_proof(coordinate, None), None,
+            "missing proof data must decline, not certify a dead language");
+        loaded.store.lock().unwrap().liveness_oracle = Some(compact);
+
+        for prefix in [b"<".as_slice(), b"<a", b"<bc", b"<b"] {
+            let mut old_state = 1;
+            let mut loaded_state = 1;
+            for &byte in prefix {
+                old_state = original.step(old_state, byte).expect("valid original prefix");
+                loaded_state = loaded.step(loaded_state, byte).expect("valid loaded prefix");
+            }
+            // This alphabet is intentionally not the oracle body (a|bc), so
+            // the specialized exact-body proof must fall through to the BFS.
+            let first = if prefix == b"<b" { b'c' } else { b'a' };
+            let mut repeating = vec![2_u32; 2 * class_count];
+            repeating[first as usize] = 1;
+            repeating[class_count + b'a' as usize] = 1;
+            let repeating_accepting = [false, true];
+            let repeating_productive = [true, true];
+            let expected_radius = original.parser_transparent_byte_dfa_repeat_radius(
+                old_state, 0, class_count, &byte_to_class, &repeating,
+                &repeating_accepting, &repeating_productive, 8, 10_000,
+            );
+            let loaded_radius = loaded.parser_transparent_byte_dfa_repeat_radius(
+                loaded_state, 0, class_count, &byte_to_class, &repeating,
+                &repeating_accepting, &repeating_productive, 8, 10_000,
+            );
+            assert!(expected_radius.is_some());
+            assert_eq!(loaded_radius, expected_radius, "prefix={prefix:?}");
+
+            let finite_states = 5usize;
+            let mut finite = vec![finite_states as u32; finite_states * class_count];
+            finite[first as usize] = 1;
+            for state in 1..finite_states - 1 {
+                finite[state * class_count + b'a' as usize] = (state + 1) as u32;
+            }
+            let finite_productive = vec![true; finite_states];
+            let expected = original.parser_transparent_byte_dfa(
+                old_state, 0, class_count, &byte_to_class, &finite,
+                &finite_productive, true, 10_000,
+            );
+            let actual = loaded.parser_transparent_byte_dfa(
+                loaded_state, 0, class_count, &byte_to_class, &finite,
+                &finite_productive, true, 10_000,
+            );
+            assert_eq!(actual, expected, "finite slice prefix={prefix:?}");
+            assert_eq!(actual, Some(true));
+        }
 
         let mut malformed = artifact;
         malformed.pattern_states += 1;
