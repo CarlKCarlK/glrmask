@@ -10125,6 +10125,131 @@ fn fill_mask_dynamic_impl(
 #[cfg(test)]
 mod tests {
     #[test]
+    fn prepared_boundary_vocabularies_keep_simultaneous_siblings_and_unknown_fallback() {
+        use crate::__private::ConstraintExt;
+        // Both children remain viable after Xa. Each boundary owns a different
+        // vocabulary and frontier, while their lower caller stack is shared.
+        let entries = vec![
+            (0, Vec::new()), (1, b"X".to_vec()), (2, b"a".to_vec()),
+            (3, b"b".to_vec()), (4, b"c".to_vec()), (5, b"!".to_vec()),
+            (6, b"?".to_vec()), (7, b"ab!".to_vec()), (8, b"ac?".to_vec()),
+            (9, b"Xaab!".to_vec()), (10, b"Xaac?".to_vec()),
+            (19, b"a".to_vec()), (31, b"b!".to_vec()), (40, b"c?".to_vec()),
+            (65, b"aab!".to_vec()), (99, b"aac?".to_vec()), (130, b"bad".to_vec()),
+        ];
+        let ids = entries.iter().map(|(id, _)| *id).collect::<Vec<_>>();
+        let vocab = Vocab::new(entries);
+        let parent = Constraint::compile(Grammar::glrm(
+            r#"glrm 1; start root; extern grammar left; extern grammar right;
+                nt root = "X" (left "!" | right "?");"#,
+        ), &vocab).unwrap();
+        let left = Constraint::compile(Grammar::glrm(
+            r#"glrm 1; start left; t A = "a"+; nt left = A "b";"#,
+        ), &vocab).unwrap();
+        let right = Constraint::compile(Grammar::glrm(
+            r#"glrm 1; start right; t A = "a"+; nt right = A "c";"#,
+        ), &vocab).unwrap();
+        let bound = parent.compose_compiled_subgrammars_dynamic(
+            &[("left", &left), ("right", &right)], &vocab,
+        ).unwrap();
+        let saved = bound.save();
+        let mut saw_simultaneous_siblings = false;
+        for mode in 0..4 {
+            let mut constraint = Constraint::load(saved.clone()).unwrap();
+            // Native metadata, all-known conservative domains, one unknown
+            // child, and all unknown. Unknown must widen, never mean empty.
+            if mode != 0 {
+                constraint.serialized_artifact_cache = None;
+                let overlay = constraint.static_dynamic_overlay.as_mut().unwrap();
+                assert_eq!(overlay.segmented_parser_components.len(), 3);
+                for (owner, component) in overlay.segmented_parser_components.iter_mut().enumerate() {
+                    let shard = component.boundary.as_mut().unwrap();
+                    shard.candidate_tokens = if mode == 3 || (mode == 2 && owner == 2) {
+                        None
+                    } else {
+                        Some(Arc::from(ids.clone()))
+                    };
+                    shard.mask_vocabulary = Default::default();
+                }
+                overlay.segmented_boundary_shards = overlay.segmented_parser_components.iter()
+                    .filter_map(|component| component.boundary.clone()).collect();
+            }
+            for prefix in ["", "X", "Xa", "Xaa", "Xaab", "Xaac", "Xaab!", "Xaac?"] {
+                let mut state = constraint.start();
+                state.commit_bytes(prefix.as_bytes()).unwrap();
+                let mut owners = BTreeSet::new();
+                for gss in state.state.values() {
+                    for top in gss.peek_values() {
+                        if let Some((owner, _)) = constraint.compact_segmented_parser_component(top) {
+                            if owner != 0 { owners.insert(owner); }
+                        }
+                    }
+                }
+                saw_simultaneous_siblings |= owners.len() >= 2;
+                let mut expected = vec![0; constraint.mask_len()];
+                state.fill_recursive_mask_by_exact_full_walk(&mut expected);
+                for _ in 0..3 {
+                    assert_eq!(state.mask(), expected, "mode={mode}, prefix={prefix:?}, owners={owners:?}");
+                }
+                // Check each admitted model-token route, not just the token
+                // consumed by one preferred trace. Aliases remain independent.
+                for &id in &ids {
+                    if token_allowed(&expected, id) {
+                        let mut branch = state.clone();
+                        branch.commit_token(id).unwrap();
+                    }
+                }
+            }
+        }
+        assert!(saw_simultaneous_siblings, "the fixture must exercise two active child owners");
+    }
+
+
+    #[test]
+    fn prepared_mask_vocabulary_partial_baselines_and_evicted_views_are_exact() {
+        let mut entries = vec![(0, Vec::new()), (1,b"X".to_vec()), (2,b"!".to_vec())];
+        for n in 1..=12 {
+            entries.push((10+n, format!("{}!", "a".repeat(n as usize)).into_bytes()));
+        }
+        entries.push((70,b"a!".to_vec()));
+        entries.push((95,b"bad".to_vec()));
+        let ids = entries.iter().map(|(id,_)| *id).collect::<Vec<_>>();
+        let vocab = Vocab::new(entries);
+        let parent = Constraint::compile(Grammar::glrm(
+            r#"glrm 1; start root; extern grammar child; nt root = "X" child "!";"#,
+        ), &vocab).unwrap();
+        let child = Constraint::compile(Grammar::glrm(
+            r#"glrm 1; start child; t A = "a"+; nt child = A;"#,
+        ), &vocab).unwrap();
+        let bound = parent.bind_grammar_dynamic_boundary("child",child).unwrap();
+        let prepared = PreparedMaskVocabulary::new(&bound,&ids).unwrap();
+        let filtered = PreparedMaskVocabulary::new(&bound,&ids).unwrap();
+        let mut state = bound.start(); state.commit_bytes(b"X").unwrap();
+        let mut full = vec![0;bound.mask_len()];
+        state.fill_recursive_mask_by_exact_full_walk(&mut full);
+        let mut seed=0xb3ea1935u32;
+        // More distinct views than the bounded cache can hold. Preserve all
+        // caller bits outside our domain, even padding words and invalid IDs.
+        for round in 0..96 {
+            let mut actual = (0..full.len()+2).map(|_| {
+                seed^=seed<<13; seed^=seed>>17; seed^=seed<<5; seed
+            }).collect::<Vec<_>>();
+            let mut expected=actual.clone();
+            for &id in &ids { expected[id as usize/32] |= full[id as usize/32] & (1<<(id%32)); }
+            let mut reference_view = actual.clone();
+            prepared.or_mask_with_pre_admission(&state,&mut actual).unwrap();
+            filtered.or_mask_filtered(&state,&mut reference_view).unwrap();
+            assert_eq!(actual,expected,"canonical partial baseline round {round}");
+            assert_eq!(reference_view,expected,"filtered partial baseline round {round}");
+        }
+        assert!(!filtered.views.lock().unwrap().is_empty(), "reference must exercise filtered vocabulary storage");
+        assert!(prepared.views.lock().unwrap().is_empty(), "canonical path must not build partial vocabularies");
+        assert!(PreparedMaskVocabulary::new(&bound,&[7]).is_err(),"missing in-range ID is not an empty token");
+        assert!(PreparedMaskVocabulary::new(&bound,&[u32::MAX]).is_err());
+    }
+
+
+    #[test]
     fn pre_admitted_subtree_pruning_matches_views_and_does_not_poison_full_cache() {
         let entries = vec![(0,b"P".to_vec()),(2,b"a".to_vec()),(5,b"b".to_vec()),(7,b"c".to_vec()),
             (9,b"Q".to_vec()),(11,b"abQ".to_vec()),(13,b"acQ".to_vec()),(17,b"bQ".to_vec()),
