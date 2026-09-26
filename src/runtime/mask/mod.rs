@@ -211,6 +211,13 @@ const DELTA_SEED_MIN_SAVINGS: u64 = 2048;
 const MASK_SINGLE_PATH_DIRECT_MAX_DEPTH: u32 = 64;
 const MASK_SINGLE_PATH_DIRECT_INLINE_PATH_CAPACITY: usize = 64;
 const MASK_SINGLE_PATH_DIRECT_MAX_TOTAL_PATHS: usize = 128;
+// Many independent lexer states with one parser stack are cheap to replay.
+// Expanding many alternatives of ONE GSS is different: it duplicates shared
+// parser suffixes and dense mask operations. Keep small local ambiguity direct,
+// but let the exact indexed-DAG evaluator retain sharing for wider GSSes.
+// This bounds speculation, not the language: an incomplete enumeration returns
+// false before touching the output, and the next evaluator visits the full GSS.
+const MASK_SINGLE_PATH_DIRECT_MAX_PATHS_PER_GSS: usize = 16;
 const MASK_SINGLE_PATH_DIRECT_INLINE_STACK_DEPTH: usize = 64;
 const MASK_SINGLE_PATH_DIRECT_MAX_PLAN_OPS: usize = 1024;
 // Below this much parser-stack work, grouping and compiling plans costs more
@@ -2037,6 +2044,7 @@ mod tests {
         DenseTokenMaskCache,
         DenseTokenSetIntersectionSmallCache,
         MASK_SINGLE_PATH_DIRECT_INLINE_PATH_CAPACITY,
+        MASK_SINGLE_PATH_DIRECT_MAX_PATHS_PER_GSS,
         MASK_SINGLE_PATH_DIRECT_MAX_TOTAL_STACK_VALUES,
     };
     use crate::automata::lexer::Lexer;
@@ -2673,6 +2681,36 @@ mod tests {
         assert_eq!(direct, dynamic);
         assert!(mask_contains(&direct, 0));
         assert!(!mask_contains(&direct, 1));
+    }
+
+    #[test]
+    fn direct_mask_declines_wide_shared_gss_without_partial_output() {
+        let vocab = Vocab::new(vec![(0, b"a".to_vec()), (1, b"b".to_vec())]);
+        let constraint = Constraint::from_glrm_grammar(
+            r#"start start; t A ::= "a"; nt start ::= A;"#,
+            &vocab,
+        )
+        .expect("routing-test grammar should compile");
+        let mut state = constraint.start();
+        let tokenizer_state = state.state.entries[0].0;
+        // Deliberately synthetic parser labels: admission must decline BEFORE
+        // looking up any of them or evaluating an incomplete subset of paths.
+        // Both the one-pass and the many-lexer two-pass admission paths matter.
+        let wide = ParserGSS::from_stacks(
+            &(0..=MASK_SINGLE_PATH_DIRECT_MAX_PATHS_PER_GSS)
+                .map(|path| (vec![0, 10_000 + path as u32, 7], TerminalsDisallowed::default()))
+                .collect::<Vec<_>>(),
+        );
+        for lexer_branches in [1, MASK_SINGLE_PATH_DIRECT_INLINE_PATH_CAPACITY] {
+            state.state.entries.clear();
+            for _ in 0..lexer_branches {
+                state.state.insert_flat_alternative(tokenizer_state, wide.clone());
+            }
+            let mut mask = vec![0x5a5a_5a5a; constraint.body_mask_len()];
+            let before = mask.clone();
+            assert!(!state.try_fill_mask_single_path_direct(&mut mask));
+            assert_eq!(mask, before, "declining admission must not publish a partial mask");
+        }
     }
 
     #[test]
@@ -6579,7 +6617,9 @@ impl<'a> ConstraintState<'a> {
                 if mask_single_path_to_stacks_fallback_disabled() {
                     return false;
                 }
-                let remaining = MASK_SINGLE_PATH_DIRECT_MAX_TOTAL_PATHS.saturating_sub(paths.len());
+                let remaining = MASK_SINGLE_PATH_DIRECT_MAX_TOTAL_PATHS
+                    .saturating_sub(paths.len())
+                    .min(MASK_SINGLE_PATH_DIRECT_MAX_PATHS_PER_GSS);
                 let complete = gss.for_each_stack_top_first_bounded(
                     remaining,
                     |stack_top_first, terminals_disallowed| {
@@ -6626,8 +6666,9 @@ impl<'a> ConstraintState<'a> {
                     if gss.max_depth() > MASK_SINGLE_PATH_DIRECT_MAX_DEPTH {
                         return false;
                     }
-                    let remaining =
-                        MASK_SINGLE_PATH_DIRECT_MAX_TOTAL_PATHS.saturating_sub(total_paths);
+                    let remaining = MASK_SINGLE_PATH_DIRECT_MAX_TOTAL_PATHS
+                        .saturating_sub(total_paths)
+                        .min(MASK_SINGLE_PATH_DIRECT_MAX_PATHS_PER_GSS);
                     let complete = gss.for_each_stack_len_bounded(remaining, |stack_len, _| {
                         total_paths += 1;
                         total_stack_values = total_stack_values.saturating_add(stack_len);
@@ -6641,8 +6682,9 @@ impl<'a> ConstraintState<'a> {
 
                 paths.clear();
                 for (&original_tokenizer_state, gss) in &self.state {
-                    let remaining =
-                        MASK_SINGLE_PATH_DIRECT_MAX_TOTAL_PATHS.saturating_sub(paths.len());
+                    let remaining = MASK_SINGLE_PATH_DIRECT_MAX_TOTAL_PATHS
+                        .saturating_sub(paths.len())
+                        .min(MASK_SINGLE_PATH_DIRECT_MAX_PATHS_PER_GSS);
                     let complete = gss.for_each_stack_top_first_bounded(
                         remaining,
                         |stack_top_first, terminals_disallowed| {
