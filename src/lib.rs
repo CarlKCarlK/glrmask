@@ -117,6 +117,40 @@ pub use public_api::{
 #[cfg(test)]
 pub(crate) static TEST_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
+/// Run an environment-mutating test in its own process. A writers-only mutex
+/// cannot protect unrelated tests that legitimately read production flags.
+/// Call this from the libtest entry, before spawning any custom-stack worker.
+/// Returns true in the parent after the exact child test has passed.
+#[cfg(test)]
+pub(crate) fn isolate_environment_test(ignored: bool) -> bool {
+    const CHILD: &str = "GLRMASK_ISOLATED_ENVIRONMENT_TEST";
+    let current = std::thread::current();
+    let name = current.name().expect("libtest names each test thread");
+    if std::env::var(CHILD).as_deref() == Ok(name) {
+        return false;
+    }
+    let mut command = std::process::Command::new(std::env::current_exe().unwrap());
+    command
+        .arg(name)
+        .arg("--exact")
+        .arg("--nocapture")
+        .arg("--test-threads=1")
+        .env(CHILD, name)
+        .env_remove("GLRMASK_STRICT_STATIC_TRAP_DYNAMIC");
+    if ignored {
+        command.arg("--ignored");
+    }
+    let output = command.output().expect("run isolated environment test");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        output.status.success() && stdout.contains("test result: ok. 1 passed; 0 failed"),
+        "isolated test {name} failed or did not run exactly one test: {}\n{stdout}\n{stderr}",
+        output.status,
+    );
+    true
+}
+
 #[cfg(test)]
 mod grammar_cross_tests;
 #[cfg(test)]
