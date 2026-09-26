@@ -6788,6 +6788,12 @@ impl<'a> ConstraintState<'a> {
                                     return false;
                                 }
                                 plan_ops.push(SinglePathDirectPlanOp::Merge(final_weight));
+                                // Every continuation only intersects this
+                                // path's candidate set. Full acceptance has
+                                // already emitted that entire set.
+                                if final_weight.is_full() {
+                                    return false;
+                                }
                             }
                             StackWalkEvent::Top(parser_state) => {
                                 let positive_label = encode_positive_label(parser_state);
@@ -6915,6 +6921,9 @@ impl<'a> ConstraintState<'a> {
                                 Some(&mut *buf),
                                 &mut direct_buf_dirty,
                             );
+                            if weight.is_full() {
+                                break;
+                            }
                         }
                         SinglePathDirectPlanOp::Intersect(weight) => {
                             if dense_is_seed {
@@ -6986,6 +6995,13 @@ impl<'a> ConstraintState<'a> {
                                     Some(&mut *buf),
                                     &mut direct_buf_dirty,
                                 );
+                                // This stops only the current correlated
+                                // parser/lexer path. Later paths may still
+                                // contribute tokens, but this path cannot:
+                                // its future masks are subsets of `dense`.
+                                if final_weight.is_full() {
+                                    return false;
+                                }
                             }
                             StackWalkEvent::Top(parser_state) => {
                                 let positive_label = encode_positive_label(parser_state);
