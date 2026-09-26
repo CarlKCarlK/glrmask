@@ -41,6 +41,51 @@ type TargetContribs = SmallVec<[(u32, Weight); 4]>;
 type DeferredFinalEntries = SmallVec<[(u32, Weight); 4]>;
 type FinalPathWeights = SmallVec<[Weight; 4]>;
 type FinalGroups = SmallVec<[(Weight, FinalPathWeights); 4]>;
+type FinalWeightSignature = SmallVec<[(usize, usize); 4]>;
+
+/// The former key grouped a sorted set of path-weight identities under each
+/// final-weight identity. Sorted unique pairs encode exactly that same key,
+/// without a separate heap allocation for every nested path-weight vector.
+/// The referenced weights remain owned by the NWA and deferred final entries.
+fn final_weight_signature(
+    pairs: impl IntoIterator<Item = (usize, usize)>,
+) -> FinalWeightSignature {
+    let mut key: FinalWeightSignature = pairs.into_iter().collect();
+    key.sort_unstable();
+    key.dedup();
+    key
+}
+
+#[cfg(test)]
+#[test]
+fn flat_final_weight_signatures_match_nested_grouping() {
+    fn reference(pairs: &[(usize, usize)]) -> Vec<(usize, usize)> {
+        let mut groups = BTreeMap::<usize, BTreeSet<usize>>::new();
+        for &(final_weight, path_weight) in pairs {
+            groups.entry(final_weight).or_default().insert(path_weight);
+        }
+        groups.into_iter().flat_map(|(final_weight, paths)| {
+            paths.into_iter().map(move |path_weight| (final_weight, path_weight))
+        }).collect()
+    }
+
+    let mut cache = FxHashMap::<FinalWeightSignature, usize>::default();
+    for len in [0usize, 1, 2, 4, 5, 8, 17, 64, 257] {
+        let pairs = (0..len)
+            .map(|index| ((index * 7) % 11, (index * 13) % 23))
+            .collect::<Vec<_>>();
+        let key = final_weight_signature(pairs.iter().copied());
+        assert_eq!(key.as_slice(), reference(&pairs).as_slice());
+        cache.insert(key.clone(), len);
+        // Input order and repeated contributions cannot change a union's key.
+        let repeated = pairs.iter().rev().chain(pairs.iter()).copied();
+        let repeated_key = final_weight_signature(repeated);
+        assert_eq!(repeated_key, key);
+        assert_eq!(cache.get(&repeated_key), Some(&len));
+    }
+    assert_ne!(final_weight_signature([(1, 2)]), final_weight_signature([(2, 1)]));
+    assert_ne!(final_weight_signature([(1, 2)]), final_weight_signature([(1, 3)]));
+}
 
 struct ParallelSupportScanScratch {
     weight_ops: ScopedWeightOpCache,
@@ -52,6 +97,7 @@ struct ParallelSupportScanScratch {
     touched_dense: Vec<usize>,
     default: TargetContribs,
     sparse: FxHashMap<i32, TargetContribs>,
+    closure_key: SmallVec<[(u32, usize); 8]>,
 }
 
 impl ParallelSupportScanScratch {
@@ -76,7 +122,17 @@ impl ParallelSupportScanScratch {
             touched_dense: Vec::new(),
             default: TargetContribs::new(),
             sparse: FxHashMap::default(),
+            closure_key: SmallVec::new(),
         }
+    }
+
+    /// Borrow a canonical cache key without allocating once per label.
+    /// The caller has already sorted and merged target contributions; pointer
+    /// identities are copied in that exact order, just as in the owned key.
+    fn closure_key_for(&mut self, contributions: &TargetContribs) -> &[(u32, usize)] {
+        self.closure_key.clear();
+        self.closure_key.extend(contributions.iter().map(|(state, weight)| (*state, weight.ptr_key())));
+        &self.closure_key
     }
 
     #[inline]
@@ -131,6 +187,28 @@ impl ParallelSupportScanScratch {
 
 const PROFILE_PARSER_DWA_DETERMINIZE_DETAIL_ENV: &str =
     "GLRMASK_PROFILE_PARSER_DWA_DETERMINIZE_DETAIL";
+
+#[cfg(test)]
+#[test]
+fn parallel_support_borrowed_keys_match_owned_keys_after_spill_and_reuse() {
+    let mut scratch = ParallelSupportScanScratch::new(4);
+    let mut cache = FxHashMap::<Vec<(u32, usize)>, usize>::default();
+    for (iteration, len) in [0usize, 1, 4, 8, 9, 32, 2, 0, 7].into_iter().enumerate() {
+        for reversed in [false, true] {
+            let mut contributions: TargetContribs = (0..len)
+                .map(|state| (state as u32, if state % 2 == 0 { Weight::all() } else { Weight::empty() }))
+                .collect();
+            if reversed { contributions.reverse(); }
+            let owned = contributions.iter().map(|(state, weight)| (*state, weight.ptr_key()))
+                .collect::<Vec<_>>();
+            cache.insert(owned.clone(), iteration);
+            let borrowed = scratch.closure_key_for(&contributions);
+            assert_eq!(borrowed, owned.as_slice());
+            assert_eq!(cache.get(borrowed), Some(&iteration));
+        }
+    }
+    assert!(scratch.closure_key.spilled(), "test must exercise retained heap storage");
+}
 
 #[inline]
 fn add_target_contribution(contribs: &mut TargetContribs, target: u32, add: Weight) {
@@ -2049,8 +2127,10 @@ fn determinize_with_supports_mode(
             .and_then(|value| value.trim().parse::<usize>().ok())
             .unwrap_or(16_384)
         && std::env::var_os("GLRMASK_DISABLE_PARSER_SUPPORT_COMPONENT_CACHE").is_none();
+    // Rows are exclusively inserted between parallel waves and immutably
+    // borrowed within each wave. A second Arc allocation per row is unnecessary.
     let mut component_row_cache =
-        FxHashMap::<(u32, usize), Arc<Vec<(i32, u32, Weight)>>>::default();
+        FxHashMap::<(u32, usize), Vec<(i32, u32, Weight)>>::default();
     let mut union_cache = UnionAllCache {
         ordered_keys: std::env::var_os("GLRMASK_DISABLE_ORDERED_UNION_CACHE_KEY").is_none(),
         profile_enabled: detail.is_some(),
@@ -2207,7 +2287,7 @@ fn determinize_with_supports_mode(
                                 }
                             }
                         }
-                        (key, Arc::new(row))
+                        (key, row)
                     })
                     .collect::<Vec<_>>();
                 if let Some(started) = compute_started {
@@ -2299,11 +2379,7 @@ fn determinize_with_supports_mode(
                                 .get(&(*state_id, weight.ptr_key()))
                                 .cloned(),
                             _ => {
-                                let key = contribs
-                                    .iter()
-                                    .map(|(state_id, weight)| (*state_id, weight.ptr_key()))
-                                    .collect::<Vec<_>>();
-                                closure_cache_ref.get(&key).cloned()
+                                closure_cache_ref.get(scratch.closure_key_for(&contribs)).cloned()
                             }
                         };
                         if let Some(cached) = cached {
@@ -2399,10 +2475,8 @@ fn determinize_with_supports_mode(
                 }
 
                 let cache_key = (*nwa_state_id, path_weight.ptr_key());
-                let cached_row = component_row_cache_enabled.then(|| {
-                    if let Some(row) = component_row_cache.get(&cache_key) {
-                        return Arc::clone(row);
-                    }
+                let cached_row = if component_row_cache_enabled {
+                    Some(component_row_cache.entry(cache_key).or_insert_with(|| {
                     let mut row = Vec::new();
                     for (&label, targets) in &state.transitions {
                         for (target, transition_weight) in targets {
@@ -2413,10 +2487,11 @@ fn determinize_with_supports_mode(
                             }
                         }
                     }
-                    let row = Arc::new(row);
-                    component_row_cache.insert(cache_key, Arc::clone(&row));
                     row
-                });
+                    }))
+                } else {
+                    None
+                };
 
                 if let Some(row) = cached_row {
                     for (label, target, next_weight) in row.iter() {
@@ -2961,36 +3036,16 @@ fn determinize_with_supports_mode(
         }
     }
 
-    let mut final_signature_ids: FxHashMap<Vec<(usize, Vec<usize>)>, usize> = FxHashMap::default();
+    let mut final_signature_ids: FxHashMap<FinalWeightSignature, usize> = FxHashMap::default();
     let mut final_signature_groups: Vec<FinalGroups> = Vec::new();
     let mut final_jobs: Vec<(u32, usize)> = Vec::with_capacity(deferred_final_entries.len());
     let final_grouping_started = (detail.is_some() || fast_support_profile).then(Instant::now);
 
     let build_signature = |entries: &DeferredFinalEntries| {
-        let mut groups: SmallVec<[(usize, SmallVec<[usize; 4]>); 4]> = SmallVec::new();
-        for (nwa_state_id, path_weight) in entries {
-            let Some(state_final) = nwa.states()[*nwa_state_id as usize].final_weight.as_ref() else {
-                continue;
-            };
-            let final_key = state_final.ptr_key();
-            if let Some((_, path_keys)) = groups
-                .iter_mut()
-                .find(|(existing_final_key, _)| *existing_final_key == final_key)
-            {
-                path_keys.push(path_weight.ptr_key());
-            } else {
-                groups.push((final_key, smallvec::smallvec![path_weight.ptr_key()]));
-            }
-        }
-        groups.sort_unstable_by_key(|(final_key, _)| *final_key);
-        groups
-            .into_iter()
-            .map(|(final_key, mut path_keys)| {
-                path_keys.sort_unstable();
-                path_keys.dedup();
-                (final_key, path_keys.into_vec())
-            })
-            .collect::<Vec<_>>()
+        final_weight_signature(entries.iter().filter_map(|(nwa_state_id, path_weight)| {
+            nwa.states()[*nwa_state_id as usize].final_weight.as_ref()
+                .map(|state_final| (state_final.ptr_key(), path_weight.ptr_key()))
+        }))
     };
 
     let parallel_signature_grouping = detail.is_none()
@@ -3086,7 +3141,7 @@ fn determinize_with_supports_mode(
         let detail_enabled = detail.is_some();
         let final_weights_by_signature: Vec<Option<Weight>> = {
             let intern_started_at = Instant::now();
-            let mut component_ids = FxHashMap::<(usize, Vec<usize>), usize>::default();
+            let mut component_ids = FxHashMap::<(usize, SmallVec<[usize; 4]>), usize>::default();
             let mut components = Vec::<(Weight, SmallVec<[Weight; 4]>)>::new();
             let signature_components: Vec<SmallVec<[usize; 8]>> = final_signature_groups
                 .iter()
@@ -3096,7 +3151,7 @@ fn determinize_with_supports_mode(
                         .map(|(final_w, path_weights)| {
                             let key = (
                                 final_w.ptr_key(),
-                                path_weights.iter().map(Weight::ptr_key).collect::<Vec<_>>(),
+                                path_weights.iter().map(Weight::ptr_key).collect::<SmallVec<[usize; 4]>>(),
                             );
                             if let Some(&component_id) = component_ids.get(&key) {
                                 component_id
