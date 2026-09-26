@@ -4615,9 +4615,92 @@ fn fast_boundary_singleton_state(
     state
 }
 
+/// Canonicalize target contributions without allocating a second frontier.
+#[inline]
+fn compact_fast_boundary_contribs(
+    contribs: &mut FastBoundaryContribs,
+    interner: &mut FastBoundaryWeightInterner,
+) {
+    if contribs.len() < 2 { return; }
+    contribs.sort_unstable_by_key(|(state, _)| *state);
+    let mut written = 0usize;
+    for read in 0..contribs.len() {
+        let (state, weight) = contribs[read];
+        if written != 0 && contribs[written - 1].0 == state {
+            let previous = contribs[written - 1].1;
+            contribs[written - 1].1 = interner.union(previous, weight);
+        } else {
+            contribs[written] = (state, weight);
+            written += 1;
+        }
+    }
+    contribs.truncate(written);
+}
+
+/// Keep common per-label frontier storage, but do not pin exceptional buffers
+/// across the entire determinization. This changes storage, not frontier keys.
+#[inline]
+fn recycle_fast_boundary_contribs(contribs: &mut FastBoundaryContribs) {
+    if contribs.capacity() > 128 {
+        *contribs = FastBoundaryContribs::new();
+    } else {
+        contribs.clear();
+    }
+}
+
+#[cfg(test)]
+#[test]
+fn recycled_boundary_contribs_preserve_small_buffers_and_release_large_ones() {
+    let mut buffer = FastBoundaryContribs::new();
+    for i in 0..64 { buffer.push((i, 1)); }
+    let pointer = buffer.as_ptr();
+    let capacity = buffer.capacity();
+    let snapshot = buffer.to_vec();
+    recycle_fast_boundary_contribs(&mut buffer);
+    assert!(buffer.is_empty());
+    assert_eq!(buffer.as_ptr(), pointer);
+    assert_eq!(buffer.capacity(), capacity);
+    buffer.push((999, 2));
+    assert_eq!(snapshot[0], (0, 1));
+    assert_eq!(snapshot.len(), 64);
+    for i in 0..512 { buffer.push((i, 3)); }
+    assert!(buffer.capacity() > 128);
+    recycle_fast_boundary_contribs(&mut buffer);
+    assert!(buffer.is_empty());
+    assert!(buffer.capacity() <= 128);
+}
+
+#[cfg(test)]
+#[test]
+fn inplace_boundary_contribs_match_independent_grouped_unions_without_reallocation() {
+    let mut pool = FastBoundaryWeightInterner::new(1, 8).unwrap();
+    let weights = (0..256u64).map(|v| pool.intern(smallvec::smallvec![v])).collect::<Vec<_>>();
+    let mut seed = 73455u64;
+    let mut next = || { seed=seed.wrapping_mul(6364136223846793005).wrapping_add(1); (seed>>32)as usize };
+    for len in 0..128 {
+        for _ in 0..16 {
+            let mut input = FastBoundaryContribs::new();
+            let mut expected = BTreeMap::<u32,u64>::new();
+            for _ in 0..len {
+                let target = (next()%24)as u32;
+                let bits = next()%256;
+                input.push((target,weights[bits]));
+                *expected.entry(target).or_default() |= bits as u64;
+            }
+            let pointer = input.as_ptr();
+            let capacity = input.capacity();
+            compact_fast_boundary_contribs(&mut input, &mut pool);
+            assert_eq!(input.as_ptr(),pointer);
+            assert_eq!(input.capacity(),capacity);
+            let actual=input.iter().map(|&(q,w)|(q,pool.values[w as usize][0])).collect::<Vec<_>>();
+            assert_eq!(actual,expected.into_iter().collect::<Vec<_>>());
+        }
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 fn fast_boundary_process_contribs(
-    mut contribs: FastBoundaryContribs,
+    contribs: &mut FastBoundaryContribs,
     nwa: &[FastBoundaryNwaState],
     interner: &mut FastBoundaryWeightInterner,
     weight_by_state: &mut [FastBoundaryWeightId],
@@ -4640,20 +4723,7 @@ fn fast_boundary_process_contribs(
     if contribs.is_empty() {
         return None;
     }
-    if contribs.len() > 1 {
-        contribs.sort_unstable_by_key(|(state, _)| *state);
-        let mut merged = FastBoundaryContribs::new();
-        for (state, weight) in contribs {
-            if let Some((last_state, last_weight)) = merged.last_mut()
-                && *last_state == state
-            {
-                *last_weight = interner.union(*last_weight, weight);
-            } else {
-                merged.push((state, weight));
-            }
-        }
-        contribs = merged;
-    }
+    compact_fast_boundary_contribs(contribs, interner);
 
     if let [(state, weight)] = contribs.as_slice()
         && nwa[*state as usize].epsilons.is_empty()
@@ -4683,7 +4753,7 @@ fn fast_boundary_process_contribs(
     }
 
     let mut incoming_edge_weight = interner.empty_id();
-    for (_, weight) in &contribs {
+    for (_, weight) in contribs.iter() {
         incoming_edge_weight = interner.union(incoming_edge_weight, *weight);
     }
     if incoming_edge_weight == 0 {
@@ -4692,7 +4762,7 @@ fn fast_boundary_process_contribs(
     let closure = fast_boundary_epsilon_closure(
         nwa,
         interner,
-        &contribs,
+        contribs.as_slice(),
         weight_by_state,
         closure_queue,
         closure_touched,
@@ -4726,7 +4796,14 @@ fn fast_boundary_process_contribs(
     if let Some(key) = singleton_key {
         singleton_closure_cache.insert(key, cached);
     } else {
-        closure_cache.insert(contribs.into_vec(), cached);
+        // Cache keys must outlive the scratch buffer. Retain common capacities
+        // for future labels/subsets; move unusually large allocations instead.
+        let key = if contribs.capacity() > 128 {
+            std::mem::take(contribs).into_vec()
+        } else {
+            contribs.to_vec()
+        };
+        closure_cache.insert(key, cached);
     }
     Some(cached)
 }
@@ -5502,9 +5579,8 @@ fn determinize_preconverted_small_boundary_output(
         touched_dense.sort_unstable();
         for label in touched_dense.drain(..) {
             dense_touched[label] = false;
-            let contribs = std::mem::take(&mut dense[label]);
             if let Some((to_state, edge_weight)) = fast_boundary_process_contribs(
-                contribs,
+                &mut dense[label],
                 fast_nwa,
                 interner,
                 &mut weight_by_state,
@@ -5522,11 +5598,11 @@ fn determinize_preconverted_small_boundary_output(
                     .transitions
                     .push((label as i32, to_state, edge_weight));
             }
+            recycle_fast_boundary_contribs(&mut dense[label]);
         }
         if !default.is_empty() {
-            let contribs = std::mem::take(&mut default);
             if let Some((to_state, edge_weight)) = fast_boundary_process_contribs(
-                contribs,
+                &mut default,
                 fast_nwa,
                 interner,
                 &mut weight_by_state,
@@ -5544,13 +5620,14 @@ fn determinize_preconverted_small_boundary_output(
                     .transitions
                     .push((DEFAULT_LABEL, to_state, edge_weight));
             }
+            recycle_fast_boundary_contribs(&mut default);
         }
         if !sparse.is_empty() {
             let mut sparse_rows = sparse.drain().collect::<Vec<_>>();
             sparse_rows.sort_unstable_by_key(|(label, _)| *label);
-            for (label, contribs) in sparse_rows {
+            for (label, mut contribs) in sparse_rows {
                 if let Some((to_state, edge_weight)) = fast_boundary_process_contribs(
-                    contribs,
+                    &mut contribs,
                     &fast_nwa,
                     interner,
                     &mut weight_by_state,

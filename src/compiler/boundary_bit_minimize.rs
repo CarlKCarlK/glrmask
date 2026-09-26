@@ -34,6 +34,8 @@ pub struct BitMinimizeProfile {
     pub push_ms: f64,
     pub merge_ms: f64,
     pub reconstruct_ms: f64,
+    pub observation_weights_before: usize,
+    pub observation_weights_used: usize,
 }
 
 const MAX_POINTS: usize = 4096;
@@ -427,6 +429,18 @@ impl Masks {
     /// Boolean operations on input weights cannot distinguish these atoms.
     /// Only the deterministic post-normalization graph will use this quotient.
     fn compress_input_observations(&mut self,domain:Mask)->Option<(Vec<Mask>,usize)> {
+        self.compress_selected_observations(domain,None)
+    }
+
+    /// Every later predicate is a Boolean expression in the referenced masks.
+    /// Extra, unused interner values must not refine their observation classes.
+    /// Omitted IDs receive an invalid mapping; callers must map referenced IDs only.
+    fn compress_selected_observations(&mut self,domain:Mask,observed:Option<&[Mask]>)
+        ->Option<(Vec<Mask>,usize)>
+    {
+        if observed.is_some_and(|ids| ids.iter().any(|&id|id as usize>=self.values.len())) {
+            return None;
+        }
         let original_count = self.decoded_atoms.as_ref().map_or_else(
             || self.points.as_ref().map_or(self.rows*64, Vec::len), Vec::len,
         );
@@ -436,17 +450,20 @@ impl Masks {
         let count=selected.len();
         let mut selected_id=vec![usize::MAX;original_count];
         for (id,&point) in selected.iter().enumerate(){selected_id[point]=id;}
-        let cols=self.values.len().div_ceil(64);
+        let predicate_count=observed.map_or(self.values.len(),<[Mask]>::len);
+        let cols=predicate_count.div_ceil(64);
         if count.checked_mul(cols)?.checked_mul(8)?>64*1024*1024{return None;}
         let mut signatures=vec![vec![0u64;cols];count];
-        for (weight,mask) in self.values.iter().enumerate() {
+        for column in 0..predicate_count {
+            let old_id=observed.map_or(column,|ids|ids[column]as usize);
+            let mask=&self.values[old_id];
             for (word_index,&word) in mask.iter().enumerate() {
                 let mut bits=word;
                 while bits!=0 {
                     let bit=bits.trailing_zeros() as usize;bits&=bits-1;
                     let point=word_index*64+bit;
                     if point<original_count && selected_id[point]!=usize::MAX {
-                        signatures[selected_id[point]][weight/64]|=1u64<<(weight%64);
+                        signatures[selected_id[point]][column/64]|=1u64<<(column%64);
                     }
                 }
             }
@@ -463,7 +480,10 @@ impl Masks {
         let atom_count=members.len();
         let mut compressed=Self::new(atom_count.div_ceil(64));
         let mut mapping=Vec::with_capacity(self.values.len());
-        for old in &self.values {
+        if observed.is_some(){mapping.resize(self.values.len(),Mask::MAX);}
+        for column in 0..predicate_count {
+            let old_id=observed.map_or(column,|ids|ids[column]as usize);
+            let old=&self.values[old_id];
             let mut bits=vec![0u64;compressed.rows];
             for (atom,points) in members.iter().enumerate() {
                 let representative=points[0];
@@ -471,7 +491,8 @@ impl Masks {
                     bits[atom/64]|=1u64<<(atom%64);
                 }
             }
-            mapping.push(compressed.intern(bits)?);
+            let new_id=compressed.intern(bits)?;
+            if observed.is_some(){mapping[old_id]=new_id;}else{mapping.push(new_id);}
         }
         let decoded = if let Some(atoms) = self.decoded_atoms.as_ref() {
             // Composition of two exact disjoint partitions is exact: the
@@ -650,9 +671,25 @@ fn minimize_core(input:&DWA,mut masks:Masks,default_label:i32,compress:bool)->Op
         started.elapsed().as_secs_f64() * 1000.0, compress)
 }
 
+/// Use the smaller exact observation algebra by default. Explicit zero keeps
+/// the historical all-interned-weights implementation for diagnostic A/B runs.
+fn referenced_observations_enabled() -> bool {
+    std::env::var("GLRMASK_BOUNDARY_MIN_REFERENCED_OBSERVATIONS")
+        .map_or(true, |value| !matches!(value.trim(), "0" | "false" | "off"))
+}
+
 fn minimize_prepared(
+    states: Vec<State>, masks: Masks, indegree: Vec<usize>,
+    edge_count: usize, start_state: u32, convert_ms: f64, compress: bool,
+) -> Option<(DWA, BitMinimizeProfile)> {
+    minimize_prepared_with_observations(states, masks, indegree, edge_count,
+        start_state, convert_ms, compress, referenced_observations_enabled())
+}
+
+fn minimize_prepared_with_observations(
     mut states: Vec<State>, mut masks: Masks, mut indegree: Vec<usize>,
     edge_count: usize, start_state: u32, convert_ms: f64, compress: bool,
+    referenced_only: bool,
 ) -> Option<(DWA, BitMinimizeProfile)> {
     const MAX_ATTEMPTS: usize = 20_000_000;
     let n = states.len();
@@ -726,11 +763,26 @@ fn minimize_prepared(
     }
     if compress {
         let start=Instant::now();
+        profile.observation_weights_before=masks.values.len();
+        let observed=referenced_only.then(||{
+            let mut used=vec![false;masks.values.len()];
+            used[0]=true;used[1]=true;
+            for (state,&support) in states.iter().zip(&needed) {
+                used[state.final_mask as usize]=true;
+                used[support as usize]=true;
+                for edge in &state.edges{used[edge.mask as usize]=true;}
+            }
+            used.iter().enumerate().filter_map(|(id,&used)|used.then_some(id as Mask)).collect::<Vec<_>>()
+        });
+        profile.observation_weights_used=observed.as_ref().map_or(masks.values.len(),Vec::len);
         // Root support is already available from the necessary backward pass.
         // Projecting every weight to that constant set commutes with the
         // Boolean operations and removes no root-prefix acceptance. Reusing
         // it here avoids a separate expensive generic range-weight prepass.
-        if let Some((mapping,atoms))=masks.compress_input_observations(needed[start_state as usize]) {
+        let compressed=if let Some(observed)=&observed {
+            masks.compress_selected_observations(needed[start_state as usize],Some(observed))
+        } else {masks.compress_input_observations(needed[start_state as usize])};
+        if let Some((mapping,atoms))=compressed {
             for state in &mut states {
                 state.final_mask=mapping[state.final_mask as usize];
                 for edge in &mut state.edges{edge.mask=mapping[edge.mask as usize];}
@@ -894,6 +946,32 @@ fn minimize_native_impl(
     input: &glrmask_parser_dwa::__private::parser_dwa::FiniteBoundaryDwa, default_label: i32,
     decoder: Option<&FiniteAtomDecoder>,
 ) -> Option<(DWA, BitMinimizeProfile)> {
+    let selected = referenced_observations_enabled();
+    let candidate = minimize_native_with_observations(input, default_label, decoder, selected)?;
+    #[cfg(feature = "internal-api")]
+    if selected && std::env::var_os("GLRMASK_VALIDATE_MIN_REFERENCED_OBSERVATIONS").is_some() {
+        let reference = minimize_native_with_observations(input, default_label, decoder, false)
+            .expect("reference observation minimizer declined");
+        // All explicit labels plus a representative unnamed label cover the
+        // exact parser-prefix alphabet, including DEFAULT and zero guards.
+        let max_label = input.states.iter().flat_map(|row| row.transitions.iter())
+            .filter_map(|&(label, _, _)| (label >= 0 && label != default_label).then_some(label as u32))
+            .max().unwrap_or(0);
+        let alphabet = max_label.checked_add(2)?.min(default_label as u32);
+        let comparison = glrmask_parser_dwa::__private::parser_equivalence::compare_parser_mask_prefix_languages(
+            &reference.0, &candidate.0, alphabet, 2_000_000)
+            .expect("observation prefix comparison invalid or budget exhausted");
+        assert!(comparison.difference.is_none(), "observation mismatch: {:?}", comparison.difference);
+        eprintln!("[glrmask/validate][min_referenced_observations] exact=true pairs={} branches={}",
+            comparison.product_states, comparison.compared_branches);
+    }
+    Some(candidate)
+}
+
+fn minimize_native_with_observations(
+    input: &glrmask_parser_dwa::__private::parser_dwa::FiniteBoundaryDwa, default_label: i32,
+    decoder: Option<&FiniteAtomDecoder>, referenced_only: bool,
+) -> Option<(DWA, BitMinimizeProfile)> {
     let started = Instant::now();
     let n = input.states.len();
     if n == 0 || n > MAX_STATES || !(1..=64).contains(&input.rows)
@@ -930,8 +1008,8 @@ fn minimize_native_impl(
         if edge_count > MAX_EDGES { return None; }
         states.push(State { final_mask, edges, guarded });
     }
-    minimize_prepared(states, masks, indegree, edge_count, 0,
-        started.elapsed().as_secs_f64() * 1000.0, true)
+    minimize_prepared_with_observations(states, masks, indegree, edge_count, 0,
+        started.elapsed().as_secs_f64() * 1000.0, true, referenced_only)
 }
 
 
@@ -939,6 +1017,74 @@ fn minimize_native_impl(
 mod tests {
     use super::*;
     const DEFAULT:i32=2147483646;
+    #[test]
+    fn referenced_observations_ignore_unused_predicates_and_preserve_prefix_masks() {
+        use glrmask_parser_dwa::__private::parser_dwa::{FiniteBoundaryDwa,SmallBoundaryDwaState};
+        let mut weights=vec![vec![0u64;4].into_boxed_slice(),vec![u64::MAX;4].into_boxed_slice()];
+        // These historical temporary masks distinguish all128 selected points,
+        // but no final, edge, or needed-domain below observes them separately.
+        for point in 0..128 {
+            let mut value=vec![0u64;4];
+            value[point/32]=1u64<<(point%32);
+            weights.push(value.into_boxed_slice());
+        }
+        let a=weights.len()as u32;weights.push(vec![0xffffu64;4].into_boxed_slice());
+        let b=weights.len()as u32;weights.push(vec![0xffff_0000u64;4].into_boxed_slice());
+        let input=FiniteBoundaryDwa{rows:4,token_count:64,weights,states:vec![
+            SmallBoundaryDwaState{final_weight:0,transitions:vec![(0,1,a),(1,2,b),(DEFAULT,3,0)]},
+            SmallBoundaryDwaState{final_weight:a,transitions:vec![(1,3,0)]},
+            SmallBoundaryDwaState{final_weight:b,transitions:vec![]},
+            SmallBoundaryDwaState{final_weight:0,transitions:vec![]},
+        ]};
+        let(reference,rp)=minimize_native_with_observations(&input,DEFAULT,None,false).unwrap();
+        let(candidate,cp)=minimize_native_with_observations(&input,DEFAULT,None,true).unwrap();
+        assert_eq!(rp.atom_count,128);
+        assert_eq!(cp.atom_count,2);
+        assert!(cp.observation_weights_used<cp.observation_weights_before/4);
+        let check=glrmask_parser_dwa::__private::parser_equivalence::compare_parser_mask_prefix_languages(
+            &reference,&candidate,3,100_000).unwrap();
+        assert!(check.difference.is_none(),"{:?}",check.difference);
+    }
+
+    #[test]
+    fn referenced_observation_native_dags_match_all_finalized_prefixes() {
+        use glrmask_parser_dwa::__private::parser_dwa::{FiniteBoundaryDwa,SmallBoundaryDwaState};
+        let mut seed=471959u64;
+        let mut next=||{seed=seed.wrapping_mul(6364136223846793005).wrapping_add(1);(seed>>32)as usize};
+        for case in 0..256 {
+            let mut weights=vec![vec![0u64;4].into_boxed_slice(),vec![u64::MAX;4].into_boxed_slice()];
+            for point in 0..128 {
+                let mut value=vec![0u64;4];value[point/32]=1u64<<(point%32);
+                weights.push(value.into_boxed_slice());
+            }
+            let masks=(0..16u64).map(|bits|{
+                let id=weights.len()as u32;
+                weights.push(vec![bits*0x1111_1111_1111_1111;4].into_boxed_slice());id
+            }).collect::<Vec<_>>();
+            let n=3+next()%8;
+            let mut states=Vec::new();
+            for q in 0..n {
+                let mut row=SmallBoundaryDwaState{final_weight:masks[next()%16],transitions:vec![]};
+                if q+1<n {
+                    for label in [0,1,2,DEFAULT] {
+                        if next()%3!=0 {
+                            row.transitions.push((label,(q+1+next()%(n-q-1))as u32,masks[next()%16]));
+                        }
+                    }
+                }
+                states.push(row);
+            }
+            let input=FiniteBoundaryDwa{rows:4,token_count:64,weights,states};
+            let(reference,_)=minimize_native_with_observations(&input,DEFAULT,None,false).unwrap();
+            for observed in [false, true] {
+                let(candidate,_)=minimize_native_with_observations(&input,DEFAULT,None,observed).unwrap();
+                let check=glrmask_parser_dwa::__private::parser_equivalence::compare_parser_mask_prefix_languages(
+                    &reference,&candidate,4,100_000).unwrap();
+                assert!(check.difference.is_none(),"case={case} observed={observed} {:?}",check.difference);
+            }
+        }
+    }
+
     #[test]
     fn resource_decline_does_not_publish_or_mutate_partial_masks() {
         let exact = Weight::from_token_set_for_tsid(7,(0..4096).collect());
