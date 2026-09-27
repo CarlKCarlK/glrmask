@@ -909,7 +909,7 @@ pub(super) fn build_composed_constraint_unfinalized(
         packed_dwa_token_dense_masks: Default::default(),
         weight_token_buf_masks: FxHashMap::default(),
         weight_token_sparse_buf_masks: FxHashMap::default(),
-        direct_sparse_weight_token_sets: FxHashSet::default(),
+        range_final_token_sets: FxHashSet::default(),
         seed_terminal_dense: FxHashMap::default(),
         seed_terminal_dense_fallback: Default::default(),
         seed_universe_dense: Arc::<[u64]>::from(Vec::<u64>::new().into_boxed_slice()),

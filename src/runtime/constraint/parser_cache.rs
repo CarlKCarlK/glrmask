@@ -5,7 +5,7 @@ use crate::automata::lexer::tokenizer::Tokenizer;
 use crate::runtime::artifact::Constraint;
 use crate::runtime::artifact::DenseWeightMaskCache;
 use crate::runtime::artifact::DenseWords;
-use crate::runtime::artifact::DirectSparseWeightTokenSetCache;
+use crate::runtime::artifact::RangeFinalTokenSetCache;
 use crate::runtime::artifact::FastCommitTemplateDfas;
 use crate::runtime::artifact::FastDwaTransitionRow;
 use crate::runtime::artifact::FastDwaTransitions;
@@ -392,15 +392,15 @@ impl Constraint {
 
     fn compute_dense_token_masks(&self) -> (usize, DenseWeightMaskCache) {
         let inventory = self.weight_token_set_inventory();
-        self.compute_dense_token_masks_excluding_direct_final(
-            &DirectSparseWeightTokenSetCache::default(),
+        self.compute_dense_token_masks_excluding_range_final(
+            &RangeFinalTokenSetCache::default(),
             inventory,
         )
     }
 
-    pub(super) fn compute_dense_token_masks_excluding_direct_final(
+    pub(super) fn compute_dense_token_masks_excluding_range_final(
         &self,
-        direct_final_sets: &DirectSparseWeightTokenSetCache,
+        direct_final_sets: &RangeFinalTokenSetCache,
         inventory: WeightTokenSetInventory,
     ) -> (usize, DenseWeightMaskCache) {
         let profile = std::env::var_os("GLRMASK_PROFILE_COMPILE").is_some();
@@ -419,7 +419,7 @@ impl Constraint {
             transition_sets: mut unique_sets,
             transition_word_spans,
         } = inventory;
-        let mut residual_final_sets: DirectSparseWeightTokenSetCache = Default::default();
+        let mut residual_final_sets: RangeFinalTokenSetCache = Default::default();
         for (key, token_set) in final_sets {
             if !direct_final_sets.contains(&key) {
                 // These sets may need the contained-output cache, which

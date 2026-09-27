@@ -795,7 +795,7 @@ impl PackedDwaDenseWeightMaskCache {
 }
 pub(crate) type DenseWeightBufMaskCache = FxHashMap<usize, Box<[u32]>>;
 pub(crate) type SparseWeightBufMaskCache = FxHashMap<usize, Box<[(u16, u32)]>>;
-pub(crate) type DirectSparseWeightTokenSetCache = FxHashSet<usize>;
+pub(crate) type RangeFinalTokenSetCache = FxHashSet<usize>;
 pub(crate) type SeedTerminalDenseMasks = FxHashMap<(u32, TerminalID), DenseWords>;
 const INLINE_DWA_TRANSITION_LIMIT: usize = 8;
 
@@ -9334,7 +9334,7 @@ pub struct Constraint {
     /// Final-weight token sets eligible for the direct sparse-intersection
     /// path. Their full output masks are intentionally not materialized: the
     /// runtime intersects them with the current dense state on every use.
-    pub(crate) direct_sparse_weight_token_sets: DirectSparseWeightTokenSetCache,
+    pub(crate) range_final_token_sets: RangeFinalTokenSetCache,
     /// Precomputed dense bitmask for the seed phase: for each (tokenizer_state, terminal_id),
     /// the dense bitmap of internal tokens that terminal covers in that state.
     pub(crate) seed_terminal_dense: SeedTerminalDenseMasks,
@@ -9768,7 +9768,7 @@ pub(crate) struct ConstraintSerde {
     /// path. Their full output masks are intentionally not materialized: the
     /// runtime intersects them with the current dense state on every use.
     #[serde(skip)]
-    pub(crate) direct_sparse_weight_token_sets: DirectSparseWeightTokenSetCache,
+    pub(crate) range_final_token_sets: RangeFinalTokenSetCache,
     /// Precomputed dense bitmask for the seed phase: for each (tokenizer_state, terminal_id),
     /// the dense bitmap of internal tokens that terminal covers in that state.
     #[serde(skip)]

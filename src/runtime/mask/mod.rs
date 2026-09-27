@@ -6343,6 +6343,29 @@ impl<'a> ConstraintState<'a> {
             |tokens| constraint.runtime_token_set_dense_mask(tokens))
     }
 
+    /// Union one final token set, replaying a cached output mask only when
+    /// the active internal mask contains the complete set. Uncached sets stay
+    /// in internal coordinates until all paths have been unioned: expanding
+    /// each small set independently repeats writes to the same output words.
+    fn merge_final_token_set(
+        &self,
+        token_set: RuntimeTokenSetRef<'_>,
+        dense: &[u64],
+        precomputed: &DenseTokenMaskCache,
+        merged: &mut [u64],
+        direct_buf: Option<&mut [u32]>,
+        direct_buf_dirty: &mut bool,
+    ) -> bool {
+        if let (Some(buf), RuntimeTokenSetRef::Materialized(tokens)) = (direct_buf, token_set) {
+            if self.constraint.try_replay_cached_final_mask(dense, tokens, buf) {
+                *direct_buf_dirty = true;
+                return true;
+            }
+        }
+        DenseMaskAcc::or_dense_and_runtime_token_set_into(dense, token_set, precomputed, merged);
+        false
+    }
+
     fn merge_single_path_final_weight_to_internal(
         &self,
         final_weight: RuntimeWeightRef<'_>,
@@ -6350,47 +6373,19 @@ impl<'a> ConstraintState<'a> {
         dense: &[u64],
         precomputed: &DenseTokenMaskCache,
         merged: &mut [u64],
-        mut direct_buf: Option<&mut [u32]>,
+        direct_buf: Option<&mut [u32]>,
         direct_buf_dirty: &mut bool,
     ) -> bool {
         if final_weight.is_full() {
-            let n = dense.len().min(merged.len());
-            for idx in 0..n {
-                merged[idx] |= dense[idx];
+            for (output, &word) in merged.iter_mut().zip(dense) {
+                *output |= word;
             }
             return false;
         }
-
-        let Some(token_set) = final_weight.token_set_for_tsid(internal_tsid) else {
+        let Some(tokens) = final_weight.token_set_for_tsid(internal_tsid) else {
             return true;
         };
-        if let (Some(buf), RuntimeTokenSetRef::Materialized(token_set)) =
-            (direct_buf.as_deref_mut(), token_set)
-        {
-            let token_set_key = Arc::as_ptr(token_set) as usize;
-            if self
-                .constraint
-                .direct_sparse_weight_token_sets
-                .contains(&token_set_key)
-                && self
-                    .constraint
-                    .or_dense_token_set_to_buf_sparse(dense, token_set, 2048, buf)
-                    .is_some()
-            {
-                *direct_buf_dirty = true;
-                return true;
-            }
-            if self
-                .constraint
-                .or_weight_token_set_to_buf_if_contained(dense, token_set, buf)
-            {
-                *direct_buf_dirty = true;
-                return true;
-            }
-        }
-
-        DenseMaskAcc::or_dense_and_runtime_token_set_into(dense, token_set, precomputed, merged);
-        false
+        self.merge_final_token_set(tokens, dense, precomputed, merged, direct_buf, direct_buf_dirty)
     }
 
     fn terminals_disallowed_to_dense_acc(
@@ -6439,56 +6434,19 @@ impl<'a> ConstraintState<'a> {
         mut direct_buf: Option<&mut [u32]>,
         direct_buf_dirty: &mut bool,
     ) -> bool {
-        let mut all_direct = true;
         if final_weight.is_full() {
-            for (_, dense) in &acc.0 {
-                let n = dense.len().min(merged.len());
-                for i in 0..n {
-                    merged[i] |= dense[i];
-                }
-                all_direct = false;
-            }
-        } else {
-            for (tsid, dense) in &acc.0 {
-                let Some(token_set) = final_weight.token_set_for_tsid(*tsid) else {
-                    continue;
-                };
-
-                let handled_directly = if let (Some(buf), RuntimeTokenSetRef::Materialized(token_set)) =
-                    (direct_buf.as_deref_mut(), token_set)
-                {
-                    let token_set_key = Arc::as_ptr(token_set) as usize;
-                    if self
-                        .constraint
-                        .direct_sparse_weight_token_sets
-                        .contains(&token_set_key)
-                        && self
-                            .constraint
-                            .or_dense_token_set_to_buf_sparse(dense, token_set, 2048, buf)
-                            .is_some()
-                    {
-                        *direct_buf_dirty = true;
-                        true
-                    } else if self
-                        .constraint
-                        .or_weight_token_set_to_buf_if_contained(dense, token_set, buf)
-                    {
-                        *direct_buf_dirty = true;
-                        true
-                    } else {
-                        false
-                    }
-                } else {
-                    false
-                };
-
-                if !handled_directly {
-                    DenseMaskAcc::or_dense_and_runtime_token_set_into(dense, token_set, precomputed, merged);
-                    all_direct = false;
-                }
-            }
+            acc.or_into_merged(merged);
+            return acc.0.is_empty();
         }
-
+        let mut all_direct = true;
+        for (tsid, dense) in &acc.0 {
+            let Some(tokens) = final_weight.token_set_for_tsid(*tsid) else {
+                continue;
+            };
+            all_direct &= self.merge_final_token_set(
+                tokens, dense, precomputed, merged, direct_buf.as_deref_mut(), direct_buf_dirty,
+            );
+        }
         all_direct
     }
 

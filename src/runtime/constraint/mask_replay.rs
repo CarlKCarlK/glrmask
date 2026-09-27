@@ -584,19 +584,16 @@ impl Constraint {
         }
     }
 
+    /// Replay an already cached output mask only when its complete internal
+    /// token set is admissible. A cache miss must leave the output untouched.
     #[inline(always)]
-    pub(crate) fn or_weight_token_set_to_buf_if_contained(
+    pub(crate) fn try_replay_cached_final_mask(
         &self,
         dense: &[u64],
         token_set: &Arc<RangeSetBlaze<u32>>,
         buf: &mut [u32],
     ) -> bool {
         let key = Arc::as_ptr(token_set) as usize;
-        if self.direct_sparse_weight_token_sets.contains(&key) {
-            return self
-                .or_dense_token_set_to_buf_sparse(dense, token_set, 2048, buf)
-                .unwrap_or(false);
-        }
         let sparse_mask = self.weight_token_sparse_buf_masks.get(&key);
         let dense_mask = self.weight_token_buf_masks.get(&key);
         if sparse_mask.is_none() && dense_mask.is_none() {
@@ -620,101 +617,6 @@ impl Constraint {
         }
         true
     }
-
-    #[inline(always)]
-    pub(crate) fn or_dense_token_set_to_buf_sparse(
-        &self,
-        dense: &[u64],
-        token_set: &Arc<RangeSetBlaze<u32>>,
-        max_tokens: u64,
-        buf: &mut [u32],
-    ) -> Option<bool> {
-        if dense.is_empty() || token_set.is_empty() {
-            return Some(false);
-        }
-
-        let mut total = 0u64;
-        for range in token_set.ranges() {
-            total = total.saturating_add((*range.end() as u64).saturating_sub(*range.start() as u64) + 1);
-            if total > max_tokens {
-                return None;
-            }
-        }
-
-        let n_internal = self.internal_token_count();
-        let mut any = false;
-        let mut stats_entries = 0u64;
-        for range in token_set.ranges() {
-            let start = *range.start() as usize;
-            let end = (*range.end() as usize).min(n_internal.saturating_sub(1));
-            if start > end {
-                continue;
-            }
-            for internal_token in start..=end {
-                let word_idx = internal_token / 64;
-                let bit = internal_token % 64;
-                if dense
-                    .get(word_idx)
-                    .is_some_and(|word| (word & (1u64 << bit)) != 0)
-                {
-                    self.or_internal_token_to_buf_fast::<false>(
-                        internal_token,
-                        buf,
-                        &mut stats_entries,
-                    );
-                    any = true;
-                }
-            }
-        }
-
-        Some(any)
-    }
-
-
-    #[inline(always)]
-    pub(crate) fn has_weight_token_set_buf_if_contained(
-        &self,
-        dense: &[u64],
-        token_set: &Arc<RangeSetBlaze<u32>>,
-    ) -> bool {
-        let key = Arc::as_ptr(token_set) as usize;
-        if self.direct_sparse_weight_token_sets.contains(&key) {
-            for range in token_set.ranges() {
-                let start = *range.start() as usize;
-                let end = *range.end() as usize;
-                for internal_token in start..=end {
-                    let word = internal_token / 64;
-                    let bit = internal_token % 64;
-                    if dense
-                        .get(word)
-                        .is_none_or(|dense_word| (dense_word & (1u64 << bit)) == 0)
-                    {
-                        return false;
-                    }
-                }
-            }
-            return true;
-        }
-        if !self.weight_token_buf_masks.contains_key(&key)
-            && !self.weight_token_sparse_buf_masks.contains_key(&key)
-        {
-            return false;
-        }
-        let Some(token_dense) = self.weight_token_dense_masks.get(&key) else {
-            return false;
-        };
-
-        for (i, &token_word) in token_dense.iter().enumerate() {
-            let dense_word = dense.get(i).copied().unwrap_or(0);
-            if token_word & !dense_word != 0 {
-                return false;
-            }
-        }
-
-        true
-    }
-
-
 
     pub(super) fn sparse_word_group_entries_in(&self, start: usize, len: usize) -> usize {
         let end = start + len;

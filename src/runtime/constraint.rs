@@ -208,3 +208,5 @@ impl Constraint {
 
 #[cfg(test)]
 mod dense_internal_token_mask_tests;
+#[cfg(test)]
+mod final_mask_replay_tests;

@@ -3,7 +3,7 @@
 use crate::runtime::artifact::Constraint;
 use crate::runtime::artifact::DenseBufMaskRows;
 use crate::runtime::artifact::DenseWeightBufMaskCache;
-use crate::runtime::artifact::DirectSparseWeightTokenSetCache;
+use crate::runtime::artifact::RangeFinalTokenSetCache;
 use crate::runtime::artifact::InternalTokenBufMasks;
 use crate::runtime::artifact::PackedInternalTokenBufMask;
 use crate::runtime::artifact::SparseWeightBufMaskCache;
@@ -16,8 +16,8 @@ use std::sync::Arc;
 use super::mask_replay::pack_internal_token_buf_entry;
 
 #[derive(Default)]
-pub(super) struct DirectSparseWeightBufCaches {
-    pub(super) eligible: DirectSparseWeightTokenSetCache,
+pub(super) struct FinalTokenSetPlan {
+    pub(super) eligible: RangeFinalTokenSetCache,
     pub(super) fallback: Vec<(usize, Arc<RangeSetBlaze<u32>>)>,
 }
 
@@ -755,9 +755,10 @@ impl Constraint {
         prefix
     }
 
-    fn direct_sparse_weight_buf_cache_enabled() -> bool {
+    fn range_final_token_sets_enabled() -> bool {
         static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
         *ENABLED.get_or_init(|| {
+            // Retain the existing diagnostic switch for cache-plan comparisons.
             std::env::var("GLRMASK_DIRECT_SPARSE_WEIGHT_BUF_CACHE")
                 .map(|value| {
                     let value = value.trim();
@@ -1067,25 +1068,24 @@ impl Constraint {
         self.weight_token_set_inventory_with_packed(None)
     }
 
-    /// Classify final-weight token sets for the direct runtime-intersection
-    /// path. The runtime itself performs an exact intersection with the active
-    /// dense state, so no final output buffer is needed for sets under its
-    /// fixed work cap. Bound both the internal-token scan and the worst-case
-    /// expanded output-mask work: token equivalence can make a small internal
-    /// set extremely expensive to replay into the original-token mask.
-    pub(super) fn compute_direct_sparse_weight_token_buf_masks(
+    /// Plan which final token sets can be intersected as ranges, avoiding
+    /// prebuilt dense and output masks. Runtime unions those sets in internal
+    /// coordinates and expands the union once, never once per final weight.
+    /// Retain the conservative scan/expansion budget used during finalization
+    /// so this runtime simplification does not add compile-time cache work.
+    pub(super) fn plan_final_token_sets(
         &self,
         final_token_sets: &[(usize, Arc<RangeSetBlaze<u32>>) ],
-    ) -> DirectSparseWeightBufCaches {
+    ) -> FinalTokenSetPlan {
         if final_token_sets.is_empty() {
-            return DirectSparseWeightBufCaches::default();
+            return FinalTokenSetPlan::default();
         }
         let profile = std::env::var_os("GLRMASK_PROFILE_COMPILE").is_some();
         let total_started = profile.then(std::time::Instant::now);
         let buf_words = self.body_mask_len();
         let direct_sparse = buf_words != 0
             && buf_words <= u16::MAX as usize
-            && Self::direct_sparse_weight_buf_cache_enabled()
+            && Self::range_final_token_sets_enabled()
             && self.final_mask_mapping.internal_len() == 0;
         let direct_token_limit = ((buf_words / 2).min(2048)) as u64;
         let direct_work_limit = direct_token_limit;
@@ -1189,22 +1189,21 @@ impl Constraint {
                 total_started.map_or(0.0, |started| started.elapsed().as_secs_f64() * 1000.0),
             );
         }
-        DirectSparseWeightBufCaches {
+        FinalTokenSetPlan {
             eligible: batch.eligible.into_iter().collect(),
             fallback: batch.fallback,
         }
     }
 
-    /// Build the small residual set of final-weight output buffers. All direct
-    /// sparse sets have already been classified, so this path visits only the
-    /// token sets that genuinely require a materialized dense or sparse output.
-    pub(super) fn compute_weight_token_buf_mask_caches_with_prebuilt_sparse(
+    /// Build output masks only for final sets selected for materialization.
+    /// Range-replayed sets need neither a dense internal mask nor an output mask.
+    pub(super) fn compute_final_output_mask_caches(
         &self,
-        mut prebuilt: DirectSparseWeightBufCaches,
+        mut prebuilt: FinalTokenSetPlan,
     ) -> (
         DenseWeightBufMaskCache,
         SparseWeightBufMaskCache,
-        DirectSparseWeightTokenSetCache,
+        RangeFinalTokenSetCache,
     ) {
         #[derive(Default)]
         struct CacheBatch {

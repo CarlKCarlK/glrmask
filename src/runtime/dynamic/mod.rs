@@ -463,7 +463,7 @@ impl DynamicConstraint {
             packed_dwa_token_dense_masks: Default::default(),
             weight_token_buf_masks: Default::default(),
             weight_token_sparse_buf_masks: Default::default(),
-            direct_sparse_weight_token_sets: Default::default(),
+            range_final_token_sets: Default::default(),
             seed_terminal_dense: Default::default(),
             seed_terminal_dense_fallback: Default::default(),
             seed_universe_dense: Arc::from(Vec::<u64>::new().into_boxed_slice()),

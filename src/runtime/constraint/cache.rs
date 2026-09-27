@@ -9,7 +9,7 @@ use crate::runtime::state::ConstraintState;
 use rustc_hash::FxHashMap;
 use std::sync::Arc;
 use std::sync::Mutex;
-use super::mask_cache::DirectSparseWeightBufCaches;
+use super::mask_cache::FinalTokenSetPlan;
 
 pub(super) const INITIAL_COMMIT_PRIME_MAX_TOKENS: usize = 16;
 
@@ -560,11 +560,11 @@ impl Constraint {
             || self.compute_fast_transitions(),
             || {
                 let inventory = self.weight_token_set_inventory();
-                let prebuilt_sparse = self.compute_direct_sparse_weight_token_buf_masks(
+                let prebuilt_sparse = self.plan_final_token_sets(
                     &inventory.final_sets,
                 );
                 let (dense_words, dense_masks) =
-                    self.compute_dense_token_masks_excluding_direct_final(
+                    self.compute_dense_token_masks_excluding_range_final(
                         &prebuilt_sparse.eligible,
                         inventory,
                     );
@@ -575,11 +575,11 @@ impl Constraint {
         self.weight_token_dense_masks = dense_masks;
         self.packed_dwa_token_dense_masks = self.compute_packed_dwa_dense_token_masks();
         self.dwa_fast_transitions = fast_transitions;
-        let (weight_token_buf_masks, weight_token_sparse_buf_masks, direct_sparse_weight_token_sets) =
-            self.compute_weight_token_buf_mask_caches_with_prebuilt_sparse(prebuilt_sparse);
+        let (weight_token_buf_masks, weight_token_sparse_buf_masks, range_final_token_sets) =
+            self.compute_final_output_mask_caches(prebuilt_sparse);
         self.weight_token_buf_masks = weight_token_buf_masks;
         self.weight_token_sparse_buf_masks = weight_token_sparse_buf_masks;
-        self.direct_sparse_weight_token_sets = direct_sparse_weight_token_sets;
+        self.range_final_token_sets = range_final_token_sets;
         self.parser_runtime_caches_prebuilt = true;
     }
 
@@ -800,7 +800,7 @@ impl Constraint {
             (
                 std::mem::take(&mut self.weight_token_buf_masks),
                 std::mem::take(&mut self.weight_token_sparse_buf_masks),
-                std::mem::take(&mut self.direct_sparse_weight_token_sets),
+                std::mem::take(&mut self.range_final_token_sets),
             )
         });
         let primary_started_at = profile.then(std::time::Instant::now);
@@ -838,17 +838,17 @@ impl Constraint {
             let parser_dense_prebuilt = prebuilt_parser_dense_masks.take();
             let (dense_masks, prebuilt_weight_caches, prebuilt_weight_sparse_ms, dense_token_masks_ms) =
                 if let Some(dense_masks) = parser_dense_prebuilt {
-                    (dense_masks, DirectSparseWeightBufCaches::default(), 0.0, 0.0)
+                    (dense_masks, FinalTokenSetPlan::default(), 0.0, 0.0)
                 } else {
                     let weight_token_sets = self
                         .weight_token_set_inventory_with_packed(packed_weight_token_sets.take());
-                    let prebuilt_weight_caches = self.compute_direct_sparse_weight_token_buf_masks(
+                    let prebuilt_weight_caches = self.plan_final_token_sets(
                         &weight_token_sets.final_sets,
                     );
                     let prebuilt_weight_sparse_ms = started
                         .map_or(0.0, |started| started.elapsed().as_secs_f64() * 1000.0);
                     let dense_started = profile.then(std::time::Instant::now);
-                    let dense_masks = self.compute_dense_token_masks_excluding_direct_final(
+                    let dense_masks = self.compute_dense_token_masks_excluding_range_final(
                         &prebuilt_weight_caches.eligible,
                         weight_token_sets,
                     );
@@ -945,17 +945,17 @@ impl Constraint {
                     let started = profile.then(std::time::Instant::now);
                     let (dense_masks, prebuilt_weight_caches, prebuilt_weight_sparse_ms, dense_token_masks_ms) =
                         if let Some(dense_masks) = prebuilt_parser_dense_masks.take() {
-                            (dense_masks, DirectSparseWeightBufCaches::default(), 0.0, 0.0)
+                            (dense_masks, FinalTokenSetPlan::default(), 0.0, 0.0)
                         } else {
                             let weight_token_sets = self
                                 .weight_token_set_inventory_with_packed(packed_weight_token_sets.take());
-                            let prebuilt_weight_caches = self.compute_direct_sparse_weight_token_buf_masks(
+                            let prebuilt_weight_caches = self.plan_final_token_sets(
                                 &weight_token_sets.final_sets,
                             );
                             let prebuilt_weight_sparse_ms = started
                                 .map_or(0.0, |started| started.elapsed().as_secs_f64() * 1000.0);
                             let dense_started = profile.then(std::time::Instant::now);
-                            let dense_masks = self.compute_dense_token_masks_excluding_direct_final(
+                            let dense_masks = self.compute_dense_token_masks_excluding_range_final(
                                 &prebuilt_weight_caches.eligible,
                                 weight_token_sets,
                             );
@@ -1083,11 +1083,11 @@ impl Constraint {
         let (
             weight_token_buf_masks,
             weight_token_sparse_buf_masks,
-            direct_sparse_weight_token_sets,
+            range_final_token_sets,
         ) = prebuilt_parser_weight_buf_caches
             .take()
             .unwrap_or_else(|| {
-                self.compute_weight_token_buf_mask_caches_with_prebuilt_sparse(
+                self.compute_final_output_mask_caches(
                     prebuilt_weight_caches,
                 )
             });
@@ -1099,7 +1099,7 @@ impl Constraint {
                 .map_or(0.0, |started| started.elapsed().as_secs_f64() * 1000.0)
         };
         self.weight_token_sparse_buf_masks = weight_token_sparse_buf_masks;
-        self.direct_sparse_weight_token_sets = direct_sparse_weight_token_sets;
+        self.range_final_token_sets = range_final_token_sets;
         let weight_sparse_ms = 0.0;
         self.dwa_fast_transitions = fast_transitions;
         self.parser_runtime_caches_prebuilt = true;
@@ -1186,7 +1186,7 @@ impl Constraint {
                 weight_sparse_ms,
                 self.weight_token_buf_masks.len(),
                 self.weight_token_sparse_buf_masks.len(),
-                self.direct_sparse_weight_token_sets.len(),
+                self.range_final_token_sets.len(),
             );
             eprintln!(
                 "[glrmask/profile][runtime_finalize] terminal_live_ms={:.3} guarded_shift_ms={:.3} dynamic_mask_vocab_ms={:.3} dynamic_mask_vocab_reused={} internal_token_buf_masks_ms={:.3} tokenizer_fast_transitions_ms={:.3} dense_token_masks_ms={:.3} dwa_fast_transitions_ms={:.3} primary_ms={:.3} word_block_masks_ms={:.3} quad_word_block_masks_ms={:.3} byte_block_masks_ms={:.3} block_masks_ms={:.3} derived_masks_ms={:.3} seed_dense_ms={:.3} tokenizer_closures_ms={:.3} initial_commit_prime_ms={:.3} total_ms={:.3}",
