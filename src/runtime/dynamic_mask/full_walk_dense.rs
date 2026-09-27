@@ -3096,6 +3096,22 @@ fn identity_subtree_requires_output(deferred: bool, positive: bool, allowed: boo
     deferred || positive == allowed
 }
 
+/// A lower-bound hit proves true; an upper-bound miss proves false.
+/// The unresolved middle must use the existing exact stack simulation.
+#[inline(always)]
+fn full_walk_row_liveness_bound(
+    guaranteed_live: bool,
+    necessary_live: impl FnOnce() -> bool,
+) -> Option<bool> {
+    if guaranteed_live {
+        Some(true)
+    } else if !necessary_live() {
+        Some(false)
+    } else {
+        None
+    }
+}
+
 struct FullWalkParserNode {
     gss: ParserStacks,
     admitted: Option<BitSet>,
@@ -3108,6 +3124,7 @@ struct FullWalkParserNode {
 }
 
 struct FullWalkParserCache {
+    row_liveness_enabled: bool,
     nodes: Vec<FullWalkParserNode>,
     lexer_state_count: usize,
     canonicalize: bool,
@@ -3167,6 +3184,10 @@ impl FullWalkParserCache {
             && full_walk_identity_context_profitable(root_branches.len(), nodes.len());
         (
             Self {
+                row_liveness_enabled: {
+                    static ENABLED: OnceLock<bool> = OnceLock::new();
+                    *ENABLED.get_or_init(|| !env_flag("GLRMASK_DISABLE_ROW_LIVENESS", false))
+                },
                 nodes,
                 lexer_state_count,
                 canonicalize,
@@ -3356,6 +3377,36 @@ impl FullWalkParserCache {
     }
 
 
+    /// Exact lower/upper bounds for one plain parser top, with no scoped or
+    /// zero-width transitions. The existing table contract is:
+    /// unconditional advance <= stack-admissible terminals <= advance row.
+    /// Only a definite answer bypasses full stack-dependent admission.
+    #[inline]
+    fn row_future_allowed<T: FullWalkTransitionTable>(
+        &self,
+        constraint: &Constraint,
+        tokenizer: &Tokenizer,
+        transitions: &T,
+        parser_node: u32,
+        lexer_state: u32,
+    ) -> Option<bool> {
+        if !self.row_liveness_enabled
+            || self.nodes[parser_node as usize].admitted.is_some()
+            || constraint.uses_sparse_direct_regular_runtime()
+            || constraint.uses_compact_segmented_parser_runtime()
+            || !constraint.table.control_terminals.is_empty()
+        {
+            return None;
+        }
+        let top = self.nodes[parser_node as usize].gss.single_top_value()?;
+        let necessary = constraint.table.advance_row(top)?;
+        let guaranteed = constraint.table.unconditional_advance_row(top)?;
+        full_walk_row_liveness_bound(
+            transitions.future_intersects(tokenizer, lexer_state, guaranteed),
+            || transitions.future_intersects(tokenizer, lexer_state, necessary),
+        )
+    }
+
     #[inline(always)]
     fn physical_token_boundary_allowed<T: FullWalkTransitionTable>(
         &mut self,
@@ -3382,25 +3433,23 @@ impl FullWalkParserCache {
         if self.profile {
             self.profile_boundary_misses += 1;
         }
-        // llguidance effectively conditions its lexer on the parser row before
-        // walking the vocabulary. Preserve GLRMask's global tokenizer state,
-        // but when the exact parser admission set is a singleton avoid a
-        // general future-set intersection at every newly-seen lexer state.
-        // This is exactly equivalent to intersecting with a one-bit set.
-        let _ = self.admitted(constraint, parser_node);
-        let parser_future_allowed = if let Some(terminal) =
-            self.nodes[node].admitted_singleton
-        {
-            transitions.future_contains(tokenizer, lexer_state, terminal)
+        // Prove liveness directly from the current parser row where possible.
+        // Ambiguous reductions and guarded actions still use full exact
+        // admission. Its singleton case retains the existing one-bit lookup.
+        let parser_future_allowed = if let Some(allowed) = self.row_future_allowed(
+            constraint, tokenizer, transitions, parser_node, lexer_state,
+        ) {
+            allowed
         } else {
-            transitions.future_intersects(
-                tokenizer,
-                lexer_state,
-                self.nodes[node]
-                    .admitted
-                    .as_ref()
-                    .expect("admitted set populated above"),
-            )
+            let _ = self.admitted(constraint, parser_node);
+            if let Some(terminal) = self.nodes[node].admitted_singleton {
+                transitions.future_contains(tokenizer, lexer_state, terminal)
+            } else {
+                transitions.future_intersects(
+                    tokenizer, lexer_state,
+                    self.nodes[node].admitted.as_ref().expect("admitted set populated above"),
+                )
+            }
         };
         let allowed = constraint
             .ignore_terminal
@@ -8223,6 +8272,104 @@ fn try_full_walk_mask_with_table_from_initial_in_output_scope<
 #[cfg(test)]
 mod full_walk_acceleration_tests {
     use super::*;
+
+    #[test]
+    fn row_liveness_bounds_are_exact_for_all_small_terminal_sets() {
+        let mut proofs = 0;
+        let mut unresolved = 0;
+        for upper in 0u32..16 {
+            for lower in 0u32..16 {
+                if lower & !upper != 0 { continue; }
+                for admitted in 0u32..16 {
+                    if lower & !admitted != 0 || admitted & !upper != 0 { continue; }
+                    for futures in 0u32..16 {
+                        match full_walk_row_liveness_bound(lower & futures != 0, || upper & futures != 0) {
+                            Some(value) => { assert_eq!(value, admitted & futures != 0); proofs += 1; }
+                            None => { assert_eq!(lower & futures, 0); assert_ne!(upper & futures, 0); unresolved += 1; }
+                        }
+                    }
+                }
+            }
+        }
+        assert!(proofs > 1000 && unresolved > 100);
+        assert_eq!(full_walk_row_liveness_bound(true, || panic!("proven positive must not query upper bound")), Some(true));
+    }
+
+    #[test]
+    fn row_liveness_bounds_match_compiled_and_loaded_parser_frontiers() {
+        use crate::{DynamicConstraint, Grammar, Vocab};
+        let vocab = Vocab::new([
+            "a", "b", "c", "aa", "ab", "ba", "bb", " ", "acb",
+        ].into_iter().enumerate()
+            .map(|(id, text)| (id as u32, text.as_bytes().to_vec())).collect());
+        let grammars = [
+            "start s; t A ::= 'a'; t B ::= 'b'; t C ::= 'c'; nt s ::= A s B | C;",
+            "start s; t A ::= 'a'; t B ::= 'b'; t C ::= 'c'; nt s ::= A s B | A A | A B | C;",
+            "start s; ignore WS; t WS ::= ' '+; t A ::= 'a'+; t B ::= 'ab'; t C ::= 'b'+; nt s ::= A s C | B | A C;",
+        ];
+        let mut positive = 0;
+        let mut negative = 0;
+        let mut compared = 0;
+        for grammar in grammars {
+            let compiled = DynamicConstraint::compile(Grammar::glrm(grammar), &vocab).unwrap();
+            let loaded = DynamicConstraint::load_with_vocab(&compiled.save(), &vocab).unwrap();
+            for dynamic in [&compiled, &loaded] {
+                let constraint = &dynamic.inner;
+                // These predicates read terminal metadata, never byte cells.
+                let transitions = FullWalkFlat32 { transitions: &[] };
+                let mut pending = constraint.start().state.entries.iter()
+                    .map(|(_, gss)| gss.apply(|_| ())).collect::<Vec<_>>();
+                let mut seen = std::collections::HashSet::new();
+                for _ in 0..5 {
+                    let mut next = Vec::new();
+                    for stacks in pending {
+                        let mut key = stacks.to_stacks(4096).expect("small grammar path bound");
+                        key.sort();
+                        if !seen.insert(key) { continue; }
+                        let (mut cache, _) = FullWalkParserCache::from_roots(
+                            &DynamicBranches::new(), constraint.tokenizer.num_states() as usize, false,
+                        );
+                        cache.row_liveness_enabled = true;
+                        let node = cache.push_parser_stacks(stacks.clone());
+                        let admitted = exact_parser_admission_for_stacks(constraint, &stacks);
+                        for lexer in 0..constraint.tokenizer.num_states() {
+                            let exact = transitions.future_intersects(&constraint.tokenizer, lexer, &admitted);
+                            if let Some(answer) = cache.row_future_allowed(
+                                constraint, &constraint.tokenizer, &transitions, node, lexer,
+                            ) {
+                                assert_eq!(answer, exact, "grammar={grammar} lexer={lexer}");
+                                positive += usize::from(answer);
+                                negative += usize::from(!answer);
+                            }
+                            compared += 1;
+                        }
+                        // Independently check the complete cached predicate,
+                        // including ignore, positive/negative hits, and disabled fallback.
+                        for lexer in 0..constraint.tokenizer.num_states() {
+                            let exact = transitions.future_intersects(&constraint.tokenizer, lexer, &admitted)
+                                || constraint.ignore_terminal.is_some_and(|terminal|
+                                    transitions.future_contains(&constraint.tokenizer, lexer, terminal));
+                            assert_eq!(cache.physical_token_boundary_allowed(
+                                constraint, &constraint.tokenizer, &transitions, node, lexer), exact);
+                            assert_eq!(cache.physical_token_boundary_allowed(
+                                constraint, &constraint.tokenizer, &transitions, node, lexer), exact);
+                        }
+                        cache.row_liveness_enabled = false;
+                        assert!(cache.row_future_allowed(constraint, &constraint.tokenizer,
+                            &transitions, node, 0).is_none());
+                        for terminal in 0..constraint.table.num_terminals {
+                            if let Some(child) = parser_child(constraint, &stacks, terminal) {
+                                next.push(child);
+                            }
+                        }
+                    }
+                    pending = next;
+                }
+            }
+        }
+        assert!(compared > 100, "test must cover actual parser/lexer combinations");
+        assert!(positive > 0 && negative > 0, "both proof directions must execute");
+    }
 
     #[test]
     fn identity_output_noop_preserves_deferred_and_both_polarities() {
