@@ -268,6 +268,8 @@ pub(crate) struct MaskCacheData {
 
 #[derive(Default)]
 pub(crate) struct MaskScratch {
+    /// Direct-kernel paths are temporary, but wide-frontier allocations are reused.
+    pub single_path_paths: crate::runtime::mask::SinglePathMaskPaths,
     pub merged_dense: Vec<u64>,
     pub chain_merged_dense: Vec<u64>,
     pub output_buf: Vec<u32>,
@@ -324,6 +326,7 @@ impl MaskScratch {
             }
         }
         Self {
+            single_path_paths: Default::default(),
             merged_dense: Vec::with_capacity(dense_words),
             chain_merged_dense: Vec::with_capacity(dense_words),
             output_buf: Vec::with_capacity(constraint.body_mask_len()),
