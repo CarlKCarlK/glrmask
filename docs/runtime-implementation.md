@@ -61,11 +61,18 @@ retain their scoped correlations instead of becoming unrelated state sets.
 The former private `build_dynamic_self_loop_projections` cluster had no callers
 in the pinned `7e84a64c9` source. Its candidate discovery, standalone proof
 builder, experimental lexical-effect builders, and unused alias builder were
-removed, along with other private helpers that had no references. This is not a
-removal of live dynamic projection support: retained projection data, runtime
-consumers, artifact fields, bounded observations, and virtual residual
-preparation remain. Vocabulary-equivalence analysis is unchanged and remains
-internal.
+removed, along with other private helpers that had no references. The follow-up
+removes the orphaned self-loop projection types, accessors and four always-empty
+cache fields. All construction and restoration paths initialized those fields
+empty, and only the removed, uncalled setters could populate them. The remaining
+profiling diagnostic therefore keeps its existing `projection=none` output.
+
+This does not remove live dynamic projection support. Bounded observations,
+terminal quotients, virtual residual preparation, pending guards and current
+artifact validation remain. Vocabulary-equivalence analysis is unchanged and
+remains internal. The private in-memory cache layout changes, so source-level
+reachability is not by itself proof of performance preservation. See the
+[cleanup validation checkpoint](runtime-cache-cleanup-validation.md).
 
 Changing responsibility boundaries does not justify deleting a live fast path.
 Validate moved function bodies and public signatures separately from intentional

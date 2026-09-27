@@ -206,6 +206,7 @@ pub(super) fn compose_dynamic_recursive_shared_fast(
         num_rules: shell_rules.len() as u32,
         rules: shell_rules,
         nonterminal_display_names: parent.table.nonterminal_display_names.clone(),
+        embedded_start: parent.table.embedded_start.clone(),
         construction: parent.table.construction,
         admission_policy: parent.table.admission_policy,
         advance: Vec::new(),

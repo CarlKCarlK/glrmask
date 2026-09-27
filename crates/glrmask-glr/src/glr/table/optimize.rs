@@ -7342,6 +7342,7 @@ pub(super) fn merge_same_core_lr1_states(table: GLRTable, core_keys: &[Vec<Item>
         num_rules: table.num_rules,
         rules: table.rules,
         nonterminal_display_names: table.nonterminal_display_names,
+        embedded_start: table.embedded_start,
         construction: table.construction,
         admission_policy: table.admission_policy,
         advance,

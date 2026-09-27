@@ -1831,8 +1831,11 @@ mod tests {
 
         let optimized = determinize_bundle_groups(&groups);
         let (profiled, _) = determinize_bundle_groups_profiled(&groups);
-        let parallel = determinize_bundle_groups_parallel_small(&groups)
-            .expect("small bundle must support parallel determinization");
+        let pool = |threads| rayon::ThreadPoolBuilder::new()
+            .num_threads(threads).build().expect("test thread pool");
+        assert!(pool(1).install(|| determinize_bundle_groups_parallel_small(&groups)).is_none());
+        let parallel = pool(2).install(|| determinize_bundle_groups_parallel_small(&groups))
+            .expect("small bundle must support parallel determinization with two workers");
         let mut word = Vec::new();
         visit_words(&[1, 2, 3, 4, 5], 4, &mut word, &mut |word| {
             let expected = eval_bundle_product(&groups, word);

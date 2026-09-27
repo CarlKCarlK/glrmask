@@ -173,36 +173,19 @@ pub(super) fn load_impl(
         let mut prepared_completion_wire: Option<Arc<[u8]>> = None;
         let mut loaded_packed_dwa_dense_masks = false;
         let mut constraint = {
-            let (
-                weight_section,
-                dwa_section,
-                table_section,
-                core_section,
-                runtime_section,
-                token_bytes_section,
-                original_token_map_section,
-                tokenizer_section,
-                internal_token_buf_masks_section,
-                token_mask_cache_section,
-                composition_metadata_section,
-            ) =
-                {
-                    let (weight, dwa, table, core, runtime, token_bytes, original_map, tokenizer, internal_masks, token_mask_cache, composition_metadata) = constraint_sections(serialized)
-                        .map_err(crate::GlrMaskError::Serialization)?;
-                    (
-                        weight,
-                        dwa,
-                        table,
-                        core,
-                        Some(runtime),
-                        Some(token_bytes),
-                        Some(original_map),
-                        Some(tokenizer),
-                        Some(internal_masks),
-                        Some(token_mask_cache),
-                        Some(composition_metadata),
-                    )
-                };
+            let sections = constraint_sections(serialized)
+                .map_err(crate::GlrMaskError::Serialization)?;
+            let weight_section = sections.weight;
+            let dwa_section = sections.dwa;
+            let table_section = sections.table;
+            let core_section = sections.core;
+            let runtime_section = Some(sections.runtime);
+            let token_bytes_section = Some(sections.token_bytes);
+            let original_token_map_section = Some(sections.original_map);
+            let tokenizer_section = Some(sections.tokenizer);
+            let internal_token_buf_masks_section = Some(sections.internal_masks);
+            let token_mask_cache_section = Some(sections.token_mask_cache);
+            let composition_metadata_section = Some(sections.composition_metadata);
             let (((dwa_result, (table_result, runtime_result)), ((tokenizer_result, original_token_map_result), (internal_token_buf_masks_result, token_mask_cache_result))), core_result) = rayon::join(
                 || rayon::join(
                     || rayon::join(

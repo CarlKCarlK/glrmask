@@ -1,5 +1,8 @@
 # Full-width output mask coordinates
 
+> Historical isolated coordinate checkpoint. The combined branch uses outer format
+> **33 / `S33`** and is validated separately. See [the coherent overhaul](coherent-overhaul.md).
+
 ## Defect and scope
 
 Model token IDs use `u32`, but several sparse output-mask representations stored

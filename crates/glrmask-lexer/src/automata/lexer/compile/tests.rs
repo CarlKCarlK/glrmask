@@ -4216,30 +4216,40 @@ use super::partition::{try_product_union_components};
                 1,
                 None,
             );
-            let (retained, trace) = match
-                super::deferred::try_compile_with_plan_deferred_dense_min_pair_cells(
-                    super::plan::build_exclusion_compile_plan(std::slice::from_ref(&expression)),
-                    0,
-                    true,
-                ) {
-                    Ok(prepared) => prepared,
-                    Err(_) => panic!("binary intersection must admit retained dense construction"),
-                };
-            assert!(trace.is_none(), "retained rows must not require a state trace");
-            let (dfa, segment) = retained.finish_runtime();
-            let runtime = Tokenizer::from_parts_with_compressed_transitions(
-                dfa,
-                1,
-                None,
-                segment.into_iter().collect(),
-            );
-
-            for input in enumerate_inputs(b"\"abx", 8) {
-                assert_eq!(
-                    tokenizer_observation(&runtime, &input),
-                    tokenizer_observation(&eager, &input),
-                    "retained compressed product differed for expression {expression:?}, input {input:?}",
+            // Runtime retention defaults to multi-worker compilation. Cover
+            // both layouts explicitly rather than depending on the caller's
+            // global RAYON_NUM_THREADS setting.
+            for threads in [1, 2] {
+                let pool = rayon::ThreadPoolBuilder::new()
+                    .num_threads(threads)
+                    .build()
+                    .expect("test thread pool");
+                let (mut retained, trace) = pool.install(|| {
+                    match super::deferred::try_compile_with_plan_deferred_dense_min_pair_cells(
+                        super::plan::build_exclusion_compile_plan(std::slice::from_ref(&expression)),
+                        0,
+                        true,
+                    ) {
+                        Ok(prepared) => prepared,
+                        Err(_) => panic!("binary intersection must admit dense construction"),
+                    }
+                });
+                assert_eq!(trace.is_some(), threads == 1);
+                if let Some(trace) = trace {
+                    retained.attach_dense_runtime_trace(trace)
+                        .expect("single-worker construction must accept its state trace");
+                }
+                let (dfa, segment) = retained.finish_runtime();
+                let runtime = Tokenizer::from_parts_with_compressed_transitions(
+                    dfa, 1, None, segment.into_iter().collect(),
                 );
+                for input in enumerate_inputs(b"\"abx", 8) {
+                    assert_eq!(
+                        tokenizer_observation(&runtime, &input),
+                        tokenizer_observation(&eager, &input),
+                        "dense product differed with {threads} workers for expression {expression:?}, input {input:?}",
+                    );
+                }
             }
         }
     }

@@ -265,8 +265,4 @@ fn fresh_runtime_instance_shares_only_vocab_derived_data() {
         &template.direct_regular_terminal_support,
         &fresh.direct_regular_terminal_support,
     ));
-    assert!(!Arc::ptr_eq(
-        &template.self_loop_projections,
-        &fresh.self_loop_projections,
-    ));
 }

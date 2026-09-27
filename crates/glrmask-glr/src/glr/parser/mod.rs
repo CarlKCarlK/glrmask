@@ -364,6 +364,7 @@ where
         num_rules: 0,
         rules: Vec::new(),
         nonterminal_display_names: Vec::new(),
+        embedded_start: Default::default(),
         construction: GlrTableConstruction::LegacyRowBisim,
         admission_policy: AdmissionPolicy::RowPresenceExact,
         advance: Vec::new(),

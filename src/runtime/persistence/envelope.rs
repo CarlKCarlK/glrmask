@@ -10,11 +10,11 @@ pub(super) const ROOT_POLICY_MAGIC: &[u8; 8] = b"GLRROOT2";
 
 pub(super) const CONSTRAINT_MAGIC: [u8; 8] = *b"GLRCONS\0";
 
-pub(super) const CONSTRAINT_VERSION: u16 = 31;
+pub(super) const CONSTRAINT_VERSION: u16 = 33;
 
 pub(super) const CONSTRAINT_HEADER_LEN: usize = CONSTRAINT_MAGIC.len() + 2 + 8;
 
-pub(super) const SECTION_MAGIC: [u8; 4] = *b"S31\0";
+pub(super) const SECTION_MAGIC: [u8; 4] = *b"S33\0";
 
 pub(super) const SECTION_HEADER_LEN: usize = SECTION_MAGIC.len() + 11 * 8;
 
@@ -88,100 +88,55 @@ pub(super) struct DecodedConstraintRuntime {
     pub(super) packed_dwa_dense_masks: Option<(Vec<u32>, Vec<u64>)>,
 }
 
-pub(super) fn eleven_section_payload<'a>(
-    payload: &'a [u8],
-    magic: &[u8; 4],
-    header_len: usize,
-    version_label: &str,
-) -> Result<
-    (
-        &'a [u8],
-        &'a [u8],
-        &'a [u8],
-        &'a [u8],
-        &'a [u8],
-        &'a [u8],
-        &'a [u8],
-        &'a [u8],
-        &'a [u8],
-        &'a [u8],
-        &'a [u8],
-    ),
-    String,
-> {
-    if payload.len() < header_len || !payload.starts_with(magic) {
-        return Err(format!("invalid {version_label} constraint section header"));
-    }
-    let mut pos = magic.len();
-    let mut take_len = || {
-        let end = pos + 8;
-        let value = u64::from_le_bytes(
-            payload[pos..end]
-                .try_into()
-                .expect("constraint section length has fixed width"),
-        );
-        pos = end;
-        usize::try_from(value)
-            .map_err(|_| format!("{version_label} section length does not fit this platform"))
-    };
-    let lengths = [
-        take_len()?,
-        take_len()?,
-        take_len()?,
-        take_len()?,
-        take_len()?,
-        take_len()?,
-        take_len()?,
-        take_len()?,
-        take_len()?,
-        take_len()?,
-        take_len()?,
-    ];
-    let total = lengths.iter().try_fold(header_len, |sum, &len| {
-        sum.checked_add(len)
-            .ok_or_else(|| format!("{version_label} constraint section lengths overflow"))
-    })?;
-    if total != payload.len() {
-        return Err(format!("invalid {version_label} constraint section lengths"));
-    }
-    let mut pos = header_len;
-    let mut next = |len: usize| {
-        let section = &payload[pos..pos + len];
-        pos += len;
-        section
-    };
-    Ok((
-        next(lengths[0]),
-        next(lengths[1]),
-        next(lengths[2]),
-        next(lengths[3]),
-        next(lengths[4]),
-        next(lengths[5]),
-        next(lengths[6]),
-        next(lengths[7]),
-        next(lengths[8]),
-        next(lengths[9]),
-        next(lengths[10]),
-    ))
+/// Borrowed sections of the one supported compiled-constraint format.
+///
+/// Field names are shared with the writer's section order; no decoding copies
+/// the payload or changes the backing allocation used by deferred readers.
+#[derive(Debug)]
+pub(super) struct ConstraintSections<'a> {
+    pub(super) weight: &'a [u8],
+    pub(super) dwa: &'a [u8],
+    pub(super) table: &'a [u8],
+    pub(super) core: &'a [u8],
+    pub(super) runtime: &'a [u8],
+    pub(super) token_bytes: &'a [u8],
+    pub(super) original_map: &'a [u8],
+    pub(super) tokenizer: &'a [u8],
+    pub(super) internal_masks: &'a [u8],
+    pub(super) token_mask_cache: &'a [u8],
+    pub(super) composition_metadata: &'a [u8],
 }
 
-pub(super) fn constraint_sections(
-    payload: &[u8],
-) -> Result<
-    (
-        &[u8],
-        &[u8],
-        &[u8],
-        &[u8],
-        &[u8],
-        &[u8],
-        &[u8],
-        &[u8],
-        &[u8],
-        &[u8],
-        &[u8],
-    ),
-    String,
-> {
-    eleven_section_payload(payload, &SECTION_MAGIC, SECTION_HEADER_LEN, "v30")
+pub(super) fn constraint_sections(payload: &[u8]) -> Result<ConstraintSections<'_>, String> {
+    if payload.len() < SECTION_HEADER_LEN || !payload.starts_with(&SECTION_MAGIC) {
+        return Err("invalid current constraint section header".to_owned());
+    }
+    let mut position = SECTION_HEADER_LEN;
+    let mut sections = [&[][..]; 11];
+    let lengths = payload[SECTION_MAGIC.len()..SECTION_HEADER_LEN].chunks_exact(8);
+    for (section, encoded_length) in sections.iter_mut().zip(lengths) {
+        let length = usize::try_from(u64::from_le_bytes(
+            encoded_length.try_into().expect("section lengths have fixed width"),
+        ))
+        .map_err(|_| "constraint section length does not fit this platform".to_owned())?;
+        let end = position
+            .checked_add(length)
+            .ok_or_else(|| "constraint section range overflow".to_owned())?;
+        *section = payload
+            .get(position..end)
+            .ok_or_else(|| "invalid current constraint section lengths".to_owned())?;
+        position = end;
+    }
+    if position != payload.len() {
+        return Err("invalid current constraint section lengths".to_owned());
+    }
+    let [weight, dwa, table, core, runtime, token_bytes, original_map,
+         tokenizer, internal_masks, token_mask_cache, composition_metadata] = sections;
+    Ok(ConstraintSections {
+        weight, dwa, table, core, runtime, token_bytes, original_map,
+        tokenizer, internal_masks, token_mask_cache, composition_metadata,
+    })
 }
+
+#[cfg(test)]
+mod tests;

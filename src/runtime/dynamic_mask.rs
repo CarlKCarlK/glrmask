@@ -8212,23 +8212,12 @@ impl InitialPruneGuard {
         let vocab = constraint.dynamic_mask_vocab_for_runtime();
         if std::env::var_os("GLRMASK_PROFILE_DYNAMIC_MASK").is_some() {
             for &(mask_state, source_state, terminal) in memories.iter() {
-                if let Some(projection) = vocab.self_loop_projection(mask_state) {
-                    eprintln!(
-                        "[glrmask/profile][pending_guard_self_loop] mask_state={} source_state={} terminal={} futures={:?} frontier_nonempty={}",
-                        mask_state,
-                        source_state,
-                        terminal,
-                        projection.future_terminals,
-                        projection.pre_match_frontier_words.iter().any(|&word| word != 0),
-                    );
-                } else {
-                    eprintln!(
-                        "[glrmask/profile][pending_guard_self_loop] mask_state={} source_state={} terminal={} projection=none",
-                        mask_state,
-                        source_state,
-                        terminal,
-                    );
-                }
+                eprintln!(
+                    "[glrmask/profile][pending_guard_self_loop] mask_state={} source_state={} terminal={} projection=none",
+                    mask_state,
+                    source_state,
+                    terminal,
+                );
             }
         }
         let mut source_memories = memories
@@ -8807,7 +8796,9 @@ pub(crate) fn try_fill_recursive_mask_shared(
     if !state.constraint.uses_compact_segmented_parser_runtime() {
         return Ok(false);
     }
-    let required = state.constraint.mask_len();
+    // The public mask dispatcher has already split off root end-token space.
+    // Recursive traversal and its caches produce body tokens, never root EOS.
+    let required = state.constraint.body_mask_len();
     assert!(buf.len() >= required, "mask buffer is smaller than constraint mask");
     let (mask, tail) = buf.split_at_mut(required);
     tail.fill(0);
@@ -8851,7 +8842,7 @@ fn fill_recursive_mask_using<T: FullWalkTransitionTable>(
     buf: &mut [u32],
     transitions: &mut T,
 ) -> Result<bool, String> {
-    let required = state.constraint.mask_len();
+    let required = state.constraint.body_mask_len();
     assert!(buf.len() >= required, "mask buffer is smaller than constraint mask");
     let (buf, tail) = buf.split_at_mut(required);
     tail.fill(0);
