@@ -113,3 +113,17 @@ experiment settings, and use `MIMALLOC_PURGE_DELAY=-1`. Runtime clocks are threa
 CPU; build clocks include parallel wall-clock compilation. Vocabulary-only
 preparation is outside schema build timing. Unsupported llguidance cases are
 never part of performance scoring.
+
+## Combined-source validation before publication
+
+Commit `bbc2ef3d3` was normally merged with upstream `8f773a455`, including the
+independent exact dynamic cache-key ordering improvement, producing
+`916d42358dc1ba5ba0beefd046913f37226d3b51`. That combined source passed 2,271 Rust
+workspace tests (zero failures, 55 ignored), the documentation test, release
+example checks and all 42 Python tests. Four fresh 126-schema, 77,582-mask
+compiled/loaded streams again matched the release oracles exactly.
+
+The frozen combined Python extension SHA-256 is
+`3e01fbdb107a1342275c50383ef51f441bf127da46cd0a54530938e4e58ef924`.
+These are integration checks, not an additional performance comparison; the
+paired figures above remain attributable only to the original weight change.

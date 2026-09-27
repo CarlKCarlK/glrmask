@@ -10195,5 +10195,59 @@
     "Stabilized per-position minima are not a hard latency bound; raw maxima are retained.",
     "Build runs are variable; apparent regressions were rechecked without discarding any individual samples.",
     "Do not attribute independent upstream dynamic-cache changes to this weight builder."
-  ]
+  ],
+  "postmerge_validation": {
+    "package": {
+      "commit": "916d42358dc1ba5ba0beefd046913f37226d3b51",
+      "sha256": "3e01fbdb107a1342275c50383ef51f441bf127da46cd0a54530938e4e58ef924",
+      "sources": {
+        "crates/glrmask-weight/src/implementation.rs": "313f71ca53bea98f66c14318a24753ed7444066a6bf6324435f2a50e11ad074f",
+        "src/runtime/dynamic_mask.rs": "3dd7fd5c856109485bb3866dc5920677e89494e5f9f5057cc8b07ece8b4498e2"
+      }
+    },
+    "rust": {
+      "suites": 52,
+      "passed": 2271,
+      "failed": 0,
+      "ignored": 55
+    },
+    "doc_pass": true,
+    "examples_pass": true,
+    "python_tail": "/Users/isaacbreen/miniforge3/envs/py312/lib/python3.12/site-packages/pytest_asyncio/plugin.py:247: PytestDeprecationWarning: The configuration option \"asyncio_default_fixture_loop_scope\" is unset.\nThe event loop scope for asynchronous fixtures will default to the fixture caching scope. Future versions of pytest-asyncio will default the loop scope for asynchronous fixtures to function scope. Set the default fixture loop scope explicitly in order to avoid unexpected behavior in the future. Valid fixture loop scopes are: \"function\", \"class\", \"module\", \"package\", \"session\"\n\n  warnings.warn(PytestDeprecationWarning(_DEFAULT_FIXTURE_LOOP_SCOPE_UNSET))\n..........................................                               [100%]\n42 passed in 1.98s\n",
+    "masks": {
+      "module_sha256": "3e01fbdb107a1342275c50383ef51f441bf127da46cd0a54530938e4e58ef924",
+      "corpus_sha256": "72c81099e01b605201467ea1e2825ff461e5e51605d8bb69abcda92bf98e7200",
+      "groups": {
+        "static-compiled": {
+          "masks": 77582,
+          "schemas": 126,
+          "sha256": "351dab2120aadea63c7515ff1c12630fd8857184817eb0f87dfaa1e30932ece2",
+          "decoded_bytes": 1245309451,
+          "compressed_bytes": 5292137
+        },
+        "static-loaded": {
+          "masks": 77582,
+          "schemas": 126,
+          "sha256": "351dab2120aadea63c7515ff1c12630fd8857184817eb0f87dfaa1e30932ece2",
+          "decoded_bytes": 1245309451,
+          "compressed_bytes": 5292137
+        },
+        "dynamic-compiled": {
+          "masks": 77582,
+          "schemas": 126,
+          "sha256": "e92ae58e35267945ea771421e735e574c34d2aa2f9d8b751454859d4d0ef33e6",
+          "decoded_bytes": 1245309459,
+          "compressed_bytes": 5297312
+        },
+        "dynamic-loaded": {
+          "masks": 77582,
+          "schemas": 126,
+          "sha256": "e92ae58e35267945ea771421e735e574c34d2aa2f9d8b751454859d4d0ef33e6",
+          "decoded_bytes": 1245309459,
+          "compressed_bytes": 5297312
+        }
+      }
+    }
+  },
+  "postmerge_summary_sha256": "4a67b0fc3075fa162965026c6e49384307c98f8d3b1bc8a5896494fcc40805a4"
 }
