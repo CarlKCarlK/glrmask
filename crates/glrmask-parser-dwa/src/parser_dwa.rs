@@ -5649,6 +5649,9 @@ enum SmallBoundaryDeterminizeOutput {
     Compact(SmallBoundaryDwa),
 }
 
+#[path = "finite_parallel_rows.rs"]
+mod finite_parallel_rows;
+
 fn determinize_preconverted_small_boundary_output(
     fast_nwa: &[FastBoundaryNwaState],
     start_states: &[u32],
@@ -5659,6 +5662,27 @@ fn determinize_preconverted_small_boundary_output(
     total_started_at: Instant,
     compact_output: bool,
     finite_output: bool,
+) -> Option<SmallBoundaryDeterminizeOutput> {
+    determinize_preconverted_small_boundary_output_with_parallel_policy(
+        fast_nwa, start_states, dense_positive_label_limit, interner,
+        source_weight_count, conversion_ms, total_started_at, compact_output,
+        finite_output, finite_parallel_rows::Policy::from_environment(
+            finite_output, fast_nwa.len(), dense_positive_label_limit as usize),
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn determinize_preconverted_small_boundary_output_with_parallel_policy(
+    fast_nwa: &[FastBoundaryNwaState],
+    start_states: &[u32],
+    dense_positive_label_limit: u32,
+    interner: &mut FastBoundaryWeightInterner,
+    source_weight_count: usize,
+    conversion_ms: f64,
+    total_started_at: Instant,
+    compact_output: bool,
+    finite_output: bool,
+    parallel_policy: Option<finite_parallel_rows::Policy>,
 ) -> Option<SmallBoundaryDeterminizeOutput> {
 
     let state_count = fast_nwa.len();
@@ -5735,7 +5759,19 @@ fn determinize_preconverted_small_boundary_output(
     let determinize_started_at = Instant::now();
 
     let mut finite_edge_count = 0usize;
-    while let Some((from_state, subset)) = worklist.pop_front() {
+    let mut parallel_profile = finite_parallel_rows::Profile::default();
+    while !worklist.is_empty() {
+        // Evaluate a bounded FIFO packet; only registration mutates shared IDs.
+        if let Some(policy) = parallel_policy
+            && worklist.len() >= policy.threshold
+        {
+            finite_parallel_rows::batch(policy, fast_nwa, dense_limit, interner,
+                &mut singleton_states, &mut subset_map, &mut singleton_closure_cache,
+                &mut closure_cache, &mut out_states, &mut supports, &mut worklist,
+                &mut finite_edge_count, &mut parallel_profile)?;
+            continue;
+        }
+        let (from_state, subset) = worklist.pop_front()?;
         if !interner.allow_work(1, out_states.len(), finite_edge_count) { return None; }
         let mut final_weight = interner.empty_id();
         for &(nwa_state, path_weight) in &subset {
@@ -5746,6 +5782,7 @@ fn determinize_preconverted_small_boundary_output(
             }
         }
         out_states[from_state as usize].final_weight = final_weight;
+
 
         for &(nwa_state, path_weight) in &subset {
             for (label, branches) in &fast_nwa[nwa_state as usize].transitions {
@@ -5848,6 +5885,9 @@ fn determinize_preconverted_small_boundary_output(
         if !interner.allow_work(subset.len(), out_states.len(), finite_edge_count) { return None; }
     }
     let determinize_ms = elapsed_ms(determinize_started_at);
+    if parallel_policy.is_some() && compile_profile_enabled() {
+        eprintln!("[glrmask/profile][native_parallel_rows] determinize_ms={determinize_ms:.4} profile={parallel_profile:?}");
+    }
     let compact_post_started_at = Instant::now();
     let compact_fallback = finite_output
         || std::env::var_os("GLRMASK_EXPERIMENT_SMALL_BOUNDARY_COMPACT_FALLBACK").is_some();
