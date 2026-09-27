@@ -120,3 +120,15 @@ package SHA-256 is
 `c85d23615e547262e9780505a2a9acd278404fb79af12b76e21c00457787e49d`;
 retained evidence is `default-test-summary.json`, `test-python-default.log`,
 and `default-validation/summary.json`.
+
+## Final default-policy verification
+
+With no core-selection environment override, the final pre-merge source passed
+2,220 top-level Rust tests (54 ignored) and all 42 Python tests. The default
+binary repeated all 4,099 JavaScript mask comparisons in each execution mode
+and the fixed 1,000-schema native guard without semantic differences. The
+final default Python package SHA-256 is
+`c85d23615e547262e9780505a2a9acd278404fb79af12b76e21c00457787e49d`;
+the native runner SHA-256 is
+`8335cdb15ddaa16a6bf8bc370d1f364a8d4875792041b18e2308bd45429bde1d`.
+These verification runs confirm default routing, not a new paired timing claim.
