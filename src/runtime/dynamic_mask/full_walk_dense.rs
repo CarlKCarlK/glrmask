@@ -3040,6 +3040,7 @@ struct FullWalkParserCache {
     nodes: Vec<FullWalkParserNode>,
     lexer_state_count: usize,
     canonicalize: bool,
+    identity_proofs_enabled: bool,
     canonical: Option<Box<FullWalkDenseParserCanonical>>,
     profile: bool,
     profile_boundary_calls: usize,
@@ -3090,11 +3091,15 @@ impl FullWalkParserCache {
             });
             root_nodes.push(id);
         }
+        let canonicalize = full_walk_acceleration_enabled();
+        let identity_proofs_enabled = canonicalize
+            && full_walk_identity_context_profitable(root_branches.len(), nodes.len());
         (
             Self {
                 nodes,
                 lexer_state_count,
-                canonicalize: full_walk_acceleration_enabled(),
+                canonicalize,
+                identity_proofs_enabled,
                 canonical: None,
                 profile,
                 profile_boundary_calls: 0,
@@ -3119,6 +3124,9 @@ impl FullWalkParserCache {
             last_child_terminal: TerminalID::MAX,
             last_child_target: Self::DEAD,
         });
+        // Nodes are append-only. Update this monotone policy at the mutation,
+        // not by re-reading two lengths for every byte in the vocabulary walk.
+        self.identity_proofs_enabled |= self.canonicalize && self.nodes.len() >= 32;
         id
     }
 
@@ -6862,9 +6870,7 @@ fn try_full_walk_mask_with_table_from_initial_in_output_scope<
         let Some(&op) = remaining_ops.next() else {
             break;
         };
-        let identity_active = accelerated && full_walk_identity_context_profitable(
-            root_branches.len(), parser_cache.nodes.len(),
-        );
+        let identity_active = parser_cache.identity_proofs_enabled;
         // A surviving scalar non-finalizing byte is retained only after
         // `physical_token_boundary_allowed()` has proved the exact
         // `(parser_node, target_lexer)` coordinate live.  When that same op is
@@ -8033,6 +8039,8 @@ fn try_full_walk_mask_with_table_from_initial_in_output_scope<
         }
     }
 
+    // Diagnostics must not be included in the measured traversal interval.
+    let walk_elapsed = walk_started.map(|start| start.elapsed());
     if profile_kernel {
         eprintln!("[glrmask/profile][full_walk_acceleration] generation={} enabled={} memo_states={} memo_lookups={} memo_hits={} outer_hits={} identity_subtrees={} identity_ops={} identity_tokens={} canonical_hits={}",
             state.generation, accelerated, many_transition_memo.states.len(),
@@ -8041,12 +8049,14 @@ fn try_full_walk_mask_with_table_from_initial_in_output_scope<
             identity_subtree_ops_skipped, identity_subtree_tokens,
             parser_cache.canonical.as_ref().map_or(0, |c| c.hits));
     }
-    if let (Some(kernel_started), Some(walk_started)) = (kernel_started, walk_started) {
+    if let (Some(kernel_started), Some(walk_started), Some(walk_elapsed)) =
+        (kernel_started, walk_started, walk_elapsed)
+    {
         eprintln!(
             "[glrmask/profile][dynamic_kernel_phases] generation={} setup_us={:.1} walk_us={:.1}",
             state.generation,
             walk_started.duration_since(kernel_started).as_secs_f64() * 1e6,
-            walk_started.elapsed().as_secs_f64() * 1e6,
+            walk_elapsed.as_secs_f64() * 1e6,
         );
     }
 
@@ -8148,6 +8158,25 @@ fn try_full_walk_mask_with_table_from_initial_in_output_scope<
 #[cfg(test)]
 mod full_walk_acceleration_tests {
     use super::*;
+
+    #[test]
+    fn cached_identity_policy_changes_only_at_the_exact_node_threshold() {
+        let (mut cache, _) = FullWalkParserCache::from_roots(&DynamicBranches::new(), 0, false);
+        cache.canonicalize = true;
+        assert!(!cache.identity_proofs_enabled);
+        for count in 1..=48 {
+            cache.push_parser_stacks(ParserStacks::from_single_stack(vec![count], ()));
+            assert_eq!(cache.identity_proofs_enabled,
+                full_walk_identity_context_profitable(0, count as usize));
+        }
+
+        let (mut disabled, _) = FullWalkParserCache::from_roots(&DynamicBranches::new(), 0, false);
+        disabled.canonicalize = false;
+        for value in 0..40 {
+            disabled.push_parser_stacks(ParserStacks::from_single_stack(vec![value], ()));
+        }
+        assert!(!disabled.identity_proofs_enabled);
+    }
 
     #[test]
     fn many_frontier_stack_is_lazy_and_restores_exact_depths() {
