@@ -4682,10 +4682,12 @@ struct ProviderAdvanceResult {
     accepted: bool,
 }
 
-/// Transactional deterministic reduction prefix on the existing virtual stack.
-/// Only the enclosing caller's reduction case opts in. Branching, guards,
-/// acceptance, extra effects or an unknown lower floor all retain the original
-/// traversal. The budget is shared across that complete enclosing advance.
+/// Bounded deterministic reductions on the existing virtual stack.
+/// Only an unambiguous initial reduction enters this lane. After a proved
+/// prefix, branching, guards, acceptance, extra effects or a hidden lower floor
+/// continue in the original traversal with the lookahead still unconsumed.
+/// Primitive failures remain transactional. The budget belongs to the complete
+/// enclosing advance, so a resumed branch cannot obtain a new allowance.
 enum ProviderReductionPrefix {
     Shifted(ParserGSS),
     /// No lookahead consumed yet; continue the ordinary reduction frontier.
@@ -4784,6 +4786,14 @@ fn try_provider_reduction_prefix_impl<P: ParserActionProvider, const RESUME: boo
     suspend_provider_reductions::<RESUME>(stack, completed_reductions)
 }
 
+/// Enabled unless an explicit override declines the bounded optimization.
+/// Keeping parsing independent of the process environment permits deterministic
+/// policy tests without changing flags underneath concurrently running tests.
+fn provider_reduction_policy_value(value: Option<&str>) -> bool {
+    value.is_none_or(|value| matches!(value.trim().to_ascii_lowercase().as_str(),
+        "1" | "true" | "yes" | "on"))
+}
+
 fn advance_provider_traversal<P: ParserActionProvider>(
     provider: &P,
     closure: ParserGSS,
@@ -4792,10 +4802,10 @@ fn advance_provider_traversal<P: ParserActionProvider>(
 ) -> ProviderAdvanceResult {
     static ENABLED: OnceLock<bool> = OnceLock::new();
     if mode == ProviderAdvanceMode::Advance
-        && *ENABLED.get_or_init(|| env_flag_enabled("GLRMASK_PROVIDER_REDUCTION_PREFIX"))
+        && *ENABLED.get_or_init(|| provider_reduction_policy_value(std::env::var("GLRMASK_PROVIDER_REDUCTION_PREFIX").ok().as_deref()))
     {
         static RESUME: OnceLock<bool> = OnceLock::new();
-        if *RESUME.get_or_init(|| env_flag_enabled("GLRMASK_PROVIDER_RESUME_REDUCTIONS")) {
+        if *RESUME.get_or_init(|| provider_reduction_policy_value(std::env::var("GLRMASK_PROVIDER_RESUME_REDUCTIONS").ok().as_deref())) {
             advance_provider_traversal_with_policy::<P, true, true>(provider, closure, symbol, mode)
         } else {
             advance_provider_traversal_impl::<P, true>(provider, closure, symbol, mode)
@@ -6271,6 +6281,17 @@ mod tests {
         assert_eq!(keys.key(&actual),keys.key(&reference.shifted));
     }
 
+
+    #[test]
+    fn bounded_provider_reductions_default_on_and_honor_reference_overrides() {
+        assert!(super::provider_reduction_policy_value(None));
+        for value in ["1", "true", "yes", "on", " TRUE "] {
+            assert!(super::provider_reduction_policy_value(Some(value)), "{value}");
+        }
+        for value in ["0", "false", "no", "off", "", "unknown"] {
+            assert!(!super::provider_reduction_policy_value(Some(value)), "{value}");
+        }
+    }
 
     #[test]
     fn provider_reduction_resumption_preserves_branch_floor_and_budget_boundaries() {
