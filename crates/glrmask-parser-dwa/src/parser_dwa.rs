@@ -5244,7 +5244,66 @@ fn fast_boundary_add_target(
     }
 }
 
+/// Storage only: both representations expose the same exact ordered slice.
+trait FallbackFrontier: Clone + Eq + std::hash::Hash
+    + std::borrow::Borrow<[(u32, FastBoundaryWeightId)]>
+{
+    fn singleton(state: u32, weight: FastBoundaryWeightId) -> Self;
+    fn from_pairs(pairs: Vec<(u32, FastBoundaryWeightId)>) -> Self;
+    fn as_slice(&self) -> &[(u32, FastBoundaryWeightId)];
+}
+
+impl FallbackFrontier for Vec<(u32, FastBoundaryWeightId)> {
+    fn singleton(state: u32, weight: FastBoundaryWeightId) -> Self { vec![(state, weight)] }
+    fn from_pairs(pairs: Vec<(u32, FastBoundaryWeightId)>) -> Self { pairs }
+    fn as_slice(&self) -> &[(u32, FastBoundaryWeightId)] { self }
+}
+
+type PackedFallbackFrontier = SmallVec<[(u32, FastBoundaryWeightId); 1]>;
+
+impl FallbackFrontier for PackedFallbackFrontier {
+    fn singleton(state: u32, weight: FastBoundaryWeightId) -> Self { smallvec::smallvec![(state, weight)] }
+    fn from_pairs(pairs: Vec<(u32, FastBoundaryWeightId)>) -> Self { SmallVec::from_vec(pairs) }
+    fn as_slice(&self) -> &[(u32, FastBoundaryWeightId)] { self }
+}
+
+struct FallbackSingletons<const PACKED: bool> {
+    dense: Vec<u32>,
+    sparse: FxHashMap<u32, u32>,
+}
+
+impl<const PACKED: bool> FallbackSingletons<PACKED> {
+    fn new(count: usize) -> Self {
+        Self { dense: if PACKED { vec![u32::MAX; count] } else { Vec::new() }, sparse: FxHashMap::default() }
+    }
+    fn get(&self, key: &u32) -> Option<&u32> {
+        if PACKED { self.dense.get(*key as usize).filter(|&&id| id != u32::MAX) }
+        else { self.sparse.get(key) }
+    }
+    fn insert(&mut self, key: u32, value: u32) {
+        if PACKED { self.dense[key as usize] = value; }
+        else { self.sparse.insert(key, value); }
+    }
+}
+
 fn determinize_fast_boundary_with_fallbacks(
+    input: &[FastBoundaryDwaState],
+    possible_by_state: &[FastPossibleOutgoingIds],
+    num_parser_states: u32,
+    interner: &mut FastBoundaryWeightInterner,
+) -> Vec<FastBoundaryDwaState> {
+    // Storage-only fast path; the normal boundary override convention keeps
+    // a reference implementation available with an explicit false/zero value.
+    if crate::optimized_env_flag("GLRMASK_BOUNDARY_PACKED_FALLBACK_SINGLETONS") {
+        determinize_fast_boundary_with_fallbacks_stored::<PackedFallbackFrontier, true>(
+            input, possible_by_state, num_parser_states, interner)
+    } else {
+        determinize_fast_boundary_with_fallbacks_stored::<Vec<_>, false>(
+            input, possible_by_state, num_parser_states, interner)
+    }
+}
+
+fn determinize_fast_boundary_with_fallbacks_stored<F: FallbackFrontier, const PACKED: bool>(
     input: &[FastBoundaryDwaState],
     possible_by_state: &[FastPossibleOutgoingIds],
     num_parser_states: u32,
@@ -5256,11 +5315,11 @@ fn determinize_fast_boundary_with_fallbacks(
     }
     let all = interner.all_id();
     let mut result = vec![FastBoundaryDwaState::default()];
-    let mut normalized_singletons = FxHashMap::<u32, u32>::default();
+    let mut normalized_singletons = FallbackSingletons::<PACKED>::new(input.len());
     normalized_singletons.insert(0, 0);
-    let mut subset_map = FxHashMap::<Vec<(u32, FastBoundaryWeightId)>, u32>::default();
-    subset_map.insert(vec![(0, all)], 0);
-    let mut worklist = VecDeque::from([(0u32, vec![(0u32, all)])]);
+    let mut subset_map = FxHashMap::<F, u32>::default();
+    if !PACKED { subset_map.insert(F::singleton(0, all), 0); }
+    let mut worklist = VecDeque::from([(0u32, F::singleton(0, all))]);
 
     let dense_limit = num_parser_states as usize;
     let mut dense = (0..dense_limit).map(|_| FastBoundaryContribs::new()).collect::<Vec<_>>();
@@ -5275,7 +5334,7 @@ fn determinize_fast_boundary_with_fallbacks(
     while let Some((from_state, subset)) = worklist.pop_front() {
         if !interner.allow_work(1, result.len(), 0) { return Vec::new(); }
         let mut final_weight = 0;
-        for &(state_id, path_weight) in &subset {
+        for &(state_id, path_weight) in subset.as_slice() {
             let state_final = input[state_id as usize].final_weight;
             if state_final != 0 {
                 let contribution = interner.intersection(path_weight, state_final);
@@ -5299,8 +5358,10 @@ fn determinize_fast_boundary_with_fallbacks(
                     let created = result.len() as u32;
                     result.push(FastBoundaryDwaState::default());
                     normalized_singletons.insert(input_target, created);
-                    subset_map.insert(vec![(input_target, all)], created);
-                    worklist.push_back((created, vec![(input_target, all)]));
+                    // Every singleton lookup uses normalized_singletons.
+                    // The general subset map is queried only for length > 1.
+                    if !PACKED { subset_map.insert(F::singleton(input_target, all), created); }
+                    worklist.push_back((created, F::singleton(input_target, all)));
                     created
                 };
                 rewritten.push((label, target, weight));
@@ -5311,7 +5372,7 @@ fn determinize_fast_boundary_with_fallbacks(
         complex_rows += 1;
         default_all.clear();
 
-        for &(input_state, path_weight) in &subset {
+        for &(input_state, path_weight) in subset.as_slice() {
             let state = &input[input_state as usize];
             for &(label, target, transition_weight) in &state.transitions {
                 if label == DEFAULT_LABEL { continue; }
@@ -5379,9 +5440,9 @@ fn determinize_fast_boundary_with_fallbacks(
         let process = |label: i32,
                            mut contribs: FastBoundaryContribs,
                            result: &mut Vec<FastBoundaryDwaState>,
-                           normalized_singletons: &mut FxHashMap<u32, u32>,
-                           subset_map: &mut FxHashMap<Vec<(u32, FastBoundaryWeightId)>, u32>,
-                           worklist: &mut VecDeque<(u32, Vec<(u32, FastBoundaryWeightId)>)>,
+                           normalized_singletons: &mut FallbackSingletons<PACKED>,
+                           subset_map: &mut FxHashMap<F, u32>,
+                           worklist: &mut VecDeque<(u32, F)>,
                            interner: &mut FastBoundaryWeightInterner| {
             if contribs.is_empty() { return; }
             contribs.sort_unstable_by_key(|(state, _)| *state);
@@ -5397,8 +5458,8 @@ fn determinize_fast_boundary_with_fallbacks(
                     let created = result.len() as u32;
                     result.push(FastBoundaryDwaState::default());
                     normalized_singletons.insert(*only_state, created);
-                    subset_map.insert(vec![(*only_state, all)], created);
-                    worklist.push_back((created, vec![(*only_state, all)]));
+                    if !PACKED { subset_map.insert(F::singleton(*only_state, all), created); }
+                    worklist.push_back((created, F::singleton(*only_state, all)));
                     created
                 }
             } else if let Some(&existing) = subset_map.get(contribs.as_slice()) {
@@ -5406,8 +5467,8 @@ fn determinize_fast_boundary_with_fallbacks(
             } else {
                 let created = result.len() as u32;
                 result.push(FastBoundaryDwaState::default());
-                subset_map.insert(contribs.clone().into_vec(), created);
-                worklist.push_back((created, contribs.into_vec()));
+                subset_map.insert(F::from_pairs(contribs.clone().into_vec()), created);
+                worklist.push_back((created, F::from_pairs(contribs.into_vec())));
                 created
             };
             result[from_state as usize].transitions.push((label, target, edge_weight));
@@ -5443,11 +5504,164 @@ fn determinize_fast_boundary_with_fallbacks(
     }
     if compile_profile_enabled() {
         eprintln!(
-            "[glrmask/profile][fast_boundary_fallback] input_states={} output_states={} singleton_rows={} complex_rows={} total_ms={:.3}",
+            "[glrmask/profile][fast_boundary_fallback] input_states={} output_states={} singleton_rows={} complex_rows={} packed_singletons={PACKED} total_ms={:.3}",
             input.len(), result.len(), singleton_rows, complex_rows, elapsed_ms(started_at),
         );
     }
     result
+}
+
+#[cfg(test)]
+mod packed_fallback_tests {
+    use super::*;
+
+    fn shape(states: &[FastBoundaryDwaState]) -> Vec<(u32, Vec<(i32, u32, u32)>)> {
+        states.iter().map(|state| (state.final_weight, state.transitions.clone())).collect()
+    }
+
+    #[test]
+    fn singleton_index_and_spilled_frontiers_preserve_exact_lookup() {
+        let mut dense = FallbackSingletons::<true>::new(257);
+        let mut reference = FallbackSingletons::<false>::new(257);
+        for round in 0..4u32 {
+            for key in 0..257 {
+                assert_eq!(dense.get(&key), reference.get(&key));
+                let value = key * 11 + round;
+                dense.insert(key, value);
+                reference.insert(key, value);
+                assert_eq!(dense.get(&key), reference.get(&key));
+            }
+        }
+        let one = PackedFallbackFrontier::singleton(12, 1);
+        assert!(!one.spilled());
+        let many = PackedFallbackFrontier::from_pairs((0..32).map(|q| (q, q + 1)).collect());
+        assert!(many.spilled());
+        let mut cache = FxHashMap::<PackedFallbackFrontier, usize>::default();
+        cache.insert(one.clone(), 1);
+        cache.insert(many.clone(), 2);
+        assert_eq!(cache.get(one.as_slice()), Some(&1));
+        assert_eq!(cache.get(many.as_slice()), Some(&2));
+        assert_eq!(many.as_slice(), many.clone().as_slice());
+    }
+
+    #[test]
+    fn packed_fallback_matches_all_rows_and_interner_ids_on_generated_dags() {
+        let mut seed = 7812459u64;
+        let mut next = || { seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1); (seed >> 32) as usize };
+        for case in 0..512 {
+            let rows = [1, 4, 44][case % 3];
+            let mut reference = FastBoundaryWeightInterner::new(rows, 4).unwrap();
+            let mut candidate = FastBoundaryWeightInterner::new(rows, 4).unwrap();
+            let mut weights = Vec::new();
+            for bits in 0..16u64 {
+                let value = smallvec::smallvec![bits; rows];
+                let id = reference.intern(value.clone());
+                assert_eq!(id, candidate.intern(value));
+                weights.push(id);
+            }
+            let n = 2 + next() % 13;
+            let mut input = Vec::new();
+            let mut possible = Vec::new();
+            for q in 0..n {
+                let mut state = FastBoundaryDwaState::default();
+                state.final_weight = weights[next() % 16];
+                if q + 1 < n {
+                    for label in [0, 1, 2, DEFAULT_LABEL, 10000] {
+                        if next() % 3 != 0 {
+                            state.transitions.push((label, (q + 1 + next() % (n - q - 1)) as u32, weights[next() % 16]));
+                        }
+                    }
+                }
+                state.transitions.sort_unstable_by_key(|edge| edge.0);
+                input.push(state);
+                possible.push(match next() % 3 {
+                    0 => FastPossibleOutgoingIds::All,
+                    1 => FastPossibleOutgoingIds::Empty,
+                    _ => FastPossibleOutgoingIds::Small(smallvec::smallvec![0, 2, 3]),
+                });
+            }
+            let a = determinize_fast_boundary_with_fallbacks_stored::<Vec<_>, false>(
+                &input, &possible, 4, &mut reference);
+            let b = determinize_fast_boundary_with_fallbacks_stored::<PackedFallbackFrontier, true>(
+                &input, &possible, 4, &mut candidate);
+            assert_eq!(shape(&a), shape(&b), "case={case}");
+            assert_eq!(reference.values, candidate.values, "weights case={case}");
+            assert_eq!(reference.work, candidate.work, "work case={case}");
+        }
+    }
+
+    /// This input is a saved POST-fallback native graph. Replaying fallback on
+    /// it measures bookkeeping only; it is NOT a whole-link performance test.
+    #[test]
+    #[ignore = "diagnostic native replay; requires GLRMASK_FALLBACK_REPLAY_FILE"]
+    fn real_native_replay() {
+        fn u32_at(bytes: &[u8], offset: &mut usize) -> u32 {
+            let end = offset.checked_add(4).unwrap();
+            let value = u32::from_le_bytes(bytes[*offset..end].try_into().unwrap());
+            *offset = end;
+            value
+        }
+        let bytes = std::fs::read(std::env::var_os("GLRMASK_FALLBACK_REPLAY_FILE").unwrap()).unwrap();
+        let mut offset = 0usize;
+        assert_eq!(u32_at(&bytes, &mut offset), 0x46424b31);
+        let alphabet = u32_at(&bytes, &mut offset);
+        let rows = u32_at(&bytes, &mut offset) as usize;
+        let tokens = u32_at(&bytes, &mut offset) as usize;
+        let count = u32_at(&bytes, &mut offset) as usize;
+        let mut weights = Vec::<FastBoundaryWeightValue>::with_capacity(count);
+        for _ in 0..count {
+            let mut value = FastBoundaryWeightValue::new();
+            for _ in 0..rows {
+                let lo = u64::from(u32_at(&bytes, &mut offset));
+                let hi = u64::from(u32_at(&bytes, &mut offset));
+                value.push(lo | hi << 32);
+            }
+            weights.push(value);
+        }
+        let n = u32_at(&bytes, &mut offset) as usize;
+        let mut input = Vec::with_capacity(n);
+        for _ in 0..n {
+            let final_weight = u32_at(&bytes, &mut offset);
+            let edges = u32_at(&bytes, &mut offset);
+            let mut transitions = Vec::with_capacity(edges as usize);
+            for _ in 0..edges {
+                transitions.push((u32_at(&bytes, &mut offset) as i32,
+                    u32_at(&bytes, &mut offset), u32_at(&bytes, &mut offset)));
+            }
+            input.push(FastBoundaryDwaState { final_weight, transitions });
+        }
+        assert_eq!(offset, bytes.len());
+        let possible = (0..n).map(|_| FastPossibleOutgoingIds::Empty).collect::<Vec<_>>();
+        let fresh_pool = || {
+            let mut pool = FastBoundaryWeightInterner::new(rows, tokens).unwrap();
+            for (id, value) in weights.iter().enumerate() { assert_eq!(pool.intern(value.clone()), id as u32); }
+            pool
+        };
+        let mut baseline = fresh_pool();
+        let expected = determinize_fast_boundary_with_fallbacks_stored::<Vec<_>, false>(
+            &input, &possible, alphabet, &mut baseline);
+        let expected_shape = shape(&expected);
+        println!("REPLAY_INPUT states={} edges={} weights={} output={}", n,
+            input.iter().map(|s| s.transitions.len()).sum::<usize>(), weights.len(), expected.len());
+        for round in 0..20 {
+            let order = match round % 3 { 0 => [0, 1, 2], 1 => [2, 0, 1], _ => [1, 2, 0] };
+            for mode in order {
+                let mut pool = fresh_pool();
+                let started = Instant::now();
+                let result = if mode == 2 {
+                    determinize_fast_boundary_with_fallbacks_stored::<PackedFallbackFrontier, true>(
+                        &input, &possible, alphabet, &mut pool)
+                } else {
+                    determinize_fast_boundary_with_fallbacks_stored::<Vec<_>, false>(
+                        &input, &possible, alphabet, &mut pool)
+                };
+                let ms = started.elapsed().as_secs_f64() * 1000.0;
+                assert_eq!(shape(&result), expected_shape);
+                assert_eq!(pool.values, baseline.values);
+                println!("REPLAY,{round},{mode},{ms:.6}");
+            }
+        }
+    }
 }
 
 fn subtract_fast_boundary_finals(
