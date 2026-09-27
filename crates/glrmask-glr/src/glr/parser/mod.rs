@@ -4686,14 +4686,41 @@ struct ProviderAdvanceResult {
 /// Only the enclosing caller's reduction case opts in. Branching, guards,
 /// acceptance, extra effects or an unknown lower floor all retain the original
 /// traversal. The budget is shared across that complete enclosing advance.
+enum ProviderReductionPrefix {
+    Shifted(ParserGSS),
+    /// No lookahead consumed yet; continue the ordinary reduction frontier.
+    Pending(ParserGSS),
+}
+
+#[inline]
+fn suspend_provider_reductions<const RESUME: bool>(
+    stack: VirtualStack<u32, TerminalsDisallowed>, completed_reductions: usize,
+) -> Option<ProviderReductionPrefix> {
+    // A zero-progress resume would create a loop at the same unsupported action.
+    (RESUME && completed_reductions != 0)
+        .then(|| ProviderReductionPrefix::Pending(stack.into_gss()))
+}
+
+#[cfg(test)]
 fn try_provider_reduction_prefix<P: ParserActionProvider>(
+    provider: &P, stack: VirtualStack<u32, TerminalsDisallowed>,
+    symbol: P::Symbol, first: &ProvidedAction<'_>, remaining_steps: &mut usize,
+) -> Option<ParserGSS> {
+    match try_provider_reduction_prefix_impl::<P, false>(provider, stack, symbol, first, remaining_steps)? {
+        ProviderReductionPrefix::Shifted(result) => Some(result),
+        ProviderReductionPrefix::Pending(_) => unreachable!("transactional policy never resumes"),
+    }
+}
+
+fn try_provider_reduction_prefix_impl<P: ParserActionProvider, const RESUME: bool>(
     provider: &P,
     mut stack: VirtualStack<u32, TerminalsDisallowed>,
     symbol: P::Symbol,
     first: &ProvidedAction<'_>,
     remaining_steps: &mut usize,
-) -> Option<ParserGSS> {
+) -> Option<ProviderReductionPrefix> {
     let allowance = *remaining_steps;
+    let mut completed_reductions = 0usize;
     for step in 0..allowance {
         *remaining_steps -= 1;
         let top = *stack.top()?;
@@ -4702,52 +4729,59 @@ fn try_provider_reduction_prefix<P: ParserActionProvider>(
             later = provider.action(top, symbol);
             match later.as_ref() {
                 Some(action) => action,
-                None => return Some(ParserGSS::empty()),
+                None => return Some(ProviderReductionPrefix::Shifted(ParserGSS::empty())),
             }
         };
-        if !provided.extra_stack_shifts.is_empty() { return None; }
+        if !provided.extra_stack_shifts.is_empty() {
+            return suspend_provider_reductions::<RESUME>(stack, completed_reductions);
+        }
         match &provided.action {
-            ProvidedActionRef::Identity => return Some(stack.into_gss()),
+            ProvidedActionRef::Identity => return Some(ProviderReductionPrefix::Shifted(stack.into_gss())),
             ProvidedActionRef::Call { parent_target, child_start, replace } => {
                 if *replace && stack.pop(1) != 0 { return None; }
                 stack.push(*parent_target);
                 stack.push(*child_start);
-                return Some(stack.into_gss());
+                return Some(ProviderReductionPrefix::Shifted(stack.into_gss()));
             }
             ProvidedActionRef::Return { pop } => {
-                if *pop as usize > stack.len() { return None; }
+                if *pop as usize > stack.len() {
+                    return suspend_provider_reductions::<RESUME>(stack, completed_reductions);
+                }
                 stack.pop(*pop as usize);
-                return Some(stack.into_gss());
+                return Some(ProviderReductionPrefix::Shifted(stack.into_gss()));
             }
             ProvidedActionRef::Local { scope, action } => match action {
-                Action::Skip => return Some(stack.into_gss()),
+                Action::Skip => return Some(ProviderReductionPrefix::Shifted(stack.into_gss())),
                 Action::Shift(target, replace) => {
                     let Some(target) = provider.scope_state(*scope, *target) else {
-                        return Some(ParserGSS::empty());
+                        return Some(ProviderReductionPrefix::Shifted(ParserGSS::empty()));
                     };
                     if *replace {
                         if !stack.replace_top(target) { return None; }
                     } else { stack.push(target); }
-                    return Some(stack.into_gss());
+                    return Some(ProviderReductionPrefix::Shifted(stack.into_gss()));
                 }
                 Action::Reduce(nonterminal, count) => {
                     // A reduction needs the concrete predecessor for its goto.
                     // Do not speculate across a hidden or ambiguous GSS floor.
-                    if *count as usize >= stack.len() { return None; }
+                    if *count as usize >= stack.len() {
+                        return suspend_provider_reductions::<RESUME>(stack, completed_reductions);
+                    }
                     stack.pop(*count as usize);
                     let predecessor = *stack.top()?;
                     let Some((target, replace)) = provider.goto_target(
                         provided.reduction_scope, predecessor, *nonterminal,
-                    ) else { return Some(ParserGSS::empty()); };
+                    ) else { return Some(ProviderReductionPrefix::Shifted(ParserGSS::empty())); };
                     if replace {
                         if !stack.replace_top(target) { return None; }
                     } else { stack.push(target); }
+                    completed_reductions += 1;
                 }
-                _ => return None,
+                _ => return suspend_provider_reductions::<RESUME>(stack, completed_reductions),
             },
         }
     }
-    None
+    suspend_provider_reductions::<RESUME>(stack, completed_reductions)
 }
 
 fn advance_provider_traversal<P: ParserActionProvider>(
@@ -4760,13 +4794,24 @@ fn advance_provider_traversal<P: ParserActionProvider>(
     if mode == ProviderAdvanceMode::Advance
         && *ENABLED.get_or_init(|| env_flag_enabled("GLRMASK_PROVIDER_REDUCTION_PREFIX"))
     {
-        advance_provider_traversal_impl::<P, true>(provider, closure, symbol, mode)
+        static RESUME: OnceLock<bool> = OnceLock::new();
+        if *RESUME.get_or_init(|| env_flag_enabled("GLRMASK_PROVIDER_RESUME_REDUCTIONS")) {
+            advance_provider_traversal_with_policy::<P, true, true>(provider, closure, symbol, mode)
+        } else {
+            advance_provider_traversal_impl::<P, true>(provider, closure, symbol, mode)
+        }
     } else {
         advance_provider_traversal_impl::<P, false>(provider, closure, symbol, mode)
     }
 }
 
 fn advance_provider_traversal_impl<P: ParserActionProvider, const REDUCTION_PREFIX: bool>(
+    provider: &P, closure: ParserGSS, symbol: P::Symbol, mode: ProviderAdvanceMode,
+) -> ProviderAdvanceResult {
+    advance_provider_traversal_with_policy::<P, REDUCTION_PREFIX, false>(provider, closure, symbol, mode)
+}
+
+fn advance_provider_traversal_with_policy<P: ParserActionProvider, const REDUCTION_PREFIX: bool, const RESUME: bool>(
     provider: &P,
     mut closure: ParserGSS,
     symbol: P::Symbol,
@@ -4790,11 +4835,14 @@ fn advance_provider_traversal_impl<P: ParserActionProvider, const REDUCTION_PREF
                 && reduction_steps_remaining != 0 && provided.extra_stack_shifts.is_empty()
                 && matches!(&provided.action, ProvidedActionRef::Local { action: Action::Reduce(..), .. })
                 && let Some(stack) = isolated.try_virtual_stack()
-                && let Some(advanced) = try_provider_reduction_prefix(
+                && let Some(advanced) = try_provider_reduction_prefix_impl::<P, RESUME>(
                     provider, stack, symbol, &provided, &mut reduction_steps_remaining,
                 )
             {
-                merge_into(&mut shifted, advanced);
+                match advanced {
+                    ProviderReductionPrefix::Shifted(stack) => merge_into(&mut shifted, stack),
+                    ProviderReductionPrefix::Pending(stack) => merge_into(&mut next, stack),
+                }
                 continue;
             }
 
@@ -6064,6 +6112,12 @@ mod tests {
                 assert_eq!(keys.key(&actual.shifted), keys.key(&reference.shifted),
                     "virtual prefix changed stack language or accumulator correlation");
                 assert_eq!(actual.accepted, reference.accepted);
+                let resumed = super::advance_provider_traversal_with_policy::<P, true, true>(
+                    provider, stack.clone(), symbol, mode,
+                );
+                assert_eq!(keys.key(&resumed.shifted), keys.key(&reference.shifted),
+                    "resumption changed stack language or accumulator correlation");
+                assert_eq!(resumed.accepted, reference.accepted);
             }
         }
         struct Components<'a>(&'a GLRTable);
@@ -6215,6 +6269,57 @@ mod tests {
             &provider,original,0,super::ProviderAdvanceMode::Advance);
         let mut keys=GssSemanticKeyInterner::<u32,TerminalsDisallowed>::new();
         assert_eq!(keys.key(&actual),keys.key(&reference.shifted));
+    }
+
+
+    #[test]
+    fn provider_reduction_resumption_preserves_branch_floor_and_budget_boundaries() {
+        use super::{ProviderReductionPrefix, ProviderAdvanceMode};
+        struct Machine { first: Action, middle: Action, terminal: Action, floor: bool }
+        impl ParserActionProvider for Machine {
+            type Symbol = u32;
+            fn action(&self, state:u32, _:u32)->Option<ProvidedAction<'_>> {
+                let action=if state==0 { &self.first }
+                    else if state==1 { &self.middle } else { &self.terminal };
+                Some(ProvidedAction{ action:ProvidedActionRef::Local{scope:0,action},
+                    reduction_scope:0, extra_stack_shifts:SmallVec::new() })
+            }
+            fn scope_state(&self, scope:u32, local:u32)->Option<u32> { (scope==0).then_some(local) }
+            fn goto_target(&self,scope:u32,from:u32,nt:u32)->Option<(u32,bool)> {
+                if scope!=0{return None;}
+                if self.floor && nt==1 {Some((from+4,false))} else {Some((from+1,false))}
+            }
+            fn state_count_hint(&self)->usize{32}
+        }
+        let label=TerminalsDisallowed::new().with_insert(17,23);
+        let ordinary=ParserGSS::from_single_stack(vec![0],label.clone());
+        let floor=ParserGSS::from_stacks(&[(vec![3],label.clone()),(vec![4],label)]).push(0);
+        assert!(floor.try_virtual_stack().unwrap().has_hidden_floor_values());
+        let cases=[
+            (Machine{first:Action::Reduce(0,0), middle:Action::ReplaceShifts(vec![7,8].into()), terminal:Action::Shift(9,false),floor:false},ordinary.clone(),64),
+            (Machine{first:Action::Reduce(0,0), middle:Action::Reduce(1,2), terminal:Action::Shift(9,false),floor:true},floor,64),
+            (Machine{first:Action::Reduce(0,0), middle:Action::Reduce(0,0), terminal:Action::Shift(9,false),floor:false},ordinary,1),
+        ];
+        for (index,(provider,input,mut budget)) in cases.into_iter().enumerate() {
+            let saved=input.clone(); let first=provider.action(0,0).unwrap();
+            let outcome=super::try_provider_reduction_prefix_impl::<_,true>(
+                &provider,input.try_virtual_stack().unwrap(),0,&first,&mut budget)
+                .expect("fixture must really suspend after a proved reduction");
+            let ProviderReductionPrefix::Pending(pending)=outcome else {panic!("expected pending reduction frontier");};
+            assert!(input.ptr_eq(&saved));
+            let expected=super::advance_provider_traversal_impl::<_,false>(
+                &provider,input.clone(),0,ProviderAdvanceMode::Advance);
+            let remainder=super::advance_provider_traversal_impl::<_,false>(
+                &provider,pending,0,ProviderAdvanceMode::Advance);
+            let integrated=super::advance_provider_traversal_with_policy::<_,true,true>(
+                &provider,input,0,ProviderAdvanceMode::Advance);
+            let mut keys=GssSemanticKeyInterner::<u32,TerminalsDisallowed>::new();
+            assert_eq!(keys.key(&remainder.shifted),keys.key(&expected.shifted),"case={index}");
+            assert_eq!(keys.key(&integrated.shifted),keys.key(&expected.shifted),"integrated case={index}");
+            assert_eq!(remainder.accepted,expected.accepted);
+            assert_eq!(integrated.accepted,expected.accepted);
+            if index==2 {assert_eq!(budget,0);}
+        }
     }
 
     #[test]
