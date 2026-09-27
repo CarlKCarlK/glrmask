@@ -3566,6 +3566,26 @@ fn build_experimental_core_merged_table(
     item_sets: &[LR1ItemSet],
     transitions: &[BTreeMap<Symbol, (u32, bool, bool)>],
 ) -> Option<GLRTable> {
+    // Both paths produce the same core partition and execution rows. Keep the
+    // materialized path as an explicit diagnostic reference, not the default.
+    let disabled = std::env::var("GLRMASK_DISABLE_DIRECT_CORE_TABLE").ok();
+    if direct_core_table_enabled_for_override(disabled.as_deref()) {
+        return build_core_merged_table_from_items(grammar, item_sets, transitions);
+    }
+    build_core_merged_table_materialized(grammar, item_sets, transitions)
+}
+
+fn direct_core_table_enabled_for_override(disabled: Option<&str>) -> bool {
+    !disabled.is_some_and(|value| {
+        matches!(value.trim().to_ascii_lowercase().as_str(), "1" | "true" | "yes" | "on")
+    })
+}
+
+fn build_core_merged_table_materialized(
+    grammar: &AnalyzedGrammar,
+    item_sets: &[LR1ItemSet],
+    transitions: &[BTreeMap<Symbol, (u32, bool, bool)>],
+) -> Option<GLRTable> {
     let canonical = build_lr1_table(grammar, item_sets, transitions);
     let core_keys = item_sets.iter().map(lr1_core_key).collect::<Vec<_>>();
     let partition = refine_experimental_core_partition(&canonical, &core_keys);
@@ -3577,6 +3597,15 @@ fn build_experimental_core_merged_table(
 }
 
 fn refine_experimental_core_partition(table: &GLRTable, core_keys: &[Vec<Item>]) -> Vec<u32> {
+    refine_core_partition_with(core_keys, |state, class, partition| {
+        ExperimentalCoreCompatibilitySig::new(table, state, class, partition)
+    })
+}
+
+fn refine_core_partition_with(
+    core_keys: &[Vec<Item>],
+    mut signature: impl FnMut(usize, u32, &[u32]) -> ExperimentalCoreCompatibilitySig,
+) -> Vec<u32> {
     let mut class_by_core: FxHashMap<&[Item], u32> = FxHashMap::default();
     class_by_core.reserve(core_keys.len());
     let mut partition = Vec::with_capacity(core_keys.len());
@@ -3594,10 +3623,10 @@ fn refine_experimental_core_partition(table: &GLRTable, core_keys: &[Vec<Item>])
 
     loop {
         let mut sig_to_class: FxHashMap<ExperimentalCoreCompatibilitySig, u32> = FxHashMap::default();
-        sig_to_class.reserve(table.num_states as usize);
+        sig_to_class.reserve(core_keys.len());
         let mut next_partition = Vec::with_capacity(partition.len());
-        for state in 0..table.num_states as usize {
-            let sig = ExperimentalCoreCompatibilitySig::new(table, state, partition[state], &partition);
+        for state in 0..core_keys.len() {
+            let sig = signature(state, partition[state], &partition);
             let next = sig_to_class.len() as u32;
             let class = match sig_to_class.get(&sig) {
                 Some(&existing) => existing,
@@ -3623,6 +3652,32 @@ struct ExperimentalCoreCompatibilitySig {
 }
 
 impl ExperimentalCoreCompatibilitySig {
+    fn from_transitions(
+        transitions: &BTreeMap<Symbol, (u32, bool, bool)>,
+        core_class: u32,
+        partition: &[u32],
+    ) -> Self {
+        // Canonical LR table construction copies these exact shift/goto
+        // observations. Reductions and acceptance never participate in core
+        // refinement, so no canonical action rows are needed to obtain the
+        // same fixed point and first-seen class numbering.
+        let mut shifts = Vec::new();
+        let mut gotos = Vec::new();
+        for (symbol, &(target, replace, forwarded)) in transitions {
+            match symbol {
+                Symbol::Terminal(terminal) => {
+                    shifts.push((*terminal, partition[target as usize], replace, forwarded));
+                }
+                Symbol::Nonterminal(nonterminal) => {
+                    gotos.push((*nonterminal, partition[target as usize], replace));
+                }
+            }
+        }
+        shifts.sort_unstable();
+        gotos.sort_unstable();
+        Self { core_class, shifts, gotos }
+    }
+
     fn new(table: &GLRTable, state: usize, core_class: u32, partition: &[u32]) -> Self {
         let mut shifts = Vec::with_capacity(table.action[state].len());
         for (terminal, action) in &table.action[state] {
@@ -3649,6 +3704,116 @@ impl ExperimentalCoreCompatibilitySig {
             gotos,
         }
     }
+}
+
+/// Emit the unchanged experimental-core table without first materializing all
+/// canonical LR(1) action rows. This is not an LALR construction: it uses the
+/// same canonical item sets, compatibility refinement, and exact-simulation
+/// admission policy as the materialized reference.
+fn build_core_merged_table_from_items(
+    grammar: &AnalyzedGrammar,
+    item_sets: &[LR1ItemSet],
+    transitions: &[BTreeMap<Symbol, (u32, bool, bool)>],
+) -> Option<GLRTable> {
+    if item_sets.len() != transitions.len() {
+        return None;
+    }
+    let core_keys = item_sets.iter().map(lr1_core_key).collect::<Vec<_>>();
+    let partition = refine_core_partition_with(&core_keys, |state, class, partition| {
+        ExperimentalCoreCompatibilitySig::from_transitions(&transitions[state], class, partition)
+    });
+    let groups = partition.iter().copied().max().map_or(0, |id| id as usize + 1);
+    let mut members = vec![Vec::new(); groups];
+    for (state, &group) in partition.iter().enumerate() {
+        members[group as usize].push(state);
+    }
+
+    let rows = members.into_par_iter().enumerate().map(|(group, members)| {
+        let mut pending = FxHashMap::<TerminalID, PendingAction>::default();
+        let mut goto = FxHashMap::default();
+        let mut forwarded_shifts = Vec::new();
+
+        // Every member has the same remapped shift and goto signature by
+        // construction. Emit it once, including replace/transfer flags.
+        for (symbol, &(target, replace, forwarded)) in &transitions[members[0]] {
+            match symbol {
+                Symbol::Terminal(terminal) => {
+                    pending.entry(*terminal).or_default()
+                        .push_shift(partition[target as usize], replace);
+                    if forwarded {
+                        forwarded_shifts.push((group as u32, *terminal));
+                    }
+                }
+                Symbol::Nonterminal(nonterminal) => {
+                    goto.insert(*nonterminal, (partition[target as usize], replace));
+                }
+            }
+        }
+        // Reductions are the union of completed, non-transferred LR(1) items.
+        // PendingAction::finish performs the same sort/dedup as the reference;
+        // state grouping cannot add a lookahead absent from those exact items.
+        for state in members {
+            for (item, lookaheads) in &item_sets[state] {
+                if item.transferred {
+                    continue;
+                }
+                let rule = &grammar.rules[item.rule as usize];
+                if item.dot as usize != rule.rhs.len() {
+                    continue;
+                }
+                for bit in lookaheads.iter_ones() {
+                    let terminal = bit_lookahead(bit, grammar.num_terminals);
+                    let action = pending.entry(terminal).or_default();
+                    if item.rule == 0 {
+                        action.push_accept();
+                    } else {
+                        action.push_reduce(rule.lhs, item.stack_depth);
+                    }
+                }
+            }
+        }
+        // Use the quotient builder's row representation, not finish_table's
+        // canonical sorted-vector representation. Large execution rows must
+        // keep hash lookup, and small rows keep their existing entry order.
+        let mut actions = pending.into_iter().collect::<Vec<_>>();
+        actions.sort_unstable_by_key(|(terminal, _)| *terminal);
+        let actions = actions.into_iter()
+            .map(|(terminal, action)| (terminal, action.finish()))
+            .collect::<ActionRow>();
+        // The reference inserts the first canonical goto row into the class
+        // map in that row's iteration order. Reproduce this small map step so
+        // observable row ordering/layout does not change with the optimization.
+        let mut class_goto = FxHashMap::default();
+        for (nonterminal, target) in goto {
+            class_goto.insert(nonterminal, target);
+        }
+        let goto = class_goto.into_iter().collect::<GotoRow>();
+        (actions, goto, forwarded_shifts)
+    }).collect::<Vec<_>>();
+
+    let mut action = Vec::with_capacity(groups);
+    let mut goto = Vec::with_capacity(groups);
+    let mut forwarded_shifts = FxHashSet::default();
+    for (actions, gotos, forwarded) in rows {
+        action.push(actions);
+        goto.push(gotos);
+        forwarded_shifts.extend(forwarded);
+    }
+    let mut table = GLRTable {
+        action, goto, forwarded_shifts,
+        num_states: groups as u32,
+        num_terminals: grammar.num_terminals,
+        num_rules: grammar.rules.len() as u32,
+        rules: grammar.rules.clone(),
+        nonterminal_display_names: grammar.nonterminal_display_names.clone(),
+        construction: GlrTableConstruction::ExperimentalCoreMerged,
+        admission_policy: AdmissionPolicy::ExactSimulation,
+        advance: Vec::new(), unconditional_advance: Vec::new(),
+        control_terminals: Default::default(), skip_terminals: Default::default(),
+        guarded_shift_index: Vec::new(), direct_regular_wide_frontiers: Vec::new(),
+    };
+    table.rebuild_advance_rows_from_actions();
+    Some(table)
 }
 
 fn action_shift(action: &Action) -> Option<(u32, bool)> {
@@ -5146,5 +5311,115 @@ mod tests {
                 "forwarded_shifts mismatch on grammar index {idx}",
             );
         }
+    }
+
+    #[test]
+    fn direct_core_table_is_default_and_reference_override_is_explicit() {
+        for value in [None, Some(""), Some("0"), Some("false"), Some("off")] {
+            assert!(super::direct_core_table_enabled_for_override(value));
+        }
+        for value in ["1", "true", "yes", "on", " TRUE "] {
+            assert!(!super::direct_core_table_enabled_for_override(Some(value)));
+        }
+    }
+
+    #[test]
+    fn direct_core_table_matches_materialized_canonical_rows() {
+        let mut grammars = vec![
+            multi_lookahead_grammar(), mysterious_conflict_grammar(),
+            recursive_ambiguous_grammar(), template_like_grammar(),
+            large_left_linear_grammar(), unit_chain_grammar(),
+            ambiguous_unit_chain_grammar(), nullable_unit_chain_grammar(),
+            js_like_statement_grammar(),
+        ];
+        for depth in 1..=5 {
+            for branches in 1..=3 {
+                for nullable in [false, true] {
+                    for recursive in [false, true] {
+                        grammars.push(generated_unit_dag_grammar(
+                            depth, branches, nullable, recursive,
+                        ));
+                    }
+                }
+            }
+        }
+        let mut reduced_cases = 0;
+        for (index, grammar) in grammars.iter().enumerate() {
+            let (items, transitions) = build_lr1_item_sets(grammar);
+            let canonical = build_lr1_table(grammar, &items, &transitions);
+            let cores = items.iter().map(lr1_core_key).collect::<Vec<_>>();
+            let partition = refine_experimental_core_partition(&canonical, &cores);
+            // Check the signature correspondence independently of the shared
+            // partition loop, including identity and final quotient targets.
+            for targets in [(0..items.len() as u32).collect::<Vec<_>>(), partition] {
+                for (state, row) in transitions.iter().enumerate() {
+                    assert_eq!(
+                        ExperimentalCoreCompatibilitySig::from_transitions(
+                            row, targets[state], &targets,
+                        ),
+                        ExperimentalCoreCompatibilitySig::new(
+                            &canonical, state, targets[state], &targets,
+                        ),
+                        "signature grammar={index} state={state}",
+                    );
+                }
+            }
+            let reference = super::build_core_merged_table_materialized(grammar, &items, &transitions)
+                .expect("materialized table");
+            let direct = super::build_core_merged_table_from_items(grammar, &items, &transitions)
+                .expect("direct table");
+            assert_eq!(direct.action, reference.action, "actions grammar={index}");
+            assert_eq!(direct.goto, reference.goto, "gotos grammar={index}");
+            for (left, right) in direct.action.iter().zip(&reference.action) {
+                let (super::ActionRow::Sparse(left), super::ActionRow::Sparse(right)) = (left, right)
+                    else { panic!("fresh core tables must retain sparse rows"); };
+                assert_eq!(std::mem::discriminant(left), std::mem::discriminant(right),
+                           "runtime action-row representation grammar={index}");
+            }
+            for (left, right) in direct.goto.iter().zip(&reference.goto) {
+                assert_eq!(std::mem::discriminant(left), std::mem::discriminant(right),
+                           "runtime goto-row representation grammar={index}");
+            }
+            assert_eq!(direct.advance, reference.advance, "admission grammar={index}");
+            assert_eq!(direct.unconditional_advance, reference.unconditional_advance);
+            assert_eq!(direct.forwarded_shifts, reference.forwarded_shifts);
+            let direct_bytes = bincode::serialize(&direct).unwrap();
+            let reference_bytes = bincode::serialize(&reference).unwrap();
+            assert!(direct_bytes == reference_bytes,
+                    "complete serialized table grammar={index}, first difference={:?}, lengths={}/{}",
+                    direct_bytes.iter().zip(&reference_bytes).position(|(a, b)| a != b),
+                    direct_bytes.len(), reference_bytes.len());
+            reduced_cases += usize::from(direct.num_states < canonical.num_states);
+        }
+        assert!(reduced_cases > 0, "must exercise canonical states merged into fewer rows");
+    }
+
+    #[test]
+    fn direct_core_table_preserves_replace_and_forwarded_shift_flags() {
+        let grammar = js_like_statement_grammar();
+        let (items, original) = build_lr1_item_sets(&grammar);
+        for salt in 0..4 {
+            let mut transitions = original.clone();
+            for (state, row) in transitions.iter_mut().enumerate() {
+                for (offset, (_, (_, replace, forwarded))) in row.iter_mut().enumerate() {
+                    *replace = (state + offset + salt) % 3 == 0;
+                    *forwarded = (state + offset + salt) % 2 == 0;
+                }
+            }
+            let reference = super::build_core_merged_table_materialized(&grammar, &items, &transitions)
+                .expect("materialized flagged table");
+            let direct = super::build_core_merged_table_from_items(&grammar, &items, &transitions)
+                .expect("direct flagged table");
+            assert_eq!(direct.action, reference.action);
+            assert_eq!(direct.goto, reference.goto);
+            assert_eq!(direct.advance, reference.advance);
+            assert_eq!(direct.forwarded_shifts, reference.forwarded_shifts);
+            let direct_bytes = bincode::serialize(&direct).unwrap();
+            let reference_bytes = bincode::serialize(&reference).unwrap();
+            assert!(direct_bytes == reference_bytes,
+                    "flagged complete table salt={salt}, first difference={:?}",
+                    direct_bytes.iter().zip(&reference_bytes).position(|(a, b)| a != b));
+        }
+        assert!(super::build_core_merged_table_from_items(&grammar, &items, &[]).is_none());
     }
 }
