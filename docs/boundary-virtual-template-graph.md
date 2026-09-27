@@ -153,3 +153,33 @@ It requires all artifact hashes to agree, runs loaded-mask/commit probes, and
 retains raw timing samples, input/executable hashes, and paired differences.
 An optional `--native-checker` accepts the diagnostic normalized-row comparator;
 the ordinary byte-for-byte artifact gate remains mandatory.
+
+## Final publication gates
+
+The cleaned default-on implementation passed ordinary Cargo release tests:
+924 root tests and 57 parser tests, zero failures, with 51 and 2 existing
+ignored tests respectively. The normal public library also passed its
+no-default-features check. After merging the independent GLR changes through
+`2bf9cbaaa`, both full suites passed again and both release examples rebuilt.
+
+The primary final matrix contains 128 interleaved links (16 rounds, four modes,
+two independently prepared fixture generations). Same-binary eager versus
+default medians were 294.7095 vs 275.041 ms current, and 301.75 vs 277.3475 ms
+legacy. Median paired savings were 16.925 and 17.933 ms, winning all 16 pairs
+in each fixture. The identical eager control independently confirms the gain.
+
+A further 48-link integration matrix on the merged source also preserved every
+artifact byte and exact normalized node/target/coefficient/decoder identity.
+It won all six eager/default pairs per fixture. Loaded-runtime probes at all
+22 anchors agree in both matrices (151 repeats per anchor, four then two
+process rounds per artifact mode). Since the serialized artifacts are
+byte-identical, no runtime representation or mask semantics changed.
+
+The frozen historical reference binary is based on `09fe81ac6`; the primary
+candidate was built on `96d5abb74` plus the focused virtual patch, and the
+integration candidate on `42706c5bb` after merging `2bf9cbaaa`. The same-binary
+eager/default comparison isolates virtualization from unrelated main changes.
+Do not add improvements from earlier, separately measured cohorts. Raw build
+samples, all source/fixture/executable hashes, and integration outcomes are in
+`docs/performance/boundary-virtual-template-20260927.json`. The target of
+10-20 ms whole link remains unmet.
