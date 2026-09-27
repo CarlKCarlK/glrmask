@@ -1931,6 +1931,10 @@ impl FullWalkTransitionTable for FullWalkConfigTransitions<'_, '_> {
         state: u32,
         terminal: TerminalID,
     ) -> Option<SmallVec<[VirtualResidualDirectCoordinate; 4]>> {
+        // A guard can reach a hot scalar alias after its original virtual
+        // residual dies. As in every other metadata query, translate that
+        // alias before treating the ID as a raw-state/subset coordinate.
+        let state = self.generic_config_for_state(state);
         let tokenizer = self.cache.tokenizer();
         let mut direct = SmallVec::<[VirtualResidualDirectCoordinate; 4]>::new();
         for index in 0..self.cache.config_len(state) {
@@ -3676,18 +3680,62 @@ fn full_walk_step_many_state<T: FullWalkTransitionTable>(
 
 
 
-/// Exact direct dynamic-mask path for the complete vocabulary.
-///
-/// This deliberately performs the complete vocabulary walk. It does not use
-/// subtree certificates, segment-effect caches, recognizer-state interning, or
-/// any other mechanism that can omit vocabulary edges. Deterministic lexers use
-/// dense Flat16/Flat32 rows when available. Epsilon-NFA and oversized/sparse
-/// coordinates use the same walk over lazily interned runtime configurations.
-/// The same complete walk is also used for composed constraints. Composition
-/// callers that already hold a static A baseline compute the complete exact
-/// dynamic language into scratch and combine it after the walk; the walker
-/// itself therefore does not need the legacy `repair_used`/component tracking
-/// that existed solely to traverse B-minus-A.
+/// The exact accelerators are default-on. This diagnostic retains the
+/// reference executor without rebuilding or changing the compiled language.
+#[inline]
+fn full_walk_acceleration_enabled() -> bool {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| !std::env::var("GLRMASK_DISABLE_FULL_WALK_ACCELERATION")
+        .ok().is_some_and(|value| matches!(value.trim().to_ascii_lowercase().as_str(),
+            "1" | "true" | "yes" | "on")))
+}
+
+/// Scheduling choice only: both executors retain the complete
+/// lexer/parser/guard correlation. The shared walk advances pending guards
+/// through each candidate byte; the factored walk subtracts the same rejected
+/// words afterwards. Keep the established single-root and large-frontier paths.
+fn joint_initial_guard_walk_enabled(roots: &DynamicBranches) -> bool {
+    // Scope fixtures deliberately exercise the factored-root path even when
+    // a full-suite environment enables joint execution globally. Keep this
+    // override thread-local; parallel tests must not mutate process settings.
+    #[cfg(test)]
+    if TEST_ROOT_OUTPUT_SCOPE_FORCE.with(|enabled| enabled.get()) { return false; }
+    (2..=8).contains(&roots.len())
+        && full_walk_acceleration_enabled()
+        && joint_initial_guard_shape_profitable(
+            roots.len(), roots.iter().any(|root| root.parser_filtered_transparent),
+        )
+}
+
+#[inline]
+fn joint_initial_guard_shape_profitable(root_count: usize, has_transparent_root: bool) -> bool {
+    // A root narrowed by exact parser admission has a dedicated transparent
+    // execution path. Factoring its token-start exclusion preserves that
+    // shortcut; merging it into a guarded generic frontier can turn a cheap
+    // filtered walk into a full-vocabulary traversal. This is a scheduling
+    // choice only: both routes preserve each root's correlated exclusions.
+    (2..=8).contains(&root_count) && !has_transparent_root
+}
+
+#[cfg(test)]
+mod joint_root_scheduling_tests {
+    use super::joint_initial_guard_shape_profitable;
+
+    #[test]
+    fn preserves_transparent_root_specialization_without_grammar_name_exceptions() {
+        for count in 0..=16 {
+            assert_eq!(joint_initial_guard_shape_profitable(count, false), (2..=8).contains(&count));
+            assert!(!joint_initial_guard_shape_profitable(count, true));
+        }
+    }
+}
+
+/// Compute the complete dynamic mask, preserving correlated parser, lexer and
+/// maximal-munch state. Bounded mask-local memoization only reuses exact states;
+/// subtree shortcuts require either a complete-state identity proof or an
+/// explicit output responsibility that the enclosing union will enforce.
+/// Every declined proof or exhausted cache falls back to ordinary traversal.
+/// Dense and lazy lexer providers share the same authoritative byte executor.
 fn try_full_walk_mask(
     state: &ConstraintState<'_>,
     vocab: &DynamicMaskVocab,
@@ -3696,6 +3744,32 @@ fn try_full_walk_mask(
     lexer_scan_cache: &mut DynamicNfaScanCache<'_>,
     buf: &mut [u32],
 ) -> Result<bool, String> {
+    try_full_walk_mask_in_output_scope(
+        state, vocab, trie, root_branches, lexer_scan_cache, buf, None,
+    )
+}
+
+#[cfg(test)]
+std::thread_local! {
+    static TEST_ROOT_OUTPUT_SCOPE_FORCE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+fn root_output_scope_enabled() -> bool {
+    #[cfg(test)]
+    if TEST_ROOT_OUTPUT_SCOPE_FORCE.with(|enabled| enabled.get()) { return true; }
+    full_walk_acceleration_enabled()
+}
+
+fn try_full_walk_mask_in_output_scope(
+    state: &ConstraintState<'_>,
+    vocab: &DynamicMaskVocab,
+    trie: &DynamicMaskTrie,
+    root_branches: &DynamicBranches,
+    lexer_scan_cache: &mut DynamicNfaScanCache<'_>,
+    buf: &mut [u32],
+    ignored_output: Option<&[u32]>,
+) -> Result<bool, String> {
+    debug_assert!(ignored_output.is_none_or(|mask| mask.len() == buf.len()));
     if root_branches.is_empty() {
         buf.fill(0);
         update_special_token_mask(state, buf);
@@ -3716,10 +3790,27 @@ fn try_full_walk_mask(
     if root_branches
         .iter()
         .any(|branch| !branch.initial_prune_guard.is_passed())
+        && !joint_initial_guard_walk_enabled(root_branches)
     {
+        let guarded_root_diagnostic = std::env::var("GLRMASK_DIAG_GUARDED_ROOT_GENERATION")
+            .ok().and_then(|v| v.parse::<u64>().ok()) == Some(state.generation);
+        if guarded_root_diagnostic {
+            for (index, branch) in root_branches.iter().enumerate() {
+                let memories = match &branch.initial_prune_guard {
+                    InitialPruneGuard::Passed => &[][..],
+                    InitialPruneGuard::Pending { memories } => memories.as_ref(),
+                };
+                eprintln!("[glrmask/profile][guarded_root] generation={} index={} config={} exact={:?} gss={} filtered={} transparent={} memories={:?}",
+                    state.generation, index, branch.tokenizer_config,
+                    branch.exact_tokenizer_state, branch.gss.ptr_key(),
+                    branch.parser_filtered_root, branch.parser_filtered_transparent, memories);
+            }
+        }
         let mut merged = vec![0u32; buf.len()];
         let mut scratch = vec![0u32; buf.len()];
-        for branch in root_branches {
+        let scope_enabled = root_output_scope_enabled();
+        let mut scope_mask = if scope_enabled { vec![0u32; buf.len()] } else { Vec::new() };
+        for (root_index, branch) in root_branches.iter().enumerate() {
             scratch.fill(0);
             let blocked = branch
                 .initial_prune_guard
@@ -3728,13 +3819,32 @@ fn try_full_walk_mask(
             let mut unguarded = branch.clone();
             unguarded.initial_prune_guard = InitialPruneGuard::Passed;
             one.push(unguarded);
-            if !try_full_walk_mask(
+            let scoped_output = if scope_enabled && !branch.parser_filtered_transparent {
+                let mut ignored_bits = 0usize;
+                for (index, word) in scope_mask.iter_mut().enumerate() {
+                    *word = merged[index]
+                        | blocked.as_ref().and_then(|mask| mask.get(index)).copied().unwrap_or(0)
+                        | ignored_output.and_then(|mask| mask.get(index)).copied().unwrap_or(0);
+                    ignored_bits += word.count_ones() as usize;
+                }
+                // Skip the index setup when little output is redundant. Tests
+                // exercise the same exact algorithm on tiny vocabularies.
+                let minimum = if cfg!(test) { 0 } else { buf.len().saturating_mul(8) };
+                (ignored_bits >= minimum).then_some(scope_mask.as_slice())
+            } else {
+                ignored_output
+            };
+            // Only this union owns a partial-output contract. Bits already in
+            // `merged` cannot alter its union; blocked bits are removed below.
+            // All other callers keep the ordinary complete-mask interface.
+            if !try_full_walk_mask_in_output_scope(
                 state,
                 vocab,
                 trie,
                 &one,
                 lexer_scan_cache,
                 &mut scratch,
+                scoped_output,
             )? {
                 return Ok(false);
             }
@@ -3742,6 +3852,14 @@ fn try_full_walk_mask(
                 for (word, &blocked) in scratch.iter_mut().zip(blocked.iter()) {
                     *word &= !blocked;
                 }
+            }
+            if guarded_root_diagnostic {
+                let allowed: u32 = scratch.iter().map(|word| word.count_ones()).sum();
+                let previous: u32 = merged.iter().map(|word| word.count_ones()).sum();
+                let new: u32 = scratch.iter().zip(merged.iter())
+                    .map(|(&incoming, &old)| (incoming & !old).count_ones()).sum();
+                eprintln!("[glrmask/profile][guarded_root_output] generation={} index={} allowed={} previous={} new={}",
+                    state.generation, root_index, allowed, previous, new);
             }
             for (dst, &word) in merged.iter_mut().zip(&scratch) {
                 *dst |= word;
@@ -3791,6 +3909,7 @@ fn try_full_walk_mask(
             transitions32,
             finalizer_code,
             single_finalizer_continues,
+            ignored_output,
         )?;
         if used {
             #[cfg(test)]
@@ -10303,6 +10422,66 @@ mod tests {
         mask
     }
 
+    #[test]
+    fn root_output_scope_preserves_overlapping_terminals_and_cross_word_aliases() {
+        struct RestoreScope(bool);
+        impl Drop for RestoreScope {
+            fn drop(&mut self) { TEST_ROOT_OUTPUT_SCOPE_FORCE.with(|flag| flag.set(self.0)); }
+        }
+        let _restore = RestoreScope(TEST_ROOT_OUTPUT_SCOPE_FORCE.with(|flag| flag.replace(true)));
+        full_walk_dense::TEST_OUTPUT_SCOPE_SKIPPED.with(|count| count.set(0));
+        let mut words = Vec::<Vec<u8>>::new();
+        let mut layer = vec![Vec::new()];
+        for _ in 0..3 {
+            let mut next = Vec::new();
+            for prefix in layer {
+                for &byte in b"ab -" {
+                    let mut word = prefix.clone();
+                    word.push(byte);
+                    next.push(word);
+                }
+            }
+            words.extend(next.iter().cloned());
+            layer = next;
+        }
+        let mut entries = words.iter().enumerate()
+            .map(|(id, bytes)| (id as u32, bytes.clone())).collect::<Vec<_>>();
+        entries.push((140, b"a".to_vec()));
+        entries.push((201, b"a".to_vec()));
+        let vocab = Vocab::new(entries);
+        for separated in [false, true] {
+            let groups = if separated {
+                "lexer group a ::= A; lexer group b ::= B; lexer group ws ::= WS;"
+            } else { "" };
+            for pair in [
+                "t A ::= 'a'+; t B ::= 'a'+ 'b';",
+                "t A ::= 'a' 'b'; t B ::= 'a';",
+                "t A ::= 'a'+; t B ::= 'a'+ 'b'?;",
+            ] {
+                let grammar = format!(
+                    "start start; ignore WS; t WS ::= (' ' | '-')+; {groups} {pair} nt item ::= A | B; nt start ::= item item? item?;"
+                );
+                let static_constraint = Constraint::from_glrm_grammar(&grammar, &vocab).unwrap();
+                let dynamic = DynamicConstraint::from_glrm_grammar(&grammar, &vocab).unwrap();
+                for prefix in std::iter::once(&[][..]).chain(words.iter().map(Vec::as_slice)) {
+                    let mut reference = static_constraint.start();
+                    let mut candidate = dynamic.inner.start();
+                    let reference_result = reference.commit_bytes(prefix);
+                    let candidate_result = candidate.commit_bytes(prefix);
+                    assert_eq!(reference_result.is_ok(), candidate_result.is_ok(),
+                        "commit status differs for {prefix:?}: {grammar}");
+                    let reference_mask = reference.mask();
+                    let candidate_mask = direct_mask(&candidate);
+                    assert_eq!(candidate_mask, reference_mask, "scope mismatch for {prefix:?}: {grammar}");
+                    assert_eq!(candidate.is_accepting(), reference.is_accepting());
+                    assert_eq!(token_allowed(&candidate_mask, 140), token_allowed(&candidate_mask, 201));
+                }
+            }
+        }
+        let skipped = full_walk_dense::TEST_OUTPUT_SCOPE_SKIPPED.with(|count| count.get());
+        assert!(skipped > 0, "fixture must execute output-scope subtree skips, not merely decline them");
+    }
+
     /// Check the independent oracle, natural probation/store path, and a
     /// genuine cached hit. A hit must not run the vocabulary walker again.
     fn assert_recursive_persistent_roundtrip(state: &ConstraintState<'_>) {
@@ -11393,6 +11572,13 @@ mod tests {
         assert!(!table.future_contains(generic, other));
         assert_eq!(table.future_contains_calls, 2, "negative results must be memoized too");
         assert_eq!(table.future_contains_cache.len(), 2);
+        // Guard transitions use the same hot/config aliases. A physical state
+        // with a live WORD continuation cannot be summarized as only virtual
+        // residuals; an absent OTHER continuation is an empty exact set.
+        assert_eq!(table.direct_prune_coordinates(hot, word), None);
+        assert_eq!(table.direct_prune_coordinates(generic, word), None);
+        assert_eq!(table.direct_prune_coordinates(hot, other), Some(SmallVec::new()));
+        assert_eq!(table.direct_prune_coordinates(generic, other), Some(SmallVec::new()));
     }
 
     #[test]
