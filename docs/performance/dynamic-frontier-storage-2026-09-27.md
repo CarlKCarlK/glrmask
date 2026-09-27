@@ -81,3 +81,7 @@ Experimental exit memos, redundant metadata gating and exact byte-column alphabe
 ## Reproduction
 
 The companion JSON records revisions, frozen package hashes, exact mask hashes, selected-case scope, raw maxima and retained artifact checksums. Private scripts and raw outputs live in `.benchmarks/dynamic-frontier-integration`; pre-integration rechecks are in `.benchmarks/dynamic-frontier-storage`. Release binaries are independently frozen, and timing uses the machine isolation gate plus interleaved runs. No cross-machine latency comparison is made.
+
+## Final upstream integration
+
+After the timed comparison, upstream `ac991889d` added packed boundary-cancellation results. It did not change the dynamic runtime code. The combined source at `10a790da477d725b44ba5616d2ac25a27ac79c6e` was rebuilt and passed the full workspace again (2,288 successful test results including child harnesses, zero failures, 55 ignored), all 42 Python tests, and all four 126-schema compiled/loaded full-mask checks. The dynamic runtime source hash is unchanged from the timed candidate. The tables above retain their stated earlier baseline/integration; no speedup from the other worker's change is attributed to this patch. The companion JSON records the final combined package and validation hashes.

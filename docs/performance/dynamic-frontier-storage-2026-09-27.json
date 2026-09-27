@@ -7718,5 +7718,390 @@
         }
       }
     }
+  },
+  "post_timing_upstream_integration": {
+    "upstream": "ac991889da562b1b1b66b06a8e955fd122ca3efa",
+    "merged_package": {
+      "revision": "10a790da477d725b44ba5616d2ac25a27ac79c6e",
+      "sha256": "0218de85c15d928f24d2103c3dc55256ed3b4c00fb514f4f3f8a241b5fe5fbf8",
+      "source_sha256": "8367e67fe5edbe8e1ffaa3fc5a7a8aed40a6396e3a23032117ec3abab1906ac3"
+    },
+    "tests": {
+      "counts_including_child_harnesses": [
+        2288,
+        0,
+        55
+      ],
+      "groups": [
+        [
+          0,
+          0,
+          0
+        ],
+        [
+          1,
+          0,
+          0
+        ],
+        [
+          1,
+          0,
+          0
+        ],
+        [
+          1,
+          0,
+          0
+        ],
+        [
+          1,
+          0,
+          0
+        ],
+        [
+          1,
+          0,
+          0
+        ],
+        [
+          1,
+          0,
+          0
+        ],
+        [
+          1,
+          0,
+          0
+        ],
+        [
+          1,
+          0,
+          0
+        ],
+        [
+          1,
+          0,
+          0
+        ],
+        [
+          952,
+          0,
+          51
+        ],
+        [
+          1,
+          0,
+          0
+        ],
+        [
+          1,
+          0,
+          0
+        ],
+        [
+          1,
+          0,
+          0
+        ],
+        [
+          1,
+          0,
+          0
+        ],
+        [
+          22,
+          0,
+          0
+        ],
+        [
+          19,
+          0,
+          0
+        ],
+        [
+          21,
+          0,
+          0
+        ],
+        [
+          2,
+          0,
+          0
+        ],
+        [
+          107,
+          0,
+          0
+        ],
+        [
+          14,
+          0,
+          0
+        ],
+        [
+          7,
+          0,
+          0
+        ],
+        [
+          12,
+          0,
+          0
+        ],
+        [
+          1,
+          0,
+          0
+        ],
+        [
+          1,
+          0,
+          0
+        ],
+        [
+          1,
+          0,
+          0
+        ],
+        [
+          2,
+          0,
+          0
+        ],
+        [
+          19,
+          0,
+          0
+        ],
+        [
+          4,
+          0,
+          0
+        ],
+        [
+          1,
+          0,
+          0
+        ],
+        [
+          2,
+          0,
+          0
+        ],
+        [
+          8,
+          0,
+          0
+        ],
+        [
+          3,
+          0,
+          0
+        ],
+        [
+          1,
+          0,
+          0
+        ],
+        [
+          1,
+          0,
+          0
+        ],
+        [
+          1,
+          0,
+          0
+        ],
+        [
+          1,
+          0,
+          0
+        ],
+        [
+          7,
+          0,
+          0
+        ],
+        [
+          2,
+          0,
+          0
+        ],
+        [
+          17,
+          0,
+          0
+        ],
+        [
+          16,
+          0,
+          0
+        ],
+        [
+          6,
+          0,
+          0
+        ],
+        [
+          216,
+          0,
+          2
+        ],
+        [
+          92,
+          0,
+          0
+        ],
+        [
+          4,
+          0,
+          0
+        ],
+        [
+          51,
+          0,
+          0
+        ],
+        [
+          240,
+          0,
+          0
+        ],
+        [
+          64,
+          0,
+          2
+        ],
+        [
+          273,
+          0,
+          0
+        ],
+        [
+          3,
+          0,
+          0
+        ],
+        [
+          27,
+          0,
+          0
+        ],
+        [
+          54,
+          0,
+          0
+        ],
+        [
+          1,
+          0,
+          0
+        ],
+        [
+          0,
+          0,
+          0
+        ],
+        [
+          0,
+          0,
+          0
+        ],
+        [
+          0,
+          0,
+          0
+        ],
+        [
+          0,
+          0,
+          0
+        ],
+        [
+          0,
+          0,
+          0
+        ],
+        [
+          0,
+          0,
+          0
+        ],
+        [
+          0,
+          0,
+          0
+        ],
+        [
+          0,
+          0,
+          0
+        ],
+        [
+          0,
+          0,
+          0
+        ],
+        [
+          0,
+          0,
+          0
+        ],
+        [
+          0,
+          0,
+          0
+        ],
+        [
+          0,
+          0,
+          0
+        ],
+        [
+          0,
+          0,
+          0
+        ]
+      ]
+    },
+    "python_tests_passed": 42,
+    "full_mask_captures": {
+      "static-compiled": {
+        "masks": 77582,
+        "schemas": 126,
+        "decoded_bytes": 1245309451,
+        "sha256": "351dab2120aadea63c7515ff1c12630fd8857184817eb0f87dfaa1e30932ece2",
+        "compressed_bytes": 5292137
+      },
+      "static-loaded": {
+        "masks": 77582,
+        "schemas": 126,
+        "decoded_bytes": 1245309451,
+        "sha256": "351dab2120aadea63c7515ff1c12630fd8857184817eb0f87dfaa1e30932ece2",
+        "compressed_bytes": 5292137
+      },
+      "dynamic-compiled": {
+        "masks": 77582,
+        "schemas": 126,
+        "decoded_bytes": 1245309459,
+        "sha256": "e92ae58e35267945ea771421e735e574c34d2aa2f9d8b751454859d4d0ef33e6",
+        "compressed_bytes": 5297312
+      },
+      "dynamic-loaded": {
+        "masks": 77582,
+        "schemas": 126,
+        "decoded_bytes": 1245309459,
+        "sha256": "e92ae58e35267945ea771421e735e574c34d2aa2f9d8b751454859d4d0ef33e6",
+        "compressed_bytes": 5297312
+      }
+    },
+    "timing_scope": "Timing tables retain the prior explicitly identified fa2863ef baseline and 4ed9ba3 integration; later boundary-cancellation-only upstream work was merged and functionally revalidated, not attributed to the storage change.",
+    "artifact_sha256": {
+      "test-latest-workspace.log": "553557e3cd14eedd58852ffae275cde82f7da8dd12066d5e7b42c9dcdac816e0",
+      "test-latest-python.log": "922e5b302419b415b4d01d8bd294a823a8a653cc6e3d39e4331ca215bfbfd86e",
+      "latest-captures/summary.json": "e43ca17ff027647a6c726bfb505a47f8f7e14a4c6586558c53559a5c843a8be4",
+      "latest-package.json": "7cf069f83513828a5183407d14147dd75a42f1c5260803af69e4071a7939c543"
+    }
   }
 }
