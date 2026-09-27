@@ -9626,6 +9626,40 @@ mod tests {
     }
 
     #[test]
+    fn link_metadata_and_lazy_templates_preserve_later_full_compiler_cache() {
+        for source in [tiny_constraint(), ignored_constraint()] {
+            let bytes = source.save();
+            let mut eager = Constraint::load(&bytes).unwrap();
+            eager.materialize_composition_metadata_for_compilation().unwrap();
+            let mut lazy = Constraint::load(&bytes).unwrap();
+            lazy.materialize_composition_link_metadata_for_compilation().unwrap();
+            assert_eq!(lazy.composition_reset_tokens_by_terminal, eager.composition_reset_tokens_by_terminal);
+            assert_eq!(lazy.composition_grammar_summary, eager.composition_grammar_summary);
+            assert!(lazy.composition_parser_characterizations_by_terminal.is_empty());
+            assert!(lazy.deferred_composition_metadata_blob.is_some());
+            assert_eq!(lazy.retained_parser_templates_for_compilation().unwrap().as_ref(),
+                eager.composition_parser_templates_by_terminal.as_slice());
+            // Reading exactly the templates must leave unrelated caches lazy.
+            assert!(lazy.composition_parser_characterizations_by_terminal.is_empty());
+            assert!(lazy.deferred_composition_metadata_blob.is_some());
+            assert_eq!(lazy.start().mask(), eager.start().mask());
+            // Exercise actual serialization, not the loaded-byte cache fast
+            // path. Both states must retain the same complete compiler data.
+            eager.serialized_artifact_cache = None;
+            lazy.serialized_artifact_cache = None;
+            assert_eq!(lazy.save(), eager.save());
+            // A later consumer can still request everything; no compiler
+            // information was thrown away by the cheaper linking prelude.
+            lazy.materialize_composition_metadata_for_compilation().unwrap();
+            assert_eq!(lazy.composition_parser_templates_by_terminal,
+                eager.composition_parser_templates_by_terminal);
+            assert_eq!(lazy.composition_parser_characterizations_by_terminal,
+                eager.composition_parser_characterizations_by_terminal);
+            assert!(lazy.deferred_composition_metadata_blob.is_none());
+        }
+    }
+
+    #[test]
     fn split_composition_metadata_allows_link_only_materialization() {
         let mut constraint = tiny_constraint();
         constraint.ensure_composition_reset_tokens_by_terminal();

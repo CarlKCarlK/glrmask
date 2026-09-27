@@ -20929,7 +20929,18 @@ fn compose_constraints_owned_parent_impl(
     }
     let parent_parser_materialize_ms = phase_started_at.elapsed().as_secs_f64() * 1000.0;
     let phase_started_at = Instant::now();
-    if direct_dynamic_boundary {
+    // The explicit static linker consumes link metadata and asks for retained
+    // templates through its existing lazy accessor. It does not need the
+    // unrelated terminal-characterization cache. Retain the complete blob so
+    // a later full/generic compiler consumer can still materialize everything.
+    let static_link_metadata_only = explicit_segmented_boundary
+        == Some(SegmentedBoundaryBackend::StaticParserDwa)
+        && std::env::var_os("GLRMASK_EXPERIMENT_STATIC_LINK_METADATA_ONLY")
+            .is_some_and(|value| !matches!(
+                value.to_string_lossy().trim().to_ascii_lowercase().as_str(),
+                "" | "0" | "false" | "no" | "off"
+            ));
+    if direct_dynamic_boundary || static_link_metadata_only {
         parent.materialize_composition_link_metadata_for_compilation()?;
     } else {
         parent.materialize_composition_metadata_for_compilation()?;
@@ -20939,6 +20950,14 @@ fn compose_constraints_owned_parent_impl(
         parent.prepare_recursive_compiler_tokenizer_for_composition()?;
     }
     let parent_metadata_materialize_ms = phase_started_at.elapsed().as_secs_f64() * 1000.0;
+    if compose_profile_enabled() {
+        eprintln!(
+            "[glrmask/profile][static_link_metadata] lazy={static_link_metadata_only} retained_blob={} templates={} characterizations={} metadata_ms={parent_metadata_materialize_ms:.3}",
+            parent.deferred_composition_metadata_blob.is_some(),
+            parent.composition_parser_templates_by_terminal.len(),
+            parent.composition_parser_characterizations_by_terminal.len(),
+        );
+    }
     let phase_started_at = Instant::now();
     let materialized_children = children
         .iter()
