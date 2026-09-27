@@ -111,24 +111,33 @@ publication separately from these frozen experiment binaries.
 
 ## Final default-mode verification
 
-The no-override production build passed the full Rust workspace and all 42
-Python tests. It also replayed the full 31-example JavaScript corpus in static
-and dynamic modes (4,099 full masks each), then all 1,000 fixed LL-supported
-native JSB schemas with no semantic differences. These checks use the default
-implementation, not the pre-adoption experimental switch. The final Python
-package SHA-256 is
-`c85d23615e547262e9780505a2a9acd278404fb79af12b76e21c00457787e49d`;
-retained evidence is `default-test-summary.json`, `test-python-default.log`,
-and `default-validation/summary.json`.
+With no core-selection override, the final pre-merge source passed 2,220
+top-level Rust tests (54 ignored) and all 42 Python tests. The default binary
+replayed the 31-example JavaScript corpus in static and dynamic modes (4,099
+full masks each), then all 1,000 fixed LL-supported native JSB schemas with
+no semantic differences. These are routing/correctness checks, not a new
+paired timing claim.
 
-## Final default-policy verification
-
-With no core-selection environment override, the final pre-merge source passed
-2,220 top-level Rust tests (54 ignored) and all 42 Python tests. The default
-binary repeated all 4,099 JavaScript mask comparisons in each execution mode
-and the fixed 1,000-schema native guard without semantic differences. The
-final default Python package SHA-256 is
+The default Python package SHA-256 is
 `c85d23615e547262e9780505a2a9acd278404fb79af12b76e21c00457787e49d`;
 the native runner SHA-256 is
 `8335cdb15ddaa16a6bf8bc370d1f364a8d4875792041b18e2308bd45429bde1d`.
-These verification runs confirm default routing, not a new paired timing claim.
+Retained evidence is `default-test-summary.json`, `test-python-default.log`,
+and `default-validation/summary.json`.
+
+## Combined upstream check
+
+The final candidate also preserves upstream `09fe81ac6` (fallback singleton
+bookkeeping). After that merge, the combined source passed 2,222 top-level
+Rust tests (55 ignored), all 42 Python tests, both full JavaScript mask
+replays, the 1,000-schema native outcome guard, and all 77,582 masks in each
+of the compiled and loaded JSB captures. The capture hash remains the exact
+reference above. This recheck used default routing and did not enable the
+separate unit-inlining, LALR, or dynamic-runtime experiments.
+
+Machine-readable paired measurements and the distinct post-merge verification
+are retained in `lr-core-build-2026-09-27.json`. The final combined Python
+package SHA-256 is
+`5c00a08a5f53745dac2ccf08705432efa83149af9f437daa88aae47950a793f9`;
+the native runner SHA-256 is
+`92a6bb430566e5120c9ffff13cdcb41fb8a30693ecd83ad55b5e16bc1824c28f`.
