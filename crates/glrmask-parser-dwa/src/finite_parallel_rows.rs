@@ -20,12 +20,17 @@ pub(super) struct Policy {
     pub threshold: usize,
     pub batch: usize,
     pub chunk: usize,
+    pub live_import: bool,
 }
 
 impl Policy {
     pub(super) fn from_environment(finite: bool, states: usize, alphabet: usize) -> Option<Self> {
-        Self::for_configuration(finite, states, alphabet, rayon::current_num_threads(),
-            crate::optimized_env_flag("GLRMASK_BOUNDARY_PARALLEL_NATIVE_ROWS"))
+        let mut policy = Self::for_configuration(finite, states, alphabet, rayon::current_num_threads(),
+            crate::optimized_env_flag("GLRMASK_BOUNDARY_PARALLEL_NATIVE_ROWS"))?;
+        // Import only values referenced by the completed packet. The exact
+        // all-values reference remains available with the ordinary override.
+        policy.live_import = crate::optimized_env_flag("GLRMASK_BOUNDARY_PARALLEL_LIVE_IMPORT");
+        Some(policy)
     }
 
     // The two-worker real-fixture screen regressed. Small inputs also cannot
@@ -35,7 +40,7 @@ impl Policy {
                          threads: usize, enabled: bool) -> Option<Self> {
         (enabled && finite && threads >= 4 && (4096..=200_000).contains(&states)
             && alphabet <= 32_768)
-            .then_some(Self { threshold: 64, batch: 4096, chunk: 256 })
+            .then_some(Self { threshold: 64, batch: 4096, chunk: 256, live_import: true })
     }
 }
 
@@ -48,6 +53,7 @@ pub(super) struct Profile {
     pub base_cache_hits: usize,
     pub local_cache_hits: usize,
     pub local_values: usize,
+    pub imported_values: usize,
     pub ready_edges: usize,
     pub worker_mask: u64,
     pub prepare_ms: f64,
@@ -158,6 +164,54 @@ struct Packet {
     base_hits: usize,
     local_hits: usize,
     worker: u64,
+}
+
+impl Packet {
+    /// Mark every coefficient that can escape into the ordered publisher.
+    /// Values are materialized bitvectors, so arithmetic operands do not need
+    /// recursive tracing. Keeping every recipe is conservative when a later
+    /// cache hit makes some of them unnecessary.
+    fn escaping_values(&self) -> Option<Vec<bool>> {
+        let mut live = vec![false; self.values.len()];
+        let mut mark = |id: u32| -> Option<()> {
+            if id & LOCAL != 0 { *live.get_mut((id & !LOCAL) as usize)? = true; }
+            Some(())
+        };
+        for recipe in &self.recipes {
+            mark(recipe.weight)?;
+            for &(_, weight) in recipe.incoming.iter().chain(&recipe.closure) { mark(weight)?; }
+        }
+        for row in &self.rows {
+            mark(row.final_weight)?;
+            for &(_, _, weight) in &row.edges { mark(weight)?; }
+            for (_, target) in &row.pending {
+                match target {
+                    Target::Known(_, weight) | Target::Singleton(_, weight) => mark(*weight)?,
+                    Target::Recipe(index) => { self.recipes.get(*index)?; }
+                }
+            }
+        }
+        Some(live)
+    }
+}
+
+fn import_private_values(
+    values: Vec<FastBoundaryWeightValue>, live: Option<&[bool]>,
+    interner: &mut FastBoundaryWeightInterner,
+) -> Option<Vec<u32>> {
+    if live.is_some_and(|marks| marks.len() != values.len()) { return None; }
+    let mut translated = Vec::with_capacity(values.len());
+    for (index, value) in values.into_iter().enumerate() {
+        if live.is_none_or(|marks| marks[index]) {
+            let id = interner.intern(value);
+            if interner.failed { return None; }
+            translated.push(id);
+        } else {
+            // Unmarked temporaries must never be confused with EMPTY.
+            translated.push(u32::MAX);
+        }
+    }
+    Some(translated)
 }
 
 struct Worker<'a> {
@@ -347,7 +401,11 @@ fn prepare_packet(
 
 #[inline]
 fn translated(id: u32, local: &[u32]) -> u32 {
-    if id & LOCAL == 0 { id } else { local[(id & !LOCAL) as usize] }
+    if id & LOCAL == 0 { id } else {
+        let translated = local[(id & !LOCAL) as usize];
+        assert_ne!(translated, u32::MAX, "unmarked private coefficient escaped its worker");
+        translated
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -375,7 +433,10 @@ pub(super) fn batch(
         profile.base_cache_hits += packet.base_hits; profile.local_cache_hits += packet.local_hits;
         profile.local_values += packet.values.len(); profile.worker_mask |= packet.worker;
         let import_started = Instant::now();
-        let local = packet.values.into_iter().map(|value| interner.intern(value)).collect::<Vec<_>>();
+        let live = if policy.live_import { Some(packet.escaping_values()?) } else { None };
+        profile.imported_values += live.as_ref().map_or(packet.values.len(),
+            |marks| marks.iter().filter(|&&marked| marked).count());
+        let local = import_private_values(packet.values, live.as_deref(), interner)?;
         profile.import_ms += import_started.elapsed().as_secs_f64() * 1000.0;
         if interner.failed { return None; }
         let mut recipes = packet.recipes.into_iter().map(Some).collect::<Vec<_>>();

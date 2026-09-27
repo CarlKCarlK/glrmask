@@ -14,6 +14,7 @@ fn automatic_policy_keeps_small_low_core_and_unsupported_inputs_serial() {
     for threads in [4, 6, 10, 64] {
         let p = Policy::for_configuration(true, 4096, 32_768, threads, true).unwrap();
         assert_eq!((p.threshold, p.batch, p.chunk), (64, 4096, 256));
+        assert!(p.live_import);
     }
 }
 
@@ -36,7 +37,7 @@ fn importing_private_values_obeys_global_limit_without_publishing_a_row() {
     let mut subsets = FxHashMap::default();
     let mut singletons = FxHashMap::default();
     let mut closures = FxHashMap::default();
-    let result = batch(Policy { threshold: 1, batch: 1, chunk: 1 }, &source, 6,
+    let result = batch(Policy { threshold: 1, batch: 1, chunk: 1, live_import: true }, &source, 6,
         &mut p, &mut singleton_states, &mut subsets, &mut singletons, &mut closures,
         &mut out, &mut supports, &mut pending, &mut 0, &mut Profile::default());
     assert!(result.is_none(), "a resource failure is not a successful empty mask");
@@ -122,7 +123,7 @@ fn same_native(a: &FiniteBoundaryDwa, b: &FiniteBoundaryDwa, case: usize) {
 fn parallel_packets_preserve_native_targets_guards_and_coefficients() {
     let threads = rayon::ThreadPoolBuilder::new().num_threads(3).build().unwrap();
     threads.install(|| {
-        let policy = Some(Policy { threshold: 1, batch: 9, chunk: 2 });
+        let policy = Policy { threshold: 1, batch: 9, chunk: 2, live_import: false };
         let mut seed = 192637u64;
         let mut next = || { seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1); (seed >> 32) as usize };
         let mut exercised = 0usize;
@@ -152,9 +153,12 @@ fn parallel_packets_preserve_native_targets_guards_and_coefficients() {
             }
             let starts = if case % 4 == 0 { vec![0,1] } else { vec![0] };
             let reference = finite(&source, &starts, &mut pool(words), None).unwrap();
-            let candidate = finite(&source, &starts, &mut pool(words), policy).unwrap();
             exercised += reference.states.len();
-            same_native(&reference, &candidate, case);
+            for live_import in [false, true] {
+                let candidate = finite(&source, &starts, &mut pool(words),
+                    Some(Policy { live_import, ..policy })).unwrap();
+                same_native(&reference, &candidate, case);
+            }
         }
         assert!(exercised > 1000, "exercise many weighted registered frontiers");
     });
@@ -170,7 +174,7 @@ fn parallel_packets_preserve_wide_convergence_and_state_budget_decline() {
         source[q].transitions.push((0, smallvec::smallvec![(97 + (q % 48) as u32, 3), (145 + (q % 48) as u32, 5)]));
     }
     for row in &mut source[97..] { row.final_weight = 7; }
-    let policy = Some(Policy { threshold: 2, batch: 64, chunk: 8 });
+    let policy = Some(Policy { threshold: 2, batch: 64, chunk: 8, live_import: true });
     let threads = rayon::ThreadPoolBuilder::new().num_threads(4).build().unwrap();
     threads.install(|| {
         let reference = finite(&source, &[0], &mut pool(17), None).unwrap();
@@ -182,4 +186,46 @@ fn parallel_packets_preserve_wide_convergence_and_state_budget_decline() {
             assert!(finite(&source, &[0], &mut p, mode).is_none());
         }
     });
+}
+
+#[test]
+fn escaping_values_cover_every_published_field_and_reject_bad_references() {
+    let mut packet = Packet {
+        values: (0..8).map(|i| smallvec::smallvec![1u64 << i]).collect(),
+        recipes: vec![Recipe {
+            incoming: vec![(10, LOCAL)], closure: vec![(11, LOCAL | 1)], weight: LOCAL | 2,
+        }],
+        rows: vec![PreparedRow {
+            id: 0, members: 1, final_weight: LOCAL | 3,
+            edges: vec![(0, 1, LOCAL | 4), (1, 1, 1)],
+            pending: vec![(0, Target::Singleton(1, LOCAL | 5)),
+                (1, Target::Known(1, LOCAL | 6)), (2, Target::Recipe(0))],
+            local_coefficients: true,
+        }],
+        base_hits: 0, local_hits: 0, worker: 1,
+    };
+    assert_eq!(packet.escaping_values().unwrap(), vec![true, true, true, true, true, true, true, false]);
+    packet.rows[0].pending.push((3, Target::Recipe(99)));
+    assert!(packet.escaping_values().is_none());
+    packet.rows[0].pending.pop();
+    packet.rows[0].final_weight = LOCAL | 8;
+    assert!(packet.escaping_values().is_none());
+}
+
+#[test]
+fn live_import_skips_only_unreferenced_values_and_preserves_exact_translation() {
+    let mut reference = pool(1);
+    let mut candidate = pool(1);
+    let values = vec![smallvec::smallvec![0x123456789abcdef0],
+        smallvec::smallvec![0x123456789abcdef1], smallvec::smallvec![u64::MAX]];
+    let all = import_private_values(values.clone(), None, &mut reference).unwrap();
+    let selected = import_private_values(values, Some(&[true, false, true]), &mut candidate).unwrap();
+    assert_eq!(selected[1], u32::MAX);
+    for index in [0usize, 2] {
+        let id = translated(LOCAL | index as u32, &selected);
+        assert_eq!(candidate.values[id as usize], reference.values[all[index] as usize]);
+    }
+    assert_eq!(translated(1, &selected), 1);
+    assert!(!candidate.ids.contains_key([0x123456789abcdef1u64].as_slice()));
+    assert_eq!(candidate.values.len() + 1, reference.values.len());
 }
