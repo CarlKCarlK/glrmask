@@ -18,6 +18,7 @@ pub struct FiniteParserReadSupport {
 }
 
 impl FiniteParserReadSupport {
+    pub(super) fn alphabet(&self) -> usize { self.target.len() }
     /// Rows are deterministic, epsilon-free adjacency residuals. Every label
     /// has one residual target independent of the source row. `live` records
     /// coaccessibility to a complete domain word. The caller retains the
@@ -74,6 +75,99 @@ fn insert(bits:&mut[u64],id:usize,root:usize){
     if id==root{bits.fill(0);}
     bits[id/64]|=1u64<<(id%64);
 }
+
+/// Sparse storage for the same transfer. An offset exists iff a successful
+/// incoming transfer supplied a nonempty context. Original graph IDs remain
+/// unchanged; only the storage of context bitsets is allocated on demand.
+pub(super) struct SparseReadContextTransfer<'a> {
+    domain: &'a FiniteParserReadSupport,
+    offsets: Vec<u32>,
+    contexts: Vec<u64>,
+    source: Vec<u64>,
+    source_nonempty: bool,
+    word_limit: usize,
+}
+
+impl<'a> SparseReadContextTransfer<'a> {
+    pub fn new(domain: &'a FiniteParserReadSupport, nodes: usize, starts: &[u32]) -> Option<Self> {
+        Self::with_word_limit(domain, nodes, starts, 8_000_000)
+    }
+
+    fn with_word_limit(domain: &'a FiniteParserReadSupport, nodes: usize, starts: &[u32], limit: usize) -> Option<Self> {
+        if nodes == 0 || nodes > 200_000 || starts.iter().any(|&q| q as usize >= nodes) { return None; }
+        let mut result = Self { domain, offsets: vec![u32::MAX; nodes], contexts: Vec::new(),
+            source: vec![0; domain.words], source_nonempty: false, word_limit: limit.min(8_000_000) };
+        for &q in starts {
+            let begin = result.destination(q as usize)?;
+            insert(&mut result.contexts[begin..begin + domain.words], domain.root, domain.root);
+        }
+        Some(result)
+    }
+
+    fn destination(&mut self, target: usize) -> Option<usize> {
+        let offset = *self.offsets.get(target)?;
+        if offset != u32::MAX { return Some(offset as usize); }
+        let begin = self.contexts.len();
+        let end = begin.checked_add(self.domain.words)?;
+        if end > self.word_limit { return None; }
+        self.contexts.resize(end, 0);
+        self.offsets[target] = begin as u32;
+        Some(begin)
+    }
+
+    pub fn allocated_nodes(&self) -> usize { self.contexts.len() / self.domain.words }
+
+    pub fn state_nonempty(&self, q: usize) -> Option<bool> {
+        Some(*self.offsets.get(q)? != u32::MAX)
+    }
+
+    pub fn load_source(&mut self, q: usize) -> Option<bool> {
+        let offset = *self.offsets.get(q)?;
+        self.source_nonempty = offset != u32::MAX;
+        if self.source_nonempty {
+            let begin = offset as usize;
+            self.source.copy_from_slice(&self.contexts[begin..begin + self.domain.words]);
+            debug_assert!(self.source.iter().any(|&bits| bits != 0));
+        }
+        Some(self.source_nonempty)
+    }
+
+    pub fn read_allowed(&self, label: i32) -> Option<bool> {
+        if label != DEFAULT_LABEL && (label < 0 || label as usize >= self.domain.target.len()) { return None; }
+        if !self.source_nonempty { return Some(false); }
+        if label == DEFAULT_LABEL { return Some(true); }
+        let begin = label as usize * self.domain.words;
+        Some(self.source.iter().zip(&self.domain.allowed[begin..begin + self.domain.words])
+            .any(|(a, b)| a & b != 0))
+    }
+
+    pub fn transfer_epsilon(&mut self, target: usize) -> Option<()> {
+        if target >= self.offsets.len() { return None; }
+        if !self.source_nonempty { return Some(()); }
+        let root = self.domain.root;
+        let source_root = has(&self.source, root);
+        let begin = self.destination(target)?;
+        let dest = &mut self.contexts[begin..begin + self.domain.words];
+        if source_root { insert(dest, root, root); }
+        else if !has(dest, root) {
+            for (a, b) in dest.iter_mut().zip(&self.source) { *a |= *b; }
+        }
+        Some(())
+    }
+
+    /// Called only after read_allowed(label) was true for the loaded source.
+    pub fn transfer_read(&mut self, label: i32, target: usize) -> Option<()> {
+        if target >= self.offsets.len() { return None; }
+        if !self.source_nonempty { return Some(()); }
+        let context = if label == DEFAULT_LABEL { self.domain.root }
+            else { *self.domain.target.get(label as usize)? as usize };
+        if context >= self.domain.states { return None; }
+        let begin = self.destination(target)?;
+        insert(&mut self.contexts[begin..begin + self.domain.words], context, self.domain.root);
+        Some(())
+    }
+}
+
 
 pub(super) fn restrict(
     nwa:&mut [FastBoundaryNwaState], starts:&[u32], domain:&FiniteParserReadSupport,
@@ -208,4 +302,32 @@ mod tests {
         assert!(restrict(&mut nwa,&[0],&domain).is_none());
         assert_eq!(nwa[0].final_weight,1);
     }
+    #[test]
+    fn sparse_context_allocates_only_nonempty_blocks_and_declines_before_publication(){
+        let domain=FiniteParserReadSupport::new_checked(3,0,
+            &[vec![(0,1),(1,1),(2,2)],vec![(0,1)],vec![(2,2)]],&[true,true,true],true).unwrap();
+        let mut c=SparseReadContextTransfer::with_word_limit(&domain,100,&[0],3).unwrap();
+        assert_eq!(c.allocated_nodes(),1);
+        assert!(!c.load_source(90).unwrap());
+        assert!(!c.read_allowed(DEFAULT_LABEL).unwrap());
+        c.transfer_epsilon(91).unwrap();
+        assert!(!c.state_nonempty(91).unwrap());
+        assert!(c.load_source(0).unwrap());
+        c.transfer_read(1,50).unwrap();
+        assert!(c.load_source(50).unwrap());
+        assert!(!c.read_allowed(2).unwrap());
+        c.transfer_read(DEFAULT_LABEL,70).unwrap();
+        assert_eq!(c.allocated_nodes(),3);
+        assert!(c.load_source(70).unwrap());
+        assert!(c.read_allowed(2).unwrap());
+        assert!(c.transfer_epsilon(99).is_none());
+        assert!(!c.state_nonempty(99).unwrap(),"failed storage growth cannot publish a node");
+        c.transfer_epsilon(50).unwrap();
+        assert!(c.load_source(50).unwrap());
+        assert!(c.read_allowed(2).unwrap(),"root dominates an existing narrower row");
+        assert!(c.load_source(100).is_none());
+        assert!(c.read_allowed(-1).is_none());
+        assert_eq!(c.allocated_nodes(),3);
+    }
+
 }
