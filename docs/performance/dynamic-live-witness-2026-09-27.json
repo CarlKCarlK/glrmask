@@ -5065,6 +5065,1118 @@
       },
       "outcomes_identical_all_twelve_runs": true,
       "interpretation": "typingsrc interval339 spike reproduced in BOTH independent binaries on first process (published151.584us/candidate122.875us); later repetitions24.459\u201331.250us published and21.250\u201327.458us candidate. Thus not AA-specific. Timing variation/cold effects remain unresolved, not erased. o60887 interval139 now3.750\u20134.375us both; original74.583us retained."
+    },
+    "integration-validation.json": {
+      "description": "Integrated AA6f9 with upstream736239528 (live finite-parallel coefficient import) as7d910e907. Clean-default workspace2288/0/55,42Python and1doc test pass; four126-schema streams preserve77582full masks/outcomes each. The postmerge screen compares frozen preintegrationAA6f9 against integrated7d910e907, not against upstream736 withoutAA. Both use original grammar and production defaults; all LL positions match. JS dynamic stabilizedP1003422.416/3423.583us, P902008.6914/2002.7166us; JSB P1002262.292/2259.625us; staticJS P10080.625/79.250us. Absolute measurements differ from the earlier release run; the earlier fresh LL comparison cannot be combined with these faster observations. Build and raw variation is retained without attributing it to this runtime patch. A first full-test attempt incorrectly inherited benchmark GLRMASK_LLGUIDANCE_COMPAT=1; same compiled exact fixture passes with normal defaults and fails with that compatibility flag. The unmodified complete workspace then passed cleanly. A zero-test partial --exact diagnostic is excluded from validation counts.",
+      "completed": {
+        "at": "2026-09-28T01:17:34.281356+08:00",
+        "head": "7d910e907721a7b7c915d47f856c60379924cdc4",
+        "package": {
+          "commit": "7d910e907721a7b7c915d47f856c60379924cdc4",
+          "sha256": "36887914ced8fa7496011dcf24dc101973b537fe44ff086ac8b9e7b87e48ab21",
+          "runtime_sha256": "d49897ee44cda79b35a0d8773c91011a0931aed26bd590aabb8e998095ff58bd"
+        },
+        "screen_sha256": "e5316d3e5c8914a3137830d3513b7a580cfb07c99ec9174676f17f8bad5809d9",
+        "captures_sha256": "e43ca17ff027647a6c726bfb505a47f8f7e14a4c6586558c53559a5c843a8be4"
+      },
+      "tests": {
+        "counts": [
+          2288,
+          0,
+          55
+        ],
+        "harnesses": [
+          {
+            "harness": "Running unittests src/lib.rs (.benchmarks/dynamic-tail/target/release/deps/_glrmask-f06fafa12d4419aa)",
+            "summary": [
+              0,
+              0,
+              0
+            ]
+          },
+          {
+            "harness": "Running unittests src/lib.rs (.benchmarks/dynamic-tail/target/release/deps/glrmask-49f418fdc9063163)",
+            "summary": [
+              955,
+              0,
+              51
+            ]
+          },
+          {
+            "harness": "Running tests/regressions/tokenizer/byte_restricted_state_equivalence.rs (.benchmarks/dynamic-tail/target/release/deps/byte_restricted_state_equivalence_mre-ff72044bb1c06dfc)",
+            "summary": [
+              1,
+              0,
+              0
+            ]
+          },
+          {
+            "harness": "Running tests/regressions/parser/direct_glrm_ordered_suffix_ambiguity.rs (.benchmarks/dynamic-tail/target/release/deps/direct_glrm_ordered_suffix_ambiguity-70446dd325fb9f54)",
+            "summary": [
+              1,
+              0,
+              0
+            ]
+          },
+          {
+            "harness": "Running tests/regressions/parser/direct_glrm_ordered_suffix_fixed_n5.rs (.benchmarks/dynamic-tail/target/release/deps/direct_glrm_ordered_suffix_fixed_n5-12b471ed20481250)",
+            "summary": [
+              1,
+              0,
+              0
+            ]
+          },
+          {
+            "harness": "Running tests/end_tokens.rs (.benchmarks/dynamic-tail/target/release/deps/end_tokens-06f979c6a0483c8d)",
+            "summary": [
+              1,
+              0,
+              0
+            ]
+          },
+          {
+            "harness": "Running tests/final_public_api.rs (.benchmarks/dynamic-tail/target/release/deps/final_public_api-1df22d5e3a4ffba2)",
+            "summary": [
+              22,
+              0,
+              0
+            ]
+          },
+          {
+            "harness": "Running tests/final_public_api_review.rs (.benchmarks/dynamic-tail/target/release/deps/final_public_api_review-3a5186190f84602e)",
+            "summary": [
+              19,
+              0,
+              0
+            ]
+          },
+          {
+            "harness": "Running tests/glrm_v1.rs (.benchmarks/dynamic-tail/target/release/deps/glrm_v1-6c0b14a10120f2ec)",
+            "summary": [
+              21,
+              0,
+              0
+            ]
+          },
+          {
+            "harness": "Running tests/regressions/json_schema/integer_multiple_exact.rs (.benchmarks/dynamic-tail/target/release/deps/integer_multiple_exact-68c9f37a1b960244)",
+            "summary": [
+              2,
+              0,
+              0
+            ]
+          },
+          {
+            "harness": "Running tests/integration.rs (.benchmarks/dynamic-tail/target/release/deps/integration-42bf669b6a6ca90c)",
+            "summary": [
+              107,
+              0,
+              0
+            ]
+          },
+          {
+            "harness": "Running tests/json_schema/unicode_class_pattern.rs (.benchmarks/dynamic-tail/target/release/deps/json_schema_unicode_class_pattern-9872e02224a45c81)",
+            "summary": [
+              14,
+              0,
+              0
+            ]
+          },
+          {
+            "harness": "Running tests/json_schema/unicode_escape_characterization.rs (.benchmarks/dynamic-tail/target/release/deps/json_schema_unicode_escape_characterization-1d7b00de2351ed2a)",
+            "summary": [
+              7,
+              0,
+              0
+            ]
+          },
+          {
+            "harness": "Running tests/regressions/mre.rs (.benchmarks/dynamic-tail/target/release/deps/mre-1e6954efcbd48946)",
+            "summary": [
+              12,
+              0,
+              0
+            ]
+          },
+          {
+            "harness": "Running tests/regressions/parser/o13029_unit_inlining_false_negative.rs (.benchmarks/dynamic-tail/target/release/deps/o13029_unit_inlining_false_negative-defdcfea8a022050)",
+            "summary": [
+              1,
+              0,
+              0
+            ]
+          },
+          {
+            "harness": "Running tests/regressions/parser/o15627_schema_gss_split.rs (.benchmarks/dynamic-tail/target/release/deps/o15627_schema_gss_split_mre-92b27d38c395232a)",
+            "summary": [
+              1,
+              0,
+              0
+            ]
+          },
+          {
+            "harness": "Running tests/regressions/json_schema/o17408_false_positive.rs (.benchmarks/dynamic-tail/target/release/deps/o17408_repro-f3031f8fd2a1e9c1)",
+            "summary": [
+              1,
+              0,
+              0
+            ]
+          },
+          {
+            "harness": "Running tests/regressions/json_schema/o25804_mask_commit_mismatch.rs (.benchmarks/dynamic-tail/target/release/deps/o25804_mask_commit_mismatch-4bf4effc9d07db40)",
+            "summary": [
+              2,
+              0,
+              0
+            ]
+          },
+          {
+            "harness": "Running tests/regressions/tokenizer/o35155_scaling.rs (.benchmarks/dynamic-tail/target/release/deps/o35155_tokenizer_scaling-ce6769c3ca1b9542)",
+            "summary": [
+              19,
+              0,
+              0
+            ]
+          },
+          {
+            "harness": "Running tests/regressions/json_schema/o4836_unicode_escape_key.rs (.benchmarks/dynamic-tail/target/release/deps/o4836_unicode_escape_key-b5c72fe87b8589d2)",
+            "summary": [
+              4,
+              0,
+              0
+            ]
+          },
+          {
+            "harness": "Running tests/regressions/json_schema/o6363_required_anyof.rs (.benchmarks/dynamic-tail/target/release/deps/o6363_required_anyof-abb3d568348a0c3c)",
+            "summary": [
+              1,
+              0,
+              0
+            ]
+          },
+          {
+            "harness": "Running tests/regressions/json_schema/o67291_recursive_anyof_ref.rs (.benchmarks/dynamic-tail/target/release/deps/o67291_recursive_anyof_ref-93a99bfac5501d7b)",
+            "summary": [
+              2,
+              0,
+              0
+            ]
+          },
+          {
+            "harness": "Running tests/regressions/json_schema/o82710_whitespace.rs (.benchmarks/dynamic-tail/target/release/deps/o82710_repro-ca36bdd24ca661c1)",
+            "summary": [
+              8,
+              0,
+              0
+            ]
+          },
+          {
+            "harness": "Running tests/regressions/parser/ordered_anyof_ambiguity.rs (.benchmarks/dynamic-tail/target/release/deps/ordered_anyof_ambiguity-f63bdcf57d7d3a2d)",
+            "summary": [
+              3,
+              0,
+              0
+            ]
+          },
+          {
+            "harness": "Running tests/regressions/json_schema/resjson_recursive_ref.rs (.benchmarks/dynamic-tail/target/release/deps/resjson_repro-21259afd7c5b4f04)",
+            "summary": [
+              1,
+              0,
+              0
+            ]
+          },
+          {
+            "harness": "Running tests/regressions/replay/snowplow_hostname.rs (.benchmarks/dynamic-tail/target/release/deps/snowplow_hostname_replay_mre-78ade5cdb5ddb76e)",
+            "summary": [
+              1,
+              0,
+              0
+            ]
+          },
+          {
+            "harness": "Running tests/regressions/terminal_interchangeability/shared_suffix.rs (.benchmarks/dynamic-tail/target/release/deps/ti_mre_final-e69ddb56117ec086)",
+            "summary": [
+              1,
+              0,
+              0
+            ]
+          },
+          {
+            "harness": "Running tests/regressions/terminal_interchangeability/separator_transport.rs (.benchmarks/dynamic-tail/target/release/deps/ti_separator_transport_mre-4213e11b3dba6e10)",
+            "summary": [
+              1,
+              0,
+              0
+            ]
+          },
+          {
+            "harness": "Running tests/regressions/tokenizer/unicode_escape_progression.rs (.benchmarks/dynamic-tail/target/release/deps/unicode_escape_progression_glrm_mre-57a77e811d235dd5)",
+            "summary": [
+              7,
+              0,
+              0
+            ]
+          },
+          {
+            "harness": "Running tests/regressions/json_schema/word_limit_totality.rs (.benchmarks/dynamic-tail/target/release/deps/word_limit_totality-b047d438c2fef591)",
+            "summary": [
+              2,
+              0,
+              0
+            ]
+          },
+          {
+            "harness": "Running unittests src/lib.rs (.benchmarks/dynamic-tail/target/release/deps/glrmask_artifact-d6fef8c47223bdff)",
+            "summary": [
+              17,
+              0,
+              0
+            ]
+          },
+          {
+            "harness": "Running unittests src/lib.rs (.benchmarks/dynamic-tail/target/release/deps/glrmask_dwa_merge-3d6e62b0d8c911f9)",
+            "summary": [
+              16,
+              0,
+              0
+            ]
+          },
+          {
+            "harness": "Running unittests src/lib.rs (.benchmarks/dynamic-tail/target/release/deps/glrmask_finite_automata-12f1cdc0b31318df)",
+            "summary": [
+              6,
+              0,
+              0
+            ]
+          },
+          {
+            "harness": "Running unittests src/lib.rs (.benchmarks/dynamic-tail/target/release/deps/glrmask_glr-0ef77f9ecdda31b6)",
+            "summary": [
+              216,
+              0,
+              2
+            ]
+          },
+          {
+            "harness": "Running unittests src/lib.rs (.benchmarks/dynamic-tail/target/release/deps/glrmask_grammar-c3e6465b3fa57e06)",
+            "summary": [
+              92,
+              0,
+              0
+            ]
+          },
+          {
+            "harness": "Running unittests src/lib.rs (.benchmarks/dynamic-tail/target/release/deps/glrmask_invariant-7abd4db0fc85f2da)",
+            "summary": [
+              4,
+              0,
+              0
+            ]
+          },
+          {
+            "harness": "Running unittests src/lib.rs (.benchmarks/dynamic-tail/target/release/deps/glrmask_json_schema-1724533bfa16e9bb)",
+            "summary": [
+              51,
+              0,
+              0
+            ]
+          },
+          {
+            "harness": "Running unittests src/lib.rs (.benchmarks/dynamic-tail/target/release/deps/glrmask_lexer-7e62ebc66b1d68ac)",
+            "summary": [
+              240,
+              0,
+              0
+            ]
+          },
+          {
+            "harness": "Running unittests src/lib.rs (.benchmarks/dynamic-tail/target/release/deps/glrmask_parser_dwa-44bddf236f63ba56)",
+            "summary": [
+              71,
+              0,
+              2
+            ]
+          },
+          {
+            "harness": "Running unittests src/lib.rs (.benchmarks/dynamic-tail/target/release/deps/glrmask_terminal_dwa-997145e7a76227b2)",
+            "summary": [
+              273,
+              0,
+              0
+            ]
+          },
+          {
+            "harness": "Running unittests src/lib.rs (.benchmarks/dynamic-tail/target/release/deps/glrmask_vocab-845a4b067cb7f438)",
+            "summary": [
+              3,
+              0,
+              0
+            ]
+          },
+          {
+            "harness": "Running unittests src/lib.rs (.benchmarks/dynamic-tail/target/release/deps/glrmask_weight-af4ddf4c3a71a0e8)",
+            "summary": [
+              27,
+              0,
+              0
+            ]
+          },
+          {
+            "harness": "Running unittests src/lib.rs (.benchmarks/dynamic-tail/target/release/deps/glrmask_weighted_automata-4c9ecb162a501f5b)",
+            "summary": [
+              54,
+              0,
+              0
+            ]
+          }
+        ]
+      },
+      "screen": {
+        "cache": "on",
+        "repetitions_per_side": 6,
+        "scope": "Only LL-success builds; only exact LL-measured (problem,example,step) runtime keys",
+        "metric": "mask_i+commit_i, minimum complete same-run pair over equal fresh-state repetitions",
+        "candidate_sha256": "36887914ced8fa7496011dcf24dc101973b537fe44ff086ac8b9e7b87e48ab21",
+        "published_sha256": "7ddcb6d7af7b7fbb748572df816554aa16e739ee95124db5f20dc4656d96cf55",
+        "groups": {
+          "js": {
+            "published": {
+              "full_masks": 4099,
+              "measured_keys": 4099,
+              "tbm_us": {
+                "p50": 598.75,
+                "p90": 2008.6914000000002,
+                "p99": 2929.68,
+                "p99.9": 3289.66613400001,
+                "p100": 3422.416
+              },
+              "raw_max_us": 7607.333,
+              "build_ms": [
+                99.20575,
+                84.844125,
+                91.3305,
+                98.714541,
+                108.0265,
+                106.902125
+              ],
+              "worst": [
+                [
+                  3422.416,
+                  [
+                    "js",
+                    30,
+                    577
+                  ]
+                ],
+                [
+                  3403.542,
+                  [
+                    "js",
+                    23,
+                    44
+                  ]
+                ],
+                [
+                  3386.0,
+                  [
+                    "js",
+                    30,
+                    578
+                  ]
+                ],
+                [
+                  3302.709,
+                  [
+                    "js",
+                    30,
+                    579
+                  ]
+                ],
+                [
+                  3291.667,
+                  [
+                    "js",
+                    23,
+                    16
+                  ]
+                ],
+                [
+                  3271.25,
+                  [
+                    "js",
+                    30,
+                    927
+                  ]
+                ],
+                [
+                  3252.25,
+                  [
+                    "js",
+                    23,
+                    11
+                  ]
+                ],
+                [
+                  3220.458,
+                  [
+                    "js",
+                    23,
+                    27
+                  ]
+                ],
+                [
+                  3210.167,
+                  [
+                    "js",
+                    30,
+                    580
+                  ]
+                ],
+                [
+                  3153.125,
+                  [
+                    "js",
+                    5,
+                    21
+                  ]
+                ],
+                [
+                  3127.917,
+                  [
+                    "js",
+                    22,
+                    54
+                  ]
+                ],
+                [
+                  3117.625,
+                  [
+                    "js",
+                    30,
+                    581
+                  ]
+                ]
+              ],
+              "build_median_ms": 98.9601455
+            },
+            "candidate": {
+              "full_masks": 4099,
+              "measured_keys": 4099,
+              "tbm_us": {
+                "p50": 591.917,
+                "p90": 2002.7166000000002,
+                "p99": 2918.19468,
+                "p99.9": 3254.2670980000066,
+                "p100": 3423.583
+              },
+              "raw_max_us": 4624.25,
+              "build_ms": [
+                90.51225000000001,
+                106.1195,
+                91.035375,
+                95.189542,
+                89.572958,
+                85.588834
+              ],
+              "worst": [
+                [
+                  3423.583,
+                  [
+                    "js",
+                    30,
+                    577
+                  ]
+                ],
+                [
+                  3388.166,
+                  [
+                    "js",
+                    23,
+                    44
+                  ]
+                ],
+                [
+                  3383.792,
+                  [
+                    "js",
+                    30,
+                    578
+                  ]
+                ],
+                [
+                  3314.166,
+                  [
+                    "js",
+                    30,
+                    579
+                  ]
+                ],
+                [
+                  3255.541,
+                  [
+                    "js",
+                    23,
+                    16
+                  ]
+                ],
+                [
+                  3242.542,
+                  [
+                    "js",
+                    23,
+                    11
+                  ]
+                ],
+                [
+                  3217.5,
+                  [
+                    "js",
+                    30,
+                    927
+                  ]
+                ],
+                [
+                  3214.25,
+                  [
+                    "js",
+                    30,
+                    580
+                  ]
+                ],
+                [
+                  3204.0,
+                  [
+                    "js",
+                    23,
+                    27
+                  ]
+                ],
+                [
+                  3159.5,
+                  [
+                    "js",
+                    5,
+                    21
+                  ]
+                ],
+                [
+                  3152.584,
+                  [
+                    "js",
+                    22,
+                    54
+                  ]
+                ],
+                [
+                  3121.75,
+                  [
+                    "js",
+                    30,
+                    581
+                  ]
+                ]
+              ],
+              "build_median_ms": 90.7738125
+            }
+          },
+          "jsb": {
+            "published": {
+              "full_masks": 9045,
+              "measured_keys": 9021,
+              "tbm_us": {
+                "p50": 39.042,
+                "p90": 115.125,
+                "p99": 334.7835999999999,
+                "p99.9": 2220.7778200000266,
+                "p100": 2262.292
+              },
+              "raw_max_us": 2704.833,
+              "build_ms": [],
+              "worst": [
+                [
+                  2262.292,
+                  [
+                    "jsb/data/Github_ultra---o21135",
+                    1,
+                    466
+                  ]
+                ],
+                [
+                  2256.458,
+                  [
+                    "jsb/data/Github_ultra---o21135",
+                    1,
+                    17
+                  ]
+                ],
+                [
+                  2250.334,
+                  [
+                    "jsb/data/Github_ultra---o21135",
+                    0,
+                    473
+                  ]
+                ],
+                [
+                  2248.5,
+                  [
+                    "jsb/data/Github_ultra---o21135",
+                    0,
+                    17
+                  ]
+                ],
+                [
+                  2240.708,
+                  [
+                    "jsb/data/Github_ultra---o21135",
+                    1,
+                    933
+                  ]
+                ],
+                [
+                  2229.083,
+                  [
+                    "jsb/data/Github_ultra---o21135",
+                    0,
+                    926
+                  ]
+                ],
+                [
+                  2226.375,
+                  [
+                    "jsb/data/Github_ultra---o21135",
+                    0,
+                    1043
+                  ]
+                ],
+                [
+                  2226.249,
+                  [
+                    "jsb/data/Github_ultra---o21135",
+                    1,
+                    1049
+                  ]
+                ],
+                [
+                  2222.667,
+                  [
+                    "jsb/data/Github_ultra---o21135",
+                    0,
+                    1172
+                  ]
+                ],
+                [
+                  2221.167,
+                  [
+                    "jsb/data/Github_ultra---o21135",
+                    1,
+                    1180
+                  ]
+                ],
+                [
+                  2201.708,
+                  [
+                    "jsb/data/Github_ultra---o21135",
+                    0,
+                    1240
+                  ]
+                ],
+                [
+                  2201.292,
+                  [
+                    "jsb/data/Github_ultra---o21135",
+                    1,
+                    1251
+                  ]
+                ]
+              ]
+            },
+            "candidate": {
+              "full_masks": 9045,
+              "measured_keys": 9021,
+              "tbm_us": {
+                "p50": 38.708,
+                "p90": 115.167,
+                "p99": 335.6177999999998,
+                "p99.9": 2219.5163200000193,
+                "p100": 2259.625
+              },
+              "raw_max_us": 2680.833,
+              "build_ms": [],
+              "worst": [
+                [
+                  2259.625,
+                  [
+                    "jsb/data/Github_ultra---o21135",
+                    1,
+                    466
+                  ]
+                ],
+                [
+                  2252.209,
+                  [
+                    "jsb/data/Github_ultra---o21135",
+                    0,
+                    17
+                  ]
+                ],
+                [
+                  2248.126,
+                  [
+                    "jsb/data/Github_ultra---o21135",
+                    0,
+                    473
+                  ]
+                ],
+                [
+                  2242.916,
+                  [
+                    "jsb/data/Github_ultra---o21135",
+                    1,
+                    17
+                  ]
+                ],
+                [
+                  2234.334,
+                  [
+                    "jsb/data/Github_ultra---o21135",
+                    1,
+                    1180
+                  ]
+                ],
+                [
+                  2227.292,
+                  [
+                    "jsb/data/Github_ultra---o21135",
+                    0,
+                    1043
+                  ]
+                ],
+                [
+                  2227.083,
+                  [
+                    "jsb/data/Github_ultra---o21135",
+                    0,
+                    1172
+                  ]
+                ],
+                [
+                  2224.375,
+                  [
+                    "jsb/data/Github_ultra---o21135",
+                    0,
+                    926
+                  ]
+                ],
+                [
+                  2222.125,
+                  [
+                    "jsb/data/Github_ultra---o21135",
+                    1,
+                    1049
+                  ]
+                ],
+                [
+                  2219.793,
+                  [
+                    "jsb/data/Github_ultra---o21135",
+                    1,
+                    933
+                  ]
+                ],
+                [
+                  2205.959,
+                  [
+                    "jsb/data/Github_ultra---o21135",
+                    1,
+                    1251
+                  ]
+                ],
+                [
+                  2200.166,
+                  [
+                    "jsb/data/Github_ultra---o21135",
+                    0,
+                    1259
+                  ]
+                ]
+              ]
+            }
+          },
+          "static": {
+            "published": {
+              "full_masks": 4099,
+              "measured_keys": 4099,
+              "tbm_us": {
+                "p50": 19.25,
+                "p90": 29.583199999999998,
+                "p99": 47.83633999999999,
+                "p99.9": 72.59648200000015,
+                "p100": 80.625
+              },
+              "raw_max_us": 160.458,
+              "build_ms": [
+                3426.2608330000003,
+                3361.098375,
+                3364.647791,
+                3382.69675,
+                3390.9415,
+                3393.721416
+              ],
+              "worst": [
+                [
+                  80.625,
+                  [
+                    "js",
+                    30,
+                    583
+                  ]
+                ],
+                [
+                  74.75,
+                  [
+                    "js",
+                    18,
+                    53
+                  ]
+                ],
+                [
+                  72.792,
+                  [
+                    "js",
+                    18,
+                    55
+                  ]
+                ],
+                [
+                  72.709,
+                  [
+                    "js",
+                    18,
+                    14
+                  ]
+                ],
+                [
+                  72.625,
+                  [
+                    "js",
+                    30,
+                    545
+                  ]
+                ],
+                [
+                  72.334,
+                  [
+                    "js",
+                    30,
+                    577
+                  ]
+                ],
+                [
+                  71.417,
+                  [
+                    "js",
+                    5,
+                    13
+                  ]
+                ],
+                [
+                  64.125,
+                  [
+                    "js",
+                    14,
+                    12
+                  ]
+                ],
+                [
+                  60.667,
+                  [
+                    "js",
+                    18,
+                    12
+                  ]
+                ],
+                [
+                  60.459,
+                  [
+                    "js",
+                    30,
+                    543
+                  ]
+                ],
+                [
+                  59.375,
+                  [
+                    "js",
+                    30,
+                    578
+                  ]
+                ],
+                [
+                  59.166,
+                  [
+                    "js",
+                    3,
+                    116
+                  ]
+                ]
+              ],
+              "build_median_ms": 3386.819125
+            },
+            "candidate": {
+              "full_masks": 4099,
+              "measured_keys": 4099,
+              "tbm_us": {
+                "p50": 19.125,
+                "p90": 29.46640000000001,
+                "p99": 47.71133999999999,
+                "p99.9": 72.1520000000005,
+                "p100": 79.25
+              },
+              "raw_max_us": 109.75,
+              "build_ms": [
+                3309.636042,
+                3389.8772080000003,
+                3348.6501670000002,
+                3387.403875,
+                3430.107458,
+                3414.277833
+              ],
+              "worst": [
+                [
+                  79.25,
+                  [
+                    "js",
+                    30,
+                    583
+                  ]
+                ],
+                [
+                  78.334,
+                  [
+                    "js",
+                    18,
+                    53
+                  ]
+                ],
+                [
+                  74.083,
+                  [
+                    "js",
+                    18,
+                    55
+                  ]
+                ],
+                [
+                  72.792,
+                  [
+                    "js",
+                    18,
+                    14
+                  ]
+                ],
+                [
+                  72.25,
+                  [
+                    "js",
+                    30,
+                    545
+                  ]
+                ],
+                [
+                  71.25,
+                  [
+                    "js",
+                    5,
+                    13
+                  ]
+                ],
+                [
+                  69.25,
+                  [
+                    "js",
+                    30,
+                    577
+                  ]
+                ],
+                [
+                  68.25,
+                  [
+                    "js",
+                    14,
+                    12
+                  ]
+                ],
+                [
+                  60.333,
+                  [
+                    "js",
+                    18,
+                    12
+                  ]
+                ],
+                [
+                  60.0,
+                  [
+                    "js",
+                    30,
+                    543
+                  ]
+                ],
+                [
+                  59.167,
+                  [
+                    "js",
+                    30,
+                    578
+                  ]
+                ],
+                [
+                  58.625,
+                  [
+                    "js",
+                    18,
+                    54
+                  ]
+                ]
+              ],
+              "build_median_ms": 3388.6405415
+            }
+          }
+        }
+      },
+      "captures": {
+        "static-compiled": {
+          "masks": 77582,
+          "schemas": 126,
+          "decoded_bytes": 1245309451,
+          "sha256": "351dab2120aadea63c7515ff1c12630fd8857184817eb0f87dfaa1e30932ece2",
+          "compressed_bytes": 5292137
+        },
+        "static-loaded": {
+          "masks": 77582,
+          "schemas": 126,
+          "decoded_bytes": 1245309451,
+          "sha256": "351dab2120aadea63c7515ff1c12630fd8857184817eb0f87dfaa1e30932ece2",
+          "compressed_bytes": 5292137
+        },
+        "dynamic-compiled": {
+          "masks": 77582,
+          "schemas": 126,
+          "decoded_bytes": 1245309459,
+          "sha256": "e92ae58e35267945ea771421e735e574c34d2aa2f9d8b751454859d4d0ef33e6",
+          "compressed_bytes": 5297312
+        },
+        "dynamic-loaded": {
+          "masks": 77582,
+          "schemas": 126,
+          "decoded_bytes": 1245309459,
+          "sha256": "e92ae58e35267945ea771421e735e574c34d2aa2f9d8b751454859d4d0ef33e6",
+          "compressed_bytes": 5297312
+        }
+      },
+      "at": "2026-09-28T01:18:52.233902+08:00"
     }
   },
   "artifacts_sha256": {
@@ -5079,7 +6191,13 @@
     "native-static-1000/summary.json": "dc4ed2e218a45e1a7fc4d66975da66c4d34c73da7f0829aa942ae071374b2c8a",
     "cfa-integrated-ll-summary.json": "ee2627623b7d284354fabfbe98473e0fc262a83144862d45d83dafe059e8389a",
     "test-curve-audit.log": "63c8473156dc11883e5271a1b883b404ca90b1904c2a0468c8b3b2bfb9b1ca5d",
-    "actual-tail-recheck/summary.json": "fed5f3215c8392ccf5d8ac836e8911625183bab18168b35fab7b4dedc2af0cbc"
+    "actual-tail-recheck/summary.json": "fed5f3215c8392ccf5d8ac836e8911625183bab18168b35fab7b4dedc2af0cbc",
+    "integration-20260928/test-workspace-summary.json": "3a3bb011b8bd221fcede39334daba4dd3c42dd4847db1950aa8aa995de25700f",
+    "integration-20260928/test-python.log": "b1b9d4f57800b0eb46a20193e556d8d630a6ece39cff6219fdb9f4af85376f91",
+    "integration-20260928/test-doc.log": "3cbb05d4b816a0c9d3b5879a92edb82b65e3cd7f9bee4022a11843aee17bfc04",
+    "integration-20260928/postmerge-screen/summary.json": "e5316d3e5c8914a3137830d3513b7a580cfb07c99ec9174676f17f8bad5809d9",
+    "integration-20260928/captures/summary.json": "e43ca17ff027647a6c726bfb505a47f8f7e14a4c6586558c53559a5c843a8be4",
+    "integration-20260928/package.json": "eb7060f694dd6f29b2215eacbe8dc26f86f7eb87e941a0dc7b0a1eab2cc30bd6"
   },
   "rejected_variants": "Many-only witness was neutral; additional per-parser proof memo did not justify its overhead. Neither experimental mode is in production."
 }
