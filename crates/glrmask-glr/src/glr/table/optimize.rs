@@ -33,6 +33,15 @@ const DEFAULT_UNIT_INLINE_WORK_MAX_CELLS: usize = 2_000_000;
 const DEFAULT_UNIT_INLINE_WORK_MAX_SYNTHETIC_STATES: usize = 4_096;
 const DEFAULT_UNIT_INLINE_WORK_MAX_STACK_EFFECT_VISITS: usize = 100_000;
 const DEFAULT_UNIT_INLINE_STATE_MAX_STACK_EFFECT_VISITS: usize = 512;
+const UNIT_INLINE_COMPLETED_ABORT_ENV: &str =
+    "GLRMASK_UNIT_INLINE_COMPLETED_WORK_ABORT";
+
+fn completed_work_abort_eligible(construction: GlrTableConstruction) -> bool {
+    // The measured benefit is in the exact core-merged builder. Keep legacy
+    // and LALR scheduling untouched instead of charging successful static
+    // passes for a certificate they have not been shown to benefit from.
+    construction == GlrTableConstruction::ExperimentalCoreMerged
+}
 
 // Most unit-inlining states are singleton constituents. Keeping those
 // inline avoids thousands of tiny BTreeSet allocations before any synthetic
@@ -224,6 +233,38 @@ struct UnitInlineBudget {
     // atomic lets the budget be shared across the parallel stack-effect
     // precompute below while keeping serial behaviour byte-for-byte identical.
     abort_code: std::sync::atomic::AtomicU8,
+}
+
+/// A lower bound on work the serial fold will charge, not a shared child
+/// budget. Only completed jobs publish here, so a scheduling-dependent partial
+/// analysis can never cause a successful reference optimization to be lost.
+/// No production table changes until the normal serial phase or rollback.
+struct CompletedStackEffectWork {
+    visits: std::sync::atomic::AtomicUsize,
+    limit: usize,
+}
+
+impl CompletedStackEffectWork {
+    fn new(budget: &UnitInlineBudget) -> Option<Self> {
+        // In particular, leave the uncapped correctness oracle unchanged.
+        (budget.max_stack_effect_visits != usize::MAX).then(|| Self {
+            visits: std::sync::atomic::AtomicUsize::new(budget.stack_effect_visits()),
+            limit: budget.max_stack_effect_visits,
+        })
+    }
+
+    fn record_completed(&self, visits: usize) {
+        use std::sync::atomic::Ordering::Relaxed;
+        // One uncontended/local-budget total per job, not an atomic per visit.
+        // Saturation preserves the exceeded predicate even at usize::MAX-1.
+        let _ = self.visits.fetch_update(Relaxed, Relaxed, |total| {
+            Some(total.saturating_add(visits).min(self.limit + 1))
+        });
+    }
+
+    fn exceeded(&self) -> bool {
+        self.visits.load(std::sync::atomic::Ordering::Relaxed) > self.limit
+    }
 }
 
 const ABORT_NONE: u8 = 0;
@@ -2220,6 +2261,22 @@ impl GLRTable {
         undo: &mut UnitInlineUndo,
         protected_terminals: &BitSet,
     ) {
+        self.collapse_sr_unit_reductions_with_completed_work_abort(
+            budget,
+            undo,
+            protected_terminals,
+            completed_work_abort_eligible(self.construction)
+                && env_flag_enabled(UNIT_INLINE_COMPLETED_ABORT_ENV, true),
+        );
+    }
+
+    fn collapse_sr_unit_reductions_with_completed_work_abort(
+        &mut self,
+        budget: &UnitInlineBudget,
+        undo: &mut UnitInlineUndo,
+        protected_terminals: &BitSet,
+        stop_proven_abort_work: bool,
+    ) {
         let profile_enabled = std::env::var_os("GLRMASK_PROFILE_COMPILE").is_some()
             || std::env::var_os("GLRMASK_PROFILE_COMPILE_SUMMARY").is_some();
         let original_num_states = self.num_states;
@@ -2323,6 +2380,19 @@ impl GLRTable {
             let isolate_state_stack_effect_budget =
                 self.construction == GlrTableConstruction::ExperimentalCoreMerged;
             let state_stack_effect_visit_limit = unit_inline_state_max_stack_effect_visits();
+            // Core-merged children stop at the local cap plus one failed visit.
+            // If even every child exhausting that cap cannot exceed the parent
+            // limit, no certificate is possible in this phase: pay no atomics.
+            let certificate_possible = !isolate_state_stack_effect_budget
+                || candidate_states.len().saturating_mul(
+                    state_stack_effect_visit_limit
+                        .min(budget.max_stack_effect_visits)
+                        .saturating_add(1),
+                ) > budget.max_stack_effect_visits
+                    .saturating_sub(budget.stack_effect_visits());
+            let completed_work = (stop_proven_abort_work && certificate_possible)
+                .then(|| CompletedStackEffectWork::new(budget))
+                .flatten();
             let per_state: Vec<(
                 usize,
                 Vec<(TerminalID, StackInlineAttempt)>,
@@ -2341,6 +2411,11 @@ impl GLRTable {
                         } else {
                             budget.child()
                         };
+                        if completed_work.as_ref().is_some_and(|work| work.exceeded()) {
+                            // A complete result slot retains indexed collection
+                            // order; this empty job contributes no actual work.
+                            return (state, Vec::new(), Vec::new(), local_budget);
+                        }
                         let mut local_depth_cache: FxHashMap<(u32, u32), Option<StateSubset>> =
                             FxHashMap::default();
                         let mut reads = Vec::new();
@@ -2386,6 +2461,9 @@ impl GLRTable {
                                 (tid, inlined)
                             })
                             .collect();
+                        if let Some(work) = &completed_work {
+                            work.record_completed(local_budget.stack_effect_visits());
+                        }
                         (state, rows, reads, local_budget)
                     })
                     .collect()
@@ -2394,6 +2472,27 @@ impl GLRTable {
             let stack_phase_ms = stack_phase_started_at
                 .map(|started_at| started_at.elapsed().as_secs_f64() * 1000.0)
                 .unwrap_or(0.0);
+            if completed_work.as_ref().is_some_and(|work| work.exceeded()) {
+                // Every completed child's nonnegative count is charged by both
+                // reference fold policies, including locally exhausted states.
+                // The reference therefore must abort before committing this
+                // iteration. Account for all completed work and use the same
+                // outer undo journal to restore earlier iterations as well.
+                for (_, _, _, child) in &per_state {
+                    budget.fold_in_counts(child);
+                }
+                budget.abort(ABORT_STACK_EFFECT_VISITS);
+                if profile_enabled {
+                    eprintln!(
+                        "[glrmask/profile][unit_reduction_completed_abort] candidates={} nonempty_results={} stack_phase_ms={stack_phase_ms:.3} completed_stack_visits={} max_stack_visits={}",
+                        candidate_states.len(),
+                        per_state.iter().filter(|(_, rows, _, _)| !rows.is_empty()).count(),
+                        budget.stack_effect_visits(),
+                        budget.max_stack_effect_visits,
+                    );
+                }
+                break;
+            }
             let unit_phase_started_at = profile_enabled.then(std::time::Instant::now);
             let mut stack_effect_candidates = 0usize;
             let mut unit_candidates = 0usize;
@@ -6834,6 +6933,143 @@ mod tests {
             stack_effect_visits: std::sync::atomic::AtomicUsize::new(0),
             abort_code: std::sync::atomic::AtomicU8::new(ABORT_NONE),
         }
+    }
+
+    #[test]
+    fn completed_work_certificate_is_strict_monotone_and_overflow_safe() {
+        let mut budget = default_unit_inline_budget();
+        budget.max_stack_effect_visits = 10;
+        budget.stack_effect_visits.store(3, std::sync::atomic::Ordering::Relaxed);
+        let work = CompletedStackEffectWork::new(&budget).unwrap();
+        assert!(!work.exceeded());
+        work.record_completed(7);
+        assert!(!work.exceeded(), "work exactly at the cap must continue");
+        work.record_completed(1);
+        assert!(work.exceeded());
+        work.record_completed(usize::MAX);
+        assert!(work.exceeded(), "addition must not wrap below the cap");
+
+        budget.max_stack_effect_visits = usize::MAX - 1;
+        let work = CompletedStackEffectWork::new(&budget).unwrap();
+        work.record_completed(usize::MAX);
+        assert!(work.exceeded());
+        budget.max_stack_effect_visits = usize::MAX;
+        assert!(CompletedStackEffectWork::new(&budget).is_none());
+    }
+
+    #[test]
+    fn completed_work_production_policy_keeps_legacy_and_lalr_scheduling() {
+        assert!(completed_work_abort_eligible(GlrTableConstruction::ExperimentalCoreMerged));
+        assert!(!completed_work_abort_eligible(GlrTableConstruction::LegacyRowBisim));
+        assert!(!completed_work_abort_eligible(GlrTableConstruction::Lalr));
+    }
+
+    #[test]
+    fn completed_work_certificate_counts_locally_exhausted_states_concurrently() {
+        let mut budget = default_unit_inline_budget();
+        budget.max_stack_effect_visits = 63;
+        let work = CompletedStackEffectWork::new(&budget).unwrap();
+        let pool = rayon::ThreadPoolBuilder::new().num_threads(4).build().unwrap();
+        pool.install(|| {
+            (0..16).into_par_iter().for_each(|_| {
+                let child = budget.child_with_stack_effect_visit_limit(3);
+                for _ in 0..3 { assert!(child.record_stack_effect_visit()); }
+                assert!(!child.record_stack_effect_visit());
+                work.record_completed(child.stack_effect_visits());
+            });
+        });
+        assert!(work.exceeded());
+        // The certificate never aborts or spends the parent's live budget.
+        // The read-only phase must finish before folding/rollback is selected.
+        assert!(!budget.is_aborted());
+        assert_eq!(budget.stack_effect_visits(), 0);
+    }
+
+    #[test]
+    fn completed_work_abort_preserves_successful_and_rolled_back_tables() {
+        fn table(groups: usize, construction: GlrTableConstruction) -> GLRTable {
+            let n = groups * 5;
+            let mut action = vec![ActionRow::default(); n];
+            let mut goto = vec![GotoRow::default(); n];
+            for group in 0..groups {
+                let base = group * 5;
+                action[base + 1].insert(0, Action::Shift((base + 2) as u32, false));
+                action[base + 2].insert(0, Action::Split {
+                    shift: Some(((base + 4) as u32, false)),
+                    reduces: vec![(10, 1)], accept: false,
+                });
+                action[base + 3].insert(0, Action::Shift((base + 4) as u32, false));
+                goto[base + 1].insert(10, ((base + 3) as u32, true));
+            }
+            let mut table = GLRTable {
+                action, goto, num_states: n as u32, num_terminals: 1,
+                num_rules: 0, rules: Vec::new(), nonterminal_display_names: Vec::new(),
+                construction, admission_policy: AdmissionPolicy::ExactSimulation,
+                advance: Vec::new(), unconditional_advance: Vec::new(),
+                forwarded_shifts: FxHashSet::default(),
+                control_terminals: Default::default(), skip_terminals: Default::default(),
+                guarded_shift_index: Vec::new(), direct_regular_wide_frontiers: Vec::new(),
+            };
+            table.rebuild_advance_rows_from_actions();
+            table
+        }
+
+        let mut aborts = 0;
+        let mut successes = 0;
+        let mut changed = 0;
+        for threads in [1, 4] {
+            let pool = rayon::ThreadPoolBuilder::new().num_threads(threads).build().unwrap();
+            for construction in [GlrTableConstruction::LegacyRowBisim,
+                                 GlrTableConstruction::ExperimentalCoreMerged] {
+                for groups in [1, 8, 64] {
+                    for limit in [1, 8, 64, 100_000, usize::MAX] {
+                        let input = table(groups, construction);
+                        let protected = BitSet::new(1);
+                        let mut results = Vec::new();
+                        for stop in [false, true] {
+                            let mut result = input.clone();
+                            let mut budget = default_unit_inline_budget();
+                            budget.max_ms = u128::MAX;
+                            budget.max_stack_effect_visits = limit;
+                            let mut undo = UnitInlineUndo::new(&result);
+                            if limit == 1 {
+                                // Model a prior iteration that already changed
+                                // an original row: certified abort must undo it,
+                                // not merely leave the current phase untouched.
+                                undo.record_cell(&result, 0, 0);
+                                result.action[0].insert(0, Action::Shift(1, false));
+                                result.advance[0].set(0);
+                                budget.stack_effect_visits.store(
+                                    1, std::sync::atomic::Ordering::Relaxed,
+                                );
+                            }
+                            pool.install(|| {
+                                result.collapse_sr_unit_reductions_with_completed_work_abort(
+                                    &budget, &mut undo, &protected, stop,
+                                );
+                            });
+                            if budget.is_aborted() { undo.rollback(&mut result); }
+                            results.push((result, budget.is_aborted()));
+                        }
+                        assert_eq!(results[0].1, results[1].1,
+                                   "abort policy threads={threads} groups={groups} limit={limit}");
+                        assert_eq!(bincode::serialize(&results[0].0).unwrap(),
+                                   bincode::serialize(&results[1].0).unwrap(),
+                                   "complete table threads={threads} groups={groups} limit={limit}");
+                        if results[0].1 {
+                            aborts += 1;
+                            assert_eq!(results[0].0.action, input.action);
+                            assert_eq!(results[0].0.goto, input.goto);
+                        } else {
+                            successes += 1;
+                            changed += usize::from(results[0].0.action != input.action);
+                        }
+                    }
+                }
+            }
+        }
+        assert!(aborts > 0 && successes > 0 && changed > 0,
+                "must cover real aborts and successful nontrivial optimization");
     }
 
     #[test]
