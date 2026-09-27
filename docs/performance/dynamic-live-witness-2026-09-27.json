@@ -1,0 +1,5085 @@
+{
+  "code_commit": "6f9f1c4824f3db98ef8989459c8c7e95385c1a36",
+  "baseline_commit": "68a648fc3ee90feaf54209bbd8d3c8a307956539",
+  "scope": "Original JavaScript grammar; builds require LL success; runtime scores require exact finite LL-measured problem/example/position keys.",
+  "default": "Live-branch subtree proof enabled; GLRMASK_DISABLE_LIVE_BRANCH_WITNESS=1 is a diagnostic opt-out.",
+  "proof": "One Passed physical lexer/parser alternative remains live and self-loops on every remaining subtree byte. Finalizers may add other branches but retain this continuation. Lazy unions expose only exact bounded physical members with the same parser coordinate. Unknown, pending or over-budget cases use the ordinary walker.",
+  "work_limits": {
+    "physical_members_per_union": 8,
+    "branches_per_frontier": 8,
+    "lexer_row_proofs_per_mask": 64,
+    "minimum_saved_operations": 64,
+    "minimum_subtree_tokens": 16
+  },
+  "package": {
+    "base": "68a648fc3ee90feaf54209bbd8d3c8a307956539",
+    "candidate_commit": "6f9f1c4824f3db98ef8989459c8c7e95385c1a36",
+    "sha256": "7ddcb6d7af7b7fbb748572df816554aa16e739ee95124db5f20dc4656d96cf55",
+    "sources": {
+      "src/runtime/dynamic_mask/full_walk_dense.rs": "d49897ee44cda79b35a0d8773c91011a0931aed26bd590aabb8e998095ff58bd"
+    },
+    "default_enabled": true,
+    "diagnostic_disable": "GLRMASK_DISABLE_LIVE_BRANCH_WITNESS",
+    "root_lock_sha256": "0b685e457d6a6a7779e33229697bb0551e21591adf8cc632cd81579789eb6733"
+  },
+  "workspace_tests": {
+    "counts": [
+      2286,
+      0,
+      55
+    ],
+    "method": "Last summary per Cargo Running harness; nested child results are not counted twice.",
+    "harnesses": [
+      {
+        "harness": "Running unittests src/lib.rs (.benchmarks/dynamic-tail/target/release/deps/_glrmask-f06fafa12d4419aa)",
+        "summary": [
+          0,
+          0,
+          0
+        ]
+      },
+      {
+        "harness": "Running unittests src/lib.rs (.benchmarks/dynamic-tail/target/release/deps/glrmask-49f418fdc9063163)",
+        "summary": [
+          955,
+          0,
+          51
+        ]
+      },
+      {
+        "harness": "Running tests/regressions/tokenizer/byte_restricted_state_equivalence.rs (.benchmarks/dynamic-tail/target/release/deps/byte_restricted_state_equivalence_mre-ff72044bb1c06dfc)",
+        "summary": [
+          1,
+          0,
+          0
+        ]
+      },
+      {
+        "harness": "Running tests/regressions/parser/direct_glrm_ordered_suffix_ambiguity.rs (.benchmarks/dynamic-tail/target/release/deps/direct_glrm_ordered_suffix_ambiguity-70446dd325fb9f54)",
+        "summary": [
+          1,
+          0,
+          0
+        ]
+      },
+      {
+        "harness": "Running tests/regressions/parser/direct_glrm_ordered_suffix_fixed_n5.rs (.benchmarks/dynamic-tail/target/release/deps/direct_glrm_ordered_suffix_fixed_n5-12b471ed20481250)",
+        "summary": [
+          1,
+          0,
+          0
+        ]
+      },
+      {
+        "harness": "Running tests/end_tokens.rs (.benchmarks/dynamic-tail/target/release/deps/end_tokens-06f979c6a0483c8d)",
+        "summary": [
+          1,
+          0,
+          0
+        ]
+      },
+      {
+        "harness": "Running tests/final_public_api.rs (.benchmarks/dynamic-tail/target/release/deps/final_public_api-1df22d5e3a4ffba2)",
+        "summary": [
+          22,
+          0,
+          0
+        ]
+      },
+      {
+        "harness": "Running tests/final_public_api_review.rs (.benchmarks/dynamic-tail/target/release/deps/final_public_api_review-3a5186190f84602e)",
+        "summary": [
+          19,
+          0,
+          0
+        ]
+      },
+      {
+        "harness": "Running tests/glrm_v1.rs (.benchmarks/dynamic-tail/target/release/deps/glrm_v1-6c0b14a10120f2ec)",
+        "summary": [
+          21,
+          0,
+          0
+        ]
+      },
+      {
+        "harness": "Running tests/regressions/json_schema/integer_multiple_exact.rs (.benchmarks/dynamic-tail/target/release/deps/integer_multiple_exact-68c9f37a1b960244)",
+        "summary": [
+          2,
+          0,
+          0
+        ]
+      },
+      {
+        "harness": "Running tests/integration.rs (.benchmarks/dynamic-tail/target/release/deps/integration-42bf669b6a6ca90c)",
+        "summary": [
+          107,
+          0,
+          0
+        ]
+      },
+      {
+        "harness": "Running tests/json_schema/unicode_class_pattern.rs (.benchmarks/dynamic-tail/target/release/deps/json_schema_unicode_class_pattern-9872e02224a45c81)",
+        "summary": [
+          14,
+          0,
+          0
+        ]
+      },
+      {
+        "harness": "Running tests/json_schema/unicode_escape_characterization.rs (.benchmarks/dynamic-tail/target/release/deps/json_schema_unicode_escape_characterization-1d7b00de2351ed2a)",
+        "summary": [
+          7,
+          0,
+          0
+        ]
+      },
+      {
+        "harness": "Running tests/regressions/mre.rs (.benchmarks/dynamic-tail/target/release/deps/mre-1e6954efcbd48946)",
+        "summary": [
+          12,
+          0,
+          0
+        ]
+      },
+      {
+        "harness": "Running tests/regressions/parser/o13029_unit_inlining_false_negative.rs (.benchmarks/dynamic-tail/target/release/deps/o13029_unit_inlining_false_negative-defdcfea8a022050)",
+        "summary": [
+          1,
+          0,
+          0
+        ]
+      },
+      {
+        "harness": "Running tests/regressions/parser/o15627_schema_gss_split.rs (.benchmarks/dynamic-tail/target/release/deps/o15627_schema_gss_split_mre-92b27d38c395232a)",
+        "summary": [
+          1,
+          0,
+          0
+        ]
+      },
+      {
+        "harness": "Running tests/regressions/json_schema/o17408_false_positive.rs (.benchmarks/dynamic-tail/target/release/deps/o17408_repro-f3031f8fd2a1e9c1)",
+        "summary": [
+          1,
+          0,
+          0
+        ]
+      },
+      {
+        "harness": "Running tests/regressions/json_schema/o25804_mask_commit_mismatch.rs (.benchmarks/dynamic-tail/target/release/deps/o25804_mask_commit_mismatch-4bf4effc9d07db40)",
+        "summary": [
+          2,
+          0,
+          0
+        ]
+      },
+      {
+        "harness": "Running tests/regressions/tokenizer/o35155_scaling.rs (.benchmarks/dynamic-tail/target/release/deps/o35155_tokenizer_scaling-ce6769c3ca1b9542)",
+        "summary": [
+          19,
+          0,
+          0
+        ]
+      },
+      {
+        "harness": "Running tests/regressions/json_schema/o4836_unicode_escape_key.rs (.benchmarks/dynamic-tail/target/release/deps/o4836_unicode_escape_key-b5c72fe87b8589d2)",
+        "summary": [
+          4,
+          0,
+          0
+        ]
+      },
+      {
+        "harness": "Running tests/regressions/json_schema/o6363_required_anyof.rs (.benchmarks/dynamic-tail/target/release/deps/o6363_required_anyof-abb3d568348a0c3c)",
+        "summary": [
+          1,
+          0,
+          0
+        ]
+      },
+      {
+        "harness": "Running tests/regressions/json_schema/o67291_recursive_anyof_ref.rs (.benchmarks/dynamic-tail/target/release/deps/o67291_recursive_anyof_ref-93a99bfac5501d7b)",
+        "summary": [
+          2,
+          0,
+          0
+        ]
+      },
+      {
+        "harness": "Running tests/regressions/json_schema/o82710_whitespace.rs (.benchmarks/dynamic-tail/target/release/deps/o82710_repro-ca36bdd24ca661c1)",
+        "summary": [
+          8,
+          0,
+          0
+        ]
+      },
+      {
+        "harness": "Running tests/regressions/parser/ordered_anyof_ambiguity.rs (.benchmarks/dynamic-tail/target/release/deps/ordered_anyof_ambiguity-f63bdcf57d7d3a2d)",
+        "summary": [
+          3,
+          0,
+          0
+        ]
+      },
+      {
+        "harness": "Running tests/regressions/json_schema/resjson_recursive_ref.rs (.benchmarks/dynamic-tail/target/release/deps/resjson_repro-21259afd7c5b4f04)",
+        "summary": [
+          1,
+          0,
+          0
+        ]
+      },
+      {
+        "harness": "Running tests/regressions/replay/snowplow_hostname.rs (.benchmarks/dynamic-tail/target/release/deps/snowplow_hostname_replay_mre-78ade5cdb5ddb76e)",
+        "summary": [
+          1,
+          0,
+          0
+        ]
+      },
+      {
+        "harness": "Running tests/regressions/terminal_interchangeability/shared_suffix.rs (.benchmarks/dynamic-tail/target/release/deps/ti_mre_final-e69ddb56117ec086)",
+        "summary": [
+          1,
+          0,
+          0
+        ]
+      },
+      {
+        "harness": "Running tests/regressions/terminal_interchangeability/separator_transport.rs (.benchmarks/dynamic-tail/target/release/deps/ti_separator_transport_mre-4213e11b3dba6e10)",
+        "summary": [
+          1,
+          0,
+          0
+        ]
+      },
+      {
+        "harness": "Running tests/regressions/tokenizer/unicode_escape_progression.rs (.benchmarks/dynamic-tail/target/release/deps/unicode_escape_progression_glrm_mre-57a77e811d235dd5)",
+        "summary": [
+          7,
+          0,
+          0
+        ]
+      },
+      {
+        "harness": "Running tests/regressions/json_schema/word_limit_totality.rs (.benchmarks/dynamic-tail/target/release/deps/word_limit_totality-b047d438c2fef591)",
+        "summary": [
+          2,
+          0,
+          0
+        ]
+      },
+      {
+        "harness": "Running unittests src/lib.rs (.benchmarks/dynamic-tail/target/release/deps/glrmask_artifact-d6fef8c47223bdff)",
+        "summary": [
+          17,
+          0,
+          0
+        ]
+      },
+      {
+        "harness": "Running unittests src/lib.rs (.benchmarks/dynamic-tail/target/release/deps/glrmask_dwa_merge-3d6e62b0d8c911f9)",
+        "summary": [
+          16,
+          0,
+          0
+        ]
+      },
+      {
+        "harness": "Running unittests src/lib.rs (.benchmarks/dynamic-tail/target/release/deps/glrmask_finite_automata-12f1cdc0b31318df)",
+        "summary": [
+          6,
+          0,
+          0
+        ]
+      },
+      {
+        "harness": "Running unittests src/lib.rs (.benchmarks/dynamic-tail/target/release/deps/glrmask_glr-0ef77f9ecdda31b6)",
+        "summary": [
+          216,
+          0,
+          2
+        ]
+      },
+      {
+        "harness": "Running unittests src/lib.rs (.benchmarks/dynamic-tail/target/release/deps/glrmask_grammar-c3e6465b3fa57e06)",
+        "summary": [
+          92,
+          0,
+          0
+        ]
+      },
+      {
+        "harness": "Running unittests src/lib.rs (.benchmarks/dynamic-tail/target/release/deps/glrmask_invariant-7abd4db0fc85f2da)",
+        "summary": [
+          4,
+          0,
+          0
+        ]
+      },
+      {
+        "harness": "Running unittests src/lib.rs (.benchmarks/dynamic-tail/target/release/deps/glrmask_json_schema-1724533bfa16e9bb)",
+        "summary": [
+          51,
+          0,
+          0
+        ]
+      },
+      {
+        "harness": "Running unittests src/lib.rs (.benchmarks/dynamic-tail/target/release/deps/glrmask_lexer-7e62ebc66b1d68ac)",
+        "summary": [
+          240,
+          0,
+          0
+        ]
+      },
+      {
+        "harness": "Running unittests src/lib.rs (.benchmarks/dynamic-tail/target/release/deps/glrmask_parser_dwa-44bddf236f63ba56)",
+        "summary": [
+          69,
+          0,
+          2
+        ]
+      },
+      {
+        "harness": "Running unittests src/lib.rs (.benchmarks/dynamic-tail/target/release/deps/glrmask_terminal_dwa-997145e7a76227b2)",
+        "summary": [
+          273,
+          0,
+          0
+        ]
+      },
+      {
+        "harness": "Running unittests src/lib.rs (.benchmarks/dynamic-tail/target/release/deps/glrmask_vocab-845a4b067cb7f438)",
+        "summary": [
+          3,
+          0,
+          0
+        ]
+      },
+      {
+        "harness": "Running unittests src/lib.rs (.benchmarks/dynamic-tail/target/release/deps/glrmask_weight-af4ddf4c3a71a0e8)",
+        "summary": [
+          27,
+          0,
+          0
+        ]
+      },
+      {
+        "harness": "Running unittests src/lib.rs (.benchmarks/dynamic-tail/target/release/deps/glrmask_weighted_automata-4c9ecb162a501f5b)",
+        "summary": [
+          54,
+          0,
+          0
+        ]
+      }
+    ]
+  },
+  "python_tests": 42,
+  "doc_tests": 1,
+  "captures": {
+    "static-compiled": {
+      "masks": 77582,
+      "schemas": 126,
+      "decoded_bytes": 1245309451,
+      "sha256": "351dab2120aadea63c7515ff1c12630fd8857184817eb0f87dfaa1e30932ece2",
+      "compressed_bytes": 5292137
+    },
+    "static-loaded": {
+      "masks": 77582,
+      "schemas": 126,
+      "decoded_bytes": 1245309451,
+      "sha256": "351dab2120aadea63c7515ff1c12630fd8857184817eb0f87dfaa1e30932ece2",
+      "compressed_bytes": 5292137
+    },
+    "dynamic-compiled": {
+      "masks": 77582,
+      "schemas": 126,
+      "decoded_bytes": 1245309459,
+      "sha256": "e92ae58e35267945ea771421e735e574c34d2aa2f9d8b751454859d4d0ef33e6",
+      "compressed_bytes": 5297312
+    },
+    "dynamic-loaded": {
+      "masks": 77582,
+      "schemas": 126,
+      "decoded_bytes": 1245309459,
+      "sha256": "e92ae58e35267945ea771421e735e574c34d2aa2f9d8b751454859d4d0ef33e6",
+      "compressed_bytes": 5297312
+    }
+  },
+  "screen": {
+    "cache": "on",
+    "repetitions_per_side": 6,
+    "scope": "Only LL-success builds; only exact LL-measured (problem,example,step) runtime keys",
+    "metric": "mask_i+commit_i, minimum complete same-run pair over equal fresh-state repetitions",
+    "candidate_sha256": "7ddcb6d7af7b7fbb748572df816554aa16e739ee95124db5f20dc4656d96cf55",
+    "published_sha256": "08419adddbf518bc049958f29cbff55a54aec0b8aa1933dca690e12dbdbfcccd",
+    "groups": {
+      "js": {
+        "published": {
+          "full_masks": 4099,
+          "measured_keys": 4099,
+          "tbm_us": {
+            "p50": 689.959,
+            "p90": 2270.8336,
+            "p99": 3389.15968,
+            "p99.9": 3857.5997500000444,
+            "p100": 4410.125
+          },
+          "raw_max_us": 5989.041,
+          "build_ms": [
+            131.10862500000002,
+            97.123459,
+            99.50658299999999,
+            101.825209,
+            112.45066700000001,
+            109.29462500000001,
+            114.58975000000001,
+            97.61975000000001
+          ],
+          "worst": [
+            [
+              4410.125,
+              [
+                "js",
+                23,
+                7
+              ]
+            ],
+            [
+              4366.375,
+              [
+                "js",
+                23,
+                23
+              ]
+            ],
+            [
+              3916.916,
+              [
+                "js",
+                23,
+                44
+              ]
+            ],
+            [
+              3871.416,
+              [
+                "js",
+                30,
+                577
+              ]
+            ],
+            [
+              3866.334,
+              [
+                "js",
+                30,
+                578
+              ]
+            ],
+            [
+              3777.209,
+              [
+                "js",
+                30,
+                579
+              ]
+            ],
+            [
+              3754.459,
+              [
+                "js",
+                23,
+                16
+              ]
+            ],
+            [
+              3732.25,
+              [
+                "js",
+                30,
+                927
+              ]
+            ],
+            [
+              3704.417,
+              [
+                "js",
+                23,
+                11
+              ]
+            ],
+            [
+              3676.292,
+              [
+                "js",
+                22,
+                54
+              ]
+            ],
+            [
+              3672.833,
+              [
+                "js",
+                5,
+                21
+              ]
+            ],
+            [
+              3667.209,
+              [
+                "js",
+                30,
+                580
+              ]
+            ]
+          ],
+          "build_median_ms": 105.55991700000001
+        },
+        "reference": {
+          "full_masks": 4099,
+          "measured_keys": 4099,
+          "tbm_us": {
+            "p50": 695.125,
+            "p90": 2296.6998000000003,
+            "p99": 3402.0838400000002,
+            "p99.9": 3877.2016340000337,
+            "p100": 4470.792
+          },
+          "raw_max_us": 4928.334,
+          "build_ms": [
+            105.539542,
+            122.651833,
+            103.769834,
+            100.979292,
+            97.32516700000001,
+            100.231125,
+            98.983333,
+            110.15625
+          ],
+          "worst": [
+            [
+              4470.792,
+              [
+                "js",
+                23,
+                7
+              ]
+            ],
+            [
+              4422.0,
+              [
+                "js",
+                23,
+                23
+              ]
+            ],
+            [
+              3943.875,
+              [
+                "js",
+                30,
+                577
+              ]
+            ],
+            [
+              3931.875,
+              [
+                "js",
+                23,
+                44
+              ]
+            ],
+            [
+              3883.833,
+              [
+                "js",
+                30,
+                578
+              ]
+            ],
+            [
+              3816.166,
+              [
+                "js",
+                30,
+                579
+              ]
+            ],
+            [
+              3783.25,
+              [
+                "js",
+                30,
+                927
+              ]
+            ],
+            [
+              3760.167,
+              [
+                "js",
+                23,
+                16
+              ]
+            ],
+            [
+              3718.833,
+              [
+                "js",
+                30,
+                580
+              ]
+            ],
+            [
+              3709.084,
+              [
+                "js",
+                23,
+                11
+              ]
+            ],
+            [
+              3698.834,
+              [
+                "js",
+                5,
+                21
+              ]
+            ],
+            [
+              3685.084,
+              [
+                "js",
+                22,
+                54
+              ]
+            ]
+          ],
+          "build_median_ms": 102.374563
+        },
+        "candidate": {
+          "full_masks": 4099,
+          "measured_keys": 4099,
+          "tbm_us": {
+            "p50": 696.208,
+            "p90": 2320.2994000000003,
+            "p99": 3431.87466,
+            "p99.9": 3823.292214000024,
+            "p100": 3964.166
+          },
+          "raw_max_us": 4292.542,
+          "build_ms": [
+            123.95837499999999,
+            98.289208,
+            99.046208,
+            97.25925000000001,
+            107.007875,
+            100.985167,
+            104.44945899999999,
+            98.340291
+          ],
+          "worst": [
+            [
+              3964.166,
+              [
+                "js",
+                30,
+                577
+              ]
+            ],
+            [
+              3962.083,
+              [
+                "js",
+                30,
+                578
+              ]
+            ],
+            [
+              3918.875,
+              [
+                "js",
+                23,
+                44
+              ]
+            ],
+            [
+              3902.958,
+              [
+                "js",
+                30,
+                579
+              ]
+            ],
+            [
+              3828.041,
+              [
+                "js",
+                30,
+                580
+              ]
+            ],
+            [
+              3779.584,
+              [
+                "js",
+                23,
+                16
+              ]
+            ],
+            [
+              3729.834,
+              [
+                "js",
+                23,
+                11
+              ]
+            ],
+            [
+              3720.625,
+              [
+                "js",
+                30,
+                581
+              ]
+            ],
+            [
+              3719.625,
+              [
+                "js",
+                30,
+                927
+              ]
+            ],
+            [
+              3714.459,
+              [
+                "js",
+                22,
+                54
+              ]
+            ],
+            [
+              3694.75,
+              [
+                "js",
+                23,
+                27
+              ]
+            ],
+            [
+              3688.333,
+              [
+                "js",
+                5,
+                21
+              ]
+            ]
+          ],
+          "build_median_ms": 100.0156875
+        }
+      },
+      "jsb": {
+        "published": {
+          "full_masks": 9045,
+          "measured_keys": 9021,
+          "tbm_us": {
+            "p50": 44.875,
+            "p90": 135.001,
+            "p99": 397.32559999999995,
+            "p99.9": 2630.1875000000127,
+            "p100": 2666.417
+          },
+          "raw_max_us": 2837.001,
+          "build_ms": [],
+          "worst": [
+            [
+              2666.417,
+              [
+                "jsb/data/Github_ultra---o21135",
+                0,
+                473
+              ]
+            ],
+            [
+              2664.166,
+              [
+                "jsb/data/Github_ultra---o21135",
+                1,
+                466
+              ]
+            ],
+            [
+              2662.458,
+              [
+                "jsb/data/Github_ultra---o21135",
+                0,
+                17
+              ]
+            ],
+            [
+              2657.624,
+              [
+                "jsb/data/Github_ultra---o21135",
+                1,
+                17
+              ]
+            ],
+            [
+              2654.625,
+              [
+                "jsb/data/Github_ultra---o21135",
+                0,
+                1043
+              ]
+            ],
+            [
+              2649.25,
+              [
+                "jsb/data/Github_ultra---o21135",
+                1,
+                1180
+              ]
+            ],
+            [
+              2641.999,
+              [
+                "jsb/data/Github_ultra---o21135",
+                1,
+                1049
+              ]
+            ],
+            [
+              2640.582,
+              [
+                "jsb/data/Github_ultra---o21135",
+                0,
+                1172
+              ]
+            ],
+            [
+              2640.458,
+              [
+                "jsb/data/Github_ultra---o21135",
+                1,
+                933
+              ]
+            ],
+            [
+              2630.375,
+              [
+                "jsb/data/Github_ultra---o21135",
+                0,
+                926
+              ]
+            ],
+            [
+              2621.0,
+              [
+                "jsb/data/Github_ultra---o21135",
+                1,
+                1251
+              ]
+            ],
+            [
+              2618.833,
+              [
+                "jsb/data/Github_ultra---o21135",
+                0,
+                1240
+              ]
+            ]
+          ]
+        },
+        "reference": {
+          "full_masks": 9045,
+          "measured_keys": 9021,
+          "tbm_us": {
+            "p50": 45.75,
+            "p90": 135.792,
+            "p99": 396.333,
+            "p99.9": 2622.9698400000193,
+            "p100": 2655.834
+          },
+          "raw_max_us": 2800.083,
+          "build_ms": [],
+          "worst": [
+            [
+              2655.834,
+              [
+                "jsb/data/Github_ultra---o21135",
+                0,
+                473
+              ]
+            ],
+            [
+              2654.291,
+              [
+                "jsb/data/Github_ultra---o21135",
+                0,
+                17
+              ]
+            ],
+            [
+              2645.834,
+              [
+                "jsb/data/Github_ultra---o21135",
+                0,
+                1043
+              ]
+            ],
+            [
+              2645.583,
+              [
+                "jsb/data/Github_ultra---o21135",
+                1,
+                17
+              ]
+            ],
+            [
+              2639.959,
+              [
+                "jsb/data/Github_ultra---o21135",
+                1,
+                466
+              ]
+            ],
+            [
+              2632.583,
+              [
+                "jsb/data/Github_ultra---o21135",
+                0,
+                1172
+              ]
+            ],
+            [
+              2627.374,
+              [
+                "jsb/data/Github_ultra---o21135",
+                1,
+                1180
+              ]
+            ],
+            [
+              2627.041,
+              [
+                "jsb/data/Github_ultra---o21135",
+                1,
+                1049
+              ]
+            ],
+            [
+              2623.334,
+              [
+                "jsb/data/Github_ultra---o21135",
+                0,
+                926
+              ]
+            ],
+            [
+              2623.249,
+              [
+                "jsb/data/Github_ultra---o21135",
+                1,
+                933
+              ]
+            ],
+            [
+              2609.291,
+              [
+                "jsb/data/Github_ultra---o21135",
+                1,
+                1251
+              ]
+            ],
+            [
+              2608.125,
+              [
+                "jsb/data/Github_ultra---o21135",
+                0,
+                1240
+              ]
+            ]
+          ]
+        },
+        "candidate": {
+          "full_masks": 9045,
+          "measured_keys": 9021,
+          "tbm_us": {
+            "p50": 45.75,
+            "p90": 135.708,
+            "p99": 400.1501999999999,
+            "p99.9": 2618.33232,
+            "p100": 2671.458
+          },
+          "raw_max_us": 2784.833,
+          "build_ms": [],
+          "worst": [
+            [
+              2671.458,
+              [
+                "jsb/data/Github_ultra---o21135",
+                1,
+                466
+              ]
+            ],
+            [
+              2664.083,
+              [
+                "jsb/data/Github_ultra---o21135",
+                1,
+                17
+              ]
+            ],
+            [
+              2663.292,
+              [
+                "jsb/data/Github_ultra---o21135",
+                0,
+                17
+              ]
+            ],
+            [
+              2654.542,
+              [
+                "jsb/data/Github_ultra---o21135",
+                0,
+                473
+              ]
+            ],
+            [
+              2652.458,
+              [
+                "jsb/data/Github_ultra---o21135",
+                1,
+                1180
+              ]
+            ],
+            [
+              2634.626,
+              [
+                "jsb/data/Github_ultra---o21135",
+                0,
+                1043
+              ]
+            ],
+            [
+              2632.667,
+              [
+                "jsb/data/Github_ultra---o21135",
+                1,
+                1049
+              ]
+            ],
+            [
+              2630.542,
+              [
+                "jsb/data/Github_ultra---o21135",
+                0,
+                1172
+              ]
+            ],
+            [
+              2619.416,
+              [
+                "jsb/data/Github_ultra---o21135",
+                1,
+                1251
+              ]
+            ],
+            [
+              2618.334,
+              [
+                "jsb/data/Github_ultra---o21135",
+                1,
+                933
+              ]
+            ],
+            [
+              2618.25,
+              [
+                "jsb/data/Github_ultra---o21135",
+                0,
+                926
+              ]
+            ],
+            [
+              2612.541,
+              [
+                "jsb/data/Github_ultra---o21135",
+                0,
+                1240
+              ]
+            ]
+          ]
+        }
+      },
+      "static": {
+        "published": {
+          "full_masks": 4099,
+          "measured_keys": 4099,
+          "tbm_us": {
+            "p50": 22.542,
+            "p90": 34.292,
+            "p99": 53.58468,
+            "p99.9": 84.29409800000273,
+            "p100": 93.084
+          },
+          "raw_max_us": 101.208,
+          "build_ms": [
+            3828.807875,
+            3809.3202920000003,
+            3698.085917,
+            3696.36025,
+            3781.396209,
+            3700.8445,
+            3757.884708,
+            3703.845125
+          ],
+          "worst": [
+            [
+              93.084,
+              [
+                "js",
+                30,
+                583
+              ]
+            ],
+            [
+              87.375,
+              [
+                "js",
+                18,
+                53
+              ]
+            ],
+            [
+              85.916,
+              [
+                "js",
+                18,
+                55
+              ]
+            ],
+            [
+              85.0,
+              [
+                "js",
+                18,
+                14
+              ]
+            ],
+            [
+              84.833,
+              [
+                "js",
+                30,
+                545
+              ]
+            ],
+            [
+              79.334,
+              [
+                "js",
+                30,
+                577
+              ]
+            ],
+            [
+              77.625,
+              [
+                "js",
+                5,
+                13
+              ]
+            ],
+            [
+              76.0,
+              [
+                "js",
+                14,
+                12
+              ]
+            ],
+            [
+              71.208,
+              [
+                "js",
+                30,
+                543
+              ]
+            ],
+            [
+              70.625,
+              [
+                "js",
+                18,
+                12
+              ]
+            ],
+            [
+              69.292,
+              [
+                "js",
+                3,
+                116
+              ]
+            ],
+            [
+              68.25,
+              [
+                "js",
+                30,
+                578
+              ]
+            ]
+          ],
+          "build_median_ms": 3730.8649164999997
+        },
+        "reference": {
+          "full_masks": 4099,
+          "measured_keys": 4099,
+          "tbm_us": {
+            "p50": 22.75,
+            "p90": 34.46640000000001,
+            "p99": 54.293499999999995,
+            "p99.9": 85.36590200000175,
+            "p100": 93.334
+          },
+          "raw_max_us": 100.0,
+          "build_ms": [
+            3881.392334,
+            3865.113667,
+            3789.4502079999997,
+            3703.4377919999997,
+            3810.911083,
+            3764.419709,
+            3713.1768749999997,
+            3743.981792
+          ],
+          "worst": [
+            [
+              93.334,
+              [
+                "js",
+                30,
+                583
+              ]
+            ],
+            [
+              86.208,
+              [
+                "js",
+                18,
+                53
+              ]
+            ],
+            [
+              85.916,
+              [
+                "js",
+                30,
+                545
+              ]
+            ],
+            [
+              85.875,
+              [
+                "js",
+                18,
+                55
+              ]
+            ],
+            [
+              85.709,
+              [
+                "js",
+                18,
+                14
+              ]
+            ],
+            [
+              82.208,
+              [
+                "js",
+                14,
+                12
+              ]
+            ],
+            [
+              81.333,
+              [
+                "js",
+                30,
+                577
+              ]
+            ],
+            [
+              74.875,
+              [
+                "js",
+                5,
+                13
+              ]
+            ],
+            [
+              71.375,
+              [
+                "js",
+                18,
+                12
+              ]
+            ],
+            [
+              70.584,
+              [
+                "js",
+                30,
+                543
+              ]
+            ],
+            [
+              70.0,
+              [
+                "js",
+                30,
+                578
+              ]
+            ],
+            [
+              68.917,
+              [
+                "js",
+                3,
+                116
+              ]
+            ]
+          ],
+          "build_median_ms": 3776.9349585
+        },
+        "candidate": {
+          "full_masks": 4099,
+          "measured_keys": 4099,
+          "tbm_us": {
+            "p50": 22.583,
+            "p90": 34.25,
+            "p99": 53.33883999999999,
+            "p99.9": 84.73565200000156,
+            "p100": 94.375
+          },
+          "raw_max_us": 102.334,
+          "build_ms": [
+            3761.328417,
+            3865.931625,
+            3786.5355,
+            3854.6917500000004,
+            4063.627959,
+            3804.853792,
+            3807.098625,
+            3809.767875
+          ],
+          "worst": [
+            [
+              94.375,
+              [
+                "js",
+                30,
+                583
+              ]
+            ],
+            [
+              88.083,
+              [
+                "js",
+                18,
+                14
+              ]
+            ],
+            [
+              86.5,
+              [
+                "js",
+                18,
+                53
+              ]
+            ],
+            [
+              85.542,
+              [
+                "js",
+                30,
+                545
+              ]
+            ],
+            [
+              85.042,
+              [
+                "js",
+                18,
+                55
+              ]
+            ],
+            [
+              81.916,
+              [
+                "js",
+                30,
+                577
+              ]
+            ],
+            [
+              81.0,
+              [
+                "js",
+                5,
+                13
+              ]
+            ],
+            [
+              80.042,
+              [
+                "js",
+                14,
+                12
+              ]
+            ],
+            [
+              70.834,
+              [
+                "js",
+                18,
+                12
+              ]
+            ],
+            [
+              70.709,
+              [
+                "js",
+                30,
+                578
+              ]
+            ],
+            [
+              70.417,
+              [
+                "js",
+                30,
+                543
+              ]
+            ],
+            [
+              68.167,
+              [
+                "js",
+                3,
+                116
+              ]
+            ]
+          ],
+          "build_median_ms": 3808.43325
+        }
+      }
+    }
+  },
+  "native": {
+    "dynamic": {
+      "mode": "dynamic",
+      "semantic_differences": 0,
+      "binary_sha256": {
+        "published": "79aa35e28c9b960c1f2ee140a307bac73b87905e50c550da996110b06488314e",
+        "candidate": "78d967581640f49c36e6bf8ed58bbe552277e77926c40acdd5fcd7d69f2ad1c8"
+      },
+      "comparison": "Independently built published 68a648fc3 versus live-branch witness 6f9f1c482 default; identical locked native harness and production cache policy.",
+      "selection": {
+        "policy": "First 1000 schemas in retained corpus order after llguidance-success filter; do not drop candidate failures",
+        "input_schemas": 9558,
+        "ll_supported": 8332,
+        "selected": 1000,
+        "ll_reference": "/Users/isaacbreen/Projects2/constraint-framework-analysis/results/final-jsb-refresh-s50-mac-20260923/raw/llguidance.json.zst",
+        "ll_sha256": "64d28941a60d8262b7e201b94a13726e48e2eddcff2e4a8eb2718e6764551adc",
+        "corpus_sha256": "e129fccf28eccb28abf064b8b39f90eb5e42aef14c112e7be794269b44ed8bbd",
+        "runner_source_sha256": "9a076512299482de5dddf34dcd9032b0cf81c0806d1a7201137ebe772dbe7821",
+        "ids": [
+          "jsb/data/Kubernetes---kb_223_Normalized",
+          "jsb/data/Snowplow---sp_295_Normalized",
+          "jsb/data/Github_easy---o76766",
+          "jsb/data/Github_medium---o83086",
+          "jsb/data/Kubernetes---kb_576_Normalized",
+          "jsb/data/Snowplow---sp_149_Normalized",
+          "jsb/data/Github_easy---o66586",
+          "jsb/data/Glaiveai2K---calculate_area_98abd231",
+          "jsb/data/Glaiveai2K---calculate_area_867a9626",
+          "jsb/data/Github_medium---o70369",
+          "jsb/data/Glaiveai2K---create_calendar_event_b6063530",
+          "jsb/data/Glaiveai2K---calculate_area_380ef84d",
+          "jsb/data/Kubernetes---kb_727_Normalized",
+          "jsb/data/Glaiveai2K---search_recipe_8096f36e",
+          "jsb/data/Kubernetes---kb_432_Normalized",
+          "jsb/data/Github_medium---o27787",
+          "jsb/data/Github_medium---o82377",
+          "jsb/data/Github_easy---o20466",
+          "jsb/data/Snowplow---sp_267_Normalized",
+          "jsb/data/Glaiveai2K---calculate_rental_income_bce2d46e",
+          "jsb/data/Github_medium---o39435",
+          "jsb/data/Github_medium---o26969",
+          "jsb/data/Github_hard---o31007",
+          "jsb/data/Github_easy---o12622",
+          "jsb/data/Github_medium---o50683",
+          "jsb/data/Github_easy---o89833",
+          "jsb/data/Github_hard---o6090",
+          "jsb/data/Snowplow---sp_409_Normalized",
+          "jsb/data/Kubernetes---kb_718_Normalized",
+          "jsb/data/Github_medium---o9878",
+          "jsb/data/Github_easy---o90345",
+          "jsb/data/Kubernetes---kb_919_Normalized",
+          "jsb/data/Github_easy---o58273",
+          "jsb/data/Github_trivial---o69753",
+          "jsb/data/Github_medium---o30735",
+          "jsb/data/Github_medium---o60973",
+          "jsb/data/Github_medium---o15178",
+          "jsb/data/Github_hard---o84200",
+          "jsb/data/Glaiveai2K---generate_invoice_c887e181",
+          "jsb/data/Kubernetes---kb_1064_Normalized",
+          "jsb/data/Kubernetes---kb_951_Normalized",
+          "jsb/data/Github_hard---o41192",
+          "jsb/data/Github_easy---o65305",
+          "jsb/data/Github_ultra---o60252",
+          "jsb/data/Kubernetes---kb_775_Normalized",
+          "jsb/data/Github_medium---o57436",
+          "jsb/data/Github_hard---o89723",
+          "jsb/data/Glaiveai2K---calculate_area_a9125cf8",
+          "jsb/data/Github_easy---o58490",
+          "jsb/data/Github_trivial---o62772",
+          "jsb/data/Kubernetes---kb_45_Normalized",
+          "jsb/data/Github_trivial---o78117",
+          "jsb/data/Github_easy---o41803",
+          "jsb/data/Github_ultra---o71471",
+          "jsb/data/Github_trivial---o83723",
+          "jsb/data/Github_medium---o83131",
+          "jsb/data/Glaiveai2K---book_hotel_8f40c25f",
+          "jsb/data/Github_trivial---o77740",
+          "jsb/data/Github_medium---o65372",
+          "jsb/data/Glaiveai2K---create_invoice_2b2ef017",
+          "jsb/data/Snowplow---sp_227_Normalized",
+          "jsb/data/Glaiveai2K---calculate_area_ed89a519",
+          "jsb/data/Github_hard---o48013",
+          "jsb/data/Glaiveai2K---calculate_area_26c9d055",
+          "jsb/data/Github_medium---o61614",
+          "jsb/data/Github_easy---o66187",
+          "jsb/data/Github_hard---o33027",
+          "jsb/data/JsonSchemaStore---importmap",
+          "jsb/data/Github_easy---o53898",
+          "jsb/data/Github_hard---o9843",
+          "jsb/data/Github_trivial---o3211",
+          "jsb/data/Github_hard---o47197",
+          "jsb/data/Github_hard---o64563",
+          "jsb/data/Github_hard---o7313",
+          "jsb/data/Kubernetes---kb_483_Normalized",
+          "jsb/data/Kubernetes---kb_269_Normalized",
+          "jsb/data/JsonSchemaStore---component",
+          "jsb/data/Github_trivial---o44989",
+          "jsb/data/Github_easy---o20458",
+          "jsb/data/Github_trivial---o40355",
+          "jsb/data/Github_easy---o90235",
+          "jsb/data/Github_medium---o13",
+          "jsb/data/Glaiveai2K---calculate_distance_731540d9",
+          "jsb/data/Github_hard---o36010",
+          "jsb/data/Github_easy---o67463",
+          "jsb/data/Github_medium---o69733",
+          "jsb/data/Kubernetes---kb_367_Normalized",
+          "jsb/data/Github_hard---o59668",
+          "jsb/data/Glaiveai2K---calculate_area_cae07f36",
+          "jsb/data/Snowplow---sp_311_Normalized",
+          "jsb/data/Github_hard---o30094",
+          "jsb/data/Glaiveai2K---calculate_area_15d77de3",
+          "jsb/data/Kubernetes---kb_1025_Normalized",
+          "jsb/data/Github_trivial---o45634",
+          "jsb/data/Github_medium---o71300",
+          "jsb/data/Glaiveai2K---calculate_area_d986777c",
+          "jsb/data/Github_ultra---o3625",
+          "jsb/data/Glaiveai2K---generate_random_password_0b5e94e6",
+          "jsb/data/Github_hard---o40394",
+          "jsb/data/Kubernetes---kb_643_Normalized",
+          "jsb/data/Github_hard---o62961",
+          "jsb/data/Github_medium---o78137",
+          "jsb/data/Github_medium---o61533",
+          "jsb/data/Github_easy---o45172",
+          "jsb/data/Github_medium---o68301",
+          "jsb/data/Github_easy---o25983",
+          "jsb/data/Github_hard---o4360",
+          "jsb/data/Github_medium---o22449",
+          "jsb/data/Github_trivial---o66311",
+          "jsb/data/Github_easy---o89607",
+          "jsb/data/Github_hard---o60288",
+          "jsb/data/Github_medium---o48002",
+          "jsb/data/Glaiveai2K---create_calendar_event_ede3b10f",
+          "jsb/data/Kubernetes---kb_889_Normalized",
+          "jsb/data/Github_easy---o11170",
+          "jsb/data/Glaiveai2K---schedule_meeting_58e2161b",
+          "jsb/data/Github_medium---o73919",
+          "jsb/data/Github_medium---o5373",
+          "jsb/data/Github_medium---o31362",
+          "jsb/data/Github_trivial---o45635",
+          "jsb/data/Github_easy---o35770",
+          "jsb/data/Github_easy---o79448",
+          "jsb/data/Kubernetes---kb_359_Normalized",
+          "jsb/data/Github_easy---o30899",
+          "jsb/data/Github_medium---o4833",
+          "jsb/data/Glaiveai2K---calculate_area_652bb90d",
+          "jsb/data/Kubernetes---kb_144_Normalized",
+          "jsb/data/Glaiveai2K---calculate_mortgage_payment_e133248d",
+          "jsb/data/Github_easy---o91008",
+          "jsb/data/Github_easy---o44231",
+          "jsb/data/Github_easy---o91096",
+          "jsb/data/Github_medium---o5147",
+          "jsb/data/Kubernetes---kb_213_Normalized",
+          "jsb/data/Kubernetes---kb_1104_Normalized",
+          "jsb/data/Github_hard---o21310",
+          "jsb/data/Github_easy---o90298",
+          "jsb/data/Kubernetes---kb_807_Normalized",
+          "jsb/data/JsonSchemaStore---foxx-manifest",
+          "jsb/data/Github_easy---o10093",
+          "jsb/data/Snowplow---sp_104_Normalized",
+          "jsb/data/Glaiveai2K---track_expenses_c8268204",
+          "jsb/data/Glaiveai2K---generate_random_password_b4515773",
+          "jsb/data/Github_medium---o71311",
+          "jsb/data/Glaiveai2K---generate_random_password_adc9cd6f",
+          "jsb/data/Glaiveai2K---calculate_area_cd0cc337",
+          "jsb/data/Github_easy---o90885",
+          "jsb/data/Glaiveai2K---calculate_shipping_cost_c68c84af",
+          "jsb/data/Github_easy---o90831",
+          "jsb/data/Github_hard---o21410",
+          "jsb/data/JsonSchemaStore---bungee-plugin",
+          "jsb/data/Glaiveai2K---generate_random_password_e0f7b38a",
+          "jsb/data/Github_medium---o31835",
+          "jsb/data/Github_easy---o44299",
+          "jsb/data/Github_medium---o55772",
+          "jsb/data/Github_medium---o47749",
+          "jsb/data/Github_medium---o66688",
+          "jsb/data/Github_hard---o75284",
+          "jsb/data/Github_easy---o41690",
+          "jsb/data/Github_medium---o8469",
+          "jsb/data/Github_medium---o72184",
+          "jsb/data/Kubernetes---kb_714_Normalized",
+          "jsb/data/Github_medium---o43230",
+          "jsb/data/Github_easy---o71312",
+          "jsb/data/Github_medium---o43729",
+          "jsb/data/Github_easy---o73015",
+          "jsb/data/Github_hard---o83834",
+          "jsb/data/Github_easy---o39082",
+          "jsb/data/JsonSchemaStore---lerna",
+          "jsb/data/Github_medium---o41283",
+          "jsb/data/Github_hard---o72193",
+          "jsb/data/Github_medium---o60319",
+          "jsb/data/Github_medium---o39426",
+          "jsb/data/Github_easy---o71308",
+          "jsb/data/Github_easy---o47149",
+          "jsb/data/Github_hard---o13112",
+          "jsb/data/Github_medium---o33687",
+          "jsb/data/Github_medium---o42580",
+          "jsb/data/Glaiveai2K---create_event_c6d94c63",
+          "jsb/data/Github_easy---o84028",
+          "jsb/data/Github_medium---o28532",
+          "jsb/data/Github_hard---o5409",
+          "jsb/data/Github_easy---o35167",
+          "jsb/data/Github_easy---o63687",
+          "jsb/data/Kubernetes---kb_428_Normalized",
+          "jsb/data/Github_hard---o55072",
+          "jsb/data/Github_easy---o83738",
+          "jsb/data/Github_trivial---o45020",
+          "jsb/data/Github_hard---o52904",
+          "jsb/data/Glaiveai2K---calculate_area_efd2f996",
+          "jsb/data/Github_medium---o48339",
+          "jsb/data/Snowplow---sp_345_Normalized",
+          "jsb/data/Github_easy---o50970",
+          "jsb/data/Github_easy---o42187",
+          "jsb/data/Glaiveai2K---calculate_area_763b5315",
+          "jsb/data/Github_easy---o43224",
+          "jsb/data/Github_easy---o8465",
+          "jsb/data/Glaiveai2K---generate_invoice_159c0a0a",
+          "jsb/data/Github_medium---o33928",
+          "jsb/data/Github_easy---o32246",
+          "jsb/data/Glaiveai2K---calculate_area_2b27249d",
+          "jsb/data/Github_easy---o59671",
+          "jsb/data/Kubernetes---kb_244_Normalized",
+          "jsb/data/Github_medium---o1",
+          "jsb/data/Github_medium---o67597",
+          "jsb/data/Kubernetes---kb_429_Normalized",
+          "jsb/data/Github_easy---o53700",
+          "jsb/data/Github_easy---o26593",
+          "jsb/data/Github_trivial---o70292",
+          "jsb/data/Github_easy---o7496",
+          "jsb/data/Github_medium---o61597",
+          "jsb/data/Glaiveai2K---create_calendar_event_c2876547",
+          "jsb/data/Github_easy---o21733",
+          "jsb/data/Kubernetes---kb_90_Normalized",
+          "jsb/data/Kubernetes---kb_820_Normalized",
+          "jsb/data/Github_easy---o89106",
+          "jsb/data/Github_hard---o21195",
+          "jsb/data/Github_medium---o82351",
+          "jsb/data/Github_medium---o33700",
+          "jsb/data/Github_easy---o19066",
+          "jsb/data/Glaiveai2K---calculate_area_b34e2184",
+          "jsb/data/Snowplow---sp_180_Normalized",
+          "jsb/data/Github_medium---o29942",
+          "jsb/data/Glaiveai2K---book_flight_ec10069a",
+          "jsb/data/Github_medium---o90620",
+          "jsb/data/Github_ultra---o18949",
+          "jsb/data/JsonSchemaStore---ntangle",
+          "jsb/data/Kubernetes---kb_591_Normalized",
+          "jsb/data/Github_medium---o53100",
+          "jsb/data/Github_medium---o78738",
+          "jsb/data/WashingtonPost---wp_68_Normalized",
+          "jsb/data/Github_medium---o56041",
+          "jsb/data/Glaiveai2K---generate_invoice_4c6c4eae",
+          "jsb/data/Github_easy---o41646",
+          "jsb/data/Github_trivial---o69499",
+          "jsb/data/Glaiveai2K---calculate_discounted_price_22361dfa",
+          "jsb/data/Glaiveai2K---search_news_8cfb92ac",
+          "jsb/data/Github_trivial---o90950",
+          "jsb/data/Github_medium---o54930",
+          "jsb/data/Glaiveai2K---calculate_area_88ee549f",
+          "jsb/data/Github_medium---o24463",
+          "jsb/data/WashingtonPost---wp_108_Normalized",
+          "jsb/data/Github_hard---o84050",
+          "jsb/data/Glaiveai2K---search_hotels_348c46f6",
+          "jsb/data/Github_medium---o30265",
+          "jsb/data/Github_medium---o48313",
+          "jsb/data/Glaiveai2K---calculate_area_6efa49a2",
+          "jsb/data/Glaiveai2K---calculate_discounted_price_07490caf",
+          "jsb/data/Github_trivial---o10021",
+          "jsb/data/Github_medium---o12289",
+          "jsb/data/Glaiveai2K---generate_invoice_a0a4ae87",
+          "jsb/data/Glaiveai2K---create_invoice_beb99d93",
+          "jsb/data/Glaiveai2K---calculate_area_79767fec",
+          "jsb/data/Github_easy---o81575",
+          "jsb/data/Glaiveai2K---calculate_area_248bb00a",
+          "jsb/data/Github_easy---o28614",
+          "jsb/data/Github_hard---o60179",
+          "jsb/data/Glaiveai2K---create_resume_3dc11395",
+          "jsb/data/Github_easy---o75096",
+          "jsb/data/Github_easy---o22866",
+          "jsb/data/Github_hard---o34342",
+          "jsb/data/Github_medium---o91089",
+          "jsb/data/Github_medium---o5158",
+          "jsb/data/Github_ultra---o9981",
+          "jsb/data/Github_hard---o71304",
+          "jsb/data/Glaiveai2K---calculate_area_69966aa8",
+          "jsb/data/Github_easy---o38553",
+          "jsb/data/Github_medium---o12244",
+          "jsb/data/Github_medium---o90787",
+          "jsb/data/Snowplow---sp_60_Normalized",
+          "jsb/data/Github_easy---o49129",
+          "jsb/data/Github_ultra---o73963",
+          "jsb/data/Github_easy---o64535",
+          "jsb/data/Glaiveai2K---calculate_area_86e1ccc1",
+          "jsb/data/Github_medium---o59694",
+          "jsb/data/Glaiveai2K---book_flight_1987304d",
+          "jsb/data/Github_easy---o39397",
+          "jsb/data/Github_medium---o43971",
+          "jsb/data/Glaiveai2K---calculate_area_8c0d66c9",
+          "jsb/data/Github_easy---o25701",
+          "jsb/data/Kubernetes---kb_554_Normalized",
+          "jsb/data/Github_medium---o9771",
+          "jsb/data/Github_hard---o21306",
+          "jsb/data/JsonSchemaStore---nightwatch",
+          "jsb/data/Snowplow---sp_36_Normalized",
+          "jsb/data/Glaiveai2K---generate_invoice_65ca3e70",
+          "jsb/data/Github_medium---o6212",
+          "jsb/data/Glaiveai2K---calculate_area_30182f13",
+          "jsb/data/Github_easy---o56866",
+          "jsb/data/Github_trivial---o25988",
+          "jsb/data/Github_medium---o48248",
+          "jsb/data/Github_trivial---o54984",
+          "jsb/data/Github_medium---o3907",
+          "jsb/data/Github_trivial---o25189",
+          "jsb/data/Github_hard---o41314",
+          "jsb/data/Github_medium---o25401",
+          "jsb/data/Github_easy---o44286",
+          "jsb/data/Github_easy---o43004",
+          "jsb/data/Github_hard---o90821",
+          "jsb/data/WashingtonPost---wp_40_Normalized",
+          "jsb/data/Kubernetes---kb_947_Normalized",
+          "jsb/data/Github_medium---o90027",
+          "jsb/data/Glaiveai2K---schedule_meeting_d81725da",
+          "jsb/data/Github_medium---o65678",
+          "jsb/data/Github_medium---o89003",
+          "jsb/data/Github_easy---o66192",
+          "jsb/data/Glaiveai2K---create_calendar_event_8a2d858d",
+          "jsb/data/Github_medium---o37090",
+          "jsb/data/Github_trivial---o88607",
+          "jsb/data/Github_hard---o56008",
+          "jsb/data/Github_easy---o31168",
+          "jsb/data/Kubernetes---kb_84_Normalized",
+          "jsb/data/Github_hard---o31337",
+          "jsb/data/Github_easy---o80622",
+          "jsb/data/Github_easy---o19033",
+          "jsb/data/Glaiveai2K---search_product_e033cad8",
+          "jsb/data/Glaiveai2K---generate_invoice_f07e2f90",
+          "jsb/data/Github_easy---o90301",
+          "jsb/data/Github_ultra---o43012",
+          "jsb/data/Glaiveai2K---search_jobs_4815ca42",
+          "jsb/data/Kubernetes---kb_57_Normalized",
+          "jsb/data/Github_medium---o70371",
+          "jsb/data/Github_hard---o57503",
+          "jsb/data/Snowplow---sp_387_Normalized",
+          "jsb/data/Github_easy---o68291",
+          "jsb/data/Glaiveai2K---generate_invoice_2138db6b",
+          "jsb/data/Github_hard---o61085",
+          "jsb/data/Github_easy---o5956",
+          "jsb/data/Github_trivial---o27832",
+          "jsb/data/Github_trivial---o41669",
+          "jsb/data/Glaiveai2K---create_invoice_7408fa0e",
+          "jsb/data/Glaiveai2K---schedule_meeting_f2cfc8de",
+          "jsb/data/Github_medium---o30747",
+          "jsb/data/Github_hard---o21246",
+          "jsb/data/Github_medium---o20484",
+          "jsb/data/Glaiveai2K---calculate_area_a536283a",
+          "jsb/data/Github_medium---o21142",
+          "jsb/data/Glaiveai2K---analyze_social_media_sentiment_b20b116b",
+          "jsb/data/Github_medium---o44008",
+          "jsb/data/Github_hard---o87865",
+          "jsb/data/Github_easy---o33832",
+          "jsb/data/Snowplow---sp_332_Normalized",
+          "jsb/data/Glaiveai2K---calculate_distance_1cbd4d8c",
+          "jsb/data/Github_easy---o63288",
+          "jsb/data/Github_easy---o6263",
+          "jsb/data/Kubernetes---kb_559_Normalized",
+          "jsb/data/Github_medium---o78478",
+          "jsb/data/Github_medium---o91594",
+          "jsb/data/Glaiveai2K---generate_password_d68d3a4c",
+          "jsb/data/Github_easy---o60117",
+          "jsb/data/Github_easy---o42289",
+          "jsb/data/Glaiveai2K---create_calendar_event_342b5c33",
+          "jsb/data/Github_easy---o43234",
+          "jsb/data/Github_easy---o37715",
+          "jsb/data/Glaiveai2K---calculate_area_0b97c15f",
+          "jsb/data/Github_hard---o21226",
+          "jsb/data/Github_easy---o90826",
+          "jsb/data/Github_easy---o58914",
+          "jsb/data/Github_medium---o30846",
+          "jsb/data/Glaiveai2K---calculate_car_emissions_847c1055",
+          "jsb/data/Github_easy---o5162",
+          "jsb/data/Github_easy---o65448",
+          "jsb/data/Github_hard---o14514",
+          "jsb/data/Github_medium---o10518",
+          "jsb/data/Github_medium---o55102",
+          "jsb/data/Glaiveai2K---calculate_gpa_11b0bca5",
+          "jsb/data/Kubernetes---kb_410_Normalized",
+          "jsb/data/Glaiveai2K---calculate_perimeter_57ef13c0",
+          "jsb/data/Github_medium---o7288",
+          "jsb/data/Kubernetes---kb_297_Normalized",
+          "jsb/data/Github_easy---o61120",
+          "jsb/data/Github_easy---o76479",
+          "jsb/data/Github_easy---o12223",
+          "jsb/data/Github_medium---o12458",
+          "jsb/data/Github_medium---o21099",
+          "jsb/data/Github_trivial---o6377",
+          "jsb/data/Github_medium---o38438",
+          "jsb/data/Github_medium---o69138",
+          "jsb/data/Github_medium---o48420",
+          "jsb/data/Github_easy---o90265",
+          "jsb/data/Glaiveai2K---calculate_gpa_ff62a7e0",
+          "jsb/data/Glaiveai2K---generate_invoice_a4231107",
+          "jsb/data/Glaiveai2K---create_todo_e7e42931",
+          "jsb/data/Kubernetes---kb_472_Normalized",
+          "jsb/data/Github_easy---o51081",
+          "jsb/data/Github_trivial---o82284",
+          "jsb/data/Github_medium---o20254",
+          "jsb/data/Kubernetes---kb_1118_Normalized",
+          "jsb/data/Kubernetes---kb_766_Normalized",
+          "jsb/data/Github_hard---o41203",
+          "jsb/data/Github_hard---o5341",
+          "jsb/data/Kubernetes---kb_680_Normalized",
+          "jsb/data/Snowplow---sp_50_Normalized",
+          "jsb/data/Github_hard---o20272",
+          "jsb/data/Github_easy---o3454",
+          "jsb/data/Github_medium---o31244",
+          "jsb/data/Kubernetes---kb_936_Normalized",
+          "jsb/data/Github_medium---o45227",
+          "jsb/data/Github_medium---o61638",
+          "jsb/data/Github_easy---o21458",
+          "jsb/data/Github_medium---o41380",
+          "jsb/data/Glaiveai2K---create_invoice_13e1ec6d",
+          "jsb/data/Snowplow---sp_399_Normalized",
+          "jsb/data/Github_medium---o28201",
+          "jsb/data/Github_hard---o58318",
+          "jsb/data/Glaiveai2K---calculate_gpa_8889db1e",
+          "jsb/data/Github_medium---o84343",
+          "jsb/data/Github_hard---o61586",
+          "jsb/data/Github_easy---o89764",
+          "jsb/data/Github_easy---o54558",
+          "jsb/data/Kubernetes---kb_187_Normalized",
+          "jsb/data/Github_easy---o53004",
+          "jsb/data/JsonSchemaStore---appsscript",
+          "jsb/data/Github_trivial---o72207",
+          "jsb/data/Kubernetes---kb_229_Normalized",
+          "jsb/data/Github_easy---o85086",
+          "jsb/data/Github_medium---o1505",
+          "jsb/data/Github_medium---o29959",
+          "jsb/data/Github_easy---o44188",
+          "jsb/data/Github_trivial---o25741",
+          "jsb/data/Github_medium---o90771",
+          "jsb/data/Github_easy---o75145",
+          "jsb/data/Github_ultra---o16062",
+          "jsb/data/Github_easy---o69219",
+          "jsb/data/Github_medium---o12971",
+          "jsb/data/Snowplow---sp_392_Normalized",
+          "jsb/data/Github_easy---o9519",
+          "jsb/data/Github_medium---o9187",
+          "jsb/data/Kubernetes---kb_286_Normalized",
+          "jsb/data/Glaiveai2K---calculate_gpa_0ca04f9f",
+          "jsb/data/Github_medium---o59293",
+          "jsb/data/Glaiveai2K---calculate_distance_9339c7aa",
+          "jsb/data/Snowplow---sp_250_Normalized",
+          "jsb/data/Glaiveai2K---generate_invoice_938a3402",
+          "jsb/data/Github_medium---o25768",
+          "jsb/data/Glaiveai2K---calculate_area_85d9648e",
+          "jsb/data/Github_easy---o39445",
+          "jsb/data/Glaiveai2K---calculate_tax_07b872b9",
+          "jsb/data/Kubernetes---kb_763_Normalized",
+          "jsb/data/Glaiveai2K---calculate_area_c05fc94a",
+          "jsb/data/Github_medium---o74447",
+          "jsb/data/Kubernetes---kb_83_Normalized",
+          "jsb/data/Snowplow---sp_276_Normalized",
+          "jsb/data/WashingtonPost---wp_24_Normalized",
+          "jsb/data/Kubernetes---kb_365_Normalized",
+          "jsb/data/Kubernetes---kb_661_Normalized",
+          "jsb/data/Github_medium---o30701",
+          "jsb/data/WashingtonPost---wp_67_Normalized",
+          "jsb/data/Github_trivial---o84271",
+          "jsb/data/Github_hard---o61612",
+          "jsb/data/Kubernetes---kb_882_Normalized",
+          "jsb/data/Snowplow---sp_312_Normalized",
+          "jsb/data/Github_hard---o47979",
+          "jsb/data/Github_easy---o58495",
+          "jsb/data/Glaiveai2K---calculate_area_5af876a7",
+          "jsb/data/Github_easy---o72587",
+          "jsb/data/Kubernetes---kb_848_Normalized",
+          "jsb/data/Glaiveai2K---calculate_area_fe414505",
+          "jsb/data/Glaiveai2K---find_restaurants_ca892923",
+          "jsb/data/Glaiveai2K---calculate_volume_56fe1b99",
+          "jsb/data/Github_medium---o91100",
+          "jsb/data/Glaiveai2K---calculate_area_cd85fa05",
+          "jsb/data/Github_easy---o64823",
+          "jsb/data/Github_easy---o64869",
+          "jsb/data/Github_hard---o5400",
+          "jsb/data/Github_hard---o41264",
+          "jsb/data/Github_medium---o14405",
+          "jsb/data/Github_easy---o83294",
+          "jsb/data/Kubernetes---kb_648_Normalized",
+          "jsb/data/Github_trivial---o70294",
+          "jsb/data/Github_medium---o54977",
+          "jsb/data/Github_hard---o48022",
+          "jsb/data/Glaiveai2K---generate_invoice_00facca8",
+          "jsb/data/Kubernetes---kb_1130_Normalized",
+          "jsb/data/Github_medium---o31136",
+          "jsb/data/Github_medium---o10217",
+          "jsb/data/Github_medium---o74597",
+          "jsb/data/Github_medium---o8475",
+          "jsb/data/Github_easy---o21487",
+          "jsb/data/Github_hard---o90895",
+          "jsb/data/Kubernetes---kb_715_Normalized",
+          "jsb/data/Kubernetes---kb_1096_Normalized",
+          "jsb/data/Glaiveai2K---find_hotels_cafa32e9",
+          "jsb/data/Github_easy---o43981",
+          "jsb/data/Github_medium---o35772",
+          "jsb/data/Kubernetes---kb_97_Normalized",
+          "jsb/data/Github_easy---o76874",
+          "jsb/data/Glaiveai2K---calculate_area_3d71020d",
+          "jsb/data/Github_medium---o83277",
+          "jsb/data/Github_easy---o25970",
+          "jsb/data/Github_medium---o79425",
+          "jsb/data/Github_hard---o89729",
+          "jsb/data/Github_medium---o54973",
+          "jsb/data/Glaiveai2K---calculate_area_63d8c1b9",
+          "jsb/data/Kubernetes---kb_18_Normalized",
+          "jsb/data/Github_hard---o82821",
+          "jsb/data/JsonSchemaStore---httpmockrc",
+          "jsb/data/Github_hard---o31290",
+          "jsb/data/Glaiveai2K---calculate_mortgage_payment_13c9494e",
+          "jsb/data/Kubernetes---kb_563_Normalized",
+          "jsb/data/Github_trivial---o21828",
+          "jsb/data/Glaiveai2K---calculate_area_d36b4351",
+          "jsb/data/Glaiveai2K---find_hotels_668d067d",
+          "jsb/data/Kubernetes---kb_62_Normalized",
+          "jsb/data/Github_hard---o41345",
+          "jsb/data/Glaiveai2K---calculate_shipping_cost_bbfa1080",
+          "jsb/data/Glaiveai2K---get_recipe_11750e82",
+          "jsb/data/Github_medium---o61645",
+          "jsb/data/Github_easy---o5118",
+          "jsb/data/JsonSchemaStore---bpkg",
+          "jsb/data/Kubernetes---kb_895_Normalized",
+          "jsb/data/Glaiveai2K---generate_random_password_8cf128ad",
+          "jsb/data/Github_easy---o82718",
+          "jsb/data/Glaiveai2K---calculate_discounted_price_3f1d7578",
+          "jsb/data/Glaiveai2K---calculate_area_a407de0a",
+          "jsb/data/Github_hard---o41366",
+          "jsb/data/Github_hard---o21414",
+          "jsb/data/Github_trivial---o45029",
+          "jsb/data/Github_easy---o91148",
+          "jsb/data/Github_ultra---o6373",
+          "jsb/data/Kubernetes---kb_146_Normalized",
+          "jsb/data/Github_easy---o9799",
+          "jsb/data/Github_trivial---o89152",
+          "jsb/data/Snowplow---sp_265_Normalized",
+          "jsb/data/Github_medium---o61648",
+          "jsb/data/Github_hard---o65310",
+          "jsb/data/Kubernetes---kb_745_Normalized",
+          "jsb/data/Kubernetes---kb_460_Normalized",
+          "jsb/data/Glaiveai2K---calculate_volume_63ef66d4",
+          "jsb/data/Github_medium---o82148",
+          "jsb/data/Glaiveai2K---calculate_shipping_cost_4b09e153",
+          "jsb/data/Glaiveai2K---schedule_meeting_3cf4e0e9",
+          "jsb/data/Github_medium---o75613",
+          "jsb/data/Kubernetes---kb_1012_Normalized",
+          "jsb/data/Github_easy---o39443",
+          "jsb/data/Github_medium---o68398",
+          "jsb/data/Github_easy---o76763",
+          "jsb/data/Glaiveai2K---calculate_area_5a417652",
+          "jsb/data/Github_trivial---o79557",
+          "jsb/data/Kubernetes---kb_923_Normalized",
+          "jsb/data/Github_easy---o19356",
+          "jsb/data/Snowplow---sp_26_Normalized",
+          "jsb/data/Kubernetes---kb_249_Normalized",
+          "jsb/data/Github_easy---o20483",
+          "jsb/data/Github_easy---o5151",
+          "jsb/data/Github_easy---o9835",
+          "jsb/data/JsonSchemaStore---nycrc",
+          "jsb/data/Github_easy---o60886",
+          "jsb/data/Github_medium---o63552",
+          "jsb/data/Github_medium---o27789",
+          "jsb/data/Glaiveai2K---calculate_area_b59b5bd4",
+          "jsb/data/Kubernetes---kb_808_Normalized",
+          "jsb/data/Github_easy---o78997",
+          "jsb/data/Snowplow---sp_61_Normalized",
+          "jsb/data/Kubernetes---kb_178_Normalized",
+          "jsb/data/Github_trivial---o4366",
+          "jsb/data/Github_medium---o60848",
+          "jsb/data/Github_hard---o41249",
+          "jsb/data/Github_easy---o51170",
+          "jsb/data/Github_medium---o19337",
+          "jsb/data/Github_hard---o41375",
+          "jsb/data/Glaiveai2K---generate_invoice_62e6f8e4",
+          "jsb/data/Github_hard---o89734",
+          "jsb/data/Github_medium---o82281",
+          "jsb/data/Github_easy---o39505",
+          "jsb/data/Github_medium---o68435",
+          "jsb/data/Github_trivial---o10525",
+          "jsb/data/Github_easy---o58320",
+          "jsb/data/Github_trivial---o41592",
+          "jsb/data/Github_medium---o84268",
+          "jsb/data/Github_hard---o15291",
+          "jsb/data/Github_hard---o77405",
+          "jsb/data/Github_hard---o31057",
+          "jsb/data/Github_hard---o60887",
+          "jsb/data/Glaiveai2K---calculate_area_c04d2e21",
+          "jsb/data/Github_easy---o79491",
+          "jsb/data/Github_hard---o69965",
+          "jsb/data/Github_easy---o90280",
+          "jsb/data/Snowplow---sp_218_Normalized",
+          "jsb/data/Github_easy---o54976",
+          "jsb/data/JsonSchemaStore---pgap_yaml_input_reader",
+          "jsb/data/Github_hard---o78059",
+          "jsb/data/Github_hard---o79656",
+          "jsb/data/Github_easy---o20479",
+          "jsb/data/Github_medium---o36468",
+          "jsb/data/Github_easy---o89671",
+          "jsb/data/Github_hard---o82738",
+          "jsb/data/Github_medium---o74175",
+          "jsb/data/Github_easy---o27248",
+          "jsb/data/Github_easy---o25194",
+          "jsb/data/Github_medium---o16736",
+          "jsb/data/Github_hard---o41261",
+          "jsb/data/Glaiveai2K---calculate_mortgage_payment_5a604234",
+          "jsb/data/Glaiveai2K---calculate_area_04b0dca0",
+          "jsb/data/Github_easy---o90339",
+          "jsb/data/Github_easy---o68414",
+          "jsb/data/Github_hard---o47116",
+          "jsb/data/Github_medium---o73955",
+          "jsb/data/Kubernetes---kb_27_Normalized",
+          "jsb/data/Github_hard---o60980",
+          "jsb/data/Github_hard---o12499",
+          "jsb/data/Github_trivial---o51222",
+          "jsb/data/Glaiveai2K---calculate_area_f9bf95b6",
+          "jsb/data/Glaiveai2K---calculate_area_2fc464f9",
+          "jsb/data/Github_medium---o83292",
+          "jsb/data/Github_easy---o9863",
+          "jsb/data/Github_easy---o64856",
+          "jsb/data/Github_easy---o79434",
+          "jsb/data/Github_trivial---o41773",
+          "jsb/data/Github_trivial---o7442",
+          "jsb/data/Github_medium---o9198",
+          "jsb/data/Snowplow---sp_177_Normalized",
+          "jsb/data/JsonSchemaStore---minecraft-pack-mcmeta",
+          "jsb/data/Glaiveai2K---calculate_gpa_6472e5f1",
+          "jsb/data/Glaiveai2K---search_jobs_3eee6557",
+          "jsb/data/Github_medium---o13402",
+          "jsb/data/Github_trivial---o45023",
+          "jsb/data/Github_easy---o65454",
+          "jsb/data/Glaiveai2K---calculate_volume_e04c004c",
+          "jsb/data/Glaiveai2K---calculate_area_84f273e3",
+          "jsb/data/Glaiveai2K---calculate_area_3d4b35ef",
+          "jsb/data/Kubernetes---kb_621_Normalized",
+          "jsb/data/Github_easy---o6187",
+          "jsb/data/Github_hard---o21362",
+          "jsb/data/Glaiveai2K---calculate_volume_fbc164ed",
+          "jsb/data/Snowplow---sp_258_Normalized",
+          "jsb/data/Github_medium---o45486",
+          "jsb/data/Github_easy---o79717",
+          "jsb/data/Glaiveai2K---calculate_area_a9700ff2",
+          "jsb/data/Github_trivial---o48167",
+          "jsb/data/Github_medium---o46413",
+          "jsb/data/Github_medium---o49732",
+          "jsb/data/Kubernetes---kb_1032_Normalized",
+          "jsb/data/Kubernetes---kb_823_Normalized",
+          "jsb/data/Github_hard---o41491",
+          "jsb/data/Github_easy---o44009",
+          "jsb/data/Github_medium---o45134",
+          "jsb/data/Github_easy---o58905",
+          "jsb/data/Github_easy---o62774",
+          "jsb/data/Github_hard---o41286",
+          "jsb/data/Github_easy---o26975",
+          "jsb/data/WashingtonPost---wp_52_Normalized",
+          "jsb/data/Github_medium---o64837",
+          "jsb/data/Glaiveai2K---generate_invoice_f09da27e",
+          "jsb/data/Github_medium---o68444",
+          "jsb/data/JsonSchemaStore---minecraft-texture-mcmeta",
+          "jsb/data/Glaiveai2K---calculate_area_16ecbdde",
+          "jsb/data/Github_medium---o82337",
+          "jsb/data/Kubernetes---kb_1098_Normalized",
+          "jsb/data/Glaiveai2K---calculate_area_c040f289",
+          "jsb/data/Github_trivial---o76469",
+          "jsb/data/Snowplow---sp_289_Normalized",
+          "jsb/data/Kubernetes---kb_896_Normalized",
+          "jsb/data/Kubernetes---kb_1028_Normalized",
+          "jsb/data/Github_medium---o73959",
+          "jsb/data/Glaiveai2K---search_products_cef602be",
+          "jsb/data/Github_medium---o50504",
+          "jsb/data/Github_easy---o12088",
+          "jsb/data/Glaiveai2K---create_calendar_event_011e9d78",
+          "jsb/data/Glaiveai2K---calculate_area_f0f97126",
+          "jsb/data/Github_easy---o5163",
+          "jsb/data/Glaiveai2K---generate_invoice_cfbcf237",
+          "jsb/data/Github_easy---o46362",
+          "jsb/data/Github_medium---o53044",
+          "jsb/data/Github_hard---o53697",
+          "jsb/data/Github_medium---o69100",
+          "jsb/data/Github_hard---o65322",
+          "jsb/data/Glaiveai2K---calculate_area_8cdcc04b",
+          "jsb/data/Github_hard---o61632",
+          "jsb/data/Github_hard---o41482",
+          "jsb/data/Kubernetes---kb_528_Normalized",
+          "jsb/data/Github_hard---o66267",
+          "jsb/data/JsonSchemaStore---minecraft-template-pool",
+          "jsb/data/Github_ultra---o53885",
+          "jsb/data/Glaiveai2K---search_news_d4aaa6d1",
+          "jsb/data/JsonSchemaStore---samtrc",
+          "jsb/data/JsonSchemaStore---ui5-workspace.yaml",
+          "jsb/data/Github_medium---o82259",
+          "jsb/data/Glaiveai2K---generate_invoice_699a7e70",
+          "jsb/data/Github_hard---o21330",
+          "jsb/data/Glaiveai2K---generate_invoice_e158ba93",
+          "jsb/data/Github_easy---o63151",
+          "jsb/data/Github_easy---o76480",
+          "jsb/data/Github_medium---o83938",
+          "jsb/data/Github_easy---o90362",
+          "jsb/data/Github_easy---o12619",
+          "jsb/data/Kubernetes---kb_156_Normalized",
+          "jsb/data/Github_hard---o41238",
+          "jsb/data/Glaiveai2K---calculate_carbon_footprint_85d634a2",
+          "jsb/data/Github_easy---o17616",
+          "jsb/data/Github_hard---o69418",
+          "jsb/data/Github_trivial---o25942",
+          "jsb/data/Github_easy---o31092",
+          "jsb/data/Github_easy---o55795",
+          "jsb/data/Glaiveai2K---calculate_volume_73171077",
+          "jsb/data/Github_medium---o14744",
+          "jsb/data/Glaiveai2K---calculate_volume_a3b6060d",
+          "jsb/data/Github_easy---o83154",
+          "jsb/data/Github_hard---o64686",
+          "jsb/data/Kubernetes---kb_926_Normalized",
+          "jsb/data/Github_medium---o11795",
+          "jsb/data/Github_medium---o61646",
+          "jsb/data/Glaiveai2K---calculate_area_c2bd214d",
+          "jsb/data/Github_hard---o72528",
+          "jsb/data/Github_easy---o36594",
+          "jsb/data/Github_medium---o39086",
+          "jsb/data/Github_easy---o88585",
+          "jsb/data/Snowplow---sp_168_Normalized",
+          "jsb/data/Github_easy---o23494",
+          "jsb/data/Github_ultra---o6362",
+          "jsb/data/Github_medium---o46359",
+          "jsb/data/Glaiveai2K---calculate_area_84607e3f",
+          "jsb/data/Glaiveai2K---calculate_area_2ad222d3",
+          "jsb/data/Github_medium---o76743",
+          "jsb/data/Glaiveai2K---search_recipes_fb66ed5b",
+          "jsb/data/Github_medium---o52827",
+          "jsb/data/Github_hard---o21386",
+          "jsb/data/Github_hard---o48422",
+          "jsb/data/Github_trivial---o62775",
+          "jsb/data/Kubernetes---kb_1040_Normalized",
+          "jsb/data/Github_hard---o74005",
+          "jsb/data/Kubernetes---kb_629_Normalized",
+          "jsb/data/Glaiveai2K---calculate_area_2ad37fb0",
+          "jsb/data/Kubernetes---kb_662_Normalized",
+          "jsb/data/Github_easy---o90937",
+          "jsb/data/Github_medium---o83275",
+          "jsb/data/Kubernetes---kb_136_Normalized",
+          "jsb/data/Snowplow---sp_77_Normalized",
+          "jsb/data/Github_hard---o78081",
+          "jsb/data/Kubernetes---kb_914_Normalized",
+          "jsb/data/Github_easy---o40224",
+          "jsb/data/Github_hard---o9831",
+          "jsb/data/Github_medium---o47108",
+          "jsb/data/Glaiveai2K---generate_invoice_2068c543",
+          "jsb/data/Github_easy---o42523",
+          "jsb/data/Github_medium---o61593",
+          "jsb/data/Github_easy---o10011",
+          "jsb/data/Glaiveai2K---calculate_area_95c5c550",
+          "jsb/data/Github_hard---o73917",
+          "jsb/data/Github_easy---o32963",
+          "jsb/data/Glaiveai2K---create_invoice_b5389caf",
+          "jsb/data/Github_easy---o9275",
+          "jsb/data/Github_easy---o53902",
+          "jsb/data/Kubernetes---kb_878_Normalized",
+          "jsb/data/Github_easy---o43992",
+          "jsb/data/Glaiveai2K---calculate_area_fbf02501",
+          "jsb/data/Glaiveai2K---calculate_area_5fc9bb9f",
+          "jsb/data/Kubernetes---kb_437_Normalized",
+          "jsb/data/JsonSchemaStore---vercel",
+          "jsb/data/Github_medium---o5357",
+          "jsb/data/WashingtonPost---wp_50_Normalized",
+          "jsb/data/JsonSchemaStore---typingsrc",
+          "jsb/data/Github_easy---o13985",
+          "jsb/data/Github_medium---o33932",
+          "jsb/data/Github_medium---o45198",
+          "jsb/data/Glaiveai2K---calculate_area_cdde5279",
+          "jsb/data/Glaiveai2K---calculate_shipping_cost_9b51c3d0",
+          "jsb/data/Github_medium---o9515",
+          "jsb/data/Glaiveai2K---calculate_distance_444a6c19",
+          "jsb/data/Glaiveai2K---fetch_news_6fd23523",
+          "jsb/data/Glaiveai2K---search_hotels_d2c27c8f",
+          "jsb/data/Github_medium---o91036",
+          "jsb/data/Github_easy---o85253",
+          "jsb/data/Github_easy---o74408",
+          "jsb/data/JsonSchemaStore---band-manifest",
+          "jsb/data/Github_medium---o81597",
+          "jsb/data/Github_hard---o53129",
+          "jsb/data/Github_easy---o58442",
+          "jsb/data/Kubernetes---kb_37_Normalized",
+          "jsb/data/Github_medium---o21178",
+          "jsb/data/Github_easy---o29003",
+          "jsb/data/Snowplow---sp_270_Normalized",
+          "jsb/data/Github_easy---o70022",
+          "jsb/data/Github_hard---o9787",
+          "jsb/data/Github_medium---o22092",
+          "jsb/data/Glaiveai2K---calculate_area_c447fd6a",
+          "jsb/data/Github_medium---o30284",
+          "jsb/data/Glaiveai2K---create_calendar_event_f33c7e77",
+          "jsb/data/Github_hard---o61649",
+          "jsb/data/Github_easy---o48816",
+          "jsb/data/Kubernetes---kb_752_Normalized",
+          "jsb/data/Github_medium---o90732",
+          "jsb/data/Github_easy---o39437",
+          "jsb/data/Github_medium---o31100",
+          "jsb/data/Glaiveai2K---calculate_area_dab4d0a9",
+          "jsb/data/Github_trivial---o63326",
+          "jsb/data/Github_medium---o19069",
+          "jsb/data/Github_hard---o82811",
+          "jsb/data/Github_easy---o25107",
+          "jsb/data/Github_easy---o73930",
+          "jsb/data/Kubernetes---kb_721_Normalized",
+          "jsb/data/Glaiveai2K---generate_invoice_6d1ed855",
+          "jsb/data/Kubernetes---kb_844_Normalized",
+          "jsb/data/Github_easy---o37087",
+          "jsb/data/Github_medium---o20377",
+          "jsb/data/Github_trivial---o75090",
+          "jsb/data/Github_medium---o84138",
+          "jsb/data/Github_medium---o47943",
+          "jsb/data/Github_trivial---o45229",
+          "jsb/data/Kubernetes---kb_220_Normalized",
+          "jsb/data/Kubernetes---kb_877_Normalized",
+          "jsb/data/Github_medium---o30506",
+          "jsb/data/Snowplow---sp_25_Normalized",
+          "jsb/data/Github_easy---o26118",
+          "jsb/data/Github_trivial---o9818",
+          "jsb/data/Github_easy---o82234",
+          "jsb/data/Github_hard---o30766",
+          "jsb/data/Kubernetes---kb_445_Normalized",
+          "jsb/data/Glaiveai2K---calculate_area_d3fc7d7f",
+          "jsb/data/Glaiveai2K---calculate_area_7d9fd253",
+          "jsb/data/Github_medium---o63935",
+          "jsb/data/Github_hard---o82974",
+          "jsb/data/Github_trivial---o6242",
+          "jsb/data/Github_medium---o30521",
+          "jsb/data/Kubernetes---kb_100_Normalized",
+          "jsb/data/Kubernetes---kb_509_Normalized",
+          "jsb/data/Github_easy---o38444",
+          "jsb/data/WashingtonPost---wp_89_Normalized",
+          "jsb/data/Github_hard---o67026",
+          "jsb/data/Glaiveai2K---calculate_area_bf611aaf",
+          "jsb/data/Github_trivial---o68438",
+          "jsb/data/Snowplow---sp_287_Normalized",
+          "jsb/data/Kubernetes---kb_986_Normalized",
+          "jsb/data/Github_medium---o61613",
+          "jsb/data/Github_trivial---o78453",
+          "jsb/data/Github_hard---o48512",
+          "jsb/data/Github_medium---o9856",
+          "jsb/data/Github_medium---o31352",
+          "jsb/data/Snowplow---sp_241_Normalized",
+          "jsb/data/Glaiveai2K---generate_invoice_d89c2b04",
+          "jsb/data/Github_trivial---o89645",
+          "jsb/data/Snowplow---sp_136_Normalized",
+          "jsb/data/Kubernetes---kb_573_Normalized",
+          "jsb/data/Snowplow---sp_316_Normalized",
+          "jsb/data/Glaiveai2K---calculate_area_32e1fdb6",
+          "jsb/data/Kubernetes---kb_361_Normalized",
+          "jsb/data/JsonSchemaStore---vsconfig",
+          "jsb/data/Github_trivial---o48514",
+          "jsb/data/Github_medium---o43029",
+          "jsb/data/Glaiveai2K---calculate_area_e6c3e283",
+          "jsb/data/Glaiveai2K---generate_invoice_e75167d8",
+          "jsb/data/Github_easy---o49496",
+          "jsb/data/Github_medium---o68277",
+          "jsb/data/Glaiveai2K---calculate_area_544de1a7",
+          "jsb/data/Glaiveai2K---search_news_d8cb5416",
+          "jsb/data/Github_easy---o78132",
+          "jsb/data/Github_easy---o47063",
+          "jsb/data/Github_easy---o12290",
+          "jsb/data/Glaiveai2K---calculate_area_887e8cfa",
+          "jsb/data/Snowplow---sp_145_Normalized",
+          "jsb/data/Github_easy---o74561",
+          "jsb/data/Github_easy---o21089",
+          "jsb/data/Github_easy---o73961",
+          "jsb/data/Github_easy---o9825",
+          "jsb/data/Glaiveai2K---calculate_area_7b538abe",
+          "jsb/data/Glaiveai2K---calculate_area_2b2a62da",
+          "jsb/data/Github_medium---o90730",
+          "jsb/data/Glaiveai2K---generate_invoice_53cb5d39",
+          "jsb/data/Github_hard---o89194",
+          "jsb/data/Github_easy---o78131",
+          "jsb/data/Glaiveai2K---calculate_area_9f3f9cb8",
+          "jsb/data/Github_hard---o42057",
+          "jsb/data/Github_hard---o5413",
+          "jsb/data/Github_hard---o90705",
+          "jsb/data/Glaiveai2K---calculate_area_0b982be6",
+          "jsb/data/Glaiveai2K---create_invoice_10ed3fc0",
+          "jsb/data/Kubernetes---kb_797_Normalized",
+          "jsb/data/Kubernetes---kb_837_Normalized",
+          "jsb/data/Kubernetes---kb_977_Normalized",
+          "jsb/data/Github_hard---o1052",
+          "jsb/data/Github_medium---o42560",
+          "jsb/data/Github_ultra---o6371",
+          "jsb/data/Github_hard---o41291",
+          "jsb/data/Github_easy---o28609",
+          "jsb/data/Kubernetes---kb_39_Normalized",
+          "jsb/data/Glaiveai2K---calculate_area_5fc1810f",
+          "jsb/data/Github_hard---o5391",
+          "jsb/data/Glaiveai2K---search_hotels_29d4c29d",
+          "jsb/data/Github_medium---o85208",
+          "jsb/data/Github_easy---o64614",
+          "jsb/data/Github_medium---o32498",
+          "jsb/data/Github_easy---o28226",
+          "jsb/data/Glaiveai2K---calculate_area_7175d0f3",
+          "jsb/data/Github_medium---o5271",
+          "jsb/data/Glaiveai2K---generate_invoice_3ab8d7c8",
+          "jsb/data/Glaiveai2K---calculate_area_ee641c30",
+          "jsb/data/Github_easy---o68355",
+          "jsb/data/Github_trivial---o24503",
+          "jsb/data/Glaiveai2K---generate_invoice_3cf1c488",
+          "jsb/data/Github_medium---o1329",
+          "jsb/data/Github_trivial---o62379",
+          "jsb/data/Github_trivial---o51255",
+          "jsb/data/Github_easy---o56027",
+          "jsb/data/Github_easy---o43007",
+          "jsb/data/Github_medium---o9853",
+          "jsb/data/Github_easy---o68826",
+          "jsb/data/Github_medium---o79504",
+          "jsb/data/Github_easy---o12235",
+          "jsb/data/Github_trivial---o83689",
+          "jsb/data/Kubernetes---kb_316_Normalized",
+          "jsb/data/Github_easy---o21466",
+          "jsb/data/Github_hard---o30532",
+          "jsb/data/Github_hard---o21074",
+          "jsb/data/Github_easy---o46258",
+          "jsb/data/Snowplow---sp_90_Normalized",
+          "jsb/data/Github_easy---o5220",
+          "jsb/data/Github_medium---o27402",
+          "jsb/data/Github_easy---o48814",
+          "jsb/data/Github_easy---o42792",
+          "jsb/data/Github_medium---o1053",
+          "jsb/data/Github_medium---o21361",
+          "jsb/data/Github_easy---o8432",
+          "jsb/data/Kubernetes---kb_66_Normalized",
+          "jsb/data/Github_medium---o30756",
+          "jsb/data/JsonSchemaStore---launchsettings",
+          "jsb/data/Github_easy---o85667",
+          "jsb/data/Github_medium---o30013",
+          "jsb/data/Glaiveai2K---generate_invoice_e418deb9",
+          "jsb/data/Kubernetes---kb_626_Normalized",
+          "jsb/data/Glaiveai2K---calculate_area_569195ed",
+          "jsb/data/Glaiveai2K---generate_invoice_855c73be",
+          "jsb/data/Snowplow---sp_327_Normalized",
+          "jsb/data/Github_easy---o90449",
+          "jsb/data/Github_medium---o56043",
+          "jsb/data/Github_hard---o66711",
+          "jsb/data/Github_easy---o57789",
+          "jsb/data/Github_hard---o71475",
+          "jsb/data/Github_easy---o6227",
+          "jsb/data/Github_trivial---o69525",
+          "jsb/data/Github_easy---o45223",
+          "jsb/data/Snowplow---sp_53_Normalized",
+          "jsb/data/Github_medium---o74464",
+          "jsb/data/Github_easy---o12621",
+          "jsb/data/Github_medium---o42286",
+          "jsb/data/Github_trivial---o27830",
+          "jsb/data/Github_medium---o53109",
+          "jsb/data/Github_easy---o79513",
+          "jsb/data/Github_medium---o50685",
+          "jsb/data/Snowplow---sp_193_Normalized",
+          "jsb/data/Github_medium---o82706",
+          "jsb/data/Github_hard---o90780",
+          "jsb/data/Glaiveai2K---calculate_shipping_cost_c34b9e81",
+          "jsb/data/Glaiveai2K---generate_invoice_eac11f93",
+          "jsb/data/Kubernetes---kb_806_Normalized",
+          "jsb/data/Github_medium---o6171",
+          "jsb/data/Snowplow---sp_94_Normalized",
+          "jsb/data/Glaiveai2K---generate_random_password_with_constraints_4bddedda",
+          "jsb/data/Github_medium---o30439",
+          "jsb/data/Github_medium---o42216",
+          "jsb/data/Kubernetes---kb_5_Normalized",
+          "jsb/data/Github_medium---o70375",
+          "jsb/data/Kubernetes---kb_913_Normalized",
+          "jsb/data/Glaiveai2K---calculate_area_3902f17e",
+          "jsb/data/Snowplow---sp_3_Normalized",
+          "jsb/data/Glaiveai2K---calculate_area_volume_2f1888fb",
+          "jsb/data/Github_medium---o69910",
+          "jsb/data/Glaiveai2K---generate_random_password_09ce64ee",
+          "jsb/data/Kubernetes---kb_584_Normalized",
+          "jsb/data/Github_trivial---o67196",
+          "jsb/data/Github_easy---o41640",
+          "jsb/data/JsonSchemaStore---drupal-links-task",
+          "jsb/data/Glaiveai2K---calculate_fitness_goal_8459efad",
+          "jsb/data/Glaiveai2K---calculate_mortgage_payment_b3e54742",
+          "jsb/data/Github_hard---o5368",
+          "jsb/data/Github_medium---o5235",
+          "jsb/data/Github_hard---o48243",
+          "jsb/data/Github_trivial---o13839",
+          "jsb/data/WashingtonPost---wp_34_Normalized",
+          "jsb/data/Github_hard---o9969",
+          "jsb/data/Glaiveai2K---calculate_area_55406f4d",
+          "jsb/data/Glaiveai2K---calculate_body_fat_percentage_33dd2c27",
+          "jsb/data/Kubernetes---kb_119_Normalized",
+          "jsb/data/Glaiveai2K---calculate_area_87442b5f",
+          "jsb/data/Github_easy---o13687",
+          "jsb/data/Github_medium---o4836",
+          "jsb/data/Github_easy---o74200",
+          "jsb/data/Github_medium---o82311",
+          "jsb/data/Glaiveai2K---calculate_area_924e3a6b",
+          "jsb/data/Glaiveai2K---generate_invoice_c57328a1",
+          "jsb/data/Github_easy---o9773",
+          "jsb/data/Github_hard---o8370",
+          "jsb/data/Snowplow---sp_78_Normalized",
+          "jsb/data/Github_hard---o69582",
+          "jsb/data/Glaiveai2K---calculate_area_22566a70",
+          "jsb/data/Glaiveai2K---create_invoice_1047f9b8",
+          "jsb/data/JsonSchemaStore---strings",
+          "jsb/data/Snowplow---sp_306_Normalized",
+          "jsb/data/Github_easy---o35907",
+          "jsb/data/Kubernetes---kb_125_Normalized",
+          "jsb/data/Github_easy---o39767",
+          "jsb/data/Github_easy---o60855",
+          "jsb/data/Github_medium---o76853",
+          "jsb/data/Github_trivial---o83705",
+          "jsb/data/Github_hard---o74004",
+          "jsb/data/WashingtonPost---wp_120_Normalized",
+          "jsb/data/Kubernetes---kb_814_Normalized",
+          "jsb/data/Snowplow---sp_163_Normalized",
+          "jsb/data/Github_easy---o6268",
+          "jsb/data/Github_easy---o90437",
+          "jsb/data/Github_hard---o63519",
+          "jsb/data/Github_medium---o2068"
+        ]
+      },
+      "measured_corpus_sha256": "e129fccf28eccb28abf064b8b39f90eb5e42aef14c112e7be794269b44ed8bbd",
+      "metric": "native commit_i to mask_i+1; minimum complete interval across two independent runs",
+      "median_paired_build_ratio": 0.9988951230379015,
+      "description_correction": {
+        "timestamp": "2026-09-28T00:57:20.049515+08:00",
+        "reason": "Correct stale copied description only. Original per-run revisions and independently frozen binary hashes identify 68a and 6f9; raw timings and scored key sets are unchanged."
+      },
+      "groups": {
+        "published": {
+          "schemas": 1000,
+          "failures": {},
+          "matched_intervals": 367640,
+          "build_ms": {
+            "p50": 1.6436665000000001,
+            "p90": 4.6335417,
+            "p95": 7.6370600999999985,
+            "p99": 22.81683167,
+            "p99.9": 42.97741258400081,
+            "p100": 51.965
+          },
+          "tbm_us": {
+            "p50": 6.958,
+            "p90": 76.0,
+            "p95": 102.208,
+            "p99": 196.48400999999942,
+            "p99.9": 587.4690140000125,
+            "p100": 2717.125
+          },
+          "total_build_ms": 2775.752644,
+          "raw_max_us": 2721.875,
+          "worst_tbm": [
+            [
+              2717.125,
+              [
+                "jsb/data/Github_hard---o21074",
+                0,
+                36
+              ]
+            ],
+            [
+              2668.209,
+              [
+                "jsb/data/Github_medium---o21142",
+                0,
+                74
+              ]
+            ],
+            [
+              2659.666,
+              [
+                "jsb/data/Github_hard---o21074",
+                0,
+                42
+              ]
+            ],
+            [
+              2637.042,
+              [
+                "jsb/data/Github_hard---o21074",
+                0,
+                218
+              ]
+            ],
+            [
+              2635.917,
+              [
+                "jsb/data/Github_hard---o21074",
+                5,
+                367
+              ]
+            ],
+            [
+              2635.792,
+              [
+                "jsb/data/Github_hard---o21074",
+                0,
+                79
+              ]
+            ],
+            [
+              2635.584,
+              [
+                "jsb/data/Github_hard---o21074",
+                5,
+                385
+              ]
+            ],
+            [
+              2635.041,
+              [
+                "jsb/data/Github_hard---o21074",
+                5,
+                393
+              ]
+            ],
+            [
+              2633.625,
+              [
+                "jsb/data/Github_hard---o21074",
+                3,
+                83
+              ]
+            ],
+            [
+              2632.833,
+              [
+                "jsb/data/Github_hard---o21074",
+                5,
+                375
+              ]
+            ],
+            [
+              2628.583,
+              [
+                "jsb/data/Github_hard---o21074",
+                5,
+                249
+              ]
+            ],
+            [
+              2628.583,
+              [
+                "jsb/data/Github_hard---o21074",
+                3,
+                50
+              ]
+            ],
+            [
+              2628.542,
+              [
+                "jsb/data/Github_hard---o21074",
+                5,
+                241
+              ]
+            ],
+            [
+              2626.667,
+              [
+                "jsb/data/Github_hard---o21074",
+                5,
+                303
+              ]
+            ],
+            [
+              2625.667,
+              [
+                "jsb/data/Github_hard---o21074",
+                5,
+                267
+              ]
+            ]
+          ]
+        },
+        "candidate": {
+          "schemas": 1000,
+          "failures": {},
+          "matched_intervals": 367640,
+          "build_ms": {
+            "p50": 1.647521,
+            "p90": 4.610678800000001,
+            "p95": 7.536966949999999,
+            "p99": 22.243435079999998,
+            "p99.9": 42.68886645800078,
+            "p100": 51.421583
+          },
+          "tbm_us": {
+            "p50": 6.958,
+            "p90": 76.458,
+            "p95": 105.917,
+            "p99": 198.99324999999826,
+            "p99.9": 589.6474120000098,
+            "p100": 2740.042
+          },
+          "total_build_ms": 2767.811323,
+          "raw_max_us": 2764.959,
+          "worst_tbm": [
+            [
+              2740.042,
+              [
+                "jsb/data/Github_hard---o21074",
+                0,
+                36
+              ]
+            ],
+            [
+              2687.667,
+              [
+                "jsb/data/Github_medium---o21142",
+                0,
+                74
+              ]
+            ],
+            [
+              2676.5,
+              [
+                "jsb/data/Github_hard---o21074",
+                3,
+                50
+              ]
+            ],
+            [
+              2659.375,
+              [
+                "jsb/data/Github_hard---o21074",
+                3,
+                83
+              ]
+            ],
+            [
+              2650.917,
+              [
+                "jsb/data/Github_hard---o21074",
+                0,
+                42
+              ]
+            ],
+            [
+              2646.542,
+              [
+                "jsb/data/Github_hard---o21074",
+                5,
+                393
+              ]
+            ],
+            [
+              2644.5,
+              [
+                "jsb/data/Github_hard---o21074",
+                0,
+                218
+              ]
+            ],
+            [
+              2641.917,
+              [
+                "jsb/data/Github_hard---o21074",
+                5,
+                241
+              ]
+            ],
+            [
+              2641.166,
+              [
+                "jsb/data/Github_hard---o21074",
+                5,
+                295
+              ]
+            ],
+            [
+              2640.958,
+              [
+                "jsb/data/Github_hard---o21074",
+                5,
+                357
+              ]
+            ],
+            [
+              2640.458,
+              [
+                "jsb/data/Github_hard---o21074",
+                3,
+                53
+              ]
+            ],
+            [
+              2638.75,
+              [
+                "jsb/data/Github_hard---o21074",
+                5,
+                267
+              ]
+            ],
+            [
+              2638.625,
+              [
+                "jsb/data/Github_hard---o21074",
+                5,
+                367
+              ]
+            ],
+            [
+              2638.375,
+              [
+                "jsb/data/Github_hard---o21074",
+                5,
+                349
+              ]
+            ],
+            [
+              2637.542,
+              [
+                "jsb/data/Github_medium---o21142",
+                3,
+                87
+              ]
+            ]
+          ]
+        }
+      }
+    },
+    "static": {
+      "mode": "static",
+      "semantic_differences": 0,
+      "binary_sha256": {
+        "published": "79aa35e28c9b960c1f2ee140a307bac73b87905e50c550da996110b06488314e",
+        "candidate": "78d967581640f49c36e6bf8ed58bbe552277e77926c40acdd5fcd7d69f2ad1c8"
+      },
+      "comparison": "Independently built published 68a648fc3 versus live-branch witness 6f9f1c482 default; identical locked native harness and production cache policy.",
+      "selection": {
+        "policy": "First 1000 schemas in retained corpus order after llguidance-success filter; do not drop candidate failures",
+        "input_schemas": 9558,
+        "ll_supported": 8332,
+        "selected": 1000,
+        "ll_reference": "/Users/isaacbreen/Projects2/constraint-framework-analysis/results/final-jsb-refresh-s50-mac-20260923/raw/llguidance.json.zst",
+        "ll_sha256": "64d28941a60d8262b7e201b94a13726e48e2eddcff2e4a8eb2718e6764551adc",
+        "corpus_sha256": "e129fccf28eccb28abf064b8b39f90eb5e42aef14c112e7be794269b44ed8bbd",
+        "runner_source_sha256": "9a076512299482de5dddf34dcd9032b0cf81c0806d1a7201137ebe772dbe7821",
+        "ids": [
+          "jsb/data/Kubernetes---kb_223_Normalized",
+          "jsb/data/Snowplow---sp_295_Normalized",
+          "jsb/data/Github_easy---o76766",
+          "jsb/data/Github_medium---o83086",
+          "jsb/data/Kubernetes---kb_576_Normalized",
+          "jsb/data/Snowplow---sp_149_Normalized",
+          "jsb/data/Github_easy---o66586",
+          "jsb/data/Glaiveai2K---calculate_area_98abd231",
+          "jsb/data/Glaiveai2K---calculate_area_867a9626",
+          "jsb/data/Github_medium---o70369",
+          "jsb/data/Glaiveai2K---create_calendar_event_b6063530",
+          "jsb/data/Glaiveai2K---calculate_area_380ef84d",
+          "jsb/data/Kubernetes---kb_727_Normalized",
+          "jsb/data/Glaiveai2K---search_recipe_8096f36e",
+          "jsb/data/Kubernetes---kb_432_Normalized",
+          "jsb/data/Github_medium---o27787",
+          "jsb/data/Github_medium---o82377",
+          "jsb/data/Github_easy---o20466",
+          "jsb/data/Snowplow---sp_267_Normalized",
+          "jsb/data/Glaiveai2K---calculate_rental_income_bce2d46e",
+          "jsb/data/Github_medium---o39435",
+          "jsb/data/Github_medium---o26969",
+          "jsb/data/Github_hard---o31007",
+          "jsb/data/Github_easy---o12622",
+          "jsb/data/Github_medium---o50683",
+          "jsb/data/Github_easy---o89833",
+          "jsb/data/Github_hard---o6090",
+          "jsb/data/Snowplow---sp_409_Normalized",
+          "jsb/data/Kubernetes---kb_718_Normalized",
+          "jsb/data/Github_medium---o9878",
+          "jsb/data/Github_easy---o90345",
+          "jsb/data/Kubernetes---kb_919_Normalized",
+          "jsb/data/Github_easy---o58273",
+          "jsb/data/Github_trivial---o69753",
+          "jsb/data/Github_medium---o30735",
+          "jsb/data/Github_medium---o60973",
+          "jsb/data/Github_medium---o15178",
+          "jsb/data/Github_hard---o84200",
+          "jsb/data/Glaiveai2K---generate_invoice_c887e181",
+          "jsb/data/Kubernetes---kb_1064_Normalized",
+          "jsb/data/Kubernetes---kb_951_Normalized",
+          "jsb/data/Github_hard---o41192",
+          "jsb/data/Github_easy---o65305",
+          "jsb/data/Github_ultra---o60252",
+          "jsb/data/Kubernetes---kb_775_Normalized",
+          "jsb/data/Github_medium---o57436",
+          "jsb/data/Github_hard---o89723",
+          "jsb/data/Glaiveai2K---calculate_area_a9125cf8",
+          "jsb/data/Github_easy---o58490",
+          "jsb/data/Github_trivial---o62772",
+          "jsb/data/Kubernetes---kb_45_Normalized",
+          "jsb/data/Github_trivial---o78117",
+          "jsb/data/Github_easy---o41803",
+          "jsb/data/Github_ultra---o71471",
+          "jsb/data/Github_trivial---o83723",
+          "jsb/data/Github_medium---o83131",
+          "jsb/data/Glaiveai2K---book_hotel_8f40c25f",
+          "jsb/data/Github_trivial---o77740",
+          "jsb/data/Github_medium---o65372",
+          "jsb/data/Glaiveai2K---create_invoice_2b2ef017",
+          "jsb/data/Snowplow---sp_227_Normalized",
+          "jsb/data/Glaiveai2K---calculate_area_ed89a519",
+          "jsb/data/Github_hard---o48013",
+          "jsb/data/Glaiveai2K---calculate_area_26c9d055",
+          "jsb/data/Github_medium---o61614",
+          "jsb/data/Github_easy---o66187",
+          "jsb/data/Github_hard---o33027",
+          "jsb/data/JsonSchemaStore---importmap",
+          "jsb/data/Github_easy---o53898",
+          "jsb/data/Github_hard---o9843",
+          "jsb/data/Github_trivial---o3211",
+          "jsb/data/Github_hard---o47197",
+          "jsb/data/Github_hard---o64563",
+          "jsb/data/Github_hard---o7313",
+          "jsb/data/Kubernetes---kb_483_Normalized",
+          "jsb/data/Kubernetes---kb_269_Normalized",
+          "jsb/data/JsonSchemaStore---component",
+          "jsb/data/Github_trivial---o44989",
+          "jsb/data/Github_easy---o20458",
+          "jsb/data/Github_trivial---o40355",
+          "jsb/data/Github_easy---o90235",
+          "jsb/data/Github_medium---o13",
+          "jsb/data/Glaiveai2K---calculate_distance_731540d9",
+          "jsb/data/Github_hard---o36010",
+          "jsb/data/Github_easy---o67463",
+          "jsb/data/Github_medium---o69733",
+          "jsb/data/Kubernetes---kb_367_Normalized",
+          "jsb/data/Github_hard---o59668",
+          "jsb/data/Glaiveai2K---calculate_area_cae07f36",
+          "jsb/data/Snowplow---sp_311_Normalized",
+          "jsb/data/Github_hard---o30094",
+          "jsb/data/Glaiveai2K---calculate_area_15d77de3",
+          "jsb/data/Kubernetes---kb_1025_Normalized",
+          "jsb/data/Github_trivial---o45634",
+          "jsb/data/Github_medium---o71300",
+          "jsb/data/Glaiveai2K---calculate_area_d986777c",
+          "jsb/data/Github_ultra---o3625",
+          "jsb/data/Glaiveai2K---generate_random_password_0b5e94e6",
+          "jsb/data/Github_hard---o40394",
+          "jsb/data/Kubernetes---kb_643_Normalized",
+          "jsb/data/Github_hard---o62961",
+          "jsb/data/Github_medium---o78137",
+          "jsb/data/Github_medium---o61533",
+          "jsb/data/Github_easy---o45172",
+          "jsb/data/Github_medium---o68301",
+          "jsb/data/Github_easy---o25983",
+          "jsb/data/Github_hard---o4360",
+          "jsb/data/Github_medium---o22449",
+          "jsb/data/Github_trivial---o66311",
+          "jsb/data/Github_easy---o89607",
+          "jsb/data/Github_hard---o60288",
+          "jsb/data/Github_medium---o48002",
+          "jsb/data/Glaiveai2K---create_calendar_event_ede3b10f",
+          "jsb/data/Kubernetes---kb_889_Normalized",
+          "jsb/data/Github_easy---o11170",
+          "jsb/data/Glaiveai2K---schedule_meeting_58e2161b",
+          "jsb/data/Github_medium---o73919",
+          "jsb/data/Github_medium---o5373",
+          "jsb/data/Github_medium---o31362",
+          "jsb/data/Github_trivial---o45635",
+          "jsb/data/Github_easy---o35770",
+          "jsb/data/Github_easy---o79448",
+          "jsb/data/Kubernetes---kb_359_Normalized",
+          "jsb/data/Github_easy---o30899",
+          "jsb/data/Github_medium---o4833",
+          "jsb/data/Glaiveai2K---calculate_area_652bb90d",
+          "jsb/data/Kubernetes---kb_144_Normalized",
+          "jsb/data/Glaiveai2K---calculate_mortgage_payment_e133248d",
+          "jsb/data/Github_easy---o91008",
+          "jsb/data/Github_easy---o44231",
+          "jsb/data/Github_easy---o91096",
+          "jsb/data/Github_medium---o5147",
+          "jsb/data/Kubernetes---kb_213_Normalized",
+          "jsb/data/Kubernetes---kb_1104_Normalized",
+          "jsb/data/Github_hard---o21310",
+          "jsb/data/Github_easy---o90298",
+          "jsb/data/Kubernetes---kb_807_Normalized",
+          "jsb/data/JsonSchemaStore---foxx-manifest",
+          "jsb/data/Github_easy---o10093",
+          "jsb/data/Snowplow---sp_104_Normalized",
+          "jsb/data/Glaiveai2K---track_expenses_c8268204",
+          "jsb/data/Glaiveai2K---generate_random_password_b4515773",
+          "jsb/data/Github_medium---o71311",
+          "jsb/data/Glaiveai2K---generate_random_password_adc9cd6f",
+          "jsb/data/Glaiveai2K---calculate_area_cd0cc337",
+          "jsb/data/Github_easy---o90885",
+          "jsb/data/Glaiveai2K---calculate_shipping_cost_c68c84af",
+          "jsb/data/Github_easy---o90831",
+          "jsb/data/Github_hard---o21410",
+          "jsb/data/JsonSchemaStore---bungee-plugin",
+          "jsb/data/Glaiveai2K---generate_random_password_e0f7b38a",
+          "jsb/data/Github_medium---o31835",
+          "jsb/data/Github_easy---o44299",
+          "jsb/data/Github_medium---o55772",
+          "jsb/data/Github_medium---o47749",
+          "jsb/data/Github_medium---o66688",
+          "jsb/data/Github_hard---o75284",
+          "jsb/data/Github_easy---o41690",
+          "jsb/data/Github_medium---o8469",
+          "jsb/data/Github_medium---o72184",
+          "jsb/data/Kubernetes---kb_714_Normalized",
+          "jsb/data/Github_medium---o43230",
+          "jsb/data/Github_easy---o71312",
+          "jsb/data/Github_medium---o43729",
+          "jsb/data/Github_easy---o73015",
+          "jsb/data/Github_hard---o83834",
+          "jsb/data/Github_easy---o39082",
+          "jsb/data/JsonSchemaStore---lerna",
+          "jsb/data/Github_medium---o41283",
+          "jsb/data/Github_hard---o72193",
+          "jsb/data/Github_medium---o60319",
+          "jsb/data/Github_medium---o39426",
+          "jsb/data/Github_easy---o71308",
+          "jsb/data/Github_easy---o47149",
+          "jsb/data/Github_hard---o13112",
+          "jsb/data/Github_medium---o33687",
+          "jsb/data/Github_medium---o42580",
+          "jsb/data/Glaiveai2K---create_event_c6d94c63",
+          "jsb/data/Github_easy---o84028",
+          "jsb/data/Github_medium---o28532",
+          "jsb/data/Github_hard---o5409",
+          "jsb/data/Github_easy---o35167",
+          "jsb/data/Github_easy---o63687",
+          "jsb/data/Kubernetes---kb_428_Normalized",
+          "jsb/data/Github_hard---o55072",
+          "jsb/data/Github_easy---o83738",
+          "jsb/data/Github_trivial---o45020",
+          "jsb/data/Github_hard---o52904",
+          "jsb/data/Glaiveai2K---calculate_area_efd2f996",
+          "jsb/data/Github_medium---o48339",
+          "jsb/data/Snowplow---sp_345_Normalized",
+          "jsb/data/Github_easy---o50970",
+          "jsb/data/Github_easy---o42187",
+          "jsb/data/Glaiveai2K---calculate_area_763b5315",
+          "jsb/data/Github_easy---o43224",
+          "jsb/data/Github_easy---o8465",
+          "jsb/data/Glaiveai2K---generate_invoice_159c0a0a",
+          "jsb/data/Github_medium---o33928",
+          "jsb/data/Github_easy---o32246",
+          "jsb/data/Glaiveai2K---calculate_area_2b27249d",
+          "jsb/data/Github_easy---o59671",
+          "jsb/data/Kubernetes---kb_244_Normalized",
+          "jsb/data/Github_medium---o1",
+          "jsb/data/Github_medium---o67597",
+          "jsb/data/Kubernetes---kb_429_Normalized",
+          "jsb/data/Github_easy---o53700",
+          "jsb/data/Github_easy---o26593",
+          "jsb/data/Github_trivial---o70292",
+          "jsb/data/Github_easy---o7496",
+          "jsb/data/Github_medium---o61597",
+          "jsb/data/Glaiveai2K---create_calendar_event_c2876547",
+          "jsb/data/Github_easy---o21733",
+          "jsb/data/Kubernetes---kb_90_Normalized",
+          "jsb/data/Kubernetes---kb_820_Normalized",
+          "jsb/data/Github_easy---o89106",
+          "jsb/data/Github_hard---o21195",
+          "jsb/data/Github_medium---o82351",
+          "jsb/data/Github_medium---o33700",
+          "jsb/data/Github_easy---o19066",
+          "jsb/data/Glaiveai2K---calculate_area_b34e2184",
+          "jsb/data/Snowplow---sp_180_Normalized",
+          "jsb/data/Github_medium---o29942",
+          "jsb/data/Glaiveai2K---book_flight_ec10069a",
+          "jsb/data/Github_medium---o90620",
+          "jsb/data/Github_ultra---o18949",
+          "jsb/data/JsonSchemaStore---ntangle",
+          "jsb/data/Kubernetes---kb_591_Normalized",
+          "jsb/data/Github_medium---o53100",
+          "jsb/data/Github_medium---o78738",
+          "jsb/data/WashingtonPost---wp_68_Normalized",
+          "jsb/data/Github_medium---o56041",
+          "jsb/data/Glaiveai2K---generate_invoice_4c6c4eae",
+          "jsb/data/Github_easy---o41646",
+          "jsb/data/Github_trivial---o69499",
+          "jsb/data/Glaiveai2K---calculate_discounted_price_22361dfa",
+          "jsb/data/Glaiveai2K---search_news_8cfb92ac",
+          "jsb/data/Github_trivial---o90950",
+          "jsb/data/Github_medium---o54930",
+          "jsb/data/Glaiveai2K---calculate_area_88ee549f",
+          "jsb/data/Github_medium---o24463",
+          "jsb/data/WashingtonPost---wp_108_Normalized",
+          "jsb/data/Github_hard---o84050",
+          "jsb/data/Glaiveai2K---search_hotels_348c46f6",
+          "jsb/data/Github_medium---o30265",
+          "jsb/data/Github_medium---o48313",
+          "jsb/data/Glaiveai2K---calculate_area_6efa49a2",
+          "jsb/data/Glaiveai2K---calculate_discounted_price_07490caf",
+          "jsb/data/Github_trivial---o10021",
+          "jsb/data/Github_medium---o12289",
+          "jsb/data/Glaiveai2K---generate_invoice_a0a4ae87",
+          "jsb/data/Glaiveai2K---create_invoice_beb99d93",
+          "jsb/data/Glaiveai2K---calculate_area_79767fec",
+          "jsb/data/Github_easy---o81575",
+          "jsb/data/Glaiveai2K---calculate_area_248bb00a",
+          "jsb/data/Github_easy---o28614",
+          "jsb/data/Github_hard---o60179",
+          "jsb/data/Glaiveai2K---create_resume_3dc11395",
+          "jsb/data/Github_easy---o75096",
+          "jsb/data/Github_easy---o22866",
+          "jsb/data/Github_hard---o34342",
+          "jsb/data/Github_medium---o91089",
+          "jsb/data/Github_medium---o5158",
+          "jsb/data/Github_ultra---o9981",
+          "jsb/data/Github_hard---o71304",
+          "jsb/data/Glaiveai2K---calculate_area_69966aa8",
+          "jsb/data/Github_easy---o38553",
+          "jsb/data/Github_medium---o12244",
+          "jsb/data/Github_medium---o90787",
+          "jsb/data/Snowplow---sp_60_Normalized",
+          "jsb/data/Github_easy---o49129",
+          "jsb/data/Github_ultra---o73963",
+          "jsb/data/Github_easy---o64535",
+          "jsb/data/Glaiveai2K---calculate_area_86e1ccc1",
+          "jsb/data/Github_medium---o59694",
+          "jsb/data/Glaiveai2K---book_flight_1987304d",
+          "jsb/data/Github_easy---o39397",
+          "jsb/data/Github_medium---o43971",
+          "jsb/data/Glaiveai2K---calculate_area_8c0d66c9",
+          "jsb/data/Github_easy---o25701",
+          "jsb/data/Kubernetes---kb_554_Normalized",
+          "jsb/data/Github_medium---o9771",
+          "jsb/data/Github_hard---o21306",
+          "jsb/data/JsonSchemaStore---nightwatch",
+          "jsb/data/Snowplow---sp_36_Normalized",
+          "jsb/data/Glaiveai2K---generate_invoice_65ca3e70",
+          "jsb/data/Github_medium---o6212",
+          "jsb/data/Glaiveai2K---calculate_area_30182f13",
+          "jsb/data/Github_easy---o56866",
+          "jsb/data/Github_trivial---o25988",
+          "jsb/data/Github_medium---o48248",
+          "jsb/data/Github_trivial---o54984",
+          "jsb/data/Github_medium---o3907",
+          "jsb/data/Github_trivial---o25189",
+          "jsb/data/Github_hard---o41314",
+          "jsb/data/Github_medium---o25401",
+          "jsb/data/Github_easy---o44286",
+          "jsb/data/Github_easy---o43004",
+          "jsb/data/Github_hard---o90821",
+          "jsb/data/WashingtonPost---wp_40_Normalized",
+          "jsb/data/Kubernetes---kb_947_Normalized",
+          "jsb/data/Github_medium---o90027",
+          "jsb/data/Glaiveai2K---schedule_meeting_d81725da",
+          "jsb/data/Github_medium---o65678",
+          "jsb/data/Github_medium---o89003",
+          "jsb/data/Github_easy---o66192",
+          "jsb/data/Glaiveai2K---create_calendar_event_8a2d858d",
+          "jsb/data/Github_medium---o37090",
+          "jsb/data/Github_trivial---o88607",
+          "jsb/data/Github_hard---o56008",
+          "jsb/data/Github_easy---o31168",
+          "jsb/data/Kubernetes---kb_84_Normalized",
+          "jsb/data/Github_hard---o31337",
+          "jsb/data/Github_easy---o80622",
+          "jsb/data/Github_easy---o19033",
+          "jsb/data/Glaiveai2K---search_product_e033cad8",
+          "jsb/data/Glaiveai2K---generate_invoice_f07e2f90",
+          "jsb/data/Github_easy---o90301",
+          "jsb/data/Github_ultra---o43012",
+          "jsb/data/Glaiveai2K---search_jobs_4815ca42",
+          "jsb/data/Kubernetes---kb_57_Normalized",
+          "jsb/data/Github_medium---o70371",
+          "jsb/data/Github_hard---o57503",
+          "jsb/data/Snowplow---sp_387_Normalized",
+          "jsb/data/Github_easy---o68291",
+          "jsb/data/Glaiveai2K---generate_invoice_2138db6b",
+          "jsb/data/Github_hard---o61085",
+          "jsb/data/Github_easy---o5956",
+          "jsb/data/Github_trivial---o27832",
+          "jsb/data/Github_trivial---o41669",
+          "jsb/data/Glaiveai2K---create_invoice_7408fa0e",
+          "jsb/data/Glaiveai2K---schedule_meeting_f2cfc8de",
+          "jsb/data/Github_medium---o30747",
+          "jsb/data/Github_hard---o21246",
+          "jsb/data/Github_medium---o20484",
+          "jsb/data/Glaiveai2K---calculate_area_a536283a",
+          "jsb/data/Github_medium---o21142",
+          "jsb/data/Glaiveai2K---analyze_social_media_sentiment_b20b116b",
+          "jsb/data/Github_medium---o44008",
+          "jsb/data/Github_hard---o87865",
+          "jsb/data/Github_easy---o33832",
+          "jsb/data/Snowplow---sp_332_Normalized",
+          "jsb/data/Glaiveai2K---calculate_distance_1cbd4d8c",
+          "jsb/data/Github_easy---o63288",
+          "jsb/data/Github_easy---o6263",
+          "jsb/data/Kubernetes---kb_559_Normalized",
+          "jsb/data/Github_medium---o78478",
+          "jsb/data/Github_medium---o91594",
+          "jsb/data/Glaiveai2K---generate_password_d68d3a4c",
+          "jsb/data/Github_easy---o60117",
+          "jsb/data/Github_easy---o42289",
+          "jsb/data/Glaiveai2K---create_calendar_event_342b5c33",
+          "jsb/data/Github_easy---o43234",
+          "jsb/data/Github_easy---o37715",
+          "jsb/data/Glaiveai2K---calculate_area_0b97c15f",
+          "jsb/data/Github_hard---o21226",
+          "jsb/data/Github_easy---o90826",
+          "jsb/data/Github_easy---o58914",
+          "jsb/data/Github_medium---o30846",
+          "jsb/data/Glaiveai2K---calculate_car_emissions_847c1055",
+          "jsb/data/Github_easy---o5162",
+          "jsb/data/Github_easy---o65448",
+          "jsb/data/Github_hard---o14514",
+          "jsb/data/Github_medium---o10518",
+          "jsb/data/Github_medium---o55102",
+          "jsb/data/Glaiveai2K---calculate_gpa_11b0bca5",
+          "jsb/data/Kubernetes---kb_410_Normalized",
+          "jsb/data/Glaiveai2K---calculate_perimeter_57ef13c0",
+          "jsb/data/Github_medium---o7288",
+          "jsb/data/Kubernetes---kb_297_Normalized",
+          "jsb/data/Github_easy---o61120",
+          "jsb/data/Github_easy---o76479",
+          "jsb/data/Github_easy---o12223",
+          "jsb/data/Github_medium---o12458",
+          "jsb/data/Github_medium---o21099",
+          "jsb/data/Github_trivial---o6377",
+          "jsb/data/Github_medium---o38438",
+          "jsb/data/Github_medium---o69138",
+          "jsb/data/Github_medium---o48420",
+          "jsb/data/Github_easy---o90265",
+          "jsb/data/Glaiveai2K---calculate_gpa_ff62a7e0",
+          "jsb/data/Glaiveai2K---generate_invoice_a4231107",
+          "jsb/data/Glaiveai2K---create_todo_e7e42931",
+          "jsb/data/Kubernetes---kb_472_Normalized",
+          "jsb/data/Github_easy---o51081",
+          "jsb/data/Github_trivial---o82284",
+          "jsb/data/Github_medium---o20254",
+          "jsb/data/Kubernetes---kb_1118_Normalized",
+          "jsb/data/Kubernetes---kb_766_Normalized",
+          "jsb/data/Github_hard---o41203",
+          "jsb/data/Github_hard---o5341",
+          "jsb/data/Kubernetes---kb_680_Normalized",
+          "jsb/data/Snowplow---sp_50_Normalized",
+          "jsb/data/Github_hard---o20272",
+          "jsb/data/Github_easy---o3454",
+          "jsb/data/Github_medium---o31244",
+          "jsb/data/Kubernetes---kb_936_Normalized",
+          "jsb/data/Github_medium---o45227",
+          "jsb/data/Github_medium---o61638",
+          "jsb/data/Github_easy---o21458",
+          "jsb/data/Github_medium---o41380",
+          "jsb/data/Glaiveai2K---create_invoice_13e1ec6d",
+          "jsb/data/Snowplow---sp_399_Normalized",
+          "jsb/data/Github_medium---o28201",
+          "jsb/data/Github_hard---o58318",
+          "jsb/data/Glaiveai2K---calculate_gpa_8889db1e",
+          "jsb/data/Github_medium---o84343",
+          "jsb/data/Github_hard---o61586",
+          "jsb/data/Github_easy---o89764",
+          "jsb/data/Github_easy---o54558",
+          "jsb/data/Kubernetes---kb_187_Normalized",
+          "jsb/data/Github_easy---o53004",
+          "jsb/data/JsonSchemaStore---appsscript",
+          "jsb/data/Github_trivial---o72207",
+          "jsb/data/Kubernetes---kb_229_Normalized",
+          "jsb/data/Github_easy---o85086",
+          "jsb/data/Github_medium---o1505",
+          "jsb/data/Github_medium---o29959",
+          "jsb/data/Github_easy---o44188",
+          "jsb/data/Github_trivial---o25741",
+          "jsb/data/Github_medium---o90771",
+          "jsb/data/Github_easy---o75145",
+          "jsb/data/Github_ultra---o16062",
+          "jsb/data/Github_easy---o69219",
+          "jsb/data/Github_medium---o12971",
+          "jsb/data/Snowplow---sp_392_Normalized",
+          "jsb/data/Github_easy---o9519",
+          "jsb/data/Github_medium---o9187",
+          "jsb/data/Kubernetes---kb_286_Normalized",
+          "jsb/data/Glaiveai2K---calculate_gpa_0ca04f9f",
+          "jsb/data/Github_medium---o59293",
+          "jsb/data/Glaiveai2K---calculate_distance_9339c7aa",
+          "jsb/data/Snowplow---sp_250_Normalized",
+          "jsb/data/Glaiveai2K---generate_invoice_938a3402",
+          "jsb/data/Github_medium---o25768",
+          "jsb/data/Glaiveai2K---calculate_area_85d9648e",
+          "jsb/data/Github_easy---o39445",
+          "jsb/data/Glaiveai2K---calculate_tax_07b872b9",
+          "jsb/data/Kubernetes---kb_763_Normalized",
+          "jsb/data/Glaiveai2K---calculate_area_c05fc94a",
+          "jsb/data/Github_medium---o74447",
+          "jsb/data/Kubernetes---kb_83_Normalized",
+          "jsb/data/Snowplow---sp_276_Normalized",
+          "jsb/data/WashingtonPost---wp_24_Normalized",
+          "jsb/data/Kubernetes---kb_365_Normalized",
+          "jsb/data/Kubernetes---kb_661_Normalized",
+          "jsb/data/Github_medium---o30701",
+          "jsb/data/WashingtonPost---wp_67_Normalized",
+          "jsb/data/Github_trivial---o84271",
+          "jsb/data/Github_hard---o61612",
+          "jsb/data/Kubernetes---kb_882_Normalized",
+          "jsb/data/Snowplow---sp_312_Normalized",
+          "jsb/data/Github_hard---o47979",
+          "jsb/data/Github_easy---o58495",
+          "jsb/data/Glaiveai2K---calculate_area_5af876a7",
+          "jsb/data/Github_easy---o72587",
+          "jsb/data/Kubernetes---kb_848_Normalized",
+          "jsb/data/Glaiveai2K---calculate_area_fe414505",
+          "jsb/data/Glaiveai2K---find_restaurants_ca892923",
+          "jsb/data/Glaiveai2K---calculate_volume_56fe1b99",
+          "jsb/data/Github_medium---o91100",
+          "jsb/data/Glaiveai2K---calculate_area_cd85fa05",
+          "jsb/data/Github_easy---o64823",
+          "jsb/data/Github_easy---o64869",
+          "jsb/data/Github_hard---o5400",
+          "jsb/data/Github_hard---o41264",
+          "jsb/data/Github_medium---o14405",
+          "jsb/data/Github_easy---o83294",
+          "jsb/data/Kubernetes---kb_648_Normalized",
+          "jsb/data/Github_trivial---o70294",
+          "jsb/data/Github_medium---o54977",
+          "jsb/data/Github_hard---o48022",
+          "jsb/data/Glaiveai2K---generate_invoice_00facca8",
+          "jsb/data/Kubernetes---kb_1130_Normalized",
+          "jsb/data/Github_medium---o31136",
+          "jsb/data/Github_medium---o10217",
+          "jsb/data/Github_medium---o74597",
+          "jsb/data/Github_medium---o8475",
+          "jsb/data/Github_easy---o21487",
+          "jsb/data/Github_hard---o90895",
+          "jsb/data/Kubernetes---kb_715_Normalized",
+          "jsb/data/Kubernetes---kb_1096_Normalized",
+          "jsb/data/Glaiveai2K---find_hotels_cafa32e9",
+          "jsb/data/Github_easy---o43981",
+          "jsb/data/Github_medium---o35772",
+          "jsb/data/Kubernetes---kb_97_Normalized",
+          "jsb/data/Github_easy---o76874",
+          "jsb/data/Glaiveai2K---calculate_area_3d71020d",
+          "jsb/data/Github_medium---o83277",
+          "jsb/data/Github_easy---o25970",
+          "jsb/data/Github_medium---o79425",
+          "jsb/data/Github_hard---o89729",
+          "jsb/data/Github_medium---o54973",
+          "jsb/data/Glaiveai2K---calculate_area_63d8c1b9",
+          "jsb/data/Kubernetes---kb_18_Normalized",
+          "jsb/data/Github_hard---o82821",
+          "jsb/data/JsonSchemaStore---httpmockrc",
+          "jsb/data/Github_hard---o31290",
+          "jsb/data/Glaiveai2K---calculate_mortgage_payment_13c9494e",
+          "jsb/data/Kubernetes---kb_563_Normalized",
+          "jsb/data/Github_trivial---o21828",
+          "jsb/data/Glaiveai2K---calculate_area_d36b4351",
+          "jsb/data/Glaiveai2K---find_hotels_668d067d",
+          "jsb/data/Kubernetes---kb_62_Normalized",
+          "jsb/data/Github_hard---o41345",
+          "jsb/data/Glaiveai2K---calculate_shipping_cost_bbfa1080",
+          "jsb/data/Glaiveai2K---get_recipe_11750e82",
+          "jsb/data/Github_medium---o61645",
+          "jsb/data/Github_easy---o5118",
+          "jsb/data/JsonSchemaStore---bpkg",
+          "jsb/data/Kubernetes---kb_895_Normalized",
+          "jsb/data/Glaiveai2K---generate_random_password_8cf128ad",
+          "jsb/data/Github_easy---o82718",
+          "jsb/data/Glaiveai2K---calculate_discounted_price_3f1d7578",
+          "jsb/data/Glaiveai2K---calculate_area_a407de0a",
+          "jsb/data/Github_hard---o41366",
+          "jsb/data/Github_hard---o21414",
+          "jsb/data/Github_trivial---o45029",
+          "jsb/data/Github_easy---o91148",
+          "jsb/data/Github_ultra---o6373",
+          "jsb/data/Kubernetes---kb_146_Normalized",
+          "jsb/data/Github_easy---o9799",
+          "jsb/data/Github_trivial---o89152",
+          "jsb/data/Snowplow---sp_265_Normalized",
+          "jsb/data/Github_medium---o61648",
+          "jsb/data/Github_hard---o65310",
+          "jsb/data/Kubernetes---kb_745_Normalized",
+          "jsb/data/Kubernetes---kb_460_Normalized",
+          "jsb/data/Glaiveai2K---calculate_volume_63ef66d4",
+          "jsb/data/Github_medium---o82148",
+          "jsb/data/Glaiveai2K---calculate_shipping_cost_4b09e153",
+          "jsb/data/Glaiveai2K---schedule_meeting_3cf4e0e9",
+          "jsb/data/Github_medium---o75613",
+          "jsb/data/Kubernetes---kb_1012_Normalized",
+          "jsb/data/Github_easy---o39443",
+          "jsb/data/Github_medium---o68398",
+          "jsb/data/Github_easy---o76763",
+          "jsb/data/Glaiveai2K---calculate_area_5a417652",
+          "jsb/data/Github_trivial---o79557",
+          "jsb/data/Kubernetes---kb_923_Normalized",
+          "jsb/data/Github_easy---o19356",
+          "jsb/data/Snowplow---sp_26_Normalized",
+          "jsb/data/Kubernetes---kb_249_Normalized",
+          "jsb/data/Github_easy---o20483",
+          "jsb/data/Github_easy---o5151",
+          "jsb/data/Github_easy---o9835",
+          "jsb/data/JsonSchemaStore---nycrc",
+          "jsb/data/Github_easy---o60886",
+          "jsb/data/Github_medium---o63552",
+          "jsb/data/Github_medium---o27789",
+          "jsb/data/Glaiveai2K---calculate_area_b59b5bd4",
+          "jsb/data/Kubernetes---kb_808_Normalized",
+          "jsb/data/Github_easy---o78997",
+          "jsb/data/Snowplow---sp_61_Normalized",
+          "jsb/data/Kubernetes---kb_178_Normalized",
+          "jsb/data/Github_trivial---o4366",
+          "jsb/data/Github_medium---o60848",
+          "jsb/data/Github_hard---o41249",
+          "jsb/data/Github_easy---o51170",
+          "jsb/data/Github_medium---o19337",
+          "jsb/data/Github_hard---o41375",
+          "jsb/data/Glaiveai2K---generate_invoice_62e6f8e4",
+          "jsb/data/Github_hard---o89734",
+          "jsb/data/Github_medium---o82281",
+          "jsb/data/Github_easy---o39505",
+          "jsb/data/Github_medium---o68435",
+          "jsb/data/Github_trivial---o10525",
+          "jsb/data/Github_easy---o58320",
+          "jsb/data/Github_trivial---o41592",
+          "jsb/data/Github_medium---o84268",
+          "jsb/data/Github_hard---o15291",
+          "jsb/data/Github_hard---o77405",
+          "jsb/data/Github_hard---o31057",
+          "jsb/data/Github_hard---o60887",
+          "jsb/data/Glaiveai2K---calculate_area_c04d2e21",
+          "jsb/data/Github_easy---o79491",
+          "jsb/data/Github_hard---o69965",
+          "jsb/data/Github_easy---o90280",
+          "jsb/data/Snowplow---sp_218_Normalized",
+          "jsb/data/Github_easy---o54976",
+          "jsb/data/JsonSchemaStore---pgap_yaml_input_reader",
+          "jsb/data/Github_hard---o78059",
+          "jsb/data/Github_hard---o79656",
+          "jsb/data/Github_easy---o20479",
+          "jsb/data/Github_medium---o36468",
+          "jsb/data/Github_easy---o89671",
+          "jsb/data/Github_hard---o82738",
+          "jsb/data/Github_medium---o74175",
+          "jsb/data/Github_easy---o27248",
+          "jsb/data/Github_easy---o25194",
+          "jsb/data/Github_medium---o16736",
+          "jsb/data/Github_hard---o41261",
+          "jsb/data/Glaiveai2K---calculate_mortgage_payment_5a604234",
+          "jsb/data/Glaiveai2K---calculate_area_04b0dca0",
+          "jsb/data/Github_easy---o90339",
+          "jsb/data/Github_easy---o68414",
+          "jsb/data/Github_hard---o47116",
+          "jsb/data/Github_medium---o73955",
+          "jsb/data/Kubernetes---kb_27_Normalized",
+          "jsb/data/Github_hard---o60980",
+          "jsb/data/Github_hard---o12499",
+          "jsb/data/Github_trivial---o51222",
+          "jsb/data/Glaiveai2K---calculate_area_f9bf95b6",
+          "jsb/data/Glaiveai2K---calculate_area_2fc464f9",
+          "jsb/data/Github_medium---o83292",
+          "jsb/data/Github_easy---o9863",
+          "jsb/data/Github_easy---o64856",
+          "jsb/data/Github_easy---o79434",
+          "jsb/data/Github_trivial---o41773",
+          "jsb/data/Github_trivial---o7442",
+          "jsb/data/Github_medium---o9198",
+          "jsb/data/Snowplow---sp_177_Normalized",
+          "jsb/data/JsonSchemaStore---minecraft-pack-mcmeta",
+          "jsb/data/Glaiveai2K---calculate_gpa_6472e5f1",
+          "jsb/data/Glaiveai2K---search_jobs_3eee6557",
+          "jsb/data/Github_medium---o13402",
+          "jsb/data/Github_trivial---o45023",
+          "jsb/data/Github_easy---o65454",
+          "jsb/data/Glaiveai2K---calculate_volume_e04c004c",
+          "jsb/data/Glaiveai2K---calculate_area_84f273e3",
+          "jsb/data/Glaiveai2K---calculate_area_3d4b35ef",
+          "jsb/data/Kubernetes---kb_621_Normalized",
+          "jsb/data/Github_easy---o6187",
+          "jsb/data/Github_hard---o21362",
+          "jsb/data/Glaiveai2K---calculate_volume_fbc164ed",
+          "jsb/data/Snowplow---sp_258_Normalized",
+          "jsb/data/Github_medium---o45486",
+          "jsb/data/Github_easy---o79717",
+          "jsb/data/Glaiveai2K---calculate_area_a9700ff2",
+          "jsb/data/Github_trivial---o48167",
+          "jsb/data/Github_medium---o46413",
+          "jsb/data/Github_medium---o49732",
+          "jsb/data/Kubernetes---kb_1032_Normalized",
+          "jsb/data/Kubernetes---kb_823_Normalized",
+          "jsb/data/Github_hard---o41491",
+          "jsb/data/Github_easy---o44009",
+          "jsb/data/Github_medium---o45134",
+          "jsb/data/Github_easy---o58905",
+          "jsb/data/Github_easy---o62774",
+          "jsb/data/Github_hard---o41286",
+          "jsb/data/Github_easy---o26975",
+          "jsb/data/WashingtonPost---wp_52_Normalized",
+          "jsb/data/Github_medium---o64837",
+          "jsb/data/Glaiveai2K---generate_invoice_f09da27e",
+          "jsb/data/Github_medium---o68444",
+          "jsb/data/JsonSchemaStore---minecraft-texture-mcmeta",
+          "jsb/data/Glaiveai2K---calculate_area_16ecbdde",
+          "jsb/data/Github_medium---o82337",
+          "jsb/data/Kubernetes---kb_1098_Normalized",
+          "jsb/data/Glaiveai2K---calculate_area_c040f289",
+          "jsb/data/Github_trivial---o76469",
+          "jsb/data/Snowplow---sp_289_Normalized",
+          "jsb/data/Kubernetes---kb_896_Normalized",
+          "jsb/data/Kubernetes---kb_1028_Normalized",
+          "jsb/data/Github_medium---o73959",
+          "jsb/data/Glaiveai2K---search_products_cef602be",
+          "jsb/data/Github_medium---o50504",
+          "jsb/data/Github_easy---o12088",
+          "jsb/data/Glaiveai2K---create_calendar_event_011e9d78",
+          "jsb/data/Glaiveai2K---calculate_area_f0f97126",
+          "jsb/data/Github_easy---o5163",
+          "jsb/data/Glaiveai2K---generate_invoice_cfbcf237",
+          "jsb/data/Github_easy---o46362",
+          "jsb/data/Github_medium---o53044",
+          "jsb/data/Github_hard---o53697",
+          "jsb/data/Github_medium---o69100",
+          "jsb/data/Github_hard---o65322",
+          "jsb/data/Glaiveai2K---calculate_area_8cdcc04b",
+          "jsb/data/Github_hard---o61632",
+          "jsb/data/Github_hard---o41482",
+          "jsb/data/Kubernetes---kb_528_Normalized",
+          "jsb/data/Github_hard---o66267",
+          "jsb/data/JsonSchemaStore---minecraft-template-pool",
+          "jsb/data/Github_ultra---o53885",
+          "jsb/data/Glaiveai2K---search_news_d4aaa6d1",
+          "jsb/data/JsonSchemaStore---samtrc",
+          "jsb/data/JsonSchemaStore---ui5-workspace.yaml",
+          "jsb/data/Github_medium---o82259",
+          "jsb/data/Glaiveai2K---generate_invoice_699a7e70",
+          "jsb/data/Github_hard---o21330",
+          "jsb/data/Glaiveai2K---generate_invoice_e158ba93",
+          "jsb/data/Github_easy---o63151",
+          "jsb/data/Github_easy---o76480",
+          "jsb/data/Github_medium---o83938",
+          "jsb/data/Github_easy---o90362",
+          "jsb/data/Github_easy---o12619",
+          "jsb/data/Kubernetes---kb_156_Normalized",
+          "jsb/data/Github_hard---o41238",
+          "jsb/data/Glaiveai2K---calculate_carbon_footprint_85d634a2",
+          "jsb/data/Github_easy---o17616",
+          "jsb/data/Github_hard---o69418",
+          "jsb/data/Github_trivial---o25942",
+          "jsb/data/Github_easy---o31092",
+          "jsb/data/Github_easy---o55795",
+          "jsb/data/Glaiveai2K---calculate_volume_73171077",
+          "jsb/data/Github_medium---o14744",
+          "jsb/data/Glaiveai2K---calculate_volume_a3b6060d",
+          "jsb/data/Github_easy---o83154",
+          "jsb/data/Github_hard---o64686",
+          "jsb/data/Kubernetes---kb_926_Normalized",
+          "jsb/data/Github_medium---o11795",
+          "jsb/data/Github_medium---o61646",
+          "jsb/data/Glaiveai2K---calculate_area_c2bd214d",
+          "jsb/data/Github_hard---o72528",
+          "jsb/data/Github_easy---o36594",
+          "jsb/data/Github_medium---o39086",
+          "jsb/data/Github_easy---o88585",
+          "jsb/data/Snowplow---sp_168_Normalized",
+          "jsb/data/Github_easy---o23494",
+          "jsb/data/Github_ultra---o6362",
+          "jsb/data/Github_medium---o46359",
+          "jsb/data/Glaiveai2K---calculate_area_84607e3f",
+          "jsb/data/Glaiveai2K---calculate_area_2ad222d3",
+          "jsb/data/Github_medium---o76743",
+          "jsb/data/Glaiveai2K---search_recipes_fb66ed5b",
+          "jsb/data/Github_medium---o52827",
+          "jsb/data/Github_hard---o21386",
+          "jsb/data/Github_hard---o48422",
+          "jsb/data/Github_trivial---o62775",
+          "jsb/data/Kubernetes---kb_1040_Normalized",
+          "jsb/data/Github_hard---o74005",
+          "jsb/data/Kubernetes---kb_629_Normalized",
+          "jsb/data/Glaiveai2K---calculate_area_2ad37fb0",
+          "jsb/data/Kubernetes---kb_662_Normalized",
+          "jsb/data/Github_easy---o90937",
+          "jsb/data/Github_medium---o83275",
+          "jsb/data/Kubernetes---kb_136_Normalized",
+          "jsb/data/Snowplow---sp_77_Normalized",
+          "jsb/data/Github_hard---o78081",
+          "jsb/data/Kubernetes---kb_914_Normalized",
+          "jsb/data/Github_easy---o40224",
+          "jsb/data/Github_hard---o9831",
+          "jsb/data/Github_medium---o47108",
+          "jsb/data/Glaiveai2K---generate_invoice_2068c543",
+          "jsb/data/Github_easy---o42523",
+          "jsb/data/Github_medium---o61593",
+          "jsb/data/Github_easy---o10011",
+          "jsb/data/Glaiveai2K---calculate_area_95c5c550",
+          "jsb/data/Github_hard---o73917",
+          "jsb/data/Github_easy---o32963",
+          "jsb/data/Glaiveai2K---create_invoice_b5389caf",
+          "jsb/data/Github_easy---o9275",
+          "jsb/data/Github_easy---o53902",
+          "jsb/data/Kubernetes---kb_878_Normalized",
+          "jsb/data/Github_easy---o43992",
+          "jsb/data/Glaiveai2K---calculate_area_fbf02501",
+          "jsb/data/Glaiveai2K---calculate_area_5fc9bb9f",
+          "jsb/data/Kubernetes---kb_437_Normalized",
+          "jsb/data/JsonSchemaStore---vercel",
+          "jsb/data/Github_medium---o5357",
+          "jsb/data/WashingtonPost---wp_50_Normalized",
+          "jsb/data/JsonSchemaStore---typingsrc",
+          "jsb/data/Github_easy---o13985",
+          "jsb/data/Github_medium---o33932",
+          "jsb/data/Github_medium---o45198",
+          "jsb/data/Glaiveai2K---calculate_area_cdde5279",
+          "jsb/data/Glaiveai2K---calculate_shipping_cost_9b51c3d0",
+          "jsb/data/Github_medium---o9515",
+          "jsb/data/Glaiveai2K---calculate_distance_444a6c19",
+          "jsb/data/Glaiveai2K---fetch_news_6fd23523",
+          "jsb/data/Glaiveai2K---search_hotels_d2c27c8f",
+          "jsb/data/Github_medium---o91036",
+          "jsb/data/Github_easy---o85253",
+          "jsb/data/Github_easy---o74408",
+          "jsb/data/JsonSchemaStore---band-manifest",
+          "jsb/data/Github_medium---o81597",
+          "jsb/data/Github_hard---o53129",
+          "jsb/data/Github_easy---o58442",
+          "jsb/data/Kubernetes---kb_37_Normalized",
+          "jsb/data/Github_medium---o21178",
+          "jsb/data/Github_easy---o29003",
+          "jsb/data/Snowplow---sp_270_Normalized",
+          "jsb/data/Github_easy---o70022",
+          "jsb/data/Github_hard---o9787",
+          "jsb/data/Github_medium---o22092",
+          "jsb/data/Glaiveai2K---calculate_area_c447fd6a",
+          "jsb/data/Github_medium---o30284",
+          "jsb/data/Glaiveai2K---create_calendar_event_f33c7e77",
+          "jsb/data/Github_hard---o61649",
+          "jsb/data/Github_easy---o48816",
+          "jsb/data/Kubernetes---kb_752_Normalized",
+          "jsb/data/Github_medium---o90732",
+          "jsb/data/Github_easy---o39437",
+          "jsb/data/Github_medium---o31100",
+          "jsb/data/Glaiveai2K---calculate_area_dab4d0a9",
+          "jsb/data/Github_trivial---o63326",
+          "jsb/data/Github_medium---o19069",
+          "jsb/data/Github_hard---o82811",
+          "jsb/data/Github_easy---o25107",
+          "jsb/data/Github_easy---o73930",
+          "jsb/data/Kubernetes---kb_721_Normalized",
+          "jsb/data/Glaiveai2K---generate_invoice_6d1ed855",
+          "jsb/data/Kubernetes---kb_844_Normalized",
+          "jsb/data/Github_easy---o37087",
+          "jsb/data/Github_medium---o20377",
+          "jsb/data/Github_trivial---o75090",
+          "jsb/data/Github_medium---o84138",
+          "jsb/data/Github_medium---o47943",
+          "jsb/data/Github_trivial---o45229",
+          "jsb/data/Kubernetes---kb_220_Normalized",
+          "jsb/data/Kubernetes---kb_877_Normalized",
+          "jsb/data/Github_medium---o30506",
+          "jsb/data/Snowplow---sp_25_Normalized",
+          "jsb/data/Github_easy---o26118",
+          "jsb/data/Github_trivial---o9818",
+          "jsb/data/Github_easy---o82234",
+          "jsb/data/Github_hard---o30766",
+          "jsb/data/Kubernetes---kb_445_Normalized",
+          "jsb/data/Glaiveai2K---calculate_area_d3fc7d7f",
+          "jsb/data/Glaiveai2K---calculate_area_7d9fd253",
+          "jsb/data/Github_medium---o63935",
+          "jsb/data/Github_hard---o82974",
+          "jsb/data/Github_trivial---o6242",
+          "jsb/data/Github_medium---o30521",
+          "jsb/data/Kubernetes---kb_100_Normalized",
+          "jsb/data/Kubernetes---kb_509_Normalized",
+          "jsb/data/Github_easy---o38444",
+          "jsb/data/WashingtonPost---wp_89_Normalized",
+          "jsb/data/Github_hard---o67026",
+          "jsb/data/Glaiveai2K---calculate_area_bf611aaf",
+          "jsb/data/Github_trivial---o68438",
+          "jsb/data/Snowplow---sp_287_Normalized",
+          "jsb/data/Kubernetes---kb_986_Normalized",
+          "jsb/data/Github_medium---o61613",
+          "jsb/data/Github_trivial---o78453",
+          "jsb/data/Github_hard---o48512",
+          "jsb/data/Github_medium---o9856",
+          "jsb/data/Github_medium---o31352",
+          "jsb/data/Snowplow---sp_241_Normalized",
+          "jsb/data/Glaiveai2K---generate_invoice_d89c2b04",
+          "jsb/data/Github_trivial---o89645",
+          "jsb/data/Snowplow---sp_136_Normalized",
+          "jsb/data/Kubernetes---kb_573_Normalized",
+          "jsb/data/Snowplow---sp_316_Normalized",
+          "jsb/data/Glaiveai2K---calculate_area_32e1fdb6",
+          "jsb/data/Kubernetes---kb_361_Normalized",
+          "jsb/data/JsonSchemaStore---vsconfig",
+          "jsb/data/Github_trivial---o48514",
+          "jsb/data/Github_medium---o43029",
+          "jsb/data/Glaiveai2K---calculate_area_e6c3e283",
+          "jsb/data/Glaiveai2K---generate_invoice_e75167d8",
+          "jsb/data/Github_easy---o49496",
+          "jsb/data/Github_medium---o68277",
+          "jsb/data/Glaiveai2K---calculate_area_544de1a7",
+          "jsb/data/Glaiveai2K---search_news_d8cb5416",
+          "jsb/data/Github_easy---o78132",
+          "jsb/data/Github_easy---o47063",
+          "jsb/data/Github_easy---o12290",
+          "jsb/data/Glaiveai2K---calculate_area_887e8cfa",
+          "jsb/data/Snowplow---sp_145_Normalized",
+          "jsb/data/Github_easy---o74561",
+          "jsb/data/Github_easy---o21089",
+          "jsb/data/Github_easy---o73961",
+          "jsb/data/Github_easy---o9825",
+          "jsb/data/Glaiveai2K---calculate_area_7b538abe",
+          "jsb/data/Glaiveai2K---calculate_area_2b2a62da",
+          "jsb/data/Github_medium---o90730",
+          "jsb/data/Glaiveai2K---generate_invoice_53cb5d39",
+          "jsb/data/Github_hard---o89194",
+          "jsb/data/Github_easy---o78131",
+          "jsb/data/Glaiveai2K---calculate_area_9f3f9cb8",
+          "jsb/data/Github_hard---o42057",
+          "jsb/data/Github_hard---o5413",
+          "jsb/data/Github_hard---o90705",
+          "jsb/data/Glaiveai2K---calculate_area_0b982be6",
+          "jsb/data/Glaiveai2K---create_invoice_10ed3fc0",
+          "jsb/data/Kubernetes---kb_797_Normalized",
+          "jsb/data/Kubernetes---kb_837_Normalized",
+          "jsb/data/Kubernetes---kb_977_Normalized",
+          "jsb/data/Github_hard---o1052",
+          "jsb/data/Github_medium---o42560",
+          "jsb/data/Github_ultra---o6371",
+          "jsb/data/Github_hard---o41291",
+          "jsb/data/Github_easy---o28609",
+          "jsb/data/Kubernetes---kb_39_Normalized",
+          "jsb/data/Glaiveai2K---calculate_area_5fc1810f",
+          "jsb/data/Github_hard---o5391",
+          "jsb/data/Glaiveai2K---search_hotels_29d4c29d",
+          "jsb/data/Github_medium---o85208",
+          "jsb/data/Github_easy---o64614",
+          "jsb/data/Github_medium---o32498",
+          "jsb/data/Github_easy---o28226",
+          "jsb/data/Glaiveai2K---calculate_area_7175d0f3",
+          "jsb/data/Github_medium---o5271",
+          "jsb/data/Glaiveai2K---generate_invoice_3ab8d7c8",
+          "jsb/data/Glaiveai2K---calculate_area_ee641c30",
+          "jsb/data/Github_easy---o68355",
+          "jsb/data/Github_trivial---o24503",
+          "jsb/data/Glaiveai2K---generate_invoice_3cf1c488",
+          "jsb/data/Github_medium---o1329",
+          "jsb/data/Github_trivial---o62379",
+          "jsb/data/Github_trivial---o51255",
+          "jsb/data/Github_easy---o56027",
+          "jsb/data/Github_easy---o43007",
+          "jsb/data/Github_medium---o9853",
+          "jsb/data/Github_easy---o68826",
+          "jsb/data/Github_medium---o79504",
+          "jsb/data/Github_easy---o12235",
+          "jsb/data/Github_trivial---o83689",
+          "jsb/data/Kubernetes---kb_316_Normalized",
+          "jsb/data/Github_easy---o21466",
+          "jsb/data/Github_hard---o30532",
+          "jsb/data/Github_hard---o21074",
+          "jsb/data/Github_easy---o46258",
+          "jsb/data/Snowplow---sp_90_Normalized",
+          "jsb/data/Github_easy---o5220",
+          "jsb/data/Github_medium---o27402",
+          "jsb/data/Github_easy---o48814",
+          "jsb/data/Github_easy---o42792",
+          "jsb/data/Github_medium---o1053",
+          "jsb/data/Github_medium---o21361",
+          "jsb/data/Github_easy---o8432",
+          "jsb/data/Kubernetes---kb_66_Normalized",
+          "jsb/data/Github_medium---o30756",
+          "jsb/data/JsonSchemaStore---launchsettings",
+          "jsb/data/Github_easy---o85667",
+          "jsb/data/Github_medium---o30013",
+          "jsb/data/Glaiveai2K---generate_invoice_e418deb9",
+          "jsb/data/Kubernetes---kb_626_Normalized",
+          "jsb/data/Glaiveai2K---calculate_area_569195ed",
+          "jsb/data/Glaiveai2K---generate_invoice_855c73be",
+          "jsb/data/Snowplow---sp_327_Normalized",
+          "jsb/data/Github_easy---o90449",
+          "jsb/data/Github_medium---o56043",
+          "jsb/data/Github_hard---o66711",
+          "jsb/data/Github_easy---o57789",
+          "jsb/data/Github_hard---o71475",
+          "jsb/data/Github_easy---o6227",
+          "jsb/data/Github_trivial---o69525",
+          "jsb/data/Github_easy---o45223",
+          "jsb/data/Snowplow---sp_53_Normalized",
+          "jsb/data/Github_medium---o74464",
+          "jsb/data/Github_easy---o12621",
+          "jsb/data/Github_medium---o42286",
+          "jsb/data/Github_trivial---o27830",
+          "jsb/data/Github_medium---o53109",
+          "jsb/data/Github_easy---o79513",
+          "jsb/data/Github_medium---o50685",
+          "jsb/data/Snowplow---sp_193_Normalized",
+          "jsb/data/Github_medium---o82706",
+          "jsb/data/Github_hard---o90780",
+          "jsb/data/Glaiveai2K---calculate_shipping_cost_c34b9e81",
+          "jsb/data/Glaiveai2K---generate_invoice_eac11f93",
+          "jsb/data/Kubernetes---kb_806_Normalized",
+          "jsb/data/Github_medium---o6171",
+          "jsb/data/Snowplow---sp_94_Normalized",
+          "jsb/data/Glaiveai2K---generate_random_password_with_constraints_4bddedda",
+          "jsb/data/Github_medium---o30439",
+          "jsb/data/Github_medium---o42216",
+          "jsb/data/Kubernetes---kb_5_Normalized",
+          "jsb/data/Github_medium---o70375",
+          "jsb/data/Kubernetes---kb_913_Normalized",
+          "jsb/data/Glaiveai2K---calculate_area_3902f17e",
+          "jsb/data/Snowplow---sp_3_Normalized",
+          "jsb/data/Glaiveai2K---calculate_area_volume_2f1888fb",
+          "jsb/data/Github_medium---o69910",
+          "jsb/data/Glaiveai2K---generate_random_password_09ce64ee",
+          "jsb/data/Kubernetes---kb_584_Normalized",
+          "jsb/data/Github_trivial---o67196",
+          "jsb/data/Github_easy---o41640",
+          "jsb/data/JsonSchemaStore---drupal-links-task",
+          "jsb/data/Glaiveai2K---calculate_fitness_goal_8459efad",
+          "jsb/data/Glaiveai2K---calculate_mortgage_payment_b3e54742",
+          "jsb/data/Github_hard---o5368",
+          "jsb/data/Github_medium---o5235",
+          "jsb/data/Github_hard---o48243",
+          "jsb/data/Github_trivial---o13839",
+          "jsb/data/WashingtonPost---wp_34_Normalized",
+          "jsb/data/Github_hard---o9969",
+          "jsb/data/Glaiveai2K---calculate_area_55406f4d",
+          "jsb/data/Glaiveai2K---calculate_body_fat_percentage_33dd2c27",
+          "jsb/data/Kubernetes---kb_119_Normalized",
+          "jsb/data/Glaiveai2K---calculate_area_87442b5f",
+          "jsb/data/Github_easy---o13687",
+          "jsb/data/Github_medium---o4836",
+          "jsb/data/Github_easy---o74200",
+          "jsb/data/Github_medium---o82311",
+          "jsb/data/Glaiveai2K---calculate_area_924e3a6b",
+          "jsb/data/Glaiveai2K---generate_invoice_c57328a1",
+          "jsb/data/Github_easy---o9773",
+          "jsb/data/Github_hard---o8370",
+          "jsb/data/Snowplow---sp_78_Normalized",
+          "jsb/data/Github_hard---o69582",
+          "jsb/data/Glaiveai2K---calculate_area_22566a70",
+          "jsb/data/Glaiveai2K---create_invoice_1047f9b8",
+          "jsb/data/JsonSchemaStore---strings",
+          "jsb/data/Snowplow---sp_306_Normalized",
+          "jsb/data/Github_easy---o35907",
+          "jsb/data/Kubernetes---kb_125_Normalized",
+          "jsb/data/Github_easy---o39767",
+          "jsb/data/Github_easy---o60855",
+          "jsb/data/Github_medium---o76853",
+          "jsb/data/Github_trivial---o83705",
+          "jsb/data/Github_hard---o74004",
+          "jsb/data/WashingtonPost---wp_120_Normalized",
+          "jsb/data/Kubernetes---kb_814_Normalized",
+          "jsb/data/Snowplow---sp_163_Normalized",
+          "jsb/data/Github_easy---o6268",
+          "jsb/data/Github_easy---o90437",
+          "jsb/data/Github_hard---o63519",
+          "jsb/data/Github_medium---o2068"
+        ]
+      },
+      "measured_corpus_sha256": "e129fccf28eccb28abf064b8b39f90eb5e42aef14c112e7be794269b44ed8bbd",
+      "metric": "native commit_i to mask_i+1; minimum complete interval across two independent runs",
+      "median_paired_build_ratio": 0.9945489731429794,
+      "description_correction": {
+        "timestamp": "2026-09-28T00:57:20.049515+08:00",
+        "reason": "Correct stale copied description only. Original per-run revisions and independently frozen binary hashes identify 68a and 6f9; raw timings and scored key sets are unchanged."
+      },
+      "groups": {
+        "published": {
+          "schemas": 1000,
+          "failures": {},
+          "matched_intervals": 367640,
+          "build_ms": {
+            "p50": 10.239833,
+            "p90": 77.26666250000007,
+            "p95": 137.0932312499998,
+            "p99": 249.19708841999997,
+            "p99.9": 630.1122777500051,
+            "p100": 685.83425
+          },
+          "tbm_us": {
+            "p50": 4.083,
+            "p90": 6.917,
+            "p95": 9.166,
+            "p99": 14.667,
+            "p99.9": 29.958361000000032,
+            "p100": 49.583
+          },
+          "total_build_ms": 29323.867075,
+          "raw_max_us": 74.583,
+          "worst_tbm": [
+            [
+              49.583,
+              [
+                "jsb/data/Snowplow---sp_345_Normalized",
+                0,
+                16
+              ]
+            ],
+            [
+              49.459,
+              [
+                "jsb/data/Snowplow---sp_345_Normalized",
+                0,
+                53
+              ]
+            ],
+            [
+              47.916,
+              [
+                "jsb/data/Snowplow---sp_345_Normalized",
+                0,
+                46
+              ]
+            ],
+            [
+              46.583,
+              [
+                "jsb/data/Snowplow---sp_345_Normalized",
+                0,
+                45
+              ]
+            ],
+            [
+              46.25,
+              [
+                "jsb/data/Snowplow---sp_345_Normalized",
+                0,
+                24
+              ]
+            ],
+            [
+              46.167,
+              [
+                "jsb/data/Snowplow---sp_345_Normalized",
+                1,
+                16
+              ]
+            ],
+            [
+              46.042,
+              [
+                "jsb/data/Snowplow---sp_345_Normalized",
+                1,
+                68
+              ]
+            ],
+            [
+              45.875,
+              [
+                "jsb/data/Snowplow---sp_345_Normalized",
+                0,
+                91
+              ]
+            ],
+            [
+              45.709,
+              [
+                "jsb/data/Snowplow---sp_345_Normalized",
+                1,
+                46
+              ]
+            ],
+            [
+              45.708,
+              [
+                "jsb/data/Snowplow---sp_345_Normalized",
+                0,
+                61
+              ]
+            ],
+            [
+              45.625,
+              [
+                "jsb/data/Snowplow---sp_345_Normalized",
+                5,
+                16
+              ]
+            ],
+            [
+              45.583,
+              [
+                "jsb/data/Snowplow---sp_345_Normalized",
+                3,
+                16
+              ]
+            ],
+            [
+              45.458,
+              [
+                "jsb/data/Snowplow---sp_345_Normalized",
+                1,
+                53
+              ]
+            ],
+            [
+              45.416,
+              [
+                "jsb/data/Snowplow---sp_345_Normalized",
+                0,
+                83
+              ]
+            ],
+            [
+              45.334,
+              [
+                "jsb/data/Snowplow---sp_345_Normalized",
+                5,
+                24
+              ]
+            ]
+          ]
+        },
+        "candidate": {
+          "schemas": 1000,
+          "failures": {},
+          "matched_intervals": 367640,
+          "build_ms": {
+            "p50": 10.153333,
+            "p90": 75.48796190000013,
+            "p95": 135.77006874999995,
+            "p99": 245.61329457999994,
+            "p99.9": 619.8165092500035,
+            "p100": 658.619917
+          },
+          "tbm_us": {
+            "p50": 4.042,
+            "p90": 6.917,
+            "p95": 8.916,
+            "p99": 14.417,
+            "p99.9": 30.390162000001407,
+            "p100": 49.375
+          },
+          "total_build_ms": 29112.246574,
+          "raw_max_us": 139.375,
+          "worst_tbm": [
+            [
+              49.375,
+              [
+                "jsb/data/Snowplow---sp_345_Normalized",
+                0,
+                16
+              ]
+            ],
+            [
+              48.584,
+              [
+                "jsb/data/Snowplow---sp_345_Normalized",
+                0,
+                68
+              ]
+            ],
+            [
+              48.041,
+              [
+                "jsb/data/Snowplow---sp_345_Normalized",
+                0,
+                24
+              ]
+            ],
+            [
+              46.833,
+              [
+                "jsb/data/Snowplow---sp_345_Normalized",
+                0,
+                46
+              ]
+            ],
+            [
+              46.584,
+              [
+                "jsb/data/Snowplow---sp_345_Normalized",
+                2,
+                16
+              ]
+            ],
+            [
+              46.584,
+              [
+                "jsb/data/Snowplow---sp_345_Normalized",
+                1,
+                16
+              ]
+            ],
+            [
+              46.291,
+              [
+                "jsb/data/Snowplow---sp_345_Normalized",
+                0,
+                83
+              ]
+            ],
+            [
+              46.167,
+              [
+                "jsb/data/Snowplow---sp_345_Normalized",
+                0,
+                130
+              ]
+            ],
+            [
+              45.875,
+              [
+                "jsb/data/Snowplow---sp_345_Normalized",
+                5,
+                16
+              ]
+            ],
+            [
+              45.709,
+              [
+                "jsb/data/Snowplow---sp_345_Normalized",
+                1,
+                53
+              ]
+            ],
+            [
+              45.709,
+              [
+                "jsb/data/Snowplow---sp_345_Normalized",
+                0,
+                53
+              ]
+            ],
+            [
+              45.708,
+              [
+                "jsb/data/Snowplow---sp_345_Normalized",
+                3,
+                16
+              ]
+            ],
+            [
+              45.417,
+              [
+                "jsb/data/Snowplow---sp_345_Normalized",
+                3,
+                24
+              ]
+            ],
+            [
+              45.416,
+              [
+                "jsb/data/Snowplow---sp_345_Normalized",
+                1,
+                61
+              ]
+            ],
+            [
+              45.292,
+              [
+                "jsb/data/Snowplow---sp_345_Normalized",
+                0,
+                61
+              ]
+            ]
+          ]
+        }
+      }
+    }
+  },
+  "fresh_llguidance": {
+    "scope": "same-machine make example-js, original grammar; only exact LL-measured keys",
+    "metric": "mask_i + commit_i within each run; minimum of six complete pairs per position",
+    "cache_policy": "production defaults, no exact-mask-cache diagnostic override",
+    "llguidance_grammar": "llguidance uses a different grammar; masks are not assumed equal across engines",
+    "provenance": {
+      "base": "68a648fc3ee90feaf54209bbd8d3c8a307956539",
+      "candidate_sha256": "7ddcb6d7af7b7fbb748572df816554aa16e739ee95124db5f20dc4656d96cf55",
+      "source_hashes": {
+        "src/runtime/dynamic_mask/full_walk_dense.rs": "d49897ee44cda79b35a0d8773c91011a0931aed26bd590aabb8e998095ff58bd"
+      },
+      "llguidance_version": "1.6.1",
+      "runs": 6,
+      "build_runs": 6,
+      "warmups": 0,
+      "clock": "thread",
+      "cache_policy": "production defaults",
+      "env": {
+        "GLRMASK_LLGUIDANCE_COMPAT": "1",
+        "MIMALLOC_PURGE_DELAY": "-1"
+      }
+    },
+    "artifact_sha256": {
+      "cfa-integrated-ll.json.zst": "72d275d2b93ca6c15a762b798de14b2bb205c4add03848ddcc59eb3caad0f9b8",
+      "cfa-integrated-ll_raw.json.zst": "af79e2fb119e0fec98bd0a7f1a63c9ce4e0d638298c2d650472a0638087e0b74"
+    },
+    "clock": "thread",
+    "groups": {
+      "glrmask_dynamic": {
+        "measured_positions": 4099,
+        "raw_observations": 24594,
+        "tbm_us": {
+          "p50": 733.7919999999999,
+          "p90": 2418.8834,
+          "p95": 2709.2625000000003,
+          "p99": 3510.4805,
+          "p99.9": 3869.078384000012,
+          "p100": 4043.4580000000005
+        },
+        "raw_max_us": 4716.2080000000005,
+        "build_ms": [
+          109.65133300000001,
+          99.628,
+          93.805375,
+          97.237375,
+          93.364666,
+          103.74912499999999
+        ],
+        "build_median_ms": 98.4326875,
+        "build_min_ms": 93.364666,
+        "worst": [
+          [
+            4043.4580000000005,
+            [
+              30,
+              578
+            ]
+          ],
+          [
+            4023.25,
+            [
+              30,
+              577
+            ]
+          ],
+          [
+            4002.5420000000004,
+            [
+              23,
+              44
+            ]
+          ],
+          [
+            3921.6659999999997,
+            [
+              30,
+              579
+            ]
+          ],
+          [
+            3871.4590000000003,
+            [
+              19,
+              249
+            ]
+          ],
+          [
+            3847.1670000000004,
+            [
+              23,
+              16
+            ]
+          ],
+          [
+            3842.291,
+            [
+              30,
+              580
+            ]
+          ],
+          [
+            3835.708,
+            [
+              30,
+              927
+            ]
+          ],
+          [
+            3787.375,
+            [
+              23,
+              11
+            ]
+          ],
+          [
+            3745.542,
+            [
+              5,
+              21
+            ]
+          ],
+          [
+            3736.042,
+            [
+              23,
+              27
+            ]
+          ],
+          [
+            3725.6249999999995,
+            [
+              30,
+              722
+            ]
+          ],
+          [
+            3724.833,
+            [
+              22,
+              54
+            ]
+          ],
+          [
+            3706.375,
+            [
+              30,
+              581
+            ]
+          ],
+          [
+            3694.958,
+            [
+              3,
+              94
+            ]
+          ]
+        ]
+      },
+      "llguidance_native": {
+        "measured_positions": 4099,
+        "raw_observations": 24594,
+        "tbm_us": {
+          "p50": 1265.25,
+          "p90": 3223.2412000000004,
+          "p95": 3345.1167,
+          "p99": 3545.69616,
+          "p99.9": 3757.6497500000073,
+          "p100": 4093.0840000000003
+        },
+        "raw_max_us": 4650.959000000001,
+        "build_ms": [
+          4.816916072741151,
+          4.646582994610071,
+          4.448833060450852,
+          4.706625011749566,
+          4.528124933131039,
+          4.528457997366786
+        ],
+        "build_median_ms": 4.587520495988429,
+        "build_min_ms": 4.448833060450852,
+        "worst": [
+          [
+            4093.0840000000003,
+            [
+              0,
+              82
+            ]
+          ],
+          [
+            3853.4999999999995,
+            [
+              0,
+              122
+            ]
+          ],
+          [
+            3851.666,
+            [
+              0,
+              42
+            ]
+          ],
+          [
+            3796.3750000000005,
+            [
+              9,
+              53
+            ]
+          ],
+          [
+            3759.083,
+            [
+              26,
+              32
+            ]
+          ],
+          [
+            3744.458,
+            [
+              9,
+              66
+            ]
+          ],
+          [
+            3735.3330000000005,
+            [
+              21,
+              90
+            ]
+          ],
+          [
+            3733.8329999999996,
+            [
+              22,
+              48
+            ]
+          ],
+          [
+            3708.584,
+            [
+              8,
+              9
+            ]
+          ],
+          [
+            3700.375,
+            [
+              15,
+              3
+            ]
+          ],
+          [
+            3692.042,
+            [
+              21,
+              88
+            ]
+          ],
+          [
+            3688.542,
+            [
+              8,
+              10
+            ]
+          ],
+          [
+            3675.749,
+            [
+              9,
+              64
+            ]
+          ],
+          [
+            3664.875,
+            [
+              0,
+              46
+            ]
+          ],
+          [
+            3662.459,
+            [
+              0,
+              81
+            ]
+          ]
+        ]
+      }
+    },
+    "quantile_curve_audit": {
+      "definition": "Compare independent sorted quantile curves on exactly the same LL-supported position set. Strict dominance at all knots implies it between knots under linear interpolation; this is finite measured evidence, not a bound on future calls.",
+      "minimum_of_six": {
+        "p0_to_p100": {
+          "strictly_below_at_all_empirical_points": false,
+          "points_checked": 4099,
+          "points_not_strictly_below": 918,
+          "worst_ratio": 1.4218482156771075,
+          "worst_ratio_percentile": 12.859931673987312,
+          "minimum_margin_us": -169.75000000000045,
+          "first_failure_percentile": 11.005368472425573
+        },
+        "p90_to_p100": {
+          "strictly_below_at_all_empirical_points": false,
+          "points_checked": 411,
+          "points_not_strictly_below": 29,
+          "worst_ratio": 1.044050862851953,
+          "worst_ratio_percentile": 99.97559785261103,
+          "minimum_margin_us": -169.75000000000045,
+          "first_failure_percentile": 99.29233772571986
+        },
+        "p99_to_p100": {
+          "strictly_below_at_all_empirical_points": false,
+          "points_checked": 42,
+          "points_not_strictly_below": 29,
+          "worst_ratio": 1.044050862851953,
+          "worst_ratio_percentile": 99.97559785261103,
+          "minimum_margin_us": -169.75000000000045,
+          "first_failure_percentile": 99.29233772571986
+        }
+      },
+      "all_raw_observations": {
+        "p0_to_p100": {
+          "strictly_below_at_all_empirical_points": false,
+          "points_checked": 24594,
+          "points_not_strictly_below": 3964,
+          "worst_ratio": 1.317143267710878,
+          "worst_ratio_percentile": 12.507624120684747,
+          "minimum_margin_us": -65.2489999999998,
+          "first_failure_percentile": 11.06005774000732
+        },
+        "p90_to_p100": {
+          "strictly_below_at_all_empirical_points": false,
+          "points_checked": 2461,
+          "points_not_strictly_below": 1,
+          "worst_ratio": 1.0140291496871936,
+          "worst_ratio_percentile": 100.0,
+          "minimum_margin_us": -65.2489999999998,
+          "first_failure_percentile": 100.0
+        },
+        "p99_to_p100": {
+          "strictly_below_at_all_empirical_points": false,
+          "points_checked": 247,
+          "points_not_strictly_below": 1,
+          "worst_ratio": 1.0140291496871936,
+          "worst_ratio_percentile": 100.0,
+          "minimum_margin_us": -65.2489999999998,
+          "first_failure_percentile": 100.0
+        }
+      }
+    }
+  },
+  "additional_checks": {
+    "actual-tail-recheck/summary.json": {
+      "protocol": "Two fixed LL-success schemas; six independent processes per binary in alternating order; native thread-CPU whole intervals; no warmup real schemas; raw spikes from original sample retained.",
+      "base": "68a648fc3ee90feaf54209bbd8d3c8a307956539",
+      "candidate": "6f9f1c4824f3db98ef8989459c8c7e95385c1a36",
+      "runs": {
+        "published": [
+          {
+            "jsb/data/JsonSchemaStore---typingsrc": {
+              "worst": [
+                [
+                  151.584,
+                  0,
+                  339
+                ],
+                [
+                  100.541,
+                  0,
+                  1
+                ],
+                [
+                  26.042,
+                  0,
+                  3
+                ]
+              ],
+              "targets_us": {
+                "1": 100.541,
+                "339": 151.584
+              }
+            },
+            "jsb/data/Github_hard---o60887": {
+              "worst": [
+                [
+                  19.417,
+                  0,
+                  0
+                ],
+                [
+                  17.791,
+                  3,
+                  326
+                ],
+                [
+                  17.667,
+                  0,
+                  3
+                ]
+              ],
+              "targets_us": {
+                "139": 4.25,
+                "142": 9.792
+              }
+            }
+          },
+          {
+            "jsb/data/JsonSchemaStore---typingsrc": {
+              "worst": [
+                [
+                  29.125,
+                  0,
+                  339
+                ],
+                [
+                  25.5,
+                  0,
+                  1
+                ],
+                [
+                  19.417,
+                  0,
+                  0
+                ]
+              ],
+              "targets_us": {
+                "1": 25.5,
+                "339": 29.125
+              }
+            },
+            "jsb/data/Github_hard---o60887": {
+              "worst": [
+                [
+                  20.625,
+                  0,
+                  0
+                ],
+                [
+                  17.083,
+                  0,
+                  4
+                ],
+                [
+                  16.25,
+                  0,
+                  3
+                ]
+              ],
+              "targets_us": {
+                "139": 4.375,
+                "142": 10.25
+              }
+            }
+          },
+          {
+            "jsb/data/JsonSchemaStore---typingsrc": {
+              "worst": [
+                [
+                  29.125,
+                  0,
+                  339
+                ],
+                [
+                  28.334,
+                  0,
+                  1
+                ],
+                [
+                  18.375,
+                  0,
+                  0
+                ]
+              ],
+              "targets_us": {
+                "1": 28.334,
+                "339": 29.125
+              }
+            },
+            "jsb/data/Github_hard---o60887": {
+              "worst": [
+                [
+                  17.292,
+                  0,
+                  0
+                ],
+                [
+                  14.75,
+                  0,
+                  412
+                ],
+                [
+                  14.375,
+                  0,
+                  3
+                ]
+              ],
+              "targets_us": {
+                "139": 4.166,
+                "142": 9.5
+              }
+            }
+          },
+          {
+            "jsb/data/JsonSchemaStore---typingsrc": {
+              "worst": [
+                [
+                  24.459,
+                  0,
+                  339
+                ],
+                [
+                  22.5,
+                  5,
+                  1965
+                ],
+                [
+                  19.459,
+                  0,
+                  1
+                ]
+              ],
+              "targets_us": {
+                "1": 19.459,
+                "339": 24.459
+              }
+            },
+            "jsb/data/Github_hard---o60887": {
+              "worst": [
+                [
+                  17.208,
+                  0,
+                  0
+                ],
+                [
+                  15.833,
+                  0,
+                  3
+                ],
+                [
+                  14.959,
+                  0,
+                  412
+                ]
+              ],
+              "targets_us": {
+                "139": 4.167,
+                "142": 10.042
+              }
+            }
+          },
+          {
+            "jsb/data/JsonSchemaStore---typingsrc": {
+              "worst": [
+                [
+                  30.417,
+                  0,
+                  339
+                ],
+                [
+                  28.083,
+                  0,
+                  1
+                ],
+                [
+                  16.75,
+                  0,
+                  0
+                ]
+              ],
+              "targets_us": {
+                "1": 28.083,
+                "339": 30.417
+              }
+            },
+            "jsb/data/Github_hard---o60887": {
+              "worst": [
+                [
+                  18.709,
+                  0,
+                  0
+                ],
+                [
+                  15.5,
+                  0,
+                  3
+                ],
+                [
+                  13.625,
+                  0,
+                  412
+                ]
+              ],
+              "targets_us": {
+                "139": 4.291,
+                "142": 9.792
+              }
+            }
+          },
+          {
+            "jsb/data/JsonSchemaStore---typingsrc": {
+              "worst": [
+                [
+                  31.25,
+                  0,
+                  339
+                ],
+                [
+                  22.75,
+                  0,
+                  1
+                ],
+                [
+                  15.25,
+                  0,
+                  3
+                ]
+              ],
+              "targets_us": {
+                "1": 22.75,
+                "339": 31.25
+              }
+            },
+            "jsb/data/Github_hard---o60887": {
+              "worst": [
+                [
+                  19.042,
+                  0,
+                  3
+                ],
+                [
+                  15.084,
+                  0,
+                  0
+                ],
+                [
+                  13.291,
+                  1,
+                  195
+                ]
+              ],
+              "targets_us": {
+                "139": 3.75,
+                "142": 9.291
+              }
+            }
+          }
+        ],
+        "candidate": [
+          {
+            "jsb/data/JsonSchemaStore---typingsrc": {
+              "worst": [
+                [
+                  122.875,
+                  0,
+                  339
+                ],
+                [
+                  94.584,
+                  0,
+                  1
+                ],
+                [
+                  16.459,
+                  0,
+                  0
+                ]
+              ],
+              "targets_us": {
+                "1": 94.584,
+                "339": 122.875
+              }
+            },
+            "jsb/data/Github_hard---o60887": {
+              "worst": [
+                [
+                  22.083,
+                  0,
+                  412
+                ],
+                [
+                  15.917,
+                  0,
+                  0
+                ],
+                [
+                  14.958,
+                  0,
+                  258
+                ]
+              ],
+              "targets_us": {
+                "139": 3.958,
+                "142": 12.375
+              }
+            }
+          },
+          {
+            "jsb/data/JsonSchemaStore---typingsrc": {
+              "worst": [
+                [
+                  23.083,
+                  0,
+                  0
+                ],
+                [
+                  21.25,
+                  0,
+                  339
+                ],
+                [
+                  18.542,
+                  0,
+                  1
+                ]
+              ],
+              "targets_us": {
+                "1": 18.542,
+                "339": 21.25
+              }
+            },
+            "jsb/data/Github_hard---o60887": {
+              "worst": [
+                [
+                  26.958,
+                  0,
+                  68
+                ],
+                [
+                  20.25,
+                  0,
+                  3
+                ],
+                [
+                  19.0,
+                  0,
+                  67
+                ]
+              ],
+              "targets_us": {
+                "139": 4.042,
+                "142": 9.417
+              }
+            }
+          },
+          {
+            "jsb/data/JsonSchemaStore---typingsrc": {
+              "worst": [
+                [
+                  25.417,
+                  0,
+                  339
+                ],
+                [
+                  18.208,
+                  0,
+                  1
+                ],
+                [
+                  16.542,
+                  0,
+                  0
+                ]
+              ],
+              "targets_us": {
+                "1": 18.208,
+                "339": 25.417
+              }
+            },
+            "jsb/data/Github_hard---o60887": {
+              "worst": [
+                [
+                  18.0,
+                  1,
+                  408
+                ],
+                [
+                  17.959,
+                  0,
+                  412
+                ],
+                [
+                  16.958,
+                  0,
+                  0
+                ]
+              ],
+              "targets_us": {
+                "139": 3.958,
+                "142": 9.041
+              }
+            }
+          },
+          {
+            "jsb/data/JsonSchemaStore---typingsrc": {
+              "worst": [
+                [
+                  21.792,
+                  0,
+                  339
+                ],
+                [
+                  18.0,
+                  0,
+                  1
+                ],
+                [
+                  11.5,
+                  0,
+                  0
+                ]
+              ],
+              "targets_us": {
+                "1": 18.0,
+                "339": 21.792
+              }
+            },
+            "jsb/data/Github_hard---o60887": {
+              "worst": [
+                [
+                  18.209,
+                  0,
+                  3
+                ],
+                [
+                  15.584,
+                  0,
+                  0
+                ],
+                [
+                  12.667,
+                  0,
+                  103
+                ]
+              ],
+              "targets_us": {
+                "139": 3.833,
+                "142": 8.5
+              }
+            }
+          },
+          {
+            "jsb/data/JsonSchemaStore---typingsrc": {
+              "worst": [
+                [
+                  27.458,
+                  0,
+                  339
+                ],
+                [
+                  24.375,
+                  0,
+                  1
+                ],
+                [
+                  13.708,
+                  0,
+                  3
+                ]
+              ],
+              "targets_us": {
+                "1": 24.375,
+                "339": 27.458
+              }
+            },
+            "jsb/data/Github_hard---o60887": {
+              "worst": [
+                [
+                  18.541,
+                  0,
+                  3
+                ],
+                [
+                  17.333,
+                  0,
+                  0
+                ],
+                [
+                  16.125,
+                  0,
+                  337
+                ]
+              ],
+              "targets_us": {
+                "139": 3.875,
+                "142": 12.625
+              }
+            }
+          },
+          {
+            "jsb/data/JsonSchemaStore---typingsrc": {
+              "worst": [
+                [
+                  26.334,
+                  0,
+                  1
+                ],
+                [
+                  21.833,
+                  0,
+                  339
+                ],
+                [
+                  15.209,
+                  0,
+                  3
+                ]
+              ],
+              "targets_us": {
+                "1": 26.334,
+                "339": 21.833
+              }
+            },
+            "jsb/data/Github_hard---o60887": {
+              "worst": [
+                [
+                  16.792,
+                  0,
+                  3
+                ],
+                [
+                  15.417,
+                  0,
+                  4
+                ],
+                [
+                  14.625,
+                  0,
+                  0
+                ]
+              ],
+              "targets_us": {
+                "139": 3.916,
+                "142": 10.917
+              }
+            }
+          }
+        ]
+      },
+      "outcomes_identical_all_twelve_runs": true,
+      "interpretation": "typingsrc interval339 spike reproduced in BOTH independent binaries on first process (published151.584us/candidate122.875us); later repetitions24.459\u201331.250us published and21.250\u201327.458us candidate. Thus not AA-specific. Timing variation/cold effects remain unresolved, not erased. o60887 interval139 now3.750\u20134.375us both; original74.583us retained."
+    }
+  },
+  "artifacts_sha256": {
+    "package.json": "e214c59a391fe55bfc72c98e607f86d4ca3e4c54f5e9526f993e19e6bc4a29f2",
+    "native-source.json": "78531ebbebf65ec97a1da654a16c6afe77b4e93e773bba1b24c4b92a7774d43c",
+    "test-workspace-summary.json": "d2835c5e994dbc941acc1ea340dea81be1ef32f9b62553cf0ead7d9fd63faa39",
+    "test-python.log": "2a57da100b91b99fc65a00a0b7087167b922e83827e2d47906068b733fbd060f",
+    "test-doc.log": "2c5f5a7e34169f2c083b444ef4035b6073c927084b77ed3820528709b36af056",
+    "captures/summary.json": "e43ca17ff027647a6c726bfb505a47f8f7e14a4c6586558c53559a5c843a8be4",
+    "release-screen/summary.json": "ad237d2d3e3f11b179a46b179903d9120dc947ca58c42caca0b7798bb9a9ea4b",
+    "native-dynamic-1000/summary.json": "bdc69c76fe5a8330c360c523ba169bf8273834fc7bafc37536e9507dd87eb043",
+    "native-static-1000/summary.json": "dc4ed2e218a45e1a7fc4d66975da66c4d34c73da7f0829aa942ae071374b2c8a",
+    "cfa-integrated-ll-summary.json": "ee2627623b7d284354fabfbe98473e0fc262a83144862d45d83dafe059e8389a",
+    "test-curve-audit.log": "63c8473156dc11883e5271a1b883b404ca90b1904c2a0468c8b3b2bfb9b1ca5d",
+    "actual-tail-recheck/summary.json": "fed5f3215c8392ccf5d8ac836e8911625183bab18168b35fab7b4dedc2af0cbc"
+  },
+  "rejected_variants": "Many-only witness was neutral; additional per-parser proof memo did not justify its overhead. Neither experimental mode is in production."
+}
