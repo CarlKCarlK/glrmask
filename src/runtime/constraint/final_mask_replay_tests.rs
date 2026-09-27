@@ -48,7 +48,7 @@ fn cached_final_masks_require_complete_internal_containment() {
         constraint.weight_token_sparse_buf_masks.remove(&key);
         if sparse {
             constraint.weight_token_sparse_buf_masks.insert(
-                key, vec![(0, expected[0]), (last as u16, expected[last])].into_boxed_slice(),
+                key, vec![(0, expected[0]), (last as u32, expected[last])].into_boxed_slice(),
             );
         } else {
             constraint.weight_token_buf_masks.insert(key, expected.clone().into_boxed_slice());

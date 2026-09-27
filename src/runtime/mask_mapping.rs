@@ -1,21 +1,21 @@
 use rayon::prelude::*;
 
-pub type InternalTokenBufMasks = Vec<(u16, u32)>;
+pub type InternalTokenBufMasks = Vec<(u32, u32)>;
 
 #[derive(Clone, Copy, Debug, Default)]
 struct SparseEntry {
-    word_idx: u16,
+    word_idx: u32,
     mask: u32,
 }
 
 impl SparseEntry {
     #[inline(always)]
-    fn new(word_idx: u16, mask: u32) -> Self {
+    fn new(word_idx: u32, mask: u32) -> Self {
         Self { word_idx, mask }
     }
 
     #[inline(always)]
-    fn word_idx(self) -> u16 {
+    fn word_idx(self) -> u32 {
         self.word_idx
     }
 
@@ -1451,7 +1451,7 @@ fn compute_token_entries(
                     continue;
                 }
                 let mask = 1u32 << (original & 31);
-                let word_idx = word_idx as u16;
+                let word_idx = word_idx as u32;
                 if let Some(existing) = entries
                     .iter_mut()
                     .find(|entry| entry.word_idx() == word_idx)
@@ -1490,7 +1490,7 @@ fn compute_block_entries(
         touched.dedup();
             touched
                 .into_iter()
-                .map(|word_idx| SparseEntry::new(word_idx as u16, dense[word_idx]))
+                .map(|word_idx| SparseEntry::new(word_idx as u32, dense[word_idx]))
                 .collect::<Vec<_>>()
                 .into_boxed_slice()
     };
@@ -1535,7 +1535,7 @@ fn compute_quad_pattern_entries(
             groups.push(
                 touched
                     .into_iter()
-                    .map(|word_idx| SparseEntry::new(word_idx as u16, dense[word_idx]))
+                    .map(|word_idx| SparseEntry::new(word_idx as u32, dense[word_idx]))
                     .collect::<Vec<_>>()
                     .into_boxed_slice(),
             );
@@ -1731,3 +1731,7 @@ fn andnot_prefix_diff(out: &mut [u32], before: &[u32], after: &[u32]) {
         }
     }
 }
+
+#[cfg(test)]
+#[path = "mask_mapping/coordinate_tests.rs"]
+mod coordinate_tests;

@@ -10,11 +10,11 @@ pub(super) const ROOT_POLICY_MAGIC: &[u8; 8] = b"GLRROOT2";
 
 pub(super) const CONSTRAINT_MAGIC: [u8; 8] = *b"GLRCONS\0";
 
-pub(super) const CONSTRAINT_VERSION: u16 = 30;
+pub(super) const CONSTRAINT_VERSION: u16 = 31;
 
 pub(super) const CONSTRAINT_HEADER_LEN: usize = CONSTRAINT_MAGIC.len() + 2 + 8;
 
-pub(super) const SECTION_MAGIC: [u8; 4] = *b"S30\0";
+pub(super) const SECTION_MAGIC: [u8; 4] = *b"S31\0";
 
 pub(super) const SECTION_HEADER_LEN: usize = SECTION_MAGIC.len() + 11 * 8;
 

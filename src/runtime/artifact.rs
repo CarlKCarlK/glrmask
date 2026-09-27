@@ -320,16 +320,15 @@ pub(crate) fn empty_dense_words() -> DenseWords {
     Arc::<[u64]>::from(Vec::<u64>::new().into_boxed_slice())
 }
 
-pub(crate) type InternalTokenBufMasks = Vec<(u16, u32)>;
-/// Runtime-native fixed-width form of one sparse output-mask entry. The two-byte
-/// pad makes the layout exactly eight bytes while keeping the hot fields at
-/// their natural offsets; current artifacts can therefore bulk-copy the slab
-/// without making commit pay bit shifts on every sparse replay.
+pub(crate) type InternalTokenBufMasks = Vec<(u32, u32)>;
+/// Runtime-native sparse output-mask entry. Every u32 model token ID has a
+/// u32 word coordinate; narrowing it to u16 would wrap IDs at or above 2^21.
+/// The two u32 fields occupy the same eight bytes as the old padded entry and
+/// preserve direct, naturally aligned replay from current artifact backing.
 #[repr(C)]
 #[derive(Debug, Clone, Copy, Default, serde::Serialize, serde::Deserialize)]
 pub(crate) struct PackedInternalTokenBufMask {
-    pub(crate) word_idx: u16,
-    pub(crate) _pad: u16,
+    pub(crate) word_idx: u32,
     pub(crate) mask: u32,
 }
 const _: () = assert!(std::mem::size_of::<PackedInternalTokenBufMask>() == 8);
@@ -399,7 +398,7 @@ impl BackedInternalTokenBufMasks {
         &self,
         start: usize,
         end: usize,
-        mut visit: impl FnMut(u16, u32),
+        mut visit: impl FnMut(u32, u32),
     ) {
         debug_assert!(start <= end && end <= self.len);
         if start > end || end > self.len {
@@ -423,7 +422,7 @@ impl BackedInternalTokenBufMasks {
             if cfg!(target_endian = "little") {
                 visit(entry.word_idx, entry.mask);
             } else {
-                visit(u16::from_le(entry.word_idx), u32::from_le(entry.mask));
+                visit(u32::from_le(entry.word_idx), u32::from_le(entry.mask));
             }
         }
     }
@@ -794,7 +793,7 @@ impl PackedDwaDenseWeightMaskCache {
     }
 }
 pub(crate) type DenseWeightBufMaskCache = FxHashMap<usize, Box<[u32]>>;
-pub(crate) type SparseWeightBufMaskCache = FxHashMap<usize, Box<[(u16, u32)]>>;
+pub(crate) type SparseWeightBufMaskCache = FxHashMap<usize, Box<[(u32, u32)]>>;
 pub(crate) type RangeFinalTokenSetCache = FxHashSet<usize>;
 pub(crate) type SeedTerminalDenseMasks = FxHashMap<(u32, TerminalID), DenseWords>;
 const INLINE_DWA_TRANSITION_LIMIT: usize = 8;
@@ -9371,7 +9370,7 @@ pub struct Constraint {
     /// All tokens' (word_index, or_mask) pairs concatenated in token order.
     /// Improves cache locality vs separate Vec allocations per token.
     pub(crate) internal_token_buf_flat: Box<[PackedInternalTokenBufMask]>,
-    /// Current IBM2 loads can retain the runtime-native flat sparse-mask slab
+    /// Current IBM3 loads can retain the runtime-native flat sparse-mask slab
     /// directly inside the owned artifact instead of copying ~0.5-1 MiB.
     pub(crate) backed_internal_token_buf_flat: Option<BackedInternalTokenBufMasks>,
     /// Offsets into `internal_token_buf_flat` for each internal token.
@@ -9815,7 +9814,7 @@ pub(crate) struct ConstraintSerde {
     /// Improves cache locality vs separate Vec allocations per token.
     #[serde(skip)]
     pub(crate) internal_token_buf_flat: Box<[PackedInternalTokenBufMask]>,
-    /// Current IBM2 loads can retain the runtime-native flat sparse-mask slab
+    /// Current IBM3 loads can retain the runtime-native flat sparse-mask slab
     /// directly inside the owned artifact instead of copying ~0.5-1 MiB.
     #[serde(skip, default)]
     pub(crate) backed_internal_token_buf_flat: Option<BackedInternalTokenBufMasks>,

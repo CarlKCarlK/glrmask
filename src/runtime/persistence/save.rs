@@ -603,13 +603,13 @@ pub(crate) fn save_body(&self) -> Vec<u8> {
             + original_token_map_wire.len()
             + tokenizer_wire_len;
         let internal_token_buf_masks_leading_padding = if internal_token_buf_masks_wire
-            .starts_with(b"IBM2")
+            .starts_with(b"IBM3")
             && internal_token_buf_masks_wire.len() >= 12
         {
             let group_count = u32::from_le_bytes(
                 internal_token_buf_masks_wire[4..8]
                     .try_into()
-                    .expect("IBM2 header has fixed width"),
+                    .expect("IBM3 header has fixed width"),
             ) as usize;
             let entries_offset = 12usize.saturating_add((group_count + 1).saturating_mul(4));
             let align = std::mem::align_of::<PackedInternalTokenBufMask>();
@@ -630,8 +630,8 @@ pub(crate) fn save_body(&self) -> Vec<u8> {
             + original_token_map_wire.len()
             + tokenizer_wire_len
             + internal_token_buf_masks_section_len;
-        let token_mask_cache_leading_padding = if token_mask_cache_wire.starts_with(b"TMC6")
-            || token_mask_cache_wire.starts_with(b"TMC7")
+        let token_mask_cache_leading_padding = if token_mask_cache_wire.starts_with(b"TMC8")
+            || token_mask_cache_wire.starts_with(b"TMC9")
         {
             (4 - (token_mask_cache_absolute_start & 3)) & 3
         } else {

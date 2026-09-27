@@ -61,7 +61,7 @@ fn copy_dense_buf(buf: &mut [u32], mask: &[u32]) {
 
 
 #[inline(always)]
-pub(super) fn or_sparse_buf_entries(buf: &mut [u32], entries: &[(u16, u32)]) {
+pub(super) fn or_sparse_buf_entries(buf: &mut [u32], entries: &[(u32, u32)]) {
     for &(word_idx, mask) in entries {
         unsafe {
             let slot = buf.get_unchecked_mut(word_idx as usize);
@@ -72,7 +72,7 @@ pub(super) fn or_sparse_buf_entries(buf: &mut [u32], entries: &[(u16, u32)]) {
 
 
 #[inline(always)]
-pub(super) fn andnot_sparse_buf_entries(buf: &mut [u32], entries: &[(u16, u32)]) {
+pub(super) fn andnot_sparse_buf_entries(buf: &mut [u32], entries: &[(u32, u32)]) {
     for &(word_idx, mask) in entries {
         unsafe {
             let slot = buf.get_unchecked_mut(word_idx as usize);
@@ -83,17 +83,16 @@ pub(super) fn andnot_sparse_buf_entries(buf: &mut [u32], entries: &[(u16, u32)])
 
 
 #[inline(always)]
-pub(super) fn pack_internal_token_buf_entry(word_idx: u16, mask: u32) -> PackedInternalTokenBufMask {
+pub(super) fn pack_internal_token_buf_entry(word_idx: u32, mask: u32) -> PackedInternalTokenBufMask {
     PackedInternalTokenBufMask {
         word_idx,
-        _pad: 0,
         mask,
     }
 }
 
 
 #[inline(always)]
-fn unpack_internal_token_buf_entry(entry: PackedInternalTokenBufMask) -> (u16, u32) {
+fn unpack_internal_token_buf_entry(entry: PackedInternalTokenBufMask) -> (u32, u32) {
     (entry.word_idx, entry.mask)
 }
 
@@ -123,7 +122,7 @@ fn andnot_packed_sparse_buf_entries(buf: &mut [u32], entries: &[PackedInternalTo
 
 
 #[inline(always)]
-fn group_buf_mask_cost(sparse: &[(u16, u32)], dense: Option<&[u32]>) -> usize {
+fn group_buf_mask_cost(sparse: &[(u32, u32)], dense: Option<&[u32]>) -> usize {
     dense.map_or(sparse.len(), <[u32]>::len)
 }
 
@@ -131,7 +130,7 @@ fn group_buf_mask_cost(sparse: &[(u16, u32)], dense: Option<&[u32]>) -> usize {
 #[inline(always)]
 pub(super) fn or_group_buf_mask(
     buf: &mut [u32],
-    sparse: &[(u16, u32)],
+    sparse: &[(u32, u32)],
     dense: Option<&[u32]>,
 ) -> usize {
     if let Some(dense) = dense {
@@ -146,7 +145,7 @@ pub(super) fn or_group_buf_mask(
 #[inline(always)]
 pub(super) fn andnot_group_buf_mask(
     buf: &mut [u32],
-    sparse: &[(u16, u32)],
+    sparse: &[(u32, u32)],
     dense: Option<&[u32]>,
 ) -> usize {
     if let Some(dense) = dense {
@@ -536,7 +535,7 @@ impl Constraint {
     pub(super) fn for_each_internal_token_buf_mask_entry(
         &self,
         internal_token: usize,
-        mut visit: impl FnMut(u16, u32),
+        mut visit: impl FnMut(u32, u32),
     ) {
         if let Some(mask) = self.internal_token_buf_packed_slice(internal_token) {
             for &entry in mask {

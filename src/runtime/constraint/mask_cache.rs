@@ -71,7 +71,7 @@ fn build_internal_token_buf_masks_from_maps(
         })
         .unwrap_or(true);
     if !grouped && !original_to_internal.is_empty() {
-        let mut masks = vec![Vec::<(u16, u32)>::new(); internal_to_tokens.len()];
+        let mut masks = vec![Vec::<(u32, u32)>::new(); internal_to_tokens.len()];
         for (original, &internal) in original_to_internal.iter().enumerate() {
             if internal == u32::MAX {
                 continue;
@@ -79,7 +79,7 @@ fn build_internal_token_buf_masks_from_maps(
             let Some(mask) = masks.get_mut(internal as usize) else {
                 continue;
             };
-            let word = (original as u32 / 32) as u16;
+            let word = original as u32 / 32;
             let bit = original as u32 % 32;
             if let Some((last_word, last_mask)) = mask.last_mut()
                 && *last_word == word
@@ -156,7 +156,7 @@ impl TokenMaskCachePrebuild {
                 let group_end =
                     (group_start + block_size).min(internal_token_buf_masks.len());
                 let mut dense = vec![0u32; mask_words];
-                let mut touched = Vec::<u16>::new();
+                let mut touched = Vec::<u32>::new();
                 for token_masks in &internal_token_buf_masks[group_start..group_end] {
                     for &(word_idx, mask) in token_masks {
                         let slot = &mut dense[word_idx as usize];
@@ -421,7 +421,7 @@ impl Constraint {
             .unwrap_or(true);
         if !grouped && self.has_original_token_map() {
             let original_token_to_internal = self.original_token_map();
-            let mut masks = vec![Vec::<(u16, u32)>::new(); internal_token_to_tokens.len()];
+            let mut masks = vec![Vec::<(u32, u32)>::new(); internal_token_to_tokens.len()];
             for (original, &internal) in original_token_to_internal.iter().enumerate() {
                 if internal == u32::MAX {
                     continue;
@@ -430,7 +430,7 @@ impl Constraint {
                 let Some(mask) = masks.get_mut(internal) else {
                     continue;
                 };
-                let word = (original as u32 / 32) as u16;
+                let word = original as u32 / 32;
                 let bit = original as u32 % 32;
                 if let Some((last_word, last_mask)) = mask.last_mut() {
                     if *last_word == word {
@@ -475,7 +475,7 @@ impl Constraint {
                 let group_start = group_id * block_size;
                 let group_end = (group_start + block_size).min(internal_count);
                 let mut dense = vec![0u32; mask_words];
-                let mut touched = Vec::<u16>::new();
+                let mut touched = Vec::<u32>::new();
                 for internal_token in group_start..group_end {
                     self.for_each_internal_token_buf_mask_entry(
                         internal_token,
@@ -1208,7 +1208,7 @@ impl Constraint {
         #[derive(Default)]
         struct CacheBatch {
             dense: Vec<(usize, Box<[u32]>)>,
-            sparse: Vec<(usize, Box<[(u16, u32)]>)>,
+            sparse: Vec<(usize, Box<[(u32, u32)]>)>,
         }
 
         impl CacheBatch {
@@ -1283,14 +1283,14 @@ impl Constraint {
         )
     }
 
-    fn dense_buf_to_sparse_entries(buf: &[u32]) -> Box<[(u16, u32)]> {
+    fn dense_buf_to_sparse_entries(buf: &[u32]) -> Box<[(u32, u32)]> {
         buf.iter()
             .enumerate()
             .filter_map(|(idx, &word)| {
                 if word == 0 {
                     None
                 } else {
-                    Some((idx as u16, word))
+                    Some((idx as u32, word))
                 }
             })
             .collect::<Vec<_>>()
@@ -1533,11 +1533,11 @@ impl Constraint {
     }
 
     fn build_internal_token_buf_mask(originals: &[u32]) -> InternalTokenBufMasks {
-        let mut result = Vec::<(u16, u32)>::new();
-        let mut current_word = None::<u16>;
+        let mut result = Vec::<(u32, u32)>::new();
+        let mut current_word = None::<u32>;
         let mut current_mask = 0u32;
         for &original in originals {
-            let word = (original / 32) as u16;
+            let word = original / 32;
             let bit = original % 32;
             match current_word {
                 None => {
@@ -1564,9 +1564,9 @@ impl Constraint {
     }
 
     fn build_internal_token_buf_mask_unsorted(originals: &[u32]) -> InternalTokenBufMasks {
-        let mut word_map = BTreeMap::<u16, u32>::new();
+        let mut word_map = BTreeMap::<u32, u32>::new();
         for &original in originals {
-            let word = (original / 32) as u16;
+            let word = original / 32;
             let bit = original % 32;
             *word_map.entry(word).or_default() |= 1u32 << bit;
         }

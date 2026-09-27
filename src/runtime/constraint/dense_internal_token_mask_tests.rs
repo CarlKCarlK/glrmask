@@ -261,10 +261,10 @@
         let backed = loaded
             .backed_internal_token_buf_flat
             .as_ref()
-            .expect("owned current load should retain IBM2 entries in artifact backing");
+            .expect("owned current load should retain IBM3 entries in artifact backing");
         assert!(
             backed.slice(0, backed.len()).is_some(),
-            "fresh current-format IBM2 entries should be naturally aligned for native access",
+            "fresh current-format IBM3 entries should be naturally aligned for native access",
         );
         assert_eq!(loaded.heavy_token_indices, constraint.heavy_token_indices);
         assert_eq!(

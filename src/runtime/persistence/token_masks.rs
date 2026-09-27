@@ -162,7 +162,7 @@ pub(super) enum TokenMaskCacheArtifact {
 }
 
 pub(super) fn encode_word_sparse_token_mask_cache(constraint: &Constraint) -> Vec<u8> {
-    const MAGIC: &[u8; 4] = b"TWS1";
+    const MAGIC: &[u8; 4] = b"TWS2";
     const MAX_BYTES: usize = 512 * 1024;
     let expected_groups = constraint.internal_token_count().div_ceil(64);
     if constraint.word_group_sparse_masks.len() != expected_groups {
@@ -175,7 +175,7 @@ pub(super) fn encode_word_sparse_token_mask_cache(constraint: &Constraint) -> Ve
         .sum::<usize>();
     let encoded_len = 12usize
         .saturating_add((expected_groups + 1).saturating_mul(4))
-        .saturating_add(entry_count.saturating_mul(6));
+        .saturating_add(entry_count.saturating_mul(8));
     if encoded_len > MAX_BYTES {
         return Vec::new();
     }
@@ -201,7 +201,7 @@ pub(super) fn encode_word_sparse_token_mask_cache(constraint: &Constraint) -> Ve
 
 pub(super) fn decode_word_sparse_token_mask_cache(input: &[u8]) -> Result<Vec<InternalTokenBufMasks>, String> {
     const HEADER_LEN: usize = 12;
-    if input.len() < HEADER_LEN || !input.starts_with(b"TWS1") {
+    if input.len() < HEADER_LEN || !input.starts_with(b"TWS2") {
         return Err("invalid sparse word-group cache header".to_owned());
     }
     let group_count = u32::from_le_bytes(input[4..8].try_into().unwrap()) as usize;
@@ -210,7 +210,7 @@ pub(super) fn decode_word_sparse_token_mask_cache(input: &[u8]) -> Result<Vec<In
         .checked_mul(4)
         .ok_or_else(|| "sparse word-group cache offsets overflow".to_owned())?;
     let entries_bytes = entry_count
-        .checked_mul(6)
+        .checked_mul(8)
         .ok_or_else(|| "sparse word-group cache entries overflow".to_owned())?;
     let expected = HEADER_LEN
         .checked_add(offsets_bytes)
@@ -237,10 +237,10 @@ pub(super) fn decode_word_sparse_token_mask_cache(input: &[u8]) -> Result<Vec<In
         let end = offsets[group + 1] as usize;
         let mut decoded = Vec::with_capacity(end - start);
         for entry in start..end {
-            let pos = entry * 6;
+            let pos = entry * 8;
             decoded.push((
-                u16::from_le_bytes(entries[pos..pos + 2].try_into().unwrap()),
-                u32::from_le_bytes(entries[pos + 2..pos + 6].try_into().unwrap()),
+                u32::from_le_bytes(entries[pos..pos + 4].try_into().unwrap()),
+                u32::from_le_bytes(entries[pos + 4..pos + 8].try_into().unwrap()),
             ));
         }
         groups.push(decoded);
@@ -367,7 +367,7 @@ pub(super) fn encode_token_mask_cache(constraint: &Constraint) -> Vec<u8> {
     let mut tail = Vec::with_capacity(32 * 1024);
     // Deduplicating tiny seed maps costs more bookkeeping than it saves. Large
     // seed tables, however, commonly repeat the same dense token mask across
-    // hundreds of tokenizer-state/terminal keys; TMC5 pools those immutable
+    // hundreds of tokenizer-state/terminal keys; the compact encoding pools those immutable
     // masks once and shares the Arc again after load.
     let compact_seed = constraint.seed_terminal_dense.len() >= 64;
     if compact_seed {
@@ -403,8 +403,8 @@ pub(super) fn encode_token_mask_cache(constraint: &Constraint) -> Vec<u8> {
     let tail_ms = tail_started
         .map_or(0.0, |started| started.elapsed().as_secs_f64() * 1000.0);
     let word_offsets_bytes = (word_groups + 1).saturating_mul(4);
-    let word_entries_bytes = word_entries.saturating_mul(6);
-    // TMC6/7 align the dense u32 matrix so an owned load can retain it directly
+    let word_entries_bytes = word_entries.saturating_mul(8);
+    // TMC8/9 align the dense u32 matrix so an owned load can retain it directly
     // from the artifact rather than copying ~1.3 MiB merely for alignment.
     let prefix_unaligned_start = HEADER_LEN
         .saturating_add(tail.len())
@@ -422,7 +422,7 @@ pub(super) fn encode_token_mask_cache(constraint: &Constraint) -> Vec<u8> {
     }
     let prefix_started = profile.then(std::time::Instant::now);
     let mut out = Vec::with_capacity(total_len);
-    out.extend_from_slice(if compact_seed { b"TMC7" } else { b"TMC6" });
+    out.extend_from_slice(if compact_seed { b"TMC9" } else { b"TMC8" });
     for value in [tail.len(), mask_words, word_groups, word_entries, prefix_rows] {
         out.extend_from_slice(
             &u32::try_from(value)
@@ -481,17 +481,15 @@ pub(super) fn decode_token_mask_cache_impl(
     input: &[u8],
     backing: Option<(std::sync::Arc<Vec<u8>>, usize)>,
 ) -> Result<TokenMaskCacheArtifact, String> {
-    // Current S20 artifacts may prefix TMC6/7 with up to three zero bytes so
-    // the cache's aligned dense matrix also lands at a u32-aligned offset in
-    // the whole artifact. Older S20 artifacts had no section-local prefix, so
-    // continue to accept both layouts.
+    // The cache may have up to three leading zero bytes to align its dense
+    // matrix within the enclosing artifact. Standalone sections need no padding.
     let has_known_magic = |bytes: &[u8]| {
-        bytes.starts_with(b"TWS1")
+        bytes.starts_with(b"TWS2")
             || bytes.starts_with(b"TMC3")
             || bytes.starts_with(b"TMC4")
             || bytes.starts_with(b"TMC5")
-            || bytes.starts_with(b"TMC6")
-            || bytes.starts_with(b"TMC7")
+            || bytes.starts_with(b"TMC8")
+            || bytes.starts_with(b"TMC9")
     };
     let leading_padding = if has_known_magic(input) {
         0
@@ -516,16 +514,16 @@ pub(super) fn decode_token_mask_cache_impl(
     });
     const MAGIC: &[u8; 4] = b"TMC3";
     const HEADER_LEN: usize = 16;
-    if input.starts_with(b"TWS1") {
+    if input.starts_with(b"TWS2") {
         return decode_word_sparse_token_mask_cache(input).map(TokenMaskCacheArtifact::WordSparse);
     }
-    if input.starts_with(b"TMC7")
-        || input.starts_with(b"TMC6")
+    if input.starts_with(b"TMC9")
+        || input.starts_with(b"TMC8")
         || input.starts_with(b"TMC5")
         || input.starts_with(b"TMC4")
     {
-        let compact_seed = input.starts_with(b"TMC7") || input.starts_with(b"TMC5");
-        let aligned_prefix = input.starts_with(b"TMC7") || input.starts_with(b"TMC6");
+        let compact_seed = input.starts_with(b"TMC9") || input.starts_with(b"TMC5");
+        let aligned_prefix = input.starts_with(b"TMC9") || input.starts_with(b"TMC8");
         const FAST_HEADER_LEN: usize = 24;
         if input.len() < FAST_HEADER_LEN {
             return Err("invalid fast token-mask cache header".to_owned());
@@ -548,7 +546,7 @@ pub(super) fn decode_token_mask_cache_impl(
             .checked_mul(4)
             .ok_or_else(|| "fast token-mask sparse offsets overflow".to_owned())?;
         let entries_bytes = word_entries
-            .checked_mul(6)
+            .checked_mul(8)
             .ok_or_else(|| "fast token-mask sparse entries overflow".to_owned())?;
         let prefix_bytes = prefix_rows
             .checked_mul(mask_words)
@@ -613,30 +611,30 @@ pub(super) fn decode_token_mask_cache_impl(
             let end = offsets[group + 1] as usize;
             let mut decoded = Vec::with_capacity(end - start);
             if cfg!(target_endian = "little") {
-                // `expected == input.len()` above proves every 6-byte record is
+                // `expected == input.len()` above proves every 8-byte record is
                 // present. Read the packed fields directly instead of doing
                 // two independently bounds-checked slices + `try_into()` per
                 // sparse entry. The wire is intentionally unaligned.
                 let base = entries.as_ptr();
                 for entry in start..end {
-                    let ptr = unsafe { base.add(entry * 6) };
-                    let word = unsafe { std::ptr::read_unaligned(ptr.cast::<u16>()) };
+                    let ptr = unsafe { base.add(entry * 8) };
+                    let word = unsafe { std::ptr::read_unaligned(ptr.cast::<u32>()) };
                     if word as usize >= mask_words {
                         return Err("fast token-mask sparse word out of range".to_owned());
                     }
-                    let bits = unsafe { std::ptr::read_unaligned(ptr.add(2).cast::<u32>()) };
+                    let bits = unsafe { std::ptr::read_unaligned(ptr.add(4).cast::<u32>()) };
                     decoded.push((word, bits));
                 }
             } else {
                 for entry in start..end {
-                    let pos = entry * 6;
-                    let word = u16::from_le_bytes(entries[pos..pos + 2].try_into().unwrap());
+                    let pos = entry * 8;
+                    let word = u32::from_le_bytes(entries[pos..pos + 4].try_into().unwrap());
                     if word as usize >= mask_words {
                         return Err("fast token-mask sparse word out of range".to_owned());
                     }
                     decoded.push((
                         word,
-                        u32::from_le_bytes(entries[pos + 2..pos + 6].try_into().unwrap()),
+                        u32::from_le_bytes(entries[pos + 4..pos + 8].try_into().unwrap()),
                     ));
                 }
             }
@@ -812,7 +810,7 @@ pub(super) fn install_token_mask_cache(
 }
 
 pub(super) fn encode_internal_token_buf_masks(constraint: &Constraint) -> Vec<u8> {
-    const MAGIC: &[u8; 4] = b"IBM2";
+    const MAGIC: &[u8; 4] = b"IBM3";
     const ENTRY_BYTES: usize = std::mem::size_of::<PackedInternalTokenBufMask>();
     let flat_len = constraint.internal_token_buf_flat_len();
     let packed_ready = constraint.internal_token_buf_offsets.len()
@@ -861,7 +859,6 @@ pub(super) fn encode_internal_token_buf_masks(constraint: &Constraint) -> Vec<u8
         } else {
             for entry in constraint.internal_token_buf_flat.iter() {
                 out.extend_from_slice(&entry.word_idx.to_le_bytes());
-                out.extend_from_slice(&0u16.to_le_bytes());
                 out.extend_from_slice(&entry.mask.to_le_bytes());
             }
         }
@@ -875,7 +872,6 @@ pub(super) fn encode_internal_token_buf_masks(constraint: &Constraint) -> Vec<u8
         for mask in &constraint.internal_token_buf_masks {
             for &(word, bits) in mask {
                 out.extend_from_slice(&word.to_le_bytes());
-                out.extend_from_slice(&0u16.to_le_bytes());
                 out.extend_from_slice(&bits.to_le_bytes());
             }
         }
@@ -900,10 +896,9 @@ pub(super) fn decode_internal_token_buf_masks(
     input: &[u8],
     mut backing: Option<(std::sync::Arc<Vec<u8>>, usize)>,
 ) -> Result<DecodedInternalTokenBufMasks, String> {
-    const LEGACY_MAGIC: &[u8; 4] = b"IBM1";
-    const FIXED_MAGIC: &[u8; 4] = b"IBM2";
+    const FIXED_MAGIC: &[u8; 4] = b"IBM3";
     let mut input = input;
-    if !input.starts_with(FIXED_MAGIC) && !input.starts_with(LEGACY_MAGIC) {
+    if !input.starts_with(FIXED_MAGIC) {
         let leading_padding = (1..std::mem::align_of::<PackedInternalTokenBufMask>())
             .find(|&padding| {
                 input.len() >= padding + FIXED_MAGIC.len()
@@ -919,8 +914,7 @@ pub(super) fn decode_internal_token_buf_masks(
             }
         }
     }
-    let fixed = input.starts_with(FIXED_MAGIC);
-    if input.len() < 12 || (!fixed && !input.starts_with(LEGACY_MAGIC)) {
+    if input.len() < 12 || !input.starts_with(FIXED_MAGIC) {
         return Err("invalid internal-token buffer-mask section".to_owned());
     }
     let group_count = u32::from_le_bytes(input[4..8].try_into().unwrap()) as usize;
@@ -928,11 +922,7 @@ pub(super) fn decode_internal_token_buf_masks(
     let offsets_bytes = (group_count + 1)
         .checked_mul(4)
         .ok_or_else(|| "internal-token buffer-mask offsets overflow".to_owned())?;
-    let entry_width = if fixed {
-        std::mem::size_of::<PackedInternalTokenBufMask>()
-    } else {
-        6
-    };
+    let entry_width = std::mem::size_of::<PackedInternalTokenBufMask>();
     let entries_bytes = entry_count
         .checked_mul(entry_width)
         .ok_or_else(|| "internal-token buffer-mask entries overflow".to_owned())?;
@@ -971,19 +961,13 @@ pub(super) fn decode_internal_token_buf_masks(
     }
     let entries_start = 12 + offsets_bytes;
     let entries = &input[entries_start..];
-    let backed = if fixed {
-        backing
-            .map(|(backing, section_start)| {
-                BackedInternalTokenBufMasks::new(
-                    backing,
-                    section_start + entries_start,
-                    entry_count,
-                )
-            })
-            .transpose()?
-    } else {
-        None
-    };
+    let backed = backing
+        .map(|(backing, section_start)| {
+            let absolute_start = section_start.checked_add(entries_start)
+                .ok_or_else(|| "internal-token buffer-mask backing offset overflow".to_owned())?;
+            BackedInternalTokenBufMasks::new(backing, absolute_start, entry_count)
+        })
+        .transpose()?;
     let mut flat = Vec::<PackedInternalTokenBufMask>::with_capacity(if backed.is_some() {
         0
     } else {
@@ -992,7 +976,7 @@ pub(super) fn decode_internal_token_buf_masks(
     if backed.is_some() {
         // The retained artifact is the runtime storage; offsets remain owned
         // because they are tiny and hot to index.
-    } else if fixed && cfg!(target_endian = "little") {
+    } else if cfg!(target_endian = "little") {
         unsafe {
             flat.set_len(entry_count);
             std::ptr::copy_nonoverlapping(
@@ -1003,23 +987,21 @@ pub(super) fn decode_internal_token_buf_masks(
         }
     } else {
         // The section length was validated above, so every record is present.
-        // IBM1 has six-byte records; IBM2 is eight bytes with a two-byte pad.
+        // IBM3 stores a little-endian u32 word index and u32 mask, without padding.
         unsafe {
             flat.set_len(entry_count);
             let src = entries.as_ptr();
             let dst = flat.as_mut_ptr();
             for entry in 0..entry_count {
                 let pos = entry * entry_width;
-                let word = u16::from_le(std::ptr::read_unaligned(src.add(pos).cast::<u16>()));
-                let bits_offset = if fixed { 4 } else { 2 };
+                let word = u32::from_le(std::ptr::read_unaligned(src.add(pos).cast::<u32>()));
                 let bits = u32::from_le(std::ptr::read_unaligned(
-                    src.add(pos + bits_offset).cast::<u32>(),
+                    src.add(pos + 4).cast::<u32>(),
                 ));
                 std::ptr::write(
                     dst.add(entry),
                     PackedInternalTokenBufMask {
                         word_idx: word,
-                        _pad: 0,
                         mask: bits,
                     },
                 );
@@ -1032,3 +1014,6 @@ pub(super) fn decode_internal_token_buf_masks(
         offsets: offsets.into_boxed_slice(),
     })
 }
+
+#[cfg(test)]
+mod output_coordinate_tests;
