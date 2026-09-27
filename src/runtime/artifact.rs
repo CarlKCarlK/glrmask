@@ -3339,6 +3339,10 @@ pub(crate) struct DynamicLazyUnionCache {
     /// Dedicated packed-key index for the overwhelmingly common two-state
     /// derivatives.  Avoids hashing/cloning a SmallVec on every pair lookup.
     pub(crate) state_by_pair: Option<Box<FxHashMap<u64, u32>>>,
+    /// Exact union of two *input coordinates*, including virtual subsets.
+    /// Distinct from state_by_pair, whose keys contain physical members only.
+    /// Bounded, runtime-only, and cleared with every extension-ID reset.
+    pub(crate) state_by_union_pair: Option<Box<FxHashMap<u64, u32>>>,
     pub(crate) state_by_subset: FxHashMap<SmallVec<[u32; 8]>, u32>,
     pub(crate) subsets: Vec<SmallVec<[u32; 8]>>,
     /// Lazy virtual-state derivatives. Most derived states see only a few

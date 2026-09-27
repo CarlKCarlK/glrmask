@@ -182,6 +182,7 @@ struct FullWalkLazyUnion<'a> {
     tokenizer: *const Tokenizer,
     overflowed: &'a std::cell::Cell<bool>,
     use_pair_map: bool,
+    use_union_pair_memo: bool,
     cache: std::cell::UnsafeCell<std::sync::MutexGuard<'a, DynamicLazyUnionCache>>,
 }
 
@@ -189,6 +190,7 @@ impl<'a> FullWalkLazyUnion<'a> {
     const UNBUILT: u32 = u32::MAX - 1;
     const SOFT_MAX_EXTENSION_STATES: usize = 4096;
     const RESERVED_EXTENSION_STATES: usize = 8192;
+    const MAX_UNION_PAIR_MEMO: usize = 2048;
 
     fn new(
         tokenizer: &Tokenizer,
@@ -226,6 +228,12 @@ impl<'a> FullWalkLazyUnion<'a> {
                 .base_rows
                 .resize_with(base_state_count as usize, || None);
         }
+        static UNION_PAIR_MEMO: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        let use_union_pair_memo = full_walk_acceleration_enabled() && *UNION_PAIR_MEMO.get_or_init(|| {
+            !std::env::var("GLRMASK_DISABLE_LAZY_UNION_PAIR_MEMO").ok().is_some_and(|value| {
+                matches!(value.trim().to_ascii_lowercase().as_str(), "1" | "true" | "yes" | "on")
+            })
+        });
         let table = Self {
             base_transitions16,
             base_transitions32,
@@ -233,6 +241,7 @@ impl<'a> FullWalkLazyUnion<'a> {
             tokenizer: tokenizer as *const Tokenizer,
             overflowed,
             use_pair_map,
+            use_union_pair_memo,
             cache: std::cell::UnsafeCell::new(cache),
         };
         let root = table.intern_states(root_states)?;
@@ -245,6 +254,9 @@ impl<'a> FullWalkLazyUnion<'a> {
         if let Some(pair_map) = cache.state_by_pair.as_mut() {
             pair_map.clear();
         }
+        if let Some(pair_map) = cache.state_by_union_pair.as_mut() {
+            pair_map.clear();
+        }
         cache.state_by_subset.clear();
         cache.subsets.clear();
         cache.rows.clear();
@@ -253,6 +265,22 @@ impl<'a> FullWalkLazyUnion<'a> {
     }
 
     fn intern_states(&self, states: &[u32]) -> Option<u32> {
+        // Cached physical subsets already have canonical IDs, but discovering
+        // that ID used to re-expand and sort both inputs on every call. Exact
+        // input-coordinate pairs are stable until clear_cache resets the whole
+        // namespace, at which point this memo is cleared too.
+        let pair_key = if self.use_union_pair_memo {
+            match states {
+                [first, second] => Some((u64::from((*first).min(*second)) << 32) | u64::from((*first).max(*second))),
+                _ => None,
+            }
+        } else { None };
+        if let Some(key) = pair_key {
+            let cache = unsafe { &*self.cache.get() };
+            if let Some(result) = cache.state_by_union_pair.as_ref().and_then(|memo| memo.get(&key)) {
+                return Some(*result);
+            }
+        }
         let mut physical = SmallVec::<[u32; 8]>::new();
         {
             let cache = unsafe { &*self.cache.get() };
@@ -267,6 +295,12 @@ impl<'a> FullWalkLazyUnion<'a> {
         }
         let cache = unsafe { &mut *self.cache.get() };
         let result = Self::intern_physical_inner(self.base_state_count, cache, physical, self.use_pair_map);
+        if let (Some(key), Some(result)) = (pair_key, result) {
+            let memo = cache.state_by_union_pair.get_or_insert_with(|| Box::new(FxHashMap::default()));
+            if memo.len() < Self::MAX_UNION_PAIR_MEMO {
+                memo.insert(key, result);
+            }
+        }
         if result.is_none() {
             self.overflowed.set(true);
         }
@@ -8672,6 +8706,52 @@ mod wide_scalar_dispatch_tests {
     use super::*;
 
     #[test]
+    fn lazy_union_pair_memo_preserves_virtual_members_aliases_and_bounds() {
+        let tokenizer = crate::automata::lexer::tokenizer::arbitrary_flat32_test_tokenizer();
+        let cache = std::sync::Mutex::new(DynamicLazyUnionCache::default());
+        let overflowed = std::cell::Cell::new(false);
+        let (mut table, first) = FullWalkLazyUnion::new(
+            &tokenizer, None, None, cache.lock().unwrap(), &[0, 32_768], &overflowed, false,
+        ).unwrap();
+        table.use_union_pair_memo = true;
+        let second = table.intern_states(&[1, 32_768]).unwrap();
+        let inputs = [0, 1, 2, 32_768, first, second];
+        for &left in &inputs {
+            for &right in &inputs {
+                let result = table.intern_states(&[left, right]).unwrap();
+                let reversed = table.intern_states(&[right, left]).unwrap();
+                assert_eq!(result, reversed);
+                let cache = unsafe { &*table.cache.get() };
+                let members = |state: u32| -> Vec<u32> {
+                    if state < table.base_state_count { vec![state] }
+                    else { cache.subsets[(state - table.base_state_count) as usize].to_vec() }
+                };
+                let mut expected = members(left);
+                expected.extend(members(right));
+                expected.sort_unstable(); expected.dedup();
+                assert_eq!(members(result), expected, "the full physical union is the oracle");
+            }
+        }
+        let invalid = table.base_state_count + FullWalkLazyUnion::RESERVED_EXTENSION_STATES as u32;
+        assert_eq!(table.intern_states(&[0, invalid]), None);
+        let before = unsafe { (&*table.cache.get()).state_by_union_pair.as_ref().unwrap().len() };
+        // Fill only the memo's bounded index with valid known results. Once
+        // full, a new union still executes normally but is not retained.
+        {
+            let cache = unsafe { &mut *table.cache.get() };
+            let memo = cache.state_by_union_pair.as_mut().unwrap();
+            for i in 1..=(FullWalkLazyUnion::MAX_UNION_PAIR_MEMO - before) {
+                memo.insert((1u64 << 63) + i as u64, first);
+            }
+            assert_eq!(memo.len(), FullWalkLazyUnion::MAX_UNION_PAIR_MEMO);
+        }
+        let joined = table.intern_states(&[10, 11]).unwrap();
+        let cache = unsafe { &*table.cache.get() };
+        assert_eq!(cache.subsets[(joined - table.base_state_count) as usize].as_slice(), &[10, 11]);
+        assert_eq!(cache.state_by_union_pair.as_ref().unwrap().len(), FullWalkLazyUnion::MAX_UNION_PAIR_MEMO);
+    }
+
+    #[test]
     fn lazy_scalar_dispatch_rows_support_states_beyond_flat16() {
         let tokenizer =
             crate::automata::lexer::tokenizer::arbitrary_flat32_test_tokenizer();
@@ -8701,6 +8781,7 @@ mod wide_scalar_dispatch_tests {
             crate::automata::lexer::tokenizer::arbitrary_flat32_test_tokenizer();
         let mut seeded = DynamicLazyUnionCache::default();
         seeded.base_state_count = tokenizer.num_states();
+        seeded.state_by_union_pair = Some(Box::new(FxHashMap::from_iter([(17, u32::MAX)])));
         seeded
             .base_rows
             .resize_with(tokenizer.num_states() as usize, || None);
@@ -8726,6 +8807,8 @@ mod wide_scalar_dispatch_tests {
         {
             let cache = unsafe { &*table.cache.get() };
             assert_eq!(cache.base_rows.len(), tokenizer.num_states() as usize);
+            assert!(!cache.state_by_union_pair.as_ref().unwrap().contains_key(&17),
+                "old extension coordinates must not survive a soft reset");
         }
         assert_eq!(table.transition(0, b'a'), 32_768);
         assert!(!overflowed.get());
