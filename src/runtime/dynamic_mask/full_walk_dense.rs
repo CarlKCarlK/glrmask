@@ -2886,6 +2886,36 @@ impl FullWalkManyCursor {
     }
 }
 
+/// Store ambiguous frontiers only at depths that actually need them. A scalar
+/// walk does not allocate or reserve hundreds of large frontier payloads in its
+/// stack frame. The parallel lexer stack remains the authority on which depths
+/// contain a Many cursor; stale entries at other depths are never read.
+#[derive(Default)]
+struct FullWalkManyStack {
+    slots: Vec<Option<FullWalkManyCursor>>,
+}
+
+impl FullWalkManyStack {
+    #[inline]
+    fn save(&mut self, depth: usize, cursor: &FullWalkManyCursor) {
+        debug_assert!(depth < 256, "full-walk trie depth was checked at entry");
+        if self.slots.len() <= depth {
+            self.slots.resize_with(depth + 1, || None);
+        }
+        match &mut self.slots[depth] {
+            Some(existing) => existing.clone_from(cursor),
+            slot @ None => *slot = Some(cursor.clone()),
+        }
+    }
+
+    #[inline]
+    fn restore(&self, depth: usize) -> &FullWalkManyCursor {
+        self.slots[depth]
+            .as_ref()
+            .expect("a Many lexer-stack entry must have a saved correlated frontier")
+    }
+}
+
 /// Exact, bounded memoization of complete correlated frontiers in one mask.
 /// Parser/lexer IDs are append-only. Full equality, not hashes, establishes
 /// identity; exhausted storage retains the authoritative direct executor.
@@ -6680,15 +6710,14 @@ fn try_full_walk_mask_with_table_from_initial_in_output_scope<
     // tracks only the certified scalar lane; ambiguity is conservatively
     // treated as parser-dependent below.
     let mut stack_parser_effect_seen = [false; 256];
-    // Multi-branch stack states are uncommon, and `FullWalkManyState` embeds a
-    // SmallVec. Do not eagerly construct/drop 256 empty SmallVec values on
-    // every complete vocabulary walk; materialize only the depths that
-    // actually carry a multi state.
+    // Multi-branch frontiers embed a large SmallVec. Even an array of empty
+    // Options would enlarge the frame of every scalar fast-path invocation;
+    // allocate depth storage only after an actual ambiguous frontier appears.
     let accelerated = full_walk_acceleration_enabled();
     let mut many_transition_memo = FullWalkManyTransitionMemo::new(
         if accelerated { FullWalkManyTransitionMemo::MAX_STATES } else { 0 },
     );
-    let mut stack_many: [Option<FullWalkManyCursor>; 256] = std::array::from_fn(|_| None);
+    let mut stack_many = FullWalkManyStack::default();
     let mut pair_union_cache = FxHashMap::<(u32, u32), Option<u32>>::default();
     let mut triple_union_cache = FxHashMap::<(u32, u32, u32), Option<u32>>::default();
     if root_branches.len() == 1 && root_branches[0].initial_prune_guard.is_passed() {
@@ -6739,7 +6768,7 @@ fn try_full_walk_mask_with_table_from_initial_in_output_scope<
             stack_lexer[0] = lexer_state;
             stack_parser[0] = parser_node;
         } else {
-            stack_many[0] = Some(many_transition_memo.hold(full_walk_many_state_from_branches(roots)));
+            stack_many.save(0, &many_transition_memo.hold(full_walk_many_state_from_branches(roots)));
         }
     }
 
@@ -6865,12 +6894,7 @@ fn try_full_walk_mask_with_table_from_initial_in_output_scope<
                     *stack_two.get_unchecked(parent_depth)
                 });
             } else if scalar_lexer == FULL_WALK_LEXER_MULTI {
-                current_many.clone_from(unsafe {
-                    stack_many
-                        .get_unchecked(parent_depth)
-                        .as_ref()
-                        .unwrap_unchecked()
-                });
+                current_many.clone_from(stack_many.restore(parent_depth));
             }
 
             if parent_depth == 0 && !op.consumes_byte() {
@@ -8003,12 +8027,7 @@ fn try_full_walk_mask_with_table_from_initial_in_output_scope<
                 } else if scalar_lexer == FULL_WALK_LEXER_GUARDED_PAIR {
                     *stack_two.get_unchecked_mut(parent_depth + 1) = current_guarded_pair.pack();
                 } else if scalar_lexer == FULL_WALK_LEXER_MULTI {
-                    let slot = stack_many.get_unchecked_mut(parent_depth + 1);
-                    if let Some(existing) = slot.as_mut() {
-                        existing.clone_from(&current_many);
-                    } else {
-                        *slot = Some(current_many.clone());
-                    }
+                    stack_many.save(parent_depth + 1, &current_many);
                 }
             }
         }
@@ -8129,6 +8148,35 @@ fn try_full_walk_mask_with_table_from_initial_in_output_scope<
 #[cfg(test)]
 mod full_walk_acceleration_tests {
     use super::*;
+
+    #[test]
+    fn many_frontier_stack_is_lazy_and_restores_exact_depths() {
+        let mut stack = FullWalkManyStack::default();
+        assert_eq!(stack.slots.capacity(), 0);
+        let root = FullWalkManyCursor::Direct(guarded_state(7, 2));
+        let child = FullWalkManyCursor::Direct(guarded_state(8, 3));
+        stack.save(0, &root);
+        stack.save(17, &child);
+        let mut memo = FullWalkManyTransitionMemo::new(4);
+        assert!(memo.view(stack.restore(0)) == memo.view(&root));
+        assert!(memo.view(stack.restore(17)) == memo.view(&child));
+        assert_eq!(stack.slots.len(), 18);
+        assert!(stack.slots[1..17].iter().all(Option::is_none));
+
+        let cached = memo.hold(guarded_state(19, 5));
+        stack.save(17, &cached);
+        assert_eq!(stack.restore(17).id(), cached.id());
+        assert!(memo.view(stack.restore(17)) == &guarded_state(19, 5));
+        assert!(memo.view(stack.restore(0)) == memo.view(&root));
+        stack.save(17, &child);
+        assert!(stack.restore(17).id().is_none());
+        assert!(memo.view(stack.restore(17)) == memo.view(&child));
+
+        stack.save(255, &cached);
+        assert_eq!(stack.slots.len(), 256);
+        assert_eq!(stack.restore(255).id(), cached.id());
+        assert!(memo.view(stack.restore(17)) == memo.view(&child));
+    }
 
     #[test]
     fn many_transition_memo_bounds_allocations_and_keeps_exact_direct_states() {
