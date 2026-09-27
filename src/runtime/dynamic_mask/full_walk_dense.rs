@@ -76,6 +76,14 @@ trait FullWalkTransitionTable {
         }))
     }
 
+    /// Exact alternatives sharing one parser coordinate. Ordinary rows are
+    /// atomic. A lazy union may expose its bounded physical member set, but
+    /// never derivative approximations or members from another table.
+    #[inline]
+    fn continuation_witness_components(&self, state: u32) -> SmallVec<[u32; 8]> {
+        smallvec::smallvec![state]
+    }
+
     #[inline(always)]
     fn transition(&self, state: u32, byte: u8) -> u32 {
         let cell = self.cell(state, byte);
@@ -789,6 +797,19 @@ impl FullWalkTransitionTable for FullWalkLazyUnion<'_> {
     #[inline(always)] fn cell_is_dead(cell: u32) -> bool { cell == u32::MAX }
     #[inline(always)] fn cell_has_finalizer(cell: u32) -> bool { cell & 0x8000_0000 != 0 }
     #[inline(always)] fn cell_target(cell: u32) -> u32 { cell & 0x7fff_ffff }
+
+    fn continuation_witness_components(&self, state: u32) -> SmallVec<[u32; 8]> {
+        if state < self.base_state_count { return smallvec::smallvec![state]; }
+        let Some(index) = self.checked_extension_index(state) else {
+            return SmallVec::new();
+        };
+        let cache = unsafe { &*self.cache.get() };
+        let members = &cache.subsets[index];
+        if members.len() > 8 { return SmallVec::new(); }
+        // The owned inline copy releases the UnsafeCell borrow before any
+        // later metadata or transition query can grow the lazy-union cache.
+        SmallVec::from_slice(members)
+    }
 
     fn proven_identity_byte_classes(
         &self,
@@ -2903,6 +2924,135 @@ impl FullWalkIdentityProofCache {
     }
 }
 
+
+/// A passed continuing branch survives each self-edge even when finalizers
+/// fork other alternatives. Exact physical liveness therefore witnesses every
+/// descendant of an alphabet-closed subtree; other branches may change.
+#[allow(clippy::too_many_arguments)]
+fn full_walk_live_branch_witness<T: FullWalkTransitionTable>(
+    branch: &FullWalkBranch,
+    alphabet: [u64; 4],
+    proofs: &mut FullWalkIdentityProofCache,
+    parser_cache: &mut FullWalkParserCache,
+    constraint: &Constraint,
+    tokenizer: &Tokenizer,
+    transitions: &T,
+) -> bool {
+    if !branch.prune_guard.is_passed() { return false; }
+    let Some(classes) = proofs.get(transitions, tokenizer, branch.lexer_state) else {
+        return false;
+    };
+    let self_edges = std::array::from_fn(|word|
+        classes.ordinary[word] | classes.finalizing[word]);
+    identity_alphabet_covers_subtree(&self_edges, alphabet)
+        && parser_cache.physical_token_boundary_allowed(
+            constraint, tokenizer, transitions, branch.parser_node, branch.lexer_state,
+        )
+}
+
+/// Bound proof work independently of whole-frontier identity. No frontier
+/// mutation or assumption about missing rows is permitted on decline.
+#[cfg(test)]
+#[allow(clippy::too_many_arguments)]
+fn full_walk_many_live_witness<T: FullWalkTransitionTable>(
+    frontier: &FullWalkManyState,
+    alphabet: [u64; 4],
+    proofs: &mut FullWalkIdentityProofCache,
+    parser_cache: &mut FullWalkParserCache,
+    constraint: &Constraint,
+    tokenizer: &Tokenizer,
+    transitions: &T,
+) -> bool {
+    let mut witness = |branch: &FullWalkBranch| full_walk_live_branch_witness(
+        branch, alphabet, proofs, parser_cache, constraint, tokenizer, transitions,
+    );
+    match frontier {
+        FullWalkManyState::Branches(branches) => {
+            branches.len() <= 8 && branches.iter().any(&mut witness)
+        }
+        FullWalkManyState::ThreeSameParser { lexers, parser_node } => {
+            [lexers.0, lexers.1, lexers.2].into_iter().any(|lexer_state| witness(&FullWalkBranch {
+                lexer_state, parser_node: *parser_node, prune_guard: FullWalkPruneGuard::Passed,
+            }))
+        }
+    }
+}
+
+/// A passed union branch is existential, not an intersection: a live physical
+/// member can keep matching while its siblings advance or disappear. The
+/// continuing branch is retained by the reference executor even on finalizers.
+/// Its parser coordinate is unchanged; no pending guard may use this helper.
+#[allow(clippy::too_many_arguments)]
+fn full_walk_live_component_witness<T: FullWalkTransitionTable>(
+    lexer: u32,
+    parser: u32,
+    alphabet: [u64; 4],
+    proofs: &mut FullWalkIdentityProofCache,
+    parser_cache: &mut FullWalkParserCache,
+    constraint: &Constraint,
+    tokenizer: &Tokenizer,
+    transitions: &T,
+) -> bool {
+    transitions.continuation_witness_components(lexer).into_iter().any(|lexer_state| {
+        full_walk_live_branch_witness(&FullWalkBranch {
+            lexer_state, parser_node: parser, prune_guard: FullWalkPruneGuard::Passed,
+        }, alphabet, proofs, parser_cache, constraint, tokenizer, transitions)
+    })
+}
+
+#[allow(clippy::too_many_arguments)]
+fn full_walk_many_component_witness<T: FullWalkTransitionTable>(
+    frontier: &FullWalkManyState,
+    alphabet: [u64; 4],
+    proofs: &mut FullWalkIdentityProofCache,
+    parser_cache: &mut FullWalkParserCache,
+    constraint: &Constraint,
+    tokenizer: &Tokenizer,
+    transitions: &T,
+) -> bool {
+    let mut witness = |lexer, parser| full_walk_live_component_witness(
+        lexer, parser, alphabet, proofs, parser_cache, constraint, tokenizer, transitions);
+    match frontier {
+        FullWalkManyState::Branches(branches) => branches.len() <= 8
+            && branches.iter().any(|branch| branch.prune_guard.is_passed()
+                && witness(branch.lexer_state, branch.parser_node)),
+        FullWalkManyState::ThreeSameParser { lexers, parser_node } =>
+            [lexers.0, lexers.1, lexers.2].into_iter().any(|lexer| witness(lexer, *parser_node)),
+    }
+}
+
+/// Only representations that prove their selected alternatives have Passed
+/// guards can enter this view. The pending side of a guarded pair is omitted.
+enum FullWalkWitnessFrontier<'a> {
+    One(u32, u32),
+    Two([(u32, u32); 2]),
+    Many(&'a FullWalkManyState),
+}
+
+/// Keep bounded proof discovery out of the large byte-dispatch loop. Most
+/// edges are too small to amortize a proof, and the ordinary walker remains
+/// the exact fallback when any certificate or work-budget check declines.
+#[inline(never)]
+#[allow(clippy::too_many_arguments)]
+fn full_walk_frontier_live_witness<T: FullWalkTransitionTable>(
+    frontier: FullWalkWitnessFrontier<'_>,
+    alphabet: [u64; 4],
+    proofs: &mut FullWalkIdentityProofCache,
+    parser_cache: &mut FullWalkParserCache,
+    constraint: &Constraint,
+    tokenizer: &Tokenizer,
+    transitions: &T,
+) -> bool {
+    match frontier {
+        FullWalkWitnessFrontier::One(lexer, parser) => full_walk_live_component_witness(
+            lexer, parser, alphabet, proofs, parser_cache, constraint, tokenizer, transitions),
+        FullWalkWitnessFrontier::Two(branches) => branches.into_iter().any(|(lexer, parser)|
+            full_walk_live_component_witness(lexer, parser, alphabet, proofs,
+                parser_cache, constraint, tokenizer, transitions)),
+        FullWalkWitnessFrontier::Many(frontier) => full_walk_many_component_witness(
+            frontier, alphabet, proofs, parser_cache, constraint, tokenizer, transitions),
+    }
+}
 
 /// A cursor into a bounded, mask-local deterministic transition memo. The
 /// direct variant preserves the reference executor when storage is exhausted.
@@ -6917,6 +7067,11 @@ fn try_full_walk_mask_with_table_from_initial_in_output_scope<
     let mut guarded_self_loop_bytes = [0u64; 4];
     let mut guarded_outer_cache_hits = 0usize;
     let mut identity_proofs = FullWalkIdentityProofCache::default();
+    let mut witness_proofs = FullWalkIdentityProofCache::default();
+    static LIVE_BRANCH_WITNESS: OnceLock<bool> = OnceLock::new();
+    let live_branch_witness_enabled = *LIVE_BRANCH_WITNESS.get_or_init(||
+        !env_flag("GLRMASK_DISABLE_LIVE_BRANCH_WITNESS", false));
+    let mut live_witness_subtrees = 0usize;
     let mut guarded_proof_state = None::<FullWalkGuardedPair>;
     let mut scalar_identity = FullWalkScalarIdentity::default();
     let mut identity_subtrees_skipped = 0usize;
@@ -7886,17 +8041,38 @@ fn try_full_walk_mask_with_table_from_initial_in_output_scope<
                 } else {
                     None
                 };
-                if let Some(identity) = identity {
+                if identity.is_some()
+                    || (live_branch_witness_enabled && scalar_lexer != FULL_WALK_LEXER_DEAD)
+                {
                     let op_index = walk_ops.len() - remaining_ops.as_slice().len() - 1;
                     let (child, subtree_end) = trie.full_walk_dead_subtree(op_index);
                     let root_offset = usize::from(trie.node(0).token_id.is_some());
                     let token_end = trie.subtree_token_index_range(child).end.saturating_sub(root_offset);
                     let saved_ops = subtree_end as usize - op_index - 1;
-                    if saved_ops >= 8
-                        && token_end.saturating_sub(token_marker_index) >= 4
-                        && identity_alphabet_covers_subtree(identity, trie.subtree_bytes(child))
-                    {
-                        let allowed = if scalar_lexer == FULL_WALK_LEXER_DEAD {
+                    let token_count = token_end.saturating_sub(token_marker_index);
+                    let identical = saved_ops >= 8 && token_count >= 4
+                        && identity.is_some_and(|identity|
+                            identity_alphabet_covers_subtree(identity, trie.subtree_bytes(child)));
+                    let witnessed = if !identical && live_branch_witness_enabled
+                        && saved_ops >= 64 && token_count >= 16 {
+                        let frontier = if scalar_lexer < FULL_WALK_LEXER_TWO_DISTINCT {
+                            Some(FullWalkWitnessFrontier::One(scalar_lexer, scalar_parser))
+                        } else if scalar_lexer == FULL_WALK_LEXER_TWO_DISTINCT
+                            || scalar_lexer == FULL_WALK_LEXER_TWO {
+                            Some(FullWalkWitnessFrontier::Two([current_two.0, current_two.1]))
+                        } else if scalar_lexer == FULL_WALK_LEXER_GUARDED_PAIR {
+                            Some(FullWalkWitnessFrontier::One(current_guarded_pair.continuing_lexer,
+                                current_guarded_pair.continuing_parser))
+                        } else if scalar_lexer == FULL_WALK_LEXER_MULTI {
+                            Some(FullWalkWitnessFrontier::Many(many_transition_memo.view(&current_many)))
+                        } else { None };
+                        frontier.is_some_and(|frontier| full_walk_frontier_live_witness(
+                            frontier, trie.subtree_bytes(child), &mut witness_proofs,
+                            &mut parser_cache, state.constraint, tokenizer, &transitions))
+                    } else { false };
+                    if identical || witnessed {
+                        live_witness_subtrees += usize::from(witnessed);
+                        let allowed = witnessed || if scalar_lexer == FULL_WALK_LEXER_DEAD {
                             false
                         } else if scalar_lexer < FULL_WALK_LEXER_TWO_DISTINCT {
                             scalar_endpoint_known_allowed
@@ -8156,6 +8332,7 @@ fn try_full_walk_mask_with_table_from_initial_in_output_scope<
     // Diagnostics must not be included in the measured traversal interval.
     let walk_elapsed = walk_started.map(|start| start.elapsed());
     if profile_kernel {
+        eprintln!("[glrmask/profile][live_branch_witness] generation={} subtrees={} rows={}", state.generation, live_witness_subtrees, witness_proofs.rows.len());
         eprintln!("[glrmask/profile][full_walk_acceleration] generation={} enabled={} memo_states={} memo_lookups={} memo_hits={} outer_hits={} identity_subtrees={} identity_ops={} identity_tokens={} canonical_hits={}",
             state.generation, accelerated, many_transition_memo.states.len(),
             many_transition_memo.lookups, many_transition_memo.hits,
@@ -8272,6 +8449,138 @@ fn try_full_walk_mask_with_table_from_initial_in_output_scope<
 #[cfg(test)]
 mod full_walk_acceleration_tests {
     use super::*;
+
+    #[test]
+    fn live_branch_witness_survives_finalizers_and_changing_alternatives() {
+        use crate::{DynamicConstraint, Grammar, Vocab};
+        let vocab = Vocab::new(["a", "b", "aa", "ab", " "].into_iter().enumerate()
+            .map(|(id, text)| (id as u32, text.as_bytes().to_vec())).collect());
+        let dynamic = DynamicConstraint::compile(Grammar::glrm(
+            "start s; ignore WS; t WS ::= ' '+; t A ::= 'a'+; t B ::= 'b'; nt s ::= A B;"), &vocab).unwrap();
+        let constraint = &dynamic.inner;
+        let tokenizer = &constraint.tokenizer;
+        let states = tokenizer.num_states() as usize;
+        let mut rows = vec![u32::MAX; states * 256];
+        let finals = (0..states).map(|state| match tokenizer.matched_terminals_slice(state as u32) {
+            [] => u32::MAX,
+            [terminal] => *terminal,
+            _ => u32::MAX - 1,
+        }).collect::<Vec<_>>();
+        for state in 0..states {
+            for (byte, target) in tokenizer.transitions_from(state as u32) {
+                rows[state * 256 + byte as usize] = target
+                    | if finals[target as usize] != u32::MAX { 0x8000_0000 } else { 0 };
+            }
+        }
+        let transitions = FullWalkFlat32 { transitions: &rows };
+        let stacks = constraint.start().state.entries[0].1.apply(|_| ());
+        let (mut cache, _) = FullWalkParserCache::from_roots(&DynamicBranches::new(), states, false);
+        let parser = cache.push_parser_stacks(stacks);
+        let mut proofs = FullWalkIdentityProofCache::default();
+        let alphabet = U8Set::single(b'a').to_words();
+        let lexer = (0..states as u32).find(|&lexer| {
+            let cell = transitions.cell(lexer, b'a');
+            !FullWalkFlat32::cell_is_dead(cell)
+                && FullWalkFlat32::cell_target(cell) == lexer
+                && FullWalkFlat32::cell_has_finalizer(cell)
+                && cache.physical_token_boundary_allowed(constraint, tokenizer, &transitions, parser, lexer)
+        }).expect("fixture must exercise a live finalizing self-edge");
+        let witness = FullWalkBranch { lexer_state: lexer, parser_node: parser,
+            prune_guard: FullWalkPruneGuard::Passed };
+        assert!(full_walk_live_branch_witness(&witness, alphabet, &mut proofs,
+            &mut cache, constraint, tokenizer, &transitions));
+        let mut current = smallvec::smallvec![witness.clone(), FullWalkBranch {
+            lexer_state: tokenizer.start_state(), parser_node: parser,
+            prune_guard: FullWalkPruneGuard::Passed,
+        }];
+        let original = current.clone();
+        for _ in 0..6 {
+            current = full_walk_step_many(&current, b'a', tokenizer.start_state(), &finals,
+                tokenizer, &transitions, &mut cache, constraint);
+            assert!(current.contains(&witness), "reference step must retain the witness");
+            assert!(current.iter().any(|branch| cache.token_boundary_allowed(
+                constraint, tokenizer, &transitions, tokenizer.start_state(), branch)));
+        }
+        assert!(current != original, "proof must work without whole-frontier identity");
+        let mut guarded = witness.clone();
+        guarded.prune_guard = FullWalkPruneGuard::Pending(smallvec::smallvec![(lexer, finals[lexer as usize])]);
+        assert!(!full_walk_live_branch_witness(&guarded, alphabet, &mut proofs,
+            &mut cache, constraint, tokenizer, &transitions));
+        assert!(!full_walk_live_branch_witness(&witness, U8Set::single(b'b').to_words(), &mut proofs,
+            &mut cache, constraint, tokenizer, &transitions));
+
+        // Proof-cache exhaustion declines without constructing more rows or
+        // weakening the physical parser-liveness condition.
+        let mut exhausted = FullWalkIdentityProofCache::default();
+        for id in 0..64 {
+            exhausted.rows.insert(u32::MAX - id, None);
+        }
+        assert!(!full_walk_live_branch_witness(&witness, alphabet, &mut exhausted,
+            &mut cache, constraint, tokenizer, &transitions));
+        assert_eq!(exhausted.rows.len(), 64);
+
+        let many = FullWalkManyState::Branches(smallvec::smallvec![guarded, witness.clone()]);
+        assert!(full_walk_many_live_witness(&many, alphabet, &mut proofs,
+            &mut cache, constraint, tokenizer, &transitions));
+        let over_budget = FullWalkManyState::Branches(
+            (0..9).map(|_| witness.clone()).collect());
+        let mut unused = FullWalkIdentityProofCache::default();
+        assert!(!full_walk_many_live_witness(&over_budget, alphabet, &mut unused,
+            &mut cache, constraint, tokenizer, &transitions));
+        assert!(unused.rows.is_empty(), "branch-work rejection must precede row proofs");
+
+        // The whole union changes on 'a': its reset member advances into A.
+        // The continuing A member nevertheless witnesses every a+ endpoint.
+        let union_storage = std::sync::Mutex::new(DynamicLazyUnionCache::default());
+        let overflowed = std::cell::Cell::new(false);
+        let (union, union_root) = FullWalkLazyUnion::new(
+            tokenizer, None, Some(&rows), union_storage.lock().unwrap(),
+            &[lexer, tokenizer.start_state()], &overflowed, false,
+        ).unwrap();
+        let (mut union_parser_cache, _) = FullWalkParserCache::from_roots(
+            &DynamicBranches::new(), union.state_count(tokenizer), false);
+        let union_parser = union_parser_cache.push_parser_stacks(cache.nodes[parser as usize].gss.clone());
+        let union_branch = FullWalkBranch {
+            lexer_state: union_root, parser_node: union_parser,
+            prune_guard: FullWalkPruneGuard::Passed,
+        };
+        let mut union_proofs = FullWalkIdentityProofCache::default();
+        assert!(!full_walk_live_branch_witness(&union_branch, alphabet, &mut union_proofs,
+            &mut union_parser_cache, constraint, tokenizer, &union));
+        assert!(full_walk_live_component_witness(union_root, union_parser, alphabet,
+            &mut union_proofs, &mut union_parser_cache, constraint, tokenizer, &union));
+        let mut union_current = smallvec::smallvec![union_branch];
+        for _ in 0..6 {
+            union_current = full_walk_step_many(&union_current, b'a', tokenizer.start_state(),
+                &finals, tokenizer, &union, &mut union_parser_cache, constraint);
+            assert!(union_current.iter().any(|branch| branch.prune_guard.is_passed()
+                && branch.parser_node == union_parser
+                && union.continuation_witness_components(branch.lexer_state).contains(&lexer)));
+            assert!(union_current.iter().any(|branch| union_parser_cache.token_boundary_allowed(
+                constraint, tokenizer, &union, tokenizer.start_state(), branch)));
+        }
+        assert!(!overflowed.get());
+        let guarded_union = FullWalkManyState::Branches(smallvec::smallvec![FullWalkBranch {
+            lexer_state: union_root, parser_node: union_parser,
+            prune_guard: FullWalkPruneGuard::Pending(smallvec::smallvec![(lexer, finals[lexer as usize])]),
+        }]);
+        assert!(!full_walk_many_component_witness(&guarded_union, alphabet, &mut union_proofs,
+            &mut union_parser_cache, constraint, tokenizer, &union));
+
+        let dead_parser = cache.push_parser_stacks(ParserStacks::empty());
+        let dead = FullWalkBranch { parser_node: dead_parser, ..witness };
+        assert!(!full_walk_live_branch_witness(&dead, alphabet, &mut proofs,
+            &mut cache, constraint, tokenizer, &transitions));
+        assert!(full_walk_frontier_live_witness(
+            FullWalkWitnessFrontier::One(lexer, parser), alphabet, &mut proofs,
+            &mut cache, constraint, tokenizer, &transitions));
+        assert!(full_walk_frontier_live_witness(
+            FullWalkWitnessFrontier::Two([(lexer, dead_parser), (lexer, parser)]),
+            alphabet, &mut proofs, &mut cache, constraint, tokenizer, &transitions));
+        assert!(!full_walk_frontier_live_witness(
+            FullWalkWitnessFrontier::Many(&guarded_union), alphabet, &mut union_proofs,
+            &mut union_parser_cache, constraint, tokenizer, &union));
+    }
 
     #[test]
     fn row_liveness_bounds_are_exact_for_all_small_terminal_sets() {
@@ -8950,6 +9259,11 @@ mod wide_scalar_dispatch_tests {
         }
         let invalid = table.base_state_count + FullWalkLazyUnion::RESERVED_EXTENSION_STATES as u32;
         assert_eq!(table.intern_states(&[0, invalid]), None);
+        assert!(table.continuation_witness_components(invalid).is_empty());
+        assert_eq!(table.continuation_witness_components(first).as_slice(), &[0, 32_768]);
+        let wide = table.intern_states(&(0..9).collect::<Vec<_>>()).unwrap();
+        assert!(table.continuation_witness_components(wide).is_empty(),
+            "oversized exact unions must fall back rather than truncate their member set");
         let before = unsafe { (&*table.cache.get()).state_by_union_pair.as_ref().unwrap().len() };
         // Fill only the memo's bounded index with valid known results. Once
         // full, a new union still executes normally but is not retained.
