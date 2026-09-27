@@ -14,12 +14,15 @@
 //! No state identity, original edge, guard key, or normalization rule changes.
 use super::*;
 use super::finite_signed_graph::{SignedGraph,SignedRow};
+#[path = "finite_cancellation_results.rs"]
+mod result_storage;
+use result_storage::{ResultRows, VectorRows, PackedRows};
 
 const MAX_QUERY_PAIRS: usize = 400_000;
 const MAX_RESULT_PAIRS: usize = 4_000_000;
 const MAX_SUMMARY_WORK: usize = 20_000_000;
 
-#[derive(Debug, Default)]
+#[derive(Debug, Default, PartialEq, Eq)]
 pub(super) struct SummaryStats {
     pub queries: usize,
     pub result_pairs: usize,
@@ -36,12 +39,12 @@ struct Frame {
     result: FastBoundaryDerivedRow,
 }
 
-struct Solver<'a,G:SignedGraph+?Sized> {
+struct Solver<'a,G:SignedGraph+?Sized,R:ResultRows> {
     states: &'a G,
     interner: &'a mut FastBoundaryWeightInterner,
     effective: Vec<Vec<(u32, FastBoundaryWeightId)>>,
-    known: FxHashMap<(u32, i32), usize>,
-    results: Vec<Vec<(u32, FastBoundaryWeightId)>>,
+    known: FxHashMap<(u32, i32), R::Handle>,
+    results: R,
     stack: Vec<Frame>,
     inflight_pairs: usize,
     stats: SummaryStats,
@@ -56,7 +59,7 @@ fn read_signature(label: i32) -> u128 {
     (1u128 << (x >> 58)) | (1u128 << (64 + ((x ^ (x >> 23)).wrapping_mul(0xd6e8feb86659fd93) >> 58)))
 }
 
-impl<G:SignedGraph+?Sized> Solver<'_,G> {
+impl<G:SignedGraph+?Sized,R:ResultRows> Solver<'_,G,R> {
     fn account(&mut self, work: usize) -> Option<()> {
         self.stats.work = self.stats.work.checked_add(work)?;
         if self.stats.work > MAX_SUMMARY_WORK
@@ -86,12 +89,12 @@ impl<G:SignedGraph+?Sized> Solver<'_,G> {
         Some(Frame { state, edge: 0, result })
     }
 
-    fn query(&mut self, state: u32, label: i32) -> Option<usize> {
+    fn query(&mut self, state: u32, label: i32) -> Option<R::Handle> {
         let wanted=read_signature(label);
         if self.filter {
             self.account(1)?;
             if self.may_read[state as usize] & wanted != wanted {
-                self.stats.rejected_queries+=1;return Some(0);
+                self.stats.rejected_queries+=1;return Some(R::EMPTY);
             }
         }
         if let Some(&id) = self.known.get(&(state, label)) {
@@ -114,10 +117,10 @@ impl<G:SignedGraph+?Sized> Solver<'_,G> {
                     }
                 }
                 if let Some(&id) = self.known.get(&(target, label)) {
-                    self.account(1 + self.results[id].len())?;
+                    self.account(1 + self.results.row_len(id))?;
                     let previous = self.stack[last].result.len();
-                    for i in 0..self.results[id].len() {
-                        let (end, suffix) = self.results[id][i];
+                    for i in 0..self.results.row_len(id) {
+                        let (end, suffix) = self.results.pair(id, i);
                         let add = self.interner.intersection(weight, suffix);
                         self.stack[last].result.merge(end, add, self.interner);
                     }
@@ -133,15 +136,13 @@ impl<G:SignedGraph+?Sized> Solver<'_,G> {
                 }
             } else {
                 let frame = self.stack.pop()?;
-                let mut row = frame.result.into_entries();
-                self.inflight_pairs -= row.len();
-                row.sort_unstable_by_key(|&(target, _)| target);
-                self.stats.result_pairs = self.stats.result_pairs.checked_add(row.len())?;
+                let row_len = frame.result.len();
+                self.inflight_pairs -= row_len;
+                self.stats.result_pairs = self.stats.result_pairs.checked_add(row_len)?;
                 if self.stats.result_pairs > MAX_RESULT_PAIRS || self.known.len() >= MAX_QUERY_PAIRS {
                     return None;
                 }
-                let id = self.results.len();
-                self.results.push(row);
+                let id = self.results.push(frame.result)?;
                 self.known.insert((q, label), id);
                 self.stats.queries += 1;
             }
@@ -184,14 +185,36 @@ fn compute_with_topology_mode(
 pub(super) fn compute_on_graph<G:SignedGraph+?Sized>(
     states:&G,interner:&mut FastBoundaryWeightInterner,topo:&[u32],filter:bool,
 )->Option<(Vec<FastBoundaryDerivedRow>,SummaryStats)> {
+    let policy = if crate::optimized_env_flag("GLRMASK_BOUNDARY_PACKED_CANCELLATION_RESULTS") {
+        ResultPolicy::Packed
+    } else { ResultPolicy::Vector };
+    compute_on_graph_policy(states,interner,topo,filter,policy)
+}
+
+#[derive(Clone,Copy,Debug)]
+enum ResultPolicy { Vector, Packed }
+
+fn compute_on_graph_policy<G:SignedGraph+?Sized>(
+    states:&G,interner:&mut FastBoundaryWeightInterner,topo:&[u32],filter:bool,
+    policy:ResultPolicy,
+)->Option<(Vec<FastBoundaryDerivedRow>,SummaryStats)> {
+    match policy {
+        ResultPolicy::Vector => compute_with_rows::<G,VectorRows>(states,interner,topo,filter),
+        ResultPolicy::Packed => compute_with_rows::<G,PackedRows>(states,interner,topo,filter),
+    }
+}
+
+fn compute_with_rows<G:SignedGraph+?Sized,R:ResultRows>(
+    states:&G,interner:&mut FastBoundaryWeightInterner,topo:&[u32],filter:bool,
+)->Option<(Vec<FastBoundaryDerivedRow>,SummaryStats)> {
     for q in 0..states.len() {
         let row=states.row(q);
         if (1..row.transition_count()).any(|i|row.label(i-1)>=row.label(i)){return None;}
     }
     let n = states.len();
     if topo.len() != n { return None; }
-    let mut solver = Solver { states, interner, effective: vec![Vec::new(); n],
-        known: FxHashMap::default(), results: vec![Vec::new()], stack: Vec::new(), inflight_pairs: 0, stats: Default::default(),
+    let mut solver = Solver::<G,R> { states, interner, effective: vec![Vec::new(); n],
+        known: FxHashMap::default(), results: R::new(), stack: Vec::new(), inflight_pairs: 0, stats: Default::default(),
         may_read:if filter{vec![u128::MAX;n]}else{Vec::new()},filter };
     let mut derived = vec![FastBoundaryDerivedRow::default(); n];
     let mut retained_edges = 0usize;
@@ -205,9 +228,9 @@ pub(super) fn compute_on_graph<G:SignedGraph+?Sized>(
                 if target as usize >= n { return None; }
                 if weight == 0 { continue; }
                 let result = solver.query(target, negative_to_positive_label(label))?;
-                solver.account(solver.results[result].len())?;
-                for i in 0..solver.results[result].len() {
-                    let (end, suffix) = solver.results[result][i];
+                solver.account(solver.results.row_len(result))?;
+                for i in 0..solver.results.row_len(result) {
+                    let (end, suffix) = solver.results.pair(result, i);
                     let add = solver.interner.intersection(weight, suffix);
                     derived[q as usize].merge(end, add, solver.interner);
                 }
@@ -241,8 +264,21 @@ pub(super) fn compute_on_graph<G:SignedGraph+?Sized>(
         solver.effective[q as usize] = row;
     }
     solver.account(0)?;
+    if compile_profile_enabled() {
+        let mut empty=0;
+        let mut single=0;
+        for &handle in solver.known.values() {
+            match solver.results.row_len(handle) {0=>empty+=1,1=>single+=1,_=>{}}
+        }
+        eprintln!("[glrmask/profile][cancellation_packed_results] representation={} queries={} empty={} single={} storage_bytes={}",
+            std::any::type_name::<R>(),solver.known.len(),empty,single,solver.results.storage_bytes());
+    }
     Some((derived, solver.stats))
 }
+
+#[cfg(test)]
+#[path = "finite_cancellation_results_tests.rs"]
+mod result_tests;
 
 #[cfg(test)]
 mod tests {
