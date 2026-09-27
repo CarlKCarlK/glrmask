@@ -565,6 +565,21 @@ fn merge(group: &mut Group, state: &Signature, domain: Mask, masks: &mut Masks) 
     Some(())
 }
 
+/// Called only after `compatible` succeeds. Each state's coefficients are
+/// contained in its needed domain, so containment of domains makes every OR
+/// in merge an identity. Guard keys and nonzero target identities were checked
+/// by compatible; zero targets were canonicalized to state zero beforehand.
+fn merge_domain_is_contained(group: &Group, domain: Mask, masks: &Masks) -> bool {
+    if domain == group.domain || domain == 0 || group.domain == 1 { return true; }
+    if group.domain == 0 { return false; }
+    masks.values[domain as usize].iter().zip(&masks.values[group.domain as usize])
+        .all(|(&a, &b)| a & !b == 0)
+}
+
+#[cfg(test)]
+#[path = "boundary_min_merge_noop_tests.rs"]
+mod merge_noop_tests;
+
 pub fn minimize_finite_bits(
     input: &DWA, rows: usize, default_label: i32,
 ) -> Option<(DWA, BitMinimizeProfile)> {
@@ -812,6 +827,11 @@ fn minimize_prepared_with_observations(
     for s in 0..n {if live[s] {buckets[heights[s]].push(s);}}
     let mut mapped=vec![0u32;n];
     let mut groups=vec![Group{domain:0,signature:Signature{final_mask:0,edges:Vec::new()},guarded:false}];
+    let skip_redundant_merges=std::env::var("GLRMASK_EXPERIMENT_MIN_REDUNDANT_MERGES")
+        .is_ok_and(|v|matches!(v.trim(),"1"|"true"|"on"));
+    let census_merges=std::env::var_os("GLRMASK_PROFILE_MIN_REDUNDANT_MERGES").is_some();
+    let (mut merge_calls,mut contained_merges,mut equal_domain_merges,mut saved_edge_visits)=
+        (0usize,0usize,0usize,0usize);
     for mut bucket in buckets {
         bucket.sort_unstable_by_key(|&s|std::cmp::Reverse((masks.popcount(needed[s]),states[s].edges.len(),s)));
         let base=groups.len();
@@ -851,7 +871,20 @@ fn minimize_prepared_with_observations(
                 if compatible(&groups[id],&signature,needed[s],states[s].guarded,&masks) {found=Some(id);break;}
             }
             let id=match found {
-                Some(id)=>{merge(&mut groups[id],&signature,needed[s],&mut masks)?;id},
+                Some(id)=>{
+                    merge_calls+=1;
+                    let contained=(skip_redundant_merges||census_merges)
+                        && merge_domain_is_contained(&groups[id],needed[s],&masks);
+                    if contained {
+                        contained_merges+=1;
+                        equal_domain_merges+=usize::from(groups[id].domain==needed[s]);
+                        saved_edge_visits+=groups[id].signature.edges.len()+signature.edges.len();
+                    }
+                    if !skip_redundant_merges||!contained {
+                        merge(&mut groups[id],&signature,needed[s],&mut masks)?;
+                    }
+                    id
+                },
                 None=>{let id=groups.len();groups.push(Group{domain:needed[s],signature:signature.clone(),guarded:states[s].guarded});id},
             };
             mapped[s]=id as u32;
@@ -862,6 +895,11 @@ fn minimize_prepared_with_observations(
         }
     }
     profile.merge_ms=started.elapsed().as_secs_f64()*1000.0;
+    if census_merges {
+        eprintln!("[glrmask/profile][min_redundant_merges] enabled={} merge_calls={} contained={} equal_domains={} candidate_edge_visits={} merge_ms={:.6}",
+            skip_redundant_merges,merge_calls,contained_merges,equal_domain_merges,
+            saved_edge_visits,profile.merge_ms);
+    }
     let started=Instant::now();
     if crate::compiler::boundary_env::enabled("GLRMASK_BOUNDARY_MIN_POINT_DECODE") {
         let selected=masks.prepare_point_decoder().is_some();
