@@ -104,3 +104,38 @@ The portable runner `scripts/compare_parallel_live_import.py` records source,
 executable, runner and input hashes, paired raw timings, exact native checks,
 and loaded-mask signatures. The final publication evidence is retained in
 `docs/performance/boundary-parallel-live-import-20260927.json`.
+
+### Final focused-source gates
+
+On main base `68a648fc3ee90feaf54209bbd8d3c8a307956539`, normal Cargo passed
+71 parser tests and 955 root tests with zero failures (2 and 51 intentionally
+ignored), plus the public no-default-features library check. The builder and
+loaded-runtime probe were rebuilt from that same source.
+
+The primary final 24-pair, ten-worker comparison yielded:
+
+| Prepared fixture | All-import median | Default median | Median paired saving | Wins |
+| --- | ---: | ---: | ---: | ---: |
+| Current | 266.035 ms | 262.551 ms | 2.7975 ms | 20/24 |
+| Legacy | 267.8765 ms | 264.1275 ms | 3.367 ms | 21/24 |
+
+An additional freshly built, same-main-base reference confirmed the high-core
+direction in another 128 builds; same-binary paired savings were 2.662 ms current
+and 2.0655 ms legacy. Neither the reference-current-main delta nor this option's
+gain should be added to earlier parallel-normalization gains.
+
+The low-core check deserves a caveat. At two workers the policy is not consulted
+and both same-binary arms run the identical serial algorithm. Nevertheless,
+the newly built executable measured approximately 2.229 ms slower on current
+and 1.5865 ms slower on legacy relative to the separately compiled same-base
+reference (under 1% of roughly 280 ms). Same-binary no-op/control deltas were
+small and variable. We do not claim a low-core speedup or zero binary-level
+regression; the performance benefit is specific to eligible parallel execution.
+
+Across the eight completed cohorts there are 1,024 timed compositions with
+exact artifact/native/loaded checks. A separate low-core attempt completed the
+current fixture but ran out of disk during gzip archival; its checked raw result
+was preserved and the complete low-core cohort was rerun in a new directory.
+That interrupted cohort is not counted as completed evidence. Duplicate OWN
+archives were replaced with hardlinks only after hash AND full decompressed-byte
+comparison, preserving every unique artifact and path.
