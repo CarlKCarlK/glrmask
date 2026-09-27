@@ -3913,7 +3913,12 @@ fn reduce_sources_from_isolated(gss: &ParserGSS, rhs_len: usize) -> ReduceSource
     }
     if let Some(v) = popped.single_top_value() {
         let mut result = SmallVec::new();
-        result.push((v, popped));
+        // A sole *visible* predecessor does not exclude an epsilon stack in
+        // the same GSS. Goto(v, nt) applies only to paths actually ending in v;
+        // retaining the epsilon alternative invents a path and can leak its
+        // accumulator into a valid path. The ordinary sole-top/no-epsilon
+        // case preserves its shared pointer through isolate.
+        result.push((v, popped.isolate(Some(v))));
         return result;
     }
     let top_vals = popped.peek_values();
@@ -6294,6 +6299,62 @@ mod tests {
         assert_eq!(keys.key(&actual),keys.key(&reference.shifted));
     }
 
+
+    #[test]
+    fn reduction_sources_exclude_epsilon_alternative_from_a_sole_predecessor() {
+        for uniform_empty in [false, true] {
+            let a = if uniform_empty { TerminalsDisallowed::new() }
+                else { TerminalsDisallowed::new().with_insert(100, 7) };
+            let b = if uniform_empty { a.clone() } else { a.with_insert(808, 909) };
+            let input = ParserGSS::from_stacks(&[
+                (vec![11, 22], a.clone()), (vec![22], b),
+            ]);
+            let popped = input.popn(1);
+            assert_eq!(popped.single_top_value(), Some(11));
+            assert!(!popped.isolate(None).is_empty(), "fixture must include epsilon");
+            let sources = super::reduce_sources_from_isolated(&input, 1);
+            assert_eq!(sources.len(), 1);
+            assert_eq!(sources[0].0, 11);
+            assert_eq!(sources[0].1.to_stacks(8).unwrap(), vec![(vec![11], a)]);
+        }
+    }
+
+    #[test]
+    fn provider_reduction_goto_never_uses_an_empty_predecessor_path() {
+        struct Machine { reduce: Action, shift: Action, replace: bool }
+        impl ParserActionProvider for Machine {
+            type Symbol = u32;
+            fn action(&self, state: u32, _: u32) -> Option<ProvidedAction<'_>> {
+                let action = match state { 22 => &self.reduce, 30 => &self.shift, _ => return None };
+                Some(ProvidedAction { action: ProvidedActionRef::Local { scope: 0, action },
+                    reduction_scope: 0, extra_stack_shifts: SmallVec::new() })
+            }
+            fn scope_state(&self, scope: u32, state: u32) -> Option<u32> {
+                (scope == 0).then_some(state)
+            }
+            fn goto_target(&self, scope: u32, from: u32, nt: u32) -> Option<(u32, bool)> {
+                (scope == 0 && from == 11 && nt == 0).then_some((30, self.replace))
+            }
+            fn state_count_hint(&self) -> usize { 41 }
+        }
+        for uniform_empty in [false, true] { for replace in [false, true] {
+            let a = if uniform_empty { TerminalsDisallowed::new() }
+                else { TerminalsDisallowed::new().with_insert(100, 7) };
+            let b = if uniform_empty { a.clone() } else { a.with_insert(808, 909) };
+            let input = ParserGSS::from_stacks(&[(vec![11, 22], a.clone()), (vec![22], b)]);
+            let machine = Machine { reduce: Action::Reduce(0, 1), shift: Action::Shift(40, false), replace };
+            let expected = vec![(if replace { vec![30, 40] } else { vec![11, 30, 40] }, a)];
+            for actual in [
+                super::advance_provider_traversal_with_policy::<_, false, false>(&machine, input.clone(), 0, super::ProviderAdvanceMode::Advance),
+                super::advance_provider_traversal_with_policy::<_, true, false>(&machine, input.clone(), 0, super::ProviderAdvanceMode::Advance),
+                super::advance_provider_traversal_with_policy::<_, true, true>(&machine, input.clone(), 0, super::ProviderAdvanceMode::Advance),
+            ] {
+                assert_eq!(actual.shifted.to_stacks(8).unwrap(), expected,
+                    "uniform_empty={uniform_empty} replace={replace}");
+                assert!(!actual.accepted);
+            }
+        }}
+    }
 
     #[test]
     fn provider_reduction_eligibility_requires_complete_uniform_empty_input() {

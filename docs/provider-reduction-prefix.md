@@ -49,3 +49,13 @@ initial preparation and cleanup, and compare it with non-boundary work from the
 same mask invocation. Separate percentile maxima must not be subtracted. This
 optimization does not itself establish that boundary cost is at parity with
 ordinary static masking; the remaining gap must be measured.
+
+## Predecessor isolation regression
+
+The reduction-source shortcut now explicitly isolates its sole visible
+predecessor. A graph with one visible top can also contain an epsilon stack;
+that empty path has no predecessor and must not receive the visible state's
+goto. Regression tests cover both append and replace gotos, uniform-empty and
+mixed accumulator labels, and the reference, transactional, and resumable
+execution policies. This fixes the common reduction-source operation rather
+than depending on the optimization to hide the error.
