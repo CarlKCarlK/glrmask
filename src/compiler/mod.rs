@@ -1,24 +1,6 @@
 pub mod compile;
-pub(crate) mod boundary_env;
-pub(crate) mod boundary_transfer;
-pub(crate) mod boundary_bit_minimize;
-pub(crate) mod boundary_weight_codec;
-mod boundary_stack_support;
-mod boundary_preimage;
-mod boundary_tagged_templates;
-mod boundary_query_view;
-mod boundary_query_terminals;
-pub(crate) mod boundary_token_support;
-mod boundary_cut_support;
-mod boundary_terminal_summary;
-pub(crate) mod boundary_scoped_follow;
-pub(crate) mod boundary_scoped_follow_delta;
-pub(crate) mod boundary_flat_transitions;
 pub(crate) mod weight_observation_quotient;
-pub(crate) mod boundary_candidates;
-pub(crate) mod boundary_tail;
-pub(crate) mod boundary_walk;
-pub(crate) mod constraint_compose;
+pub(crate) mod composition;
 #[cfg(feature = "internal-api")]
 pub(crate) mod o21137_subgrammar_bench;
 pub(crate) mod constraint_possible_matches;
@@ -132,9 +114,3 @@ pub(crate) fn synthetic_bounded_terminals_enabled() -> bool {
         },
     }
 }
-
-mod boundary_prefix_dominance;
-
-mod boundary_first_completion;
-mod boundary_finite_lexer;
-pub(crate) mod boundary_precomputed_completion;

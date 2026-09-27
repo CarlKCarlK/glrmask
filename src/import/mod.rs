@@ -24,7 +24,7 @@ use crate::grammar::factoring::factor_named_grammar;
 use crate::grammar::flat::GrammarDef;
 use crate::compiler::glr::table::GlrTableConstruction;
 use crate::runtime::Constraint;
-use crate::dynamic_constraint::DynamicConstraint;
+use crate::runtime::dynamic::DynamicConstraint;
 
 fn parse_ebnf_to_named(source: &str) -> crate::Result<ast::NamedGrammar> {
     Ok(ebnf::parse_ebnf_to_named(source)?)
@@ -954,9 +954,9 @@ impl Constraint {
                         "dynamic-value JSON Schema lost its linker terminal".to_string(),
                     )
                 })?;
-            crate::compiler::constraint_compose::compose_constraints_owned_parent(
+            crate::compiler::composition::compose_constraints_owned_parent(
                 parent,
-                &[crate::compiler::constraint_compose::CompiledSubgrammarInput {
+                &[crate::compiler::composition::CompiledSubgrammarInput {
                     placeholder_terminal,
                     additional_placeholder_terminals: &[],
                     constraint: dynamic_value,
@@ -1031,15 +1031,15 @@ impl Constraint {
             // children; these two distinct JS children have no sibling regions
             // worth sharing, and sequential exact composition preserves the
             // same language while avoiding that unnecessary pass.
-            let with_value = crate::compiler::constraint_compose::compose_constraints_owned_parent_segmented(
+            let with_value = crate::compiler::composition::compose_constraints_owned_parent_segmented(
                 parent,
-                &[crate::compiler::constraint_compose::CompiledSubgrammarInput {
+                &[crate::compiler::composition::CompiledSubgrammarInput {
                     placeholder_terminal: value_terminal,
                     additional_placeholder_terminals: &[],
                     constraint: dynamic_value,
                 }],
                 vocab,
-                crate::compiler::constraint_compose::SegmentedBoundaryBackend::StaticParserDwa,
+                crate::compiler::composition::SegmentedBoundaryBackend::StaticParserDwa,
             )
             .map(|composition| composition.constraint)
             .map_err(crate::GlrMaskError::Compilation)?;
@@ -1051,15 +1051,15 @@ impl Constraint {
                 .ok_or_else(|| crate::GlrMaskError::Compilation(
                     "programmatic JSON Schema lost its condition linker terminal after value composition".to_string(),
                 ))?;
-            crate::compiler::constraint_compose::compose_constraints_owned_parent_segmented(
+            crate::compiler::composition::compose_constraints_owned_parent_segmented(
                 with_value,
-                &[crate::compiler::constraint_compose::CompiledSubgrammarInput {
+                &[crate::compiler::composition::CompiledSubgrammarInput {
                     placeholder_terminal: condition_terminal,
                     additional_placeholder_terminals: &[],
                     constraint: condition,
                 }],
                 vocab,
-                crate::compiler::constraint_compose::SegmentedBoundaryBackend::StaticParserDwa,
+                crate::compiler::composition::SegmentedBoundaryBackend::StaticParserDwa,
             )
             .map(|composition| composition.constraint)
             .map_err(crate::GlrMaskError::Compilation)
@@ -1078,7 +1078,7 @@ impl Constraint {
         dynamic_value: &Constraint,
         condition: &Constraint,
         vocab: &crate::Vocab,
-        backend: Option<crate::compiler::constraint_compose::SegmentedBoundaryBackend>,
+        backend: Option<crate::compiler::composition::SegmentedBoundaryBackend>,
     ) -> crate::Result<Self> {
         with_large_import_stack(schema.len(), || {
             let child_reserved = dynamic_value
@@ -1128,17 +1128,17 @@ impl Constraint {
                            placeholder: u32,
                            child: &Constraint|
              -> crate::Result<Constraint> {
-                let input = [crate::compiler::constraint_compose::CompiledSubgrammarInput {
+                let input = [crate::compiler::composition::CompiledSubgrammarInput {
                     placeholder_terminal: placeholder,
                     additional_placeholder_terminals: &[],
                     constraint: child,
                 }];
                 let composition = match backend {
-                    None => crate::compiler::constraint_compose::compose_constraints_owned_parent(
+                    None => crate::compiler::composition::compose_constraints_owned_parent(
                         parent, &input, vocab,
                     ),
                     Some(backend) => {
-                        crate::compiler::constraint_compose::compose_constraints_owned_parent_segmented(
+                        crate::compiler::composition::compose_constraints_owned_parent_segmented(
                             parent, &input, vocab, backend,
                         )
                     }
@@ -1383,7 +1383,7 @@ impl Constraint {
                     )));
                 }
                 composition_inputs.push(
-                    crate::compiler::constraint_compose::CompiledSubgrammarInput {
+                    crate::compiler::composition::CompiledSubgrammarInput {
                         placeholder_terminal,
                         additional_placeholder_terminals: &[],
                         constraint: child,
@@ -1391,11 +1391,11 @@ impl Constraint {
                 );
             }
             let parent_late_slots = parent.late_grammar_slots.clone();
-            let mut composition = crate::compiler::constraint_compose::compose_constraints_owned_parent_segmented(
+            let mut composition = crate::compiler::composition::compose_constraints_owned_parent_segmented(
                 parent,
                 &composition_inputs,
                 vocab,
-                crate::compiler::constraint_compose::SegmentedBoundaryBackend::StaticParserDwa,
+                crate::compiler::composition::SegmentedBoundaryBackend::StaticParserDwa,
             )
             .map_err(crate::GlrMaskError::Compilation)?;
             // Parent terminals keep offset zero. Child slots are rebased into
@@ -1833,7 +1833,7 @@ impl DynamicConstraint {
                         )));
                     }
                     composition_inputs.push(
-                        crate::compiler::constraint_compose::CompiledSubgrammarInput {
+                        crate::compiler::composition::CompiledSubgrammarInput {
                             placeholder_terminal,
                             additional_placeholder_terminals: &[],
                             constraint: child,
@@ -1844,11 +1844,11 @@ impl DynamicConstraint {
                     composed.push(parent);
                 } else {
                     composed.push(
-                        crate::compiler::constraint_compose::compose_constraints_owned_parent_segmented(
+                        crate::compiler::composition::compose_constraints_owned_parent_segmented(
                             parent,
                             &composition_inputs,
                             vocab,
-                            crate::compiler::constraint_compose::SegmentedBoundaryBackend::Dynamic,
+                            crate::compiler::composition::SegmentedBoundaryBackend::Dynamic,
                         )
                         .map_err(crate::GlrMaskError::Compilation)?
                         .constraint,

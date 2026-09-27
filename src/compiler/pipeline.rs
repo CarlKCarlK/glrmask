@@ -10,19 +10,12 @@ use rustc_hash::FxHashMap;
 
 use crate::Vocab;
 use crate::automata::lexer::compile::{
+    build_regex_partitioned_with_options, PartitionOptions,
     build_partitioned_tokenizer_from_precompiled_terminal_dfas,
     build_partitioned_tokenizer_with_product_trace_terminal_residuals,
     build_exact_partitioned_runtime_tokenizer,
     build_virtual_unit_repeat_tokenizer,
     build_regex,
-    build_regex_partitioned,
-    build_regex_partitioned_with_adaptive,
-    build_regex_partitioned_with_adaptive_and_residual_isolation,
-    build_regex_partitioned_with_profile_labels,
-    build_regex_partitioned_with_profile_labels_and_adaptive,
-    build_regex_partitioned_with_profile_labels_and_adaptive_and_residual_isolation,
-    build_regex_partitioned_with_profile_labels_and_residual_isolation,
-    build_regex_partitioned_with_residual_isolation,
     build_regex_with_profile_labels,
     compile_terminal_expr_dfa,
     compile_terminal_expression_pair_with_structural_map,
@@ -99,7 +92,7 @@ use crate::ds::weight::Weight;
 use crate::ds::u8set::U8Set;
 use crate::grammar::flat::{GrammarDef, Terminal, TerminalID};
 use crate::runtime::{Constraint, SpecialTokenTerminal};
-use crate::dynamic_constraint::DynamicConstraint;
+use crate::runtime::dynamic::DynamicConstraint;
 use super::{macro_join, macro_join_if, macro_parallelism_disabled};
 
 fn env_flag_enabled(name: &str) -> bool {
@@ -2423,57 +2416,15 @@ fn build_tokenizer_from_exprs_partitioned_impl_with_trace_policy(
         }
         return tokenizer;
     }
-    let regex = match (
-        adaptive_override,
-        profile_labels,
-        residual_isolation_classes,
-    ) {
-        (Some(adaptive), Some(labels), Some(classes)) => {
-            build_regex_partitioned_with_profile_labels_and_adaptive_and_residual_isolation(
-                exprs,
-                labels,
-                partition_ids,
-                classes,
-                adaptive,
-            )
-        }
-        (Some(adaptive), None, Some(classes)) => {
-            build_regex_partitioned_with_adaptive_and_residual_isolation(
-                exprs,
-                partition_ids,
-                classes,
-                adaptive,
-            )
-        }
-        (Some(adaptive), Some(labels), None) => {
-            build_regex_partitioned_with_profile_labels_and_adaptive(
-                exprs,
-                labels,
-                partition_ids,
-                adaptive,
-            )
-        }
-        (Some(adaptive), None, None) => {
-            build_regex_partitioned_with_adaptive(exprs, partition_ids, adaptive)
-        }
-        (None, Some(labels), Some(classes)) => {
-            build_regex_partitioned_with_profile_labels_and_residual_isolation(
-                exprs,
-                labels,
-                partition_ids,
-                classes,
-            )
-        }
-        (None, None, Some(classes)) => build_regex_partitioned_with_residual_isolation(
-            exprs,
-            partition_ids,
-            classes,
-        ),
-        (None, Some(labels), None) => {
-            build_regex_partitioned_with_profile_labels(exprs, labels, partition_ids)
-        }
-        (None, None, None) => build_regex_partitioned(exprs, partition_ids),
-    };
+    let regex = build_regex_partitioned_with_options(
+        exprs,
+        partition_ids,
+        PartitionOptions {
+            adaptive: adaptive_override,
+            profile_labels,
+            residual_isolation_classes,
+        },
+    );
     if profile_detail {
         eprintln!(
             "[glrmask/profile][tokenizer] partitioned_build_done terminals={} partitions={} elapsed_ms={:.3} final_states={} final_transitions={}",
@@ -6241,7 +6192,7 @@ fn compile_dynamic_owned_with_vocab_partition_impl(
                     let partition = crate::compiler::vocab_partition::compile_vocab_partition_owned(
                         partition_grammar,
                         vocab,
-                        crate::public_api::VocabPartitionStrategy::Automatic,
+                        crate::api::VocabPartitionStrategy::Automatic,
                     );
                     let partition_ms = elapsed_ms(partition_started);
                     let quotient_started = Instant::now();

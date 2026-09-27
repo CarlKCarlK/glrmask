@@ -33,7 +33,7 @@ pub(crate) fn vocab_content_digest(vocab: &crate::Vocab) -> [u8; 32] {
     if let Some(cached) = vocab.vocab_derived_cache_get::<VocabContentDigest>() {
         return cached.digest;
     }
-    let buffered = crate::compiler::boundary_env::enabled("GLRMASK_BUFFERED_VOCAB_DIGEST");
+    let buffered = crate::compiler::composition::boundary::env::enabled("GLRMASK_BUFFERED_VOCAB_DIGEST");
     let digest = compute_vocab_content_digest(vocab, buffered);
     if buffered && std::env::var_os("GLRMASK_VALIDATE_BUFFERED_VOCAB_DIGEST").is_some() {
         assert_eq!(digest, compute_vocab_content_digest(vocab, false),

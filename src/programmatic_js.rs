@@ -16,7 +16,7 @@
 
 use std::collections::BTreeSet;
 
-use crate::compiler::constraint_compose::{
+use crate::compiler::composition::{
     CompiledSubgrammarInput, SegmentedBoundaryBackend, compose_constraints_owned_parent_segmented,
 };
 use crate::{Constraint, GlrMaskError, Vocab};

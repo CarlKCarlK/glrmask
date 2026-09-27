@@ -444,14 +444,14 @@ fn compose_named_parent_owned(
                 .position(|candidate| candidate == name)
                 .unwrap_or_else(|| panic!("benchmark placeholder terminal {name:?}"))
                 as u32;
-            crate::compiler::constraint_compose::CompiledSubgrammarInput {
+            crate::compiler::composition::CompiledSubgrammarInput {
                 placeholder_terminal,
                 additional_placeholder_terminals: &[],
                 constraint: child,
             }
         })
         .collect::<Vec<_>>();
-    crate::compiler::constraint_compose::compose_constraints_owned_parent(parent, &inputs, vocab)
+    crate::compiler::composition::compose_constraints_owned_parent(parent, &inputs, vocab)
         .expect("compose benchmark subgrammars")
         .constraint
 }

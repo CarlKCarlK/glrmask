@@ -1,3 +1,4 @@
+pub(crate) mod dynamic;
 mod artifact;
 mod commit;
 mod constraint;
@@ -6,8 +7,8 @@ pub(crate) use dynamic_mask::dynamic_mask_profile_enabled;
 mod finalize;
 mod mask;
 pub(crate) mod mask_mapping;
-pub(crate) mod serde;
-pub(crate) use serde::compact_large_non_dwa_weight_runtime;
+pub(crate) mod persistence;
+pub(crate) use persistence::compact_large_non_dwa_weight_runtime;
 mod state;
 mod token_space;
 pub(crate) use glrmask_artifact::CommitTemplateDfas;

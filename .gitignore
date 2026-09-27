@@ -43,3 +43,6 @@ patch_debug*.py
 src.zip
 
 .agents
+
+# This is a Rust source module, not a generated build directory.
+!crates/glrmask-glr/src/glr/table/build/
