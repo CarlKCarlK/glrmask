@@ -18,6 +18,7 @@ pub(crate) mod weight_observation_quotient;
 pub(crate) mod boundary_candidates;
 pub(crate) mod boundary_tail;
 pub(crate) mod boundary_walk;
+mod boundary_rule_layout;
 pub(crate) mod constraint_compose;
 #[cfg(feature = "internal-api")]
 pub(crate) mod o21137_subgrammar_bench;

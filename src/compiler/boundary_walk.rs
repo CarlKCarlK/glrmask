@@ -2346,24 +2346,57 @@ pub(crate) fn build_walk_static_boundary_link(
             start_nullable: child.constraint.table.embedded_start_nullable(),
         })
         .collect();
-    let mut composed = compose_subgrammar_tables_with_rules(
-        &parent.table,
-        parent_rules,
-        (!global_ignores).then_some(parent.ignore_terminal).flatten(),
-        &table_inputs,
-        child_rules.as_slice(),
-    )?;
-    eliminate_composed_runtime_controls(&mut composed)?;
-    if !composed.table.control_terminals.is_empty() || !composed.control_terminals.is_empty()
-    {
-        return Err(
-            "walk static link requires a control-free spliced table".to_string(),
-        );
+    let metadata_started = Instant::now();
+    let rules_only_enabled = std::env::var_os("GLRMASK_EXPERIMENT_BOUNDARY_RULE_LAYOUT")
+        .is_some_and(|value| !matches!(value.to_string_lossy().trim().to_ascii_lowercase().as_str(),
+            "" | "0" | "false" | "no" | "off"));
+    let validate_rules_only = rules_only_enabled
+        && std::env::var_os("GLRMASK_VALIDATE_BOUNDARY_RULE_LAYOUT").is_some();
+    let projected = if rules_only_enabled {
+        Some(super::boundary_rule_layout::compose(
+            &parent.table, parent_rules, &table_inputs, child_rules.as_slice(),
+        )?)
+    } else { None };
+    // Keep the old table alive through the same scope in the reference mode.
+    // Only the candidate avoids ACTION/GOTO construction and their destruction.
+    let legacy = if projected.is_none() || validate_rules_only {
+        let mut composed = compose_subgrammar_tables_with_rules(
+            &parent.table, parent_rules,
+            (!global_ignores).then_some(parent.ignore_terminal).flatten(),
+            &table_inputs, child_rules.as_slice(),
+        )?;
+        eliminate_composed_runtime_controls(&mut composed)?;
+        if !composed.table.control_terminals.is_empty() || !composed.control_terminals.is_empty() {
+            return Err("walk static link requires a control-free spliced table".into());
+        }
+        Some(composed)
+    } else { None };
+    if validate_rules_only {
+        let direct = projected.as_ref().expect("selected rule projection");
+        let reference = legacy.as_ref().expect("independent legacy metadata reference");
+        assert_eq!(direct.terminal_offsets, reference.terminal_offsets);
+        assert_eq!(direct.num_terminals, reference.table.num_terminals);
+        assert_eq!(direct.rules, reference.table.rules);
+        assert_eq!(direct.nonterminal_display_names, reference.table.nonterminal_display_names);
+        eprintln!("[glrmask/validate][boundary_rule_layout] literal_metadata_equal=true rules={} terminals={}",
+            direct.rules.len(), direct.num_terminals);
     }
-    if composed.terminal_offsets.as_slice() != inputs.expected_terminal_offsets {
+    let (terminal_offsets, num_terminals, composed_rules, composed_nonterminal_names) =
+        if let Some(layout) = projected.as_ref() {
+            (&layout.terminal_offsets, layout.num_terminals, &layout.rules, &layout.nonterminal_display_names)
+        } else {
+            let reference = legacy.as_ref().expect("legacy layout when projection disabled");
+            (&reference.terminal_offsets, reference.table.num_terminals,
+                &reference.table.rules, &reference.table.nonterminal_display_names)
+        };
+    if compose_profile_enabled() {
+        eprintln!("[glrmask/profile][boundary_rule_layout] direct={rules_only_enabled} rules={} terminals={} ms={:.3}",
+            composed_rules.len(), num_terminals, metadata_started.elapsed().as_secs_f64()*1000.0);
+    }
+    if terminal_offsets.as_slice() != inputs.expected_terminal_offsets {
         return Err(format!(
             "walk static link terminal layout differs from coordinator table: walk {:?} vs coordinator {:?} (leaf_terms {:?}, top_sizes {:?})",
-            composed.terminal_offsets,
+            terminal_offsets,
             inputs.expected_terminal_offsets,
             expansion.leaves.iter().map(|leaf| leaf.table.num_terminals).collect::<Vec<_>>(),
             expansion.top_terminal_sizes,
@@ -2372,9 +2405,9 @@ pub(crate) fn build_walk_static_boundary_link(
     // Signed-transfer link context: intact local tables, provider-layout
     // injections, validated Entry/Finish contracts.
     let link_context_started = Instant::now();
-    let unbound = unbound_link_slot_terminals(parent, children, &composed.terminal_offsets)?;
+    let unbound = unbound_link_slot_terminals(parent, children, &terminal_offsets)?;
     for &terminal in &unbound {
-        if terminal as usize >= composed.table.num_terminals as usize {
+        if terminal as usize >= num_terminals as usize {
             return Err(format!(
                 "unbound slot terminal {terminal} lies outside the composed terminal domain",
             ));
@@ -2383,8 +2416,8 @@ pub(crate) fn build_walk_static_boundary_link(
     let signed_context = crate::compiler::boundary_transfer::build_signed_link_context(
         parent,
         children,
-        &composed.terminal_offsets,
-        composed.table.num_terminals,
+        &terminal_offsets,
+        num_terminals,
         global_ignores,
         unbound.into_iter().collect(),
     )?;
@@ -2398,7 +2431,7 @@ pub(crate) fn build_walk_static_boundary_link(
         .chain(children.iter().map(|child| child.constraint))
         .enumerate()
         .map(|(index, constraint)| {
-            (constraint.composition_tokenizer(), composed.terminal_offsets[index])
+            (constraint.composition_tokenizer(), terminal_offsets[index])
         })
         .collect();
     let (mut merged, tokenizer_offsets) =
@@ -2415,7 +2448,7 @@ pub(crate) fn build_walk_static_boundary_link(
         .then(|| std::iter::once(parent)
             .chain(children.iter().map(|child| child.constraint))
             .zip(tokenizer_offsets.iter().copied())
-            .zip(composed.terminal_offsets.iter().copied())
+            .zip(terminal_offsets.iter().copied())
             .map(|((component, offset), terminal_offset)| super::boundary_precomputed_completion::PreparedSourceSpan::for_component(component, offset, terminal_offset))
             .collect::<Vec<_>>());
     if merged.terminal_exprs().is_none() {
@@ -2424,29 +2457,27 @@ pub(crate) fn build_walk_static_boundary_link(
             .collect();
         if let Some(exprs) = merged_retained_terminal_exprs(
             &all,
-            &composed.terminal_offsets,
-            composed.table.num_terminals,
+            &terminal_offsets,
+            num_terminals,
         ) {
             merged.restore_terminal_exprs(Some(exprs))?;
         }
     }
     let ignores =
-        merged_ignore_terminals(parent, children, &composed.terminal_offsets, global_ignores);
+        merged_ignore_terminals(parent, children, &terminal_offsets, global_ignores);
     let tokenizer_merge_ms = tokenizer_merge_started.elapsed().as_secs_f64() * 1000.0;
 
     // Grammar + pairwise follows over the non-emptied composed rules.
     let grammar_analysis_started = Instant::now();
-    let augmented_start = composed
-        .table
-        .rules
+    let augmented_start = composed_rules
         .first()
         .map(|rule| rule.lhs)
         .ok_or_else(|| "composed table contains no augmented-start rule".to_string())?;
     let grammar = AnalyzedGrammar::from_composed_rules(
-        composed.table.rules.clone(),
-        composed.table.num_terminals,
+        composed_rules.clone(),
+        num_terminals,
         terminal_names,
-        composed.table.nonterminal_display_names.clone(),
+        composed_nonterminal_names.clone(),
         augmented_start,
     );
     let disallowed = compute_disallowed_follows(&grammar);
@@ -2534,7 +2565,7 @@ pub(crate) fn build_walk_static_boundary_link(
         let counts = components.iter().map(|component| component.table.nonterminal_display_names.len()).collect::<Vec<_>>();
         let labels = components.iter().enumerate().map(|(owner, component)| {
             component.ignore_terminal.into_iter().chain(component.table.skip_terminals.iter().copied())
-                .map(|terminal| terminal + composed.terminal_offsets[owner]).collect::<BTreeSet<_>>().into_iter().collect::<Vec<_>>()
+                .map(|terminal| terminal + terminal_offsets[owner]).collect::<BTreeSet<_>>().into_iter().collect::<Vec<_>>()
         }).collect::<Vec<_>>();
         let reference_relation = || {
             let mut relation = crate::compiler::boundary_scoped_follow::scoped_follow_relation(&grammar,&counts,&labels);
@@ -2630,7 +2661,7 @@ pub(crate) fn build_walk_static_boundary_link(
         let (_, summary_stats, summary_ms) = &candidate_summary_profiles[start_component];
         let emitted = boundary_emitted_terminals(
             &shard.output.dwa,
-            composed.table.num_terminals as usize,
+            num_terminals as usize,
         );
         let templates_started = Instant::now();
         let library = crate::compiler::boundary_transfer::build_fragment_library_cached(
@@ -2644,7 +2675,7 @@ pub(crate) fn build_walk_static_boundary_link(
         trace_boundary_terminal_dwa_words(
             &format!("component{start_component}"),
             &shard.output.dwa,
-            composed.table.num_terminals as usize,
+            num_terminals as usize,
         );
         let parser_started = Instant::now();
         let compiled = crate::compiler::boundary_transfer::compile_signed_shard_parser(
@@ -2718,7 +2749,7 @@ pub(crate) fn build_walk_static_boundary_link(
             disallowed_follows: &disallowed,
             ignore_terminal: ignores.canonical,
             follow_transparent_ignores: Some(&ignores.scoped),
-            terminal_offsets: &composed.terminal_offsets,
+            terminal_offsets: &terminal_offsets,
             leaf_to_immediate: None,
             tokenizer_offsets: &tokenizer_offsets,
             component_state_counts: &component_state_counts,
