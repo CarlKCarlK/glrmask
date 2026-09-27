@@ -65,6 +65,10 @@ commit operations, and dynamic execution. `runtime/dynamic/` contains dynamic
 constraint construction, transport, and union state; it is no longer mounted as
 an unrelated crate-root module.
 
+The private artifact facade now separates layouts, vocabulary ownership, proof
+construction, cache operations, and transfer validation into focused modules.
+See [artifact module boundaries](runtime-artifact-modules.md).
+
 See [runtime implementation](runtime-implementation.md) for constraint cache,
 parser, observation, and mask-replay ownership. See [lexer compilation](lexer-architecture.md)
 for expression lowering, product construction, repeat horizons, and state-map
