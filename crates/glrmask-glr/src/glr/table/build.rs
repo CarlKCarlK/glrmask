@@ -2725,12 +2725,27 @@ fn union_lookaheads(item_set: &mut LR1ItemSet, core: LR1ItemCore, lookaheads: &B
     entry.union_with_delta(lookaheads)
 }
 
-fn lr1_closure(
+/// Cache only emissions completed in this closure. A first empty request must
+/// still insert the production-entry cores, exactly as the reference does.
+fn emitted_lr1_lookaheads_changed(
+    emitted: &mut FxHashMap<u32, BitSet>,
+    nonterminal: u32,
+    requested: &BitSet,
+) -> bool {
+    use std::collections::hash_map::Entry;
+    match emitted.entry(nonterminal) {
+        Entry::Vacant(entry) => { entry.insert(requested.clone()); true }
+        Entry::Occupied(mut entry) => entry.get_mut().union_with_changed(requested),
+    }
+}
+
+fn lr1_closure<const CACHE_EMISSIONS: bool>(
     mut result: LR1ItemSet,
     grammar: &AnalyzedGrammar,
     suffix_first: &[RuleSuffixFirst],
 ) -> LR1ItemSet {
     let rules = &grammar.rules;
+    let mut emitted_by_nonterminal = FxHashMap::default();
     // Every caller constructs its kernel solely to close it. Consume that
     // kernel directly instead of cloning its ordered map and lookahead bitsets
     // before the fixed point starts.
@@ -2751,6 +2766,11 @@ fn lr1_closure(
             if suffix.nullable[suffix_index] {
                 let mut propagated_lookaheads = base_lookaheads.clone();
                 propagated_lookaheads.union_with(&lookahead_delta);
+                if CACHE_EMISSIONS && grammar.rules_by_lhs[*nt as usize].len() > 1
+                    && !emitted_lr1_lookaheads_changed(&mut emitted_by_nonterminal, *nt, &propagated_lookaheads)
+                {
+                    continue;
+                }
                 for &i in &grammar.rules_by_lhs[*nt as usize] {
                     let sd = grammar.rules[i as usize].rhs.len() as u32;
                     let new_item = LR1ItemCore::new(i, 0, sd);
@@ -2764,6 +2784,11 @@ fn lr1_closure(
                     }
                 }
             } else {
+                if CACHE_EMISSIONS && grammar.rules_by_lhs[*nt as usize].len() > 1
+                    && !emitted_lr1_lookaheads_changed(&mut emitted_by_nonterminal, *nt, base_lookaheads)
+                {
+                    continue;
+                }
                 for &i in &grammar.rules_by_lhs[*nt as usize] {
                     let sd = grammar.rules[i as usize].rhs.len() as u32;
                     let new_item = LR1ItemCore::new(i, 0, sd);
@@ -2914,7 +2939,7 @@ fn lr1_kernel_matches_closed_state(kernel: &LR1ItemSet, closed: &LR1ItemSet) -> 
     closed_kernel.next().is_none()
 }
 
-fn expand_lr1_state(
+fn expand_lr1_state<const CACHE_EMISSIONS: bool>(
     source_items: &LR1ItemSet,
     grammar: &AnalyzedGrammar,
     suffix_first: &[RuleSuffixFirst],
@@ -3001,7 +3026,7 @@ fn expand_lr1_state(
                     preclosed_target: Some(target_id),
                 });
             }
-            let target_items = Arc::new(lr1_closure(adjusted_kernel, grammar, suffix_first));
+            let target_items = Arc::new(lr1_closure::<CACHE_EMISSIONS>(adjusted_kernel, grammar, suffix_first));
             if target_items.is_empty() {
                 None
             } else {
@@ -3028,7 +3053,27 @@ fn build_lr1_item_sets(
     build_lr1_item_sets_with_preclosure_reuse(grammar, preclosure_reuse_enabled)
 }
 
+// The reference path remains available for exact differential validation.
+// Read the diagnostic once per build; no environment lookup enters the closure.
+fn lr1_emission_cache_enabled_for_override(disabled: Option<&str>) -> bool {
+    !disabled.is_some_and(|value| {
+        matches!(value.trim().to_ascii_lowercase().as_str(), "1" | "true" | "yes" | "on")
+    })
+}
+
 fn build_lr1_item_sets_with_preclosure_reuse(
+    grammar: &AnalyzedGrammar,
+    preclosure_reuse_enabled: bool,
+) -> (Vec<LR1ItemSet>, Vec<BTreeMap<Symbol, (u32, bool, bool)>>) {
+    let disabled = std::env::var("GLRMASK_DISABLE_LR1_EMISSION_CACHE").ok();
+    if lr1_emission_cache_enabled_for_override(disabled.as_deref()) {
+        build_lr1_item_sets_impl::<true>(grammar, preclosure_reuse_enabled)
+    } else {
+        build_lr1_item_sets_impl::<false>(grammar, preclosure_reuse_enabled)
+    }
+}
+
+fn build_lr1_item_sets_impl<const CACHE_EMISSIONS: bool>(
     grammar: &AnalyzedGrammar,
     preclosure_reuse_enabled: bool,
 ) -> (Vec<LR1ItemSet>, Vec<BTreeMap<Symbol, (u32, bool, bool)>>) {
@@ -3042,7 +3087,7 @@ fn build_lr1_item_sets_with_preclosure_reuse(
         let mut lookaheads = BitSet::new(lookahead_len);
         lookaheads.set(lookahead_bit(EOF, grammar.num_terminals));
         s.insert(LR1ItemCore::new(0, 0, sd), lookaheads);
-        lr1_closure(s, grammar, &suffix_first)
+        lr1_closure::<CACHE_EMISSIONS>(s, grammar, &suffix_first)
     });
 
     let mut item_sets = vec![initial.clone()];
@@ -3077,7 +3122,7 @@ fn build_lr1_item_sets_with_preclosure_reuse(
         let expanded = frontier
             .par_iter()
             .map(|&state_id| {
-                let successors = expand_lr1_state(
+                let successors = expand_lr1_state::<CACHE_EMISSIONS>(
                     &item_sets[state_id as usize],
                     grammar,
                     &suffix_first,
@@ -3146,7 +3191,7 @@ fn build_lr1_item_sets_with_preclosure_reuse(
     }
     if profile_enabled {
         eprintln!(
-            "[glrmask/profile][lr1_item_sets] states={} successors={} preclosure_reuses={} existing_successors={} new_successors={} expand_ms={:.3} intern_ms={:.3}",
+            "[glrmask/profile][lr1_item_sets] states={} successors={} preclosure_reuses={} existing_successors={} new_successors={} expand_ms={:.3} intern_ms={:.3} cached_emissions={CACHE_EMISSIONS}",
             item_sets.len(),
             successor_count,
             preclosure_reuse_count,
@@ -4019,6 +4064,7 @@ mod tests {
         selected_glr_table_construction, slr_reductions_would_conflict,
         try_build_direct_regular_table, try_build_direct_regular_table_reference,
         union_experimental_core_rows, ExperimentalCoreCompatibilitySig, Item,
+        BitSet, FxHashMap, LR1ItemCore, LR1ItemSet,
     };
     use crate::compiler::glr::accumulator::TerminalsDisallowed;
     use crate::compiler::glr::analysis::AnalyzedGrammar;
@@ -5320,6 +5366,99 @@ mod tests {
         }
         for value in ["1", "true", "yes", "on", " TRUE "] {
             assert!(!super::direct_core_table_enabled_for_override(Some(value)));
+        }
+    }
+
+    #[test]
+    fn emitted_lr1_lookaheads_keep_first_empty_request_and_exact_subsets() {
+        for len in [0, 1, 64, 65, 257] {
+            let mut emitted = FxHashMap::default();
+            let empty = BitSet::new(len);
+            assert!(super::emitted_lr1_lookaheads_changed(&mut emitted, 11, &empty));
+            assert!(!super::emitted_lr1_lookaheads_changed(&mut emitted, 11, &empty));
+            for bit in 0..len {
+                let mut request = BitSet::new(len);
+                request.set(bit);
+                assert!(super::emitted_lr1_lookaheads_changed(&mut emitted, 11, &request));
+                assert!(!super::emitted_lr1_lookaheads_changed(&mut emitted, 11, &request));
+            }
+            assert_eq!(emitted[&11].count_ones(), len);
+            // A different nonterminal has not emitted anything yet.
+            assert!(super::emitted_lr1_lookaheads_changed(&mut emitted, 12, &empty));
+        }
+    }
+
+    #[test]
+    fn emitted_lr1_closure_preserves_zero_lookahead_entry_cores() {
+        let grammar = AnalyzedGrammar::from_grammar_def(&GrammarDef {
+            rules: vec![
+                Rule { lhs: 0, rhs: vec![Symbol::Nonterminal(1)] },
+                Rule { lhs: 1, rhs: vec![Symbol::Nonterminal(2)] },
+                Rule { lhs: 1, rhs: vec![Symbol::Nonterminal(3)] },
+                Rule { lhs: 2, rhs: vec![Symbol::Terminal(0)] },
+                Rule { lhs: 3, rhs: vec![Symbol::Terminal(1)] },
+            ],
+            start: 0,
+            terminals: vec![
+                Terminal::Literal { id: 0, bytes: b"a".to_vec() },
+                Terminal::Literal { id: 1, bytes: b"b".to_vec() },
+            ],
+            ..GrammarDef::default()
+        });
+        let rule = grammar.rules.iter().position(|r| matches!(r.rhs.as_slice(),
+            [Symbol::Nonterminal(nt)] if grammar.rules_by_lhs[*nt as usize].len() > 1
+        )).expect("multi-production nonterminal in singleton suffix");
+        let mut seed = LR1ItemSet::new();
+        for depth in [7, 9] {
+            seed.insert(LR1ItemCore::new(rule as u32, 0, depth),
+                        BitSet::new(grammar.num_terminals as usize + 1));
+        }
+        let suffix = super::rule_suffix_first_sets(&grammar);
+        let reference = super::lr1_closure::<false>(seed.clone(), &grammar, &suffix);
+        let candidate = super::lr1_closure::<true>(seed, &grammar, &suffix);
+        assert!(candidate.len() > 2, "first empty emission must create entry cores");
+        assert_eq!(candidate, reference);
+    }
+
+    #[test]
+    fn lr1_emission_cache_is_default_with_explicit_reference_override() {
+        for disabled in [None, Some(""), Some("0"), Some("false"), Some("off")] {
+            assert!(super::lr1_emission_cache_enabled_for_override(disabled));
+        }
+        for disabled in ["1", "true", "yes", "on", " TRUE "] {
+            assert!(!super::lr1_emission_cache_enabled_for_override(Some(disabled)));
+        }
+    }
+
+    #[test]
+    fn cached_lr1_emissions_preserve_canonical_items_edges_and_complete_tables() {
+        let mut grammars = vec![
+            multi_lookahead_grammar(), mysterious_conflict_grammar(),
+            recursive_ambiguous_grammar(), template_like_grammar(),
+            large_left_linear_grammar(), unit_chain_grammar(),
+            ambiguous_unit_chain_grammar(), nullable_unit_chain_grammar(),
+            js_like_statement_grammar(),
+        ];
+        for depth in 1..=5 {
+            for branches in 1..=3 {
+                for nullable in [false, true] {
+                    for recursive in [false, true] {
+                        grammars.push(generated_unit_dag_grammar(depth, branches, nullable, recursive));
+                    }
+                }
+            }
+        }
+        for (index, grammar) in grammars.iter().enumerate() {
+            for reuse in [false, true] {
+                let (old_items, old_edges) = super::build_lr1_item_sets_impl::<false>(grammar, reuse);
+                let (new_items, new_edges) = super::build_lr1_item_sets_impl::<true>(grammar, reuse);
+                assert_eq!(new_items, old_items, "canonical items grammar={index} reuse={reuse}");
+                assert_eq!(new_edges, old_edges, "canonical edges grammar={index} reuse={reuse}");
+                let reference = super::build_core_merged_table_from_items(grammar, &old_items, &old_edges).unwrap();
+                let candidate = super::build_core_merged_table_from_items(grammar, &new_items, &new_edges).unwrap();
+                assert_eq!(bincode::serialize(&candidate).unwrap(), bincode::serialize(&reference).unwrap(),
+                           "complete table grammar={index} reuse={reuse}");
+            }
         }
     }
 
