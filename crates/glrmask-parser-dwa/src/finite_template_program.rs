@@ -56,7 +56,7 @@ fn empty_state() -> FastBoundaryNwaState {
     FastBoundaryNwaState { epsilons: Vec::new(), transitions: Vec::new(), final_weight: 0 }
 }
 
-fn build(
+pub(super) fn build(
     program: &FiniteTemplateProgram<'_>, alphabet: u32,
     interner: &mut FastBoundaryWeightInterner, limits: FiniteCompileLimits,
 ) -> Option<(Vec<FastBoundaryNwaState>, usize, Vec<u32>)> {
@@ -142,7 +142,7 @@ fn build(
 
 /// Injective positive reachability compaction. Keep every explicit label key,
 /// including a zero-weight guard. No two productive targets become equal.
-fn trim(states: Vec<FastBoundaryNwaState>, starts: &[u32])
+pub(super) fn trim(states: Vec<FastBoundaryNwaState>, starts: &[u32])
     -> Option<(Vec<FastBoundaryNwaState>, Vec<u32>)>
 {
     let n = states.len();
@@ -183,16 +183,42 @@ pub fn normalize_finite_template_program(
     let limits = FiniteCompileLimits::default();
     let mut interner = FastBoundaryWeightInterner::new(rows, 64)?;
     interner.limits = Some(limits);
-    let (mut states, edges, topology_order) = build(program, parser_states, &mut interner, limits)?;
-    let topology = if std::env::var_os("GLRMASK_BOUNDARY_REUSE_PROGRAM_TOPOLOGY").is_some()
-        && std::env::var_os("GLRMASK_BOUNDARY_EARLY_TOP_TRIM").is_none()
-    { Some(CheckedNativeTopology::from_order(topology_order)?) } else { None };
+    let reuse_topology=std::env::var_os("GLRMASK_BOUNDARY_REUSE_PROGRAM_TOPOLOGY").is_some()
+        && std::env::var_os("GLRMASK_BOUNDARY_EARLY_TOP_TRIM").is_none();
+    // Virtualize storage only when the existing positive-trim policy applies.
+    // Unsupported early-support/diagnostic modes retain the eager reference.
+    let virtual_selected=crate::optimized_env_flag("GLRMASK_BOUNDARY_VIRTUAL_TEMPLATE_GRAPH")
+        && trim_positive
+        && crate::optimized_env_flag("GLRMASK_BOUNDARY_MEMO_CANCELLATIONS")
+        && ["GLRMASK_BOUNDARY_EARLY_WEIGHTED_TOP","GLRMASK_BOUNDARY_EARLY_TOP_SUPPORT",
+            "GLRMASK_BOUNDARY_EARLY_TOP_TRIM","GLRMASK_VALIDATE_BOUNDARY_MEMO_CANCELLATIONS"]
+            .iter().all(|name|std::env::var_os(name).is_none());
+    let(mut states,edges,topology_order,mut active_starts,logical_states,assembly_ms,virtual_resolve_ms)=if virtual_selected {
+        let(graph,order)=finite_signed_graph::VirtualSignedGraph::build(program,parser_states,&mut interner,limits)?;
+        if !selected_for_state_count(graph.profile.logical_states) { return None; }
+        let assembly_ms=elapsed_ms(started);
+        let phase=Instant::now();
+        let filter=crate::optimized_env_flag("GLRMASK_BOUNDARY_CANCELLATION_READ_FILTER");
+        let result=graph.resolve_positive_reachable(&mut interner,&order,reuse_topology,filter,program.starts)?;
+        let(states,resolve_profile,order,starts)=(result.states,result.profile,result.topology,result.starts);
+        let edges=graph.profile.logical_edges;
+        let logical_states=graph.profile.logical_states;
+        if compile_profile_enabled(){
+            eprintln!("[glrmask/profile][virtual_signed_graph] prepare_ms={assembly_ms:.3} graph={:?} resolve={resolve_profile:?}",graph.profile);
+        }
+        drop(graph);
+        (states,edges,order,starts,logical_states,assembly_ms,Some(elapsed_ms(phase)))
+    } else {
+        let(states,edges,order)=build(program,parser_states,&mut interner,limits)?;
+        let logical_states=states.len();
+        (states,edges,order,program.starts.to_vec(),logical_states,elapsed_ms(started),None)
+    };
+    let topology=if reuse_topology{Some(CheckedNativeTopology::from_order(topology_order)?)}else{None};
     if !selected_for_state_count(states.len()) { return None; }
     let mut profile = FiniteTemplateProgramProfile {
-        input_states: states.len(), input_edges: edges,
-        assembly_ms: elapsed_ms(started), ..Default::default()
+        input_states: logical_states, input_edges: edges,
+        assembly_ms, ..Default::default()
     };
-    let mut active_starts=program.starts.to_vec();
     if std::env::var_os("GLRMASK_BOUNDARY_EARLY_WEIGHTED_TOP").is_some() {
         // Keep attribution and the old Boolean experiment separate. Failure
         // discards this private graph; the outer caller runs the exact fallback.
@@ -227,9 +253,13 @@ pub fn normalize_finite_template_program(
             if compile_profile_enabled(){eprintln!("[glrmask/profile][boundary_early_top_trim] states={} ms={:.3}",states.len(),profile.early_trim_ms);}
         }
     }
-    let phase = Instant::now();
-    fast_boundary_resolve_negative_codes_with_topology(&mut states, &mut interner, topology.as_ref())?;
-    profile.resolve_ms = elapsed_ms(phase);
+    if let Some(resolve_ms)=virtual_resolve_ms {
+        profile.resolve_ms=resolve_ms;
+    } else {
+        let phase = Instant::now();
+        fast_boundary_resolve_negative_codes_with_topology(&mut states, &mut interner, topology.as_ref())?;
+        profile.resolve_ms = elapsed_ms(phase);
+    }
     let phase = Instant::now();
     if let Some(context) = read_context {
         finite_read_support::restrict_with_topology(&mut states, &active_starts, context, topology.as_ref())?;

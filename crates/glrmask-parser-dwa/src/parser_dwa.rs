@@ -4181,6 +4181,8 @@ fn fast_boundary_cancellations_worklist(
 
 #[path = "finite_cancellation.rs"]
 mod finite_cancellation;
+#[path = "finite_signed_graph.rs"]
+mod finite_signed_graph;
 
 struct NativeCancellationResult {
     derived: Vec<FastBoundaryDerivedRow>,
@@ -4197,6 +4199,27 @@ fn fast_boundary_resolve_negative_codes(
     interner: &mut FastBoundaryWeightInterner,
 ) -> Option<()> {
     fast_boundary_resolve_negative_codes_with_topology(states, interner, None)
+}
+
+
+fn fast_boundary_prune_terminal_defaults(
+    states: &mut [FastBoundaryNwaState], interner: &FastBoundaryWeightInterner,
+) {
+    let n = states.len();
+    let terminal = finite_signed_graph::terminal_default_states(states, interner);
+    for state in states.iter_mut() {
+        let final_weight = state.final_weight;
+        for (label, branches) in &mut state.transitions {
+            if *label == DEFAULT_LABEL && final_weight != 0 {
+                branches.retain(|(target, edge_weight)| {
+                    (*target as usize) >= n
+                        || !terminal[*target as usize]
+                        || !interner.is_subset(*edge_weight, final_weight)
+                });
+            }
+        }
+        state.transitions.retain(|(_, branches)| !branches.is_empty());
+    }
 }
 
 fn fast_boundary_resolve_negative_codes_with_topology(
@@ -4281,102 +4304,7 @@ fn fast_boundary_resolve_negative_codes_with_topology(
 
     let finality_ms = elapsed_ms(finality_started);
     let prune_started = Instant::now();
-    let mut terminal = states
-        .iter()
-        .map(|state| {
-            state.final_weight != 0
-                && state.epsilons.is_empty()
-                && !state
-                    .transitions
-                    .iter()
-                    .any(|(label, branches)| *label != DEFAULT_LABEL && !branches.is_empty())
-                && !state
-                    .transitions
-                    .iter()
-                    .any(|(label, branches)| *label == DEFAULT_LABEL && !branches.is_empty())
-        })
-        .collect::<Vec<_>>();
-    let mut dependents = vec![Vec::<usize>::new(); n];
-    let mut remaining = vec![usize::MAX; n];
-    let mut terminal_queue = VecDeque::new();
-    for (state, &is_terminal) in terminal.iter().enumerate() {
-        if is_terminal {
-            terminal_queue.push_back(state);
-        }
-    }
-    for state_id in 0..n {
-        if terminal[state_id] {
-            continue;
-        }
-        let state = &states[state_id];
-        let candidate = state.final_weight != 0
-            && state.epsilons.is_empty()
-            && !state
-                .transitions
-                .iter()
-                .any(|(label, branches)| *label != DEFAULT_LABEL && !branches.is_empty());
-        if !candidate {
-            continue;
-        }
-        let default = state
-            .transitions
-            .iter()
-            .find_map(|(label, branches)| (*label == DEFAULT_LABEL).then_some(branches));
-        let Some(default) = default else {
-            terminal[state_id] = true;
-            terminal_queue.push_back(state_id);
-            continue;
-        };
-        if default
-            .iter()
-            .any(|(_, weight)| !interner.is_subset(*weight, state.final_weight))
-        {
-            continue;
-        }
-        let mut count = 0usize;
-        for (target, _) in default {
-            let target = *target as usize;
-            if target >= n {
-                count += 1;
-            } else if !terminal[target] {
-                dependents[target].push(state_id);
-                count += 1;
-            }
-        }
-        remaining[state_id] = count;
-        if count == 0 {
-            terminal[state_id] = true;
-            terminal_queue.push_back(state_id);
-        }
-    }
-    while let Some(done) = terminal_queue.pop_front() {
-        for dependent in dependents[done].clone() {
-            if terminal[dependent] {
-                continue;
-            }
-            if remaining[dependent] == usize::MAX || remaining[dependent] == 0 {
-                continue;
-            }
-            remaining[dependent] -= 1;
-            if remaining[dependent] == 0 {
-                terminal[dependent] = true;
-                terminal_queue.push_back(dependent);
-            }
-        }
-    }
-    for state in states.iter_mut() {
-        let final_weight = state.final_weight;
-        for (label, branches) in &mut state.transitions {
-            if *label == DEFAULT_LABEL && final_weight != 0 {
-                branches.retain(|(target, edge_weight)| {
-                    (*target as usize) >= n
-                        || !terminal[*target as usize]
-                        || !interner.is_subset(*edge_weight, final_weight)
-                });
-            }
-        }
-        state.transitions.retain(|(_, branches)| !branches.is_empty());
-    }
+    fast_boundary_prune_terminal_defaults(states, interner);
     let prune_ms = elapsed_ms(prune_started);
     if compile_profile_enabled() {
         eprintln!(
