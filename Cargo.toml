@@ -125,6 +125,10 @@ path = "tests/regressions/mre.rs"
 
 # Parser and GSS regressions.
 [[test]]
+name = "terminal_run_language"
+path = "tests/regressions/parser/terminal_run_language.rs"
+
+[[test]]
 name = "direct_glrm_ordered_suffix_ambiguity"
 path = "tests/regressions/parser/direct_glrm_ordered_suffix_ambiguity.rs"
 

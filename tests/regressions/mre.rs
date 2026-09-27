@@ -138,7 +138,7 @@ nt start ::= 'a' ;
 }
 
 #[test]
-fn certified_terminal_run_collapse_preserves_bounded_item_count() {
+fn model_tokens_preserve_bounded_item_count() {
     let vocab = Vocab::new(
         vec![
             (0, b"a".to_vec()),
