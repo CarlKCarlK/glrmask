@@ -203,6 +203,9 @@ pub(super) struct VirtualResolveProfile {
     pub materialize_ms:f64,
     pub prune_ms:f64,
     pub reachability_ms:f64,
+    pub read_context_ms:f64,
+    pub context_input_states:usize,
+    pub context_allocated_states:usize,
     pub materialized_states:usize,
     pub materialized_edges:usize,
 }
@@ -215,6 +218,7 @@ pub(super) struct PositiveMaterialization {
 }
 
 pub(super) struct VirtualSignedGraph {
+    alphabet:u32,
     templates:Vec<TemplateTopology>,instances:Vec<Instance>,ports:Vec<FastBoundaryNwaState>,
     node_instance:Vec<u32>,
     pub profile:VirtualGraphProfile,
@@ -376,7 +380,7 @@ impl VirtualSignedGraph {
             stored_template_states:templates.iter().map(|t|t.rows.len()).sum(),
             stored_template_edges:templates.iter().map(|t|t.logical_edges).sum(),
             instances:instances.len(),port_edges:port_rows.iter().map(|r|r.epsilons.len()).sum()};
-        let graph=Self{templates,instances,ports:port_rows,node_instance,profile};
+        let graph=Self{alphabet,templates,instances,ports:port_rows,node_instance,profile};
         let order=topological_order(&graph)?;
         Some((graph,order))
     }
@@ -388,18 +392,27 @@ impl VirtualSignedGraph {
     pub fn resolve_positive(&self,pool:&mut FastBoundaryWeightInterner,initial_order:&[u32],
         reuse_topology:bool,filter:bool,
     )->Option<(Vec<FastBoundaryNwaState>,VirtualResolveProfile)> {
-        let result=self.resolve_positive_mode(pool,initial_order,reuse_topology,filter,None)?;
+        let result=self.resolve_positive_mode(pool,initial_order,reuse_topology,filter,None,None)?;
         Some((result.states,result.profile))
     }
 
     pub fn resolve_positive_reachable(&self,pool:&mut FastBoundaryWeightInterner,initial_order:&[u32],
         reuse_topology:bool,filter:bool,starts:&[u32],
     )->Option<PositiveMaterialization> {
-        self.resolve_positive_mode(pool,initial_order,reuse_topology,filter,Some(starts))
+        self.resolve_positive_mode(pool,initial_order,reuse_topology,filter,Some(starts),None)
+    }
+
+    pub fn resolve_positive_with_context(&self,pool:&mut FastBoundaryWeightInterner,
+        initial_order:&[u32],reuse_topology:bool,filter:bool,starts:&[u32],
+        context:&FiniteParserReadSupport,
+    )->Option<PositiveMaterialization> {
+        if context.alphabet()!=self.alphabet as usize{return None;}
+        self.resolve_positive_mode(pool,initial_order,reuse_topology,filter,Some(starts),Some(context))
     }
 
     fn resolve_positive_mode(&self,pool:&mut FastBoundaryWeightInterner,initial_order:&[u32],
         reuse_topology:bool,filter:bool,reachable_starts:Option<&[u32]>,
+        read_context:Option<&FiniteParserReadSupport>,
     )->Option<PositiveMaterialization> {
         let phase=Instant::now();
         let(derived,stats)=super::finite_cancellation::compute_on_graph(self,pool,initial_order,filter)?;
@@ -445,6 +458,12 @@ impl VirtualSignedGraph {
         profile.finality_ms=elapsed_ms(phase);
         if let Some(starts)=reachable_starts {
             let finalized=FinalizedGraph{graph:&overlay,finals:&finals};
+            if let Some(context)=read_context {
+                // This order certifies the complete original/derived overlay;
+                // positive pruning removes edges only. Context transfer can
+                // therefore precede row allocation without another graph scan.
+                return materialize_sparse_context_positive(&finalized,pool,order,starts,profile,context);
+            }
             return materialize_reachable_positive(&finalized,pool,initial_order,starts,profile);
         }
         let phase=Instant::now();
@@ -542,6 +561,95 @@ fn materialize_reachable_positive<G:SignedGraph+?Sized>(graph:&G,pool:&mut FastB
             // Prune removes empty keys; trim retains zero-only guard keys as
             // exactly one dummy edge, without making an unreachable target live.
             if !had_branches{continue;}
+            if branches.is_empty(){branches.push((0,0));}
+            transitions.push((label,branches));
+        }
+        profile.materialized_edges+=epsilons.len()+transitions.iter().map(|(_,b)|b.len()).sum::<usize>();
+        states.push(FastBoundaryNwaState{epsilons,transitions,final_weight:row.final_weight()});
+    }
+    profile.materialized_states=states.len();
+    profile.materialize_ms=elapsed_ms(phase);
+    if !pool.allow_work(0,n,profile.materialized_edges){return None;}
+    Some(PositiveMaterialization{states,starts,topology,profile})
+}
+
+/// A private consumer of the complete, checked finalized positive view.
+/// The only caller has validated all original and derived targets/topology,
+/// plus equality of graph/domain alphabets. DEFAULT classification is still
+/// evaluated over every logical row before any context-sensitive removal.
+fn materialize_sparse_context_positive<G:SignedGraph+?Sized>(
+    graph:&G,pool:&mut FastBoundaryWeightInterner,order:&[u32],starts:&[u32],
+    mut profile:VirtualResolveProfile,domain:&FiniteParserReadSupport,
+)->Option<PositiveMaterialization> {
+    let n=graph.len();
+    let phase=Instant::now();
+    let terminal=terminal_default_states(graph,pool);
+    profile.prune_ms=elapsed_ms(phase);
+    let phase=Instant::now();
+    let mut transfer=super::finite_read_support::SparseReadContextTransfer::new(domain,n,starts)?;
+    for &q in order {
+        if !transfer.load_source(q as usize)?{continue;}
+        let row=graph.row(q as usize);
+        for e in 0..row.epsilon_count(){
+            let(target,weight)=row.epsilon(e);
+            if weight!=0 {transfer.transfer_epsilon(target as usize)?;}
+        }
+        for e in 0..row.transition_count(){
+            let label=row.label(e);
+            if is_negative_label(label) || !transfer.read_allowed(label)? {continue;}
+            for b in 0..row.branch_count(e){
+                let(target,weight)=row.branch(e,b);
+                if weight!=0 && keep_positive_branch(label,target,weight,row.final_weight(),&terminal,pool){
+                    transfer.transfer_read(label,target as usize)?;
+                }
+            }
+        }
+    }
+    profile.context_input_states=n;
+    profile.context_allocated_states=transfer.allocated_nodes();
+    profile.read_context_ms=elapsed_ms(phase);
+    let phase=Instant::now();
+    let mut mapping=vec![u32::MAX;n];
+    let mut count=0u32;
+    for(q,slot)in mapping.iter_mut().enumerate(){
+        if transfer.state_nonempty(q)? {*slot=count;count+=1;}
+    }
+    let starts=starts.iter().map(|&q|mapping[q as usize]).collect();
+    let topology=order.iter().filter_map(|&q|{
+        let mapped=mapping[q as usize];(mapped!=u32::MAX).then_some(mapped)
+    }).collect();
+    profile.reachability_ms=elapsed_ms(phase);
+    let phase=Instant::now();
+    let mut states=Vec::with_capacity(count as usize);
+    for(q,&mapped)in mapping.iter().enumerate(){
+        if mapped==u32::MAX {continue;}
+        if !transfer.load_source(q)? {return None;}
+        let row=graph.row(q);
+        let mut epsilons=Vec::new();
+        for e in 0..row.epsilon_count(){let(target,weight)=row.epsilon(e);
+            if weight!=0{
+                let target=*mapping.get(target as usize)?;
+                if target==u32::MAX{return None;}
+                epsilons.push((target,weight));
+            }
+        }
+        let mut transitions=Vec::new();
+        for e in 0..row.transition_count(){
+            let label=row.label(e);
+            if is_negative_label(label){continue;}
+            let allowed=transfer.read_allowed(label)?;
+            let mut had_branches=false;
+            let mut branches=SmallVec::<[(u32,FastBoundaryWeightId);1]>::new();
+            for b in 0..row.branch_count(e){let(target,weight)=row.branch(e,b);
+                if !keep_positive_branch(label,target,weight,row.final_weight(),&terminal,pool){continue;}
+                had_branches=true;
+                if weight!=0 && allowed{
+                    let target=*mapping.get(target as usize)?;
+                    if target==u32::MAX{return None;}
+                    branches.push((target,weight));
+                }
+            }
+            if !had_branches {continue;}
             if branches.is_empty(){branches.push((0,0));}
             transitions.push((label,branches));
         }
@@ -682,6 +790,27 @@ mod tests {
             let(actual,actual_starts)=super::super::finite_template_program::trim(actual,&compact.starts).unwrap();
             assert_eq!(expected_starts,actual_starts);
             assert_same_rows(&expected,&actual,case);
+            for reuse in [false,true] {
+                let mut reference_pool=FastBoundaryWeightInterner::new(1,64).unwrap();
+                let(mut reference,_,reference_order)=super::super::finite_template_program::build(
+                    &program,3,&mut reference_pool,Default::default()).unwrap();
+                let reference_topology=reuse.then(||CheckedNativeTopology::from_order(reference_order).unwrap());
+                fast_boundary_resolve_negative_codes_with_topology(
+                    &mut reference,&mut reference_pool,reference_topology.as_ref()).unwrap();
+                super::super::finite_read_support::restrict_with_topology(
+                    &mut reference,&[0],&domain,reference_topology.as_ref()).unwrap();
+                let(reference,reference_starts)=super::super::finite_template_program::trim(reference,&[0]).unwrap();
+                let mut sparse_pool=FastBoundaryWeightInterner::new(1,64).unwrap();
+                let(graph,order)=VirtualSignedGraph::build(&program,3,&mut sparse_pool,Default::default()).unwrap();
+                let sparse=graph.resolve_positive_with_context(
+                    &mut sparse_pool,&order,reuse,true,&[0],&domain).unwrap();
+                assert_eq!(sparse.starts,reference_starts,"sparse starts case={case}");
+                assert_same_rows(&reference,&sparse.states,case);
+                assert_eq!(reference_pool.values,sparse_pool.values,"sparse interner case={case} reuse={reuse}");
+                assert_eq!(sparse.profile.context_allocated_states,sparse.states.len());
+                let certificate=CheckedNativeTopology::from_order(sparse.topology).unwrap();
+                assert!(certificate.certifies(&sparse.states));
+            }
         }
     }
 

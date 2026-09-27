@@ -175,6 +175,13 @@ pub(super) fn trim(states: Vec<FastBoundaryNwaState>, starts: &[u32])
     Some((output, starts.iter().map(|&q| map[q as usize]).collect()))
 }
 
+// A mismatched or absent certificate uses the original materialize-then-filter
+// route. This selector establishes eligibility, not a new grammar certificate.
+fn select_virtual_read_context(context:Option<&FiniteParserReadSupport>,alphabet:u32,enabled:bool)
+    ->Option<&FiniteParserReadSupport> {
+    context.filter(|domain|enabled && domain.alphabet()==alphabet as usize)
+}
+
 pub fn normalize_finite_template_program(
     program: &FiniteTemplateProgram<'_>, parser_states: u32, rows: usize,
     read_context: Option<&FiniteParserReadSupport>, trim_positive: bool,
@@ -193,13 +200,19 @@ pub fn normalize_finite_template_program(
         && ["GLRMASK_BOUNDARY_EARLY_WEIGHTED_TOP","GLRMASK_BOUNDARY_EARLY_TOP_SUPPORT",
             "GLRMASK_BOUNDARY_EARLY_TOP_TRIM","GLRMASK_VALIDATE_BOUNDARY_MEMO_CANCELLATIONS"]
             .iter().all(|name|std::env::var_os(name).is_none());
+    let virtual_read_context=select_virtual_read_context(read_context,parser_states,
+        virtual_selected && crate::optimized_env_flag("GLRMASK_BOUNDARY_VIRTUAL_READ_CONTEXT"));
     let(mut states,edges,topology_order,mut active_starts,logical_states,assembly_ms,virtual_resolve_ms)=if virtual_selected {
         let(graph,order)=finite_signed_graph::VirtualSignedGraph::build(program,parser_states,&mut interner,limits)?;
         if !selected_for_state_count(graph.profile.logical_states) { return None; }
         let assembly_ms=elapsed_ms(started);
         let phase=Instant::now();
         let filter=crate::optimized_env_flag("GLRMASK_BOUNDARY_CANCELLATION_READ_FILTER");
-        let result=graph.resolve_positive_reachable(&mut interner,&order,reuse_topology,filter,program.starts)?;
+        let result=if let Some(context)=virtual_read_context {
+            graph.resolve_positive_with_context(&mut interner,&order,reuse_topology,filter,program.starts,context)?
+        }else{
+            graph.resolve_positive_reachable(&mut interner,&order,reuse_topology,filter,program.starts)?
+        };
         let(states,resolve_profile,order,starts)=(result.states,result.profile,result.topology,result.starts);
         let edges=graph.profile.logical_edges;
         let logical_states=graph.profile.logical_states;
@@ -261,13 +274,13 @@ pub fn normalize_finite_template_program(
         profile.resolve_ms = elapsed_ms(phase);
     }
     let phase = Instant::now();
-    if let Some(context) = read_context {
+    if let Some(context) = read_context.filter(|_|virtual_read_context.is_none()) {
         finite_read_support::restrict_with_topology(&mut states, &active_starts, context, topology.as_ref())?;
     }
     profile.support_ms = elapsed_ms(phase);
     let phase = Instant::now();
     let owned_starts;
-    let starts = if trim_positive {
+    let starts = if trim_positive && virtual_read_context.is_none() {
         (states, owned_starts) = trim(states, &active_starts)?;
         owned_starts.as_slice()
     } else { &active_starts };
@@ -308,6 +321,16 @@ pub fn normalize_finite_template_program(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn virtual_context_selector_requires_enabled_matching_certificate() {
+        let context=FiniteParserReadSupport::new_checked(1,0,
+            &[vec![(0,0)]],&[true],true).unwrap();
+        assert!(select_virtual_read_context(Some(&context),1,true).is_some());
+        assert!(select_virtual_read_context(Some(&context),1,false).is_none());
+        assert!(select_virtual_read_context(Some(&context),2,true).is_none());
+        assert!(select_virtual_read_context(None,1,true).is_none());
+    }
 
     fn reference(program: &FiniteTemplateProgram<'_>) -> NWA {
         let mut result = NWA::new(0, 0);
