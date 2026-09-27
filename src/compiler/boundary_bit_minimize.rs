@@ -827,11 +827,11 @@ fn minimize_prepared_with_observations(
     for s in 0..n {if live[s] {buckets[heights[s]].push(s);}}
     let mut mapped=vec![0u32;n];
     let mut groups=vec![Group{domain:0,signature:Signature{final_mask:0,edges:Vec::new()},guarded:false}];
-    let skip_redundant_merges=std::env::var("GLRMASK_EXPERIMENT_MIN_REDUNDANT_MERGES")
-        .is_ok_and(|v|matches!(v.trim(),"1"|"true"|"on"));
-    let census_merges=std::env::var_os("GLRMASK_PROFILE_MIN_REDUNDANT_MERGES").is_some();
-    let (mut merge_calls,mut contained_merges,mut equal_domain_merges,mut saved_edge_visits)=
-        (0usize,0usize,0usize,0usize);
+    let skip_redundant_merges=crate::compiler::boundary_env::enabled(
+        "GLRMASK_BOUNDARY_MIN_CONTAINED_MERGES");
+    if std::env::var_os("GLRMASK_PROFILE_COMPOSE").is_some() {
+        eprintln!("[glrmask/profile][min_contained_merges] enabled={skip_redundant_merges}");
+    }
     for mut bucket in buckets {
         bucket.sort_unstable_by_key(|&s|std::cmp::Reverse((masks.popcount(needed[s]),states[s].edges.len(),s)));
         let base=groups.len();
@@ -872,15 +872,8 @@ fn minimize_prepared_with_observations(
             }
             let id=match found {
                 Some(id)=>{
-                    merge_calls+=1;
-                    let contained=(skip_redundant_merges||census_merges)
-                        && merge_domain_is_contained(&groups[id],needed[s],&masks);
-                    if contained {
-                        contained_merges+=1;
-                        equal_domain_merges+=usize::from(groups[id].domain==needed[s]);
-                        saved_edge_visits+=groups[id].signature.edges.len()+signature.edges.len();
-                    }
-                    if !skip_redundant_merges||!contained {
+                    if !skip_redundant_merges
+                        || !merge_domain_is_contained(&groups[id],needed[s],&masks) {
                         merge(&mut groups[id],&signature,needed[s],&mut masks)?;
                     }
                     id
@@ -895,11 +888,6 @@ fn minimize_prepared_with_observations(
         }
     }
     profile.merge_ms=started.elapsed().as_secs_f64()*1000.0;
-    if census_merges {
-        eprintln!("[glrmask/profile][min_redundant_merges] enabled={} merge_calls={} contained={} equal_domains={} candidate_edge_visits={} merge_ms={:.6}",
-            skip_redundant_merges,merge_calls,contained_merges,equal_domain_merges,
-            saved_edge_visits,profile.merge_ms);
-    }
     let started=Instant::now();
     if crate::compiler::boundary_env::enabled("GLRMASK_BOUNDARY_MIN_POINT_DECODE") {
         let selected=masks.prepare_point_decoder().is_some();
