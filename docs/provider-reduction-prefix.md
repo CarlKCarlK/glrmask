@@ -8,6 +8,15 @@ and concrete commits. No vocabulary or grammar preprocessing is required.
 
 ## Exact fallback and bounds
 
+The complete input frontier must be an Interface-backed graph with an empty
+accumulator label. That is a constant-time structural certificate covering every
+input stack, not merely one isolated branch. Mixed labels, nonempty labels, and
+other representations retain the original general traversal. This matters
+because accumulator union and reduction-wave grouping can otherwise interact;
+changing the order is not justified just by a concrete-stack argument. The mask
+walk keeps its lexer exclusions separately, so this restriction does not erase
+or bypass exclusion semantics.
+
 A reduction does not consume the lookahead. If a supported reduction sequence
 reaches branching, guards, acceptance, extra stack effects, or an unknown lower
 stack region, the completed intermediate stack re-enters the general **reduction

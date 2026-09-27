@@ -4821,12 +4821,25 @@ fn advance_provider_traversal_impl<P: ParserActionProvider, const REDUCTION_PREF
     advance_provider_traversal_with_policy::<P, REDUCTION_PREFIX, false>(provider, closure, symbol, mode)
 }
 
+/// Changing reduction-wave grouping is harmless only under a fixed label.
+/// The current GSS accumulator merge is observable for mixed labels, so do not
+/// reorder those frontiers. An Interface certifies one shared empty label over
+/// its complete lower graph in O(1); unknown representations use the reference.
+#[inline]
+fn provider_reduction_input_is_uniform_empty(stack: &ParserGSS) -> bool {
+    stack.single_interface_lower_id().is_some()
+        && stack.all_accs_satisfy(TerminalsDisallowed::is_empty)
+}
+
 fn advance_provider_traversal_with_policy<P: ParserActionProvider, const REDUCTION_PREFIX: bool, const RESUME: bool>(
     provider: &P,
     mut closure: ParserGSS,
     symbol: P::Symbol,
     mode: ProviderAdvanceMode,
 ) -> ProviderAdvanceResult {
+    let reduction_prefix_eligible = REDUCTION_PREFIX
+        && mode == ProviderAdvanceMode::Advance
+        && provider_reduction_input_is_uniform_empty(&closure);
     let mut reduction_steps_remaining = 64usize;
     let mut shifted = ParserGSS::empty();
     let mut accepted = false;
@@ -4841,7 +4854,7 @@ fn advance_provider_traversal_with_policy<P: ParserActionProvider, const REDUCTI
                 continue;
             };
             let isolated = closure.isolate(Some(state));
-            if REDUCTION_PREFIX && mode == ProviderAdvanceMode::Advance
+            if reduction_prefix_eligible
                 && reduction_steps_remaining != 0 && provided.extra_stack_shifts.is_empty()
                 && matches!(&provided.action, ProvidedActionRef::Local { action: Action::Reduce(..), .. })
                 && let Some(stack) = isolated.try_virtual_stack()
@@ -6281,6 +6294,27 @@ mod tests {
         assert_eq!(keys.key(&actual),keys.key(&reference.shifted));
     }
 
+
+    #[test]
+    fn provider_reduction_eligibility_requires_complete_uniform_empty_input() {
+        let empty_label = TerminalsDisallowed::new();
+        let simple = ParserGSS::from_single_stack(vec![1, 2], empty_label.clone());
+        assert!(super::provider_reduction_input_is_uniform_empty(&simple));
+        let hidden = ParserGSS::from_stacks(&[
+            (vec![3], empty_label.clone()), (vec![4], empty_label),
+        ]).push(2);
+        assert!(hidden.try_virtual_stack().unwrap().has_hidden_floor_values());
+        assert!(super::provider_reduction_input_is_uniform_empty(&hidden));
+        let a = TerminalsDisallowed::new().with_insert(100, 7);
+        let b = a.with_insert(808, 909);
+        let nonempty = ParserGSS::from_single_stack(vec![1, 2], a.clone());
+        assert!(!super::provider_reduction_input_is_uniform_empty(&nonempty));
+        let mixed = ParserGSS::from_stacks(&[
+            (vec![], a.clone()), (vec![1008, 1014], a), (vec![1009, 18], b),
+        ]);
+        assert!(!super::provider_reduction_input_is_uniform_empty(&mixed),
+            "a single isolated branch must not certify the whole input");
+    }
 
     #[test]
     fn bounded_provider_reductions_default_on_and_honor_reference_overrides() {
