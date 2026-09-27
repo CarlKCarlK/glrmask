@@ -327,6 +327,84 @@ fn set_gss_summary_fields(
     Ok(())
 }
 
+fn commit_profile_to_dict<'py>(
+    py: Python<'py>,
+    profile: glrmask::__private::CommitProfile,
+) -> PyResult<Bound<'py, PyDict>> {
+    let dict = PyDict::new(py);
+    dict.set_item("total_ns", profile.total_ns)?;
+    dict.set_item("mask_cache_reuse_ns", profile.mask_cache_reuse_ns)?;
+    dict.set_item("scan_ns", profile.scan_ns)?;
+    dict.set_item("prune_ns", profile.prune_ns)?;
+    dict.set_item("queue_ns", profile.queue_ns)?;
+    dict.set_item("fuse_ns", profile.fuse_ns)?;
+    dict.set_item("initial_exec_ns", profile.initial_exec_ns)?;
+    dict.set_item("exec_ns", profile.exec_ns)?;
+    dict.set_item("queue_exec_ns", profile.queue_exec_ns)?;
+    dict.set_item("queue_match_ns", profile.queue_match_ns)?;
+    dict.set_item("queue_enqueue_ns", profile.queue_enqueue_ns)?;
+    dict.set_item("queue_bookkeeping_ns", profile.queue_bookkeeping_ns)?;
+    dict.set_item("advance_ns", profile.advance_ns)?;
+    dict.set_item("advance_may_check_ns", profile.advance_may_check_ns)?;
+    dict.set_item("advance_core_ns", profile.advance_core_ns)?;
+    dict.set_item("advance_future_disallow_ns", profile.advance_future_disallow_ns)?;
+    dict.set_item("actionable_ns", profile.actionable_ns)?;
+    dict.set_item("may_advance_ns", profile.may_advance_ns)?;
+    dict.set_item("n_tokenizer_states", profile.n_tokenizer_states)?;
+    dict.set_item("n_queue_entries", profile.n_queue_entries)?;
+    dict.set_item("n_advances", profile.n_advances)?;
+    dict.set_item("adv_n_reduces_above_floor", profile.adv_n_reduces_above_floor)?;
+    dict.set_item("adv_n_floor_crossings", profile.adv_n_floor_crossings)?;
+    dict.set_item("adv_n_nondet_waves", profile.adv_n_nondet_waves)?;
+    dict.set_item("adv_n_nondet_branches", profile.adv_n_nondet_branches)?;
+    dict.set_item("adv_clone_ns", profile.adv_clone_ns)?;
+    dict.set_item("adv_summary_ns", profile.adv_summary_ns)?;
+    dict.set_item("adv_fast_path_ns", profile.adv_fast_path_ns)?;
+    dict.set_item("adv_stack_shift_apply_ns", profile.adv_stack_shift_apply_ns)?;
+    dict.set_item("adv_det_ns", profile.adv_det_ns)?;
+    dict.set_item("adv_det_floor_cross_ns", profile.adv_det_floor_cross_ns)?;
+    dict.set_item("adv_nondet_ns", profile.adv_nondet_ns)?;
+    dict.set_item("adv_vstack_len", profile.adv_vstack_len)?;
+    dict.set_item("adv_gss_depth", profile.adv_gss_depth)?;
+    dict.set_item("adv_det_exit_reason", profile.adv_det_exit_reason)?;
+    dict.set_item("adv_det_exit_state", profile.adv_det_exit_state)?;
+    dict.set_item("adv_n_det_action_lookups", profile.adv_n_det_action_lookups)?;
+    dict.set_item("adv_n_det_goto_lookups", profile.adv_n_det_goto_lookups)?;
+    dict.set_item("adv_n_det_popn_ops", profile.adv_n_det_popn_ops)?;
+    dict.set_item("adv_n_nondet_reduce_ops", profile.adv_n_nondet_reduce_ops)?;
+    dict.set_item("adv_n_nondet_merges", profile.adv_n_nondet_merges)?;
+    dict.set_item("adv_n_nondet_isolates", profile.adv_n_nondet_isolates)?;
+    dict.set_item("adv_nondet_det_ns", profile.adv_nondet_det_ns)?;
+    dict.set_item("adv_nondet_det_floor_cross_ns", profile.adv_nondet_det_floor_cross_ns)?;
+    dict.set_item("fast_path_total_ns", profile.fast_path_total_ns)?;
+    dict.set_item("fast_path_tokenizer_exec_ns", profile.fast_path_tokenizer_exec_ns)?;
+    dict.set_item("fast_path_match_scan_ns", profile.fast_path_match_scan_ns)?;
+    dict.set_item("fast_path_end_state_check_ns", profile.fast_path_end_state_check_ns)?;
+    dict.set_item("fast_path_prune_ns", profile.fast_path_prune_ns)?;
+    dict.set_item("fast_path_advance_ns", profile.fast_path_advance_ns)?;
+    dict.set_item("fast_path_future_disallow_ns", profile.fast_path_future_disallow_ns)?;
+    dict.set_item("fast_path_fuse_ns", profile.fast_path_fuse_ns)?;
+    dict.set_item("fast_path_state_update_ns", profile.fast_path_state_update_ns)?;
+    dict.set_item("failed_fast_path_probe_ns", profile.failed_fast_path_probe_ns)?;
+    dict.set_item("linear_fast_path_total_ns", profile.linear_fast_path_total_ns)?;
+    dict.set_item("linear_fast_path_exec_ns", profile.linear_fast_path_exec_ns)?;
+    dict.set_item("linear_fast_path_match_scan_ns", profile.linear_fast_path_match_scan_ns)?;
+    dict.set_item("linear_fast_path_end_state_check_ns", profile.linear_fast_path_end_state_check_ns)?;
+    dict.set_item("linear_fast_path_advance_ns", profile.linear_fast_path_advance_ns)?;
+    dict.set_item("linear_fast_path_action_lookup_ns", profile.linear_fast_path_action_lookup_ns)?;
+    dict.set_item("linear_fast_path_carried_gate_ns", profile.linear_fast_path_carried_gate_ns)?;
+    dict.set_item("linear_fast_path_materialize_ns", profile.linear_fast_path_materialize_ns)?;
+    dict.set_item("linear_fast_path_apply_action_wall_ns", profile.linear_fast_path_apply_action_wall_ns)?;
+    dict.set_item("linear_fast_path_profile_bookkeeping_ns", profile.linear_fast_path_profile_bookkeeping_ns)?;
+    dict.set_item("linear_fast_path_future_disallow_ns", profile.linear_fast_path_future_disallow_ns)?;
+    dict.set_item("linear_fast_path_fuse_ns", profile.linear_fast_path_fuse_ns)?;
+    dict.set_item("linear_fast_path_eligibility_ns", profile.linear_fast_path_eligibility_ns)?;
+    dict.set_item("linear_fast_path_setup_ns", profile.linear_fast_path_setup_ns)?;
+    dict.set_item("linear_fast_path_state_update_ns", profile.linear_fast_path_state_update_ns)?;
+    dict.set_item("linear_fast_path_steps", profile.linear_fast_path_steps)?;
+    Ok(dict)
+}
+
 fn mask_profile_to_dict<'py>(
     py: Python<'py>,
     profile: glrmask::__private::MaskProfile,
@@ -899,44 +977,7 @@ impl PyDynamicConstraintState {
                 .commit_token_profiled(token_id)
                 .map_err(PyValueError::new_err)
         })?;
-        let dict = PyDict::new(py);
-        dict.set_item("total_ns", profile.total_ns)?;
-        dict.set_item("scan_ns", profile.scan_ns)?;
-        dict.set_item("prune_ns", profile.prune_ns)?;
-        dict.set_item("queue_ns", profile.queue_ns)?;
-        dict.set_item("fuse_ns", profile.fuse_ns)?;
-        dict.set_item("initial_exec_ns", profile.initial_exec_ns)?;
-        dict.set_item("exec_ns", profile.exec_ns)?;
-        dict.set_item("queue_exec_ns", profile.queue_exec_ns)?;
-        dict.set_item("queue_match_ns", profile.queue_match_ns)?;
-        dict.set_item("queue_enqueue_ns", profile.queue_enqueue_ns)?;
-        dict.set_item("queue_bookkeeping_ns", profile.queue_bookkeeping_ns)?;
-        dict.set_item("advance_ns", profile.advance_ns)?;
-        dict.set_item("advance_may_check_ns", profile.advance_may_check_ns)?;
-        dict.set_item("advance_core_ns", profile.advance_core_ns)?;
-        dict.set_item("advance_future_disallow_ns", profile.advance_future_disallow_ns)?;
-        dict.set_item("actionable_ns", profile.actionable_ns)?;
-        dict.set_item("may_advance_ns", profile.may_advance_ns)?;
-        dict.set_item("n_tokenizer_states", profile.n_tokenizer_states)?;
-        dict.set_item("n_queue_entries", profile.n_queue_entries)?;
-        dict.set_item("n_advances", profile.n_advances)?;
-        dict.set_item("fast_path_total_ns", profile.fast_path_total_ns)?;
-        dict.set_item("fast_path_tokenizer_exec_ns", profile.fast_path_tokenizer_exec_ns)?;
-        dict.set_item("fast_path_match_scan_ns", profile.fast_path_match_scan_ns)?;
-        dict.set_item("fast_path_end_state_check_ns", profile.fast_path_end_state_check_ns)?;
-        dict.set_item("fast_path_prune_ns", profile.fast_path_prune_ns)?;
-        dict.set_item("fast_path_advance_ns", profile.fast_path_advance_ns)?;
-        dict.set_item("fast_path_future_disallow_ns", profile.fast_path_future_disallow_ns)?;
-        dict.set_item("fast_path_fuse_ns", profile.fast_path_fuse_ns)?;
-        dict.set_item("fast_path_state_update_ns", profile.fast_path_state_update_ns)?;
-        dict.set_item("failed_fast_path_probe_ns", profile.failed_fast_path_probe_ns)?;
-        dict.set_item("linear_fast_path_total_ns", profile.linear_fast_path_total_ns)?;
-        dict.set_item("linear_fast_path_exec_ns", profile.linear_fast_path_exec_ns)?;
-        dict.set_item("linear_fast_path_match_scan_ns", profile.linear_fast_path_match_scan_ns)?;
-        dict.set_item("linear_fast_path_end_state_check_ns", profile.linear_fast_path_end_state_check_ns)?;
-        dict.set_item("linear_fast_path_advance_ns", profile.linear_fast_path_advance_ns)?;
-        dict.set_item("linear_fast_path_fuse_ns", profile.linear_fast_path_fuse_ns)?;
-        Ok(dict)
+        commit_profile_to_dict(py, profile)
     }
 
     fn fill_mask(&self, mut bitmask: PyReadwriteArray1<i32>) -> PyResult<()> {
@@ -1167,80 +1208,7 @@ impl PyConstraintState {
         let profile = self.inner.with_dependent_mut(|_owner, state| {
             state.commit_token_profiled(token_id).map_err(|e| PyValueError::new_err(e))
         })?;
-        let dict = pyo3::types::PyDict::new(py);
-        dict.set_item("total_ns", profile.total_ns)?;
-        dict.set_item("scan_ns", profile.scan_ns)?;
-        dict.set_item("prune_ns", profile.prune_ns)?;
-        dict.set_item("queue_ns", profile.queue_ns)?;
-        dict.set_item("fuse_ns", profile.fuse_ns)?;
-        dict.set_item("initial_exec_ns", profile.initial_exec_ns)?;
-        dict.set_item("exec_ns", profile.exec_ns)?;
-        dict.set_item("queue_exec_ns", profile.queue_exec_ns)?;
-        dict.set_item("queue_match_ns", profile.queue_match_ns)?;
-        dict.set_item("queue_enqueue_ns", profile.queue_enqueue_ns)?;
-        dict.set_item("queue_bookkeeping_ns", profile.queue_bookkeeping_ns)?;
-        dict.set_item("advance_ns", profile.advance_ns)?;
-        dict.set_item("advance_may_check_ns", profile.advance_may_check_ns)?;
-        dict.set_item("advance_core_ns", profile.advance_core_ns)?;
-        dict.set_item("advance_future_disallow_ns", profile.advance_future_disallow_ns)?;
-        dict.set_item("actionable_ns", profile.actionable_ns)?;
-        dict.set_item("may_advance_ns", profile.may_advance_ns)?;
-        dict.set_item("n_tokenizer_states", profile.n_tokenizer_states)?;
-        dict.set_item("n_queue_entries", profile.n_queue_entries)?;
-        dict.set_item("n_advances", profile.n_advances)?;
-        dict.set_item("adv_n_reduces_above_floor", profile.adv_n_reduces_above_floor)?;
-        dict.set_item("adv_n_floor_crossings", profile.adv_n_floor_crossings)?;
-        dict.set_item("adv_n_nondet_waves", profile.adv_n_nondet_waves)?;
-        dict.set_item("adv_n_nondet_branches", profile.adv_n_nondet_branches)?;
-        dict.set_item("adv_clone_ns", profile.adv_clone_ns)?;
-        dict.set_item("adv_fast_path_ns", profile.adv_fast_path_ns)?;
-        dict.set_item("adv_stack_shift_apply_ns", profile.adv_stack_shift_apply_ns)?;
-        dict.set_item("adv_det_ns", profile.adv_det_ns)?;
-        dict.set_item("adv_det_floor_cross_ns", profile.adv_det_floor_cross_ns)?;
-        dict.set_item("adv_nondet_ns", profile.adv_nondet_ns)?;
-        dict.set_item("adv_vstack_len", profile.adv_vstack_len)?;
-        dict.set_item("adv_gss_depth", profile.adv_gss_depth)?;
-        dict.set_item("adv_det_exit_reason", profile.adv_det_exit_reason)?;
-        dict.set_item("adv_det_exit_state", profile.adv_det_exit_state)?;
-        dict.set_item("adv_n_det_action_lookups", profile.adv_n_det_action_lookups)?;
-        dict.set_item("adv_n_det_goto_lookups", profile.adv_n_det_goto_lookups)?;
-        dict.set_item("adv_n_det_popn_ops", profile.adv_n_det_popn_ops)?;
-        dict.set_item("adv_n_nondet_reduce_ops", profile.adv_n_nondet_reduce_ops)?;
-        dict.set_item("adv_n_nondet_merges", profile.adv_n_nondet_merges)?;
-        dict.set_item("adv_n_nondet_isolates", profile.adv_n_nondet_isolates)?;
-        dict.set_item("adv_nondet_det_ns", profile.adv_nondet_det_ns)?;
-        dict.set_item(
-            "adv_nondet_det_floor_cross_ns",
-            profile.adv_nondet_det_floor_cross_ns,
-        )?;
-        dict.set_item("adv_summary_ns", profile.adv_summary_ns)?;
-        dict.set_item("fast_path_total_ns", profile.fast_path_total_ns)?;
-        dict.set_item("fast_path_tokenizer_exec_ns", profile.fast_path_tokenizer_exec_ns)?;
-        dict.set_item("fast_path_match_scan_ns", profile.fast_path_match_scan_ns)?;
-        dict.set_item("fast_path_end_state_check_ns", profile.fast_path_end_state_check_ns)?;
-        dict.set_item("fast_path_prune_ns", profile.fast_path_prune_ns)?;
-        dict.set_item("fast_path_advance_ns", profile.fast_path_advance_ns)?;
-        dict.set_item("fast_path_future_disallow_ns", profile.fast_path_future_disallow_ns)?;
-        dict.set_item("fast_path_fuse_ns", profile.fast_path_fuse_ns)?;
-        dict.set_item("fast_path_state_update_ns", profile.fast_path_state_update_ns)?;
-        dict.set_item("failed_fast_path_probe_ns", profile.failed_fast_path_probe_ns)?;
-        dict.set_item("linear_fast_path_total_ns", profile.linear_fast_path_total_ns)?;
-        dict.set_item("linear_fast_path_exec_ns", profile.linear_fast_path_exec_ns)?;
-        dict.set_item("linear_fast_path_match_scan_ns", profile.linear_fast_path_match_scan_ns)?;
-        dict.set_item("linear_fast_path_end_state_check_ns", profile.linear_fast_path_end_state_check_ns)?;
-        dict.set_item("linear_fast_path_advance_ns", profile.linear_fast_path_advance_ns)?;
-        dict.set_item("linear_fast_path_action_lookup_ns", profile.linear_fast_path_action_lookup_ns)?;
-        dict.set_item("linear_fast_path_carried_gate_ns", profile.linear_fast_path_carried_gate_ns)?;
-        dict.set_item("linear_fast_path_materialize_ns", profile.linear_fast_path_materialize_ns)?;
-        dict.set_item("linear_fast_path_apply_action_wall_ns", profile.linear_fast_path_apply_action_wall_ns)?;
-        dict.set_item("linear_fast_path_profile_bookkeeping_ns", profile.linear_fast_path_profile_bookkeeping_ns)?;
-        dict.set_item("linear_fast_path_future_disallow_ns", profile.linear_fast_path_future_disallow_ns)?;
-        dict.set_item("linear_fast_path_fuse_ns", profile.linear_fast_path_fuse_ns)?;
-        dict.set_item("linear_fast_path_eligibility_ns", profile.linear_fast_path_eligibility_ns)?;
-        dict.set_item("linear_fast_path_setup_ns", profile.linear_fast_path_setup_ns)?;
-        dict.set_item("linear_fast_path_state_update_ns", profile.linear_fast_path_state_update_ns)?;
-        dict.set_item("linear_fast_path_steps", profile.linear_fast_path_steps)?;
-        Ok(dict)
+        commit_profile_to_dict(py, profile)
     }
 
     /// Return total parser GSS root count across all tokenizer states.
@@ -1321,78 +1289,7 @@ impl PyConstraintState {
         }
         result.set_item("advances", advance_list)?;
         result.set_item("final_stacks", final_stacks)?;
-        let commit_dict = pyo3::types::PyDict::new(py);
-        commit_dict.set_item("total_ns", commit_profile.total_ns)?;
-        commit_dict.set_item("scan_ns", commit_profile.scan_ns)?;
-        commit_dict.set_item("prune_ns", commit_profile.prune_ns)?;
-        commit_dict.set_item("queue_ns", commit_profile.queue_ns)?;
-        commit_dict.set_item("fuse_ns", commit_profile.fuse_ns)?;
-        commit_dict.set_item("initial_exec_ns", commit_profile.initial_exec_ns)?;
-        commit_dict.set_item("exec_ns", commit_profile.exec_ns)?;
-        commit_dict.set_item("queue_exec_ns", commit_profile.queue_exec_ns)?;
-        commit_dict.set_item("queue_match_ns", commit_profile.queue_match_ns)?;
-        commit_dict.set_item("queue_enqueue_ns", commit_profile.queue_enqueue_ns)?;
-        commit_dict.set_item("queue_bookkeeping_ns", commit_profile.queue_bookkeeping_ns)?;
-        commit_dict.set_item("advance_ns", commit_profile.advance_ns)?;
-        commit_dict.set_item("advance_may_check_ns", commit_profile.advance_may_check_ns)?;
-        commit_dict.set_item("advance_core_ns", commit_profile.advance_core_ns)?;
-        commit_dict.set_item("advance_future_disallow_ns", commit_profile.advance_future_disallow_ns)?;
-        commit_dict.set_item("actionable_ns", commit_profile.actionable_ns)?;
-        commit_dict.set_item("may_advance_ns", commit_profile.may_advance_ns)?;
-        commit_dict.set_item("n_tokenizer_states", commit_profile.n_tokenizer_states)?;
-        commit_dict.set_item("n_queue_entries", commit_profile.n_queue_entries)?;
-        commit_dict.set_item("n_advances", commit_profile.n_advances)?;
-        commit_dict.set_item("adv_n_reduces_above_floor", commit_profile.adv_n_reduces_above_floor)?;
-        commit_dict.set_item("adv_n_floor_crossings", commit_profile.adv_n_floor_crossings)?;
-        commit_dict.set_item("adv_n_nondet_waves", commit_profile.adv_n_nondet_waves)?;
-        commit_dict.set_item("adv_n_nondet_branches", commit_profile.adv_n_nondet_branches)?;
-        commit_dict.set_item("adv_clone_ns", commit_profile.adv_clone_ns)?;
-        commit_dict.set_item("adv_fast_path_ns", commit_profile.adv_fast_path_ns)?;
-        commit_dict.set_item("adv_stack_shift_apply_ns", commit_profile.adv_stack_shift_apply_ns)?;
-        commit_dict.set_item("adv_det_ns", commit_profile.adv_det_ns)?;
-        commit_dict.set_item(
-            "adv_det_floor_cross_ns",
-            commit_profile.adv_det_floor_cross_ns,
-        )?;
-        commit_dict.set_item("adv_nondet_ns", commit_profile.adv_nondet_ns)?;
-        commit_dict.set_item("adv_vstack_len", commit_profile.adv_vstack_len)?;
-        commit_dict.set_item("adv_gss_depth", commit_profile.adv_gss_depth)?;
-        commit_dict.set_item("adv_det_exit_reason", commit_profile.adv_det_exit_reason)?;
-        commit_dict.set_item("adv_det_exit_state", commit_profile.adv_det_exit_state)?;
-        commit_dict.set_item("adv_n_det_action_lookups", commit_profile.adv_n_det_action_lookups)?;
-        commit_dict.set_item("adv_n_det_goto_lookups", commit_profile.adv_n_det_goto_lookups)?;
-        commit_dict.set_item("adv_n_det_popn_ops", commit_profile.adv_n_det_popn_ops)?;
-        commit_dict.set_item("adv_n_nondet_reduce_ops", commit_profile.adv_n_nondet_reduce_ops)?;
-        commit_dict.set_item("adv_n_nondet_merges", commit_profile.adv_n_nondet_merges)?;
-        commit_dict.set_item("adv_n_nondet_isolates", commit_profile.adv_n_nondet_isolates)?;
-        commit_dict.set_item("adv_nondet_det_ns", commit_profile.adv_nondet_det_ns)?;
-        commit_dict.set_item(
-            "adv_nondet_det_floor_cross_ns",
-            commit_profile.adv_nondet_det_floor_cross_ns,
-        )?;
-        commit_dict.set_item("adv_summary_ns", commit_profile.adv_summary_ns)?;
-        commit_dict.set_item("fast_path_total_ns", commit_profile.fast_path_total_ns)?;
-        commit_dict.set_item("fast_path_tokenizer_exec_ns", commit_profile.fast_path_tokenizer_exec_ns)?;
-        commit_dict.set_item("fast_path_match_scan_ns", commit_profile.fast_path_match_scan_ns)?;
-        commit_dict.set_item("fast_path_end_state_check_ns", commit_profile.fast_path_end_state_check_ns)?;
-        commit_dict.set_item("fast_path_prune_ns", commit_profile.fast_path_prune_ns)?;
-        commit_dict.set_item("fast_path_advance_ns", commit_profile.fast_path_advance_ns)?;
-        commit_dict.set_item("fast_path_future_disallow_ns", commit_profile.fast_path_future_disallow_ns)?;
-        commit_dict.set_item("fast_path_fuse_ns", commit_profile.fast_path_fuse_ns)?;
-        commit_dict.set_item("fast_path_state_update_ns", commit_profile.fast_path_state_update_ns)?;
-        commit_dict.set_item("linear_fast_path_total_ns", commit_profile.linear_fast_path_total_ns)?;
-        commit_dict.set_item("linear_fast_path_exec_ns", commit_profile.linear_fast_path_exec_ns)?;
-        commit_dict.set_item("linear_fast_path_match_scan_ns", commit_profile.linear_fast_path_match_scan_ns)?;
-        commit_dict.set_item("linear_fast_path_end_state_check_ns", commit_profile.linear_fast_path_end_state_check_ns)?;
-        commit_dict.set_item("linear_fast_path_advance_ns", commit_profile.linear_fast_path_advance_ns)?;
-        commit_dict.set_item("linear_fast_path_action_lookup_ns", commit_profile.linear_fast_path_action_lookup_ns)?;
-        commit_dict.set_item("linear_fast_path_carried_gate_ns", commit_profile.linear_fast_path_carried_gate_ns)?;
-        commit_dict.set_item("linear_fast_path_materialize_ns", commit_profile.linear_fast_path_materialize_ns)?;
-        commit_dict.set_item("linear_fast_path_apply_action_wall_ns", commit_profile.linear_fast_path_apply_action_wall_ns)?;
-        commit_dict.set_item("linear_fast_path_profile_bookkeeping_ns", commit_profile.linear_fast_path_profile_bookkeeping_ns)?;
-        commit_dict.set_item("linear_fast_path_future_disallow_ns", commit_profile.linear_fast_path_future_disallow_ns)?;
-        commit_dict.set_item("linear_fast_path_fuse_ns", commit_profile.linear_fast_path_fuse_ns)?;
-        commit_dict.set_item("linear_fast_path_steps", commit_profile.linear_fast_path_steps)?;
+        let commit_dict = commit_profile_to_dict(py, commit_profile)?;
         result.set_item("commit_profile", commit_dict)?;
 
         Ok(result)

@@ -13,6 +13,8 @@ pub type GssProfileSummary = LeveledGSSSummary;
 #[derive(Clone, Debug, Default)]
 pub struct CommitProfile {
 	pub total_ns: u64,
+	/// Final generation update and optional mask-equality proof; included in total_ns.
+	pub mask_cache_reuse_ns: u64,
 	pub scan_ns: u64,
 	pub prune_ns: u64,
 	pub queue_ns: u64,

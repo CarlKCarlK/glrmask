@@ -6587,27 +6587,6 @@ impl DynamicMaskVocab {
         !self.terminal_observation_classes.is_empty()
     }
 
-    /// Cheap necessary condition for the exact parser-relative observation
-    /// certificate: at least one prepared terminal quotient places both lexer
-    /// source states in the same nonzero class. This is not sufficient for
-    /// parser-relative equivalence, but it cheaply avoids arming the expensive
-    /// checkpoint for unrelated source pairs.
-    #[inline]
-    pub(crate) fn shares_terminal_observation_class(
-        &self,
-        left_state: u32,
-        right_state: u32,
-    ) -> bool {
-        let left = left_state as usize;
-        let right = right_state as usize;
-        self.terminal_observation_classes.iter().any(|(_, classes)| {
-            let Some(&left_class) = classes.get(left) else {
-                return false;
-            };
-            left_class != 0 && classes.get(right).copied() == Some(left_class)
-        })
-    }
-
     /// Prove equality of every parser-admitted terminal observation that is
     /// live at either lexer source, using only the selectively prepared exact
     /// per-terminal quotient rows. Returns the number of relevant live
