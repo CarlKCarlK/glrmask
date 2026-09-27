@@ -127,3 +127,14 @@ The script records source/binary/input hashes and every raw timing, checks
 every artifact against the independent baseline, separates validation from
 timing, checks loaded masks, and losslessly archives the final temporary
 artifact instead of accumulating one large file per repetition.
+
+## Latest-main integration gate
+
+The focused implementation commit is `def6b1993`. It was merged with the
+subsequent provider-reduction runtime work from main `fa2863ef2`, without
+conflicts. The combined source passed 216 GLR tests, 951 root tests, and
+64 parser-DWA tests, with zero failures. Another 64 interleaved links on
+both fixtures retained every baseline artifact byte, native row and loaded
+mask signature. The eight-pair follow-up showed paired whole-link gains
+about 1.87 ms current and 1.64 ms legacy, but it is an integration screen,
+not grounds for ignoring the weaker result in the larger 24-pair matrix.
