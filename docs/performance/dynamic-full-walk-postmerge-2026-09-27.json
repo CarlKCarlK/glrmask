@@ -1,0 +1,1130 @@
+{
+  "validated_commit": "e07744d3a3b4358bc5c8f1f6cc72e93415d56487",
+  "candidate_package_sha256": "b62a84073d997d00f81e2a449d984c3aa0577f3a6a2c41cf73fda5ab6a7defea",
+  "premerge_reference_commit": "a14d990ff6fb3d15ff4c2ec3573181696d8c3559",
+  "runtime_sources": {
+    "src/runtime/dynamic_mask.rs": "222b4e193e995750a22a447028ffc845886902bcbc2d41441f4fad603a4c460b",
+    "src/runtime/dynamic_mask/full_walk_dense.rs": "08e8c2f9635e75d153eeef4586371d095b86020fa54da91311721cce86fbe64b"
+  },
+  "tests": {
+    "rust_passed": 2269,
+    "rust_failed": 0,
+    "rust_ignored": 55,
+    "python_passed": 42,
+    "doc_and_examples": "passed"
+  },
+  "captures": {
+    "static-compiled": {
+      "masks": 77582,
+      "schemas": 126,
+      "decoded_bytes": 1245309451,
+      "sha256": "351dab2120aadea63c7515ff1c12630fd8857184817eb0f87dfaa1e30932ece2",
+      "compressed_bytes": 5292137
+    },
+    "static-loaded": {
+      "masks": 77582,
+      "schemas": 126,
+      "decoded_bytes": 1245309451,
+      "sha256": "351dab2120aadea63c7515ff1c12630fd8857184817eb0f87dfaa1e30932ece2",
+      "compressed_bytes": 5292137
+    },
+    "dynamic-compiled": {
+      "masks": 77582,
+      "schemas": 126,
+      "decoded_bytes": 1245309459,
+      "sha256": "e92ae58e35267945ea771421e735e574c34d2aa2f9d8b751454859d4d0ef33e6",
+      "compressed_bytes": 5297312
+    },
+    "dynamic-loaded": {
+      "masks": 77582,
+      "schemas": 126,
+      "decoded_bytes": 1245309459,
+      "sha256": "e92ae58e35267945ea771421e735e574c34d2aa2f9d8b751454859d4d0ef33e6",
+      "compressed_bytes": 5297312
+    }
+  },
+  "screen": {
+    "scope": "Only LL-success builds; only exact LL-measured (problem,example,step) runtime keys",
+    "metric": "mask_i+commit_i, minimum complete same-run pair over equal fresh-state repetitions",
+    "candidate_sha256": "b62a84073d997d00f81e2a449d984c3aa0577f3a6a2c41cf73fda5ab6a7defea",
+    "published_sha256": "b31202cdf46788e6ed5f74c8848947702c71cd5583a8bea2808acbc2fa2c38a2",
+    "groups": {
+      "js": {
+        "published": {
+          "full_masks": 4099,
+          "measured_keys": 4099,
+          "tbm_us": {
+            "p50": 2025.208,
+            "p90": 2748.7421999999997,
+            "p99": 3568.0913399999995,
+            "p99.9": 3984.5104820000015,
+            "p100": 4400.75
+          },
+          "raw_max_us": 5928.334,
+          "build_ms": [
+            89.950667,
+            87.43875,
+            90.373084,
+            113.343875,
+            118.17275,
+            90.487583
+          ],
+          "worst": [
+            [
+              4400.75,
+              [
+                "js",
+                23,
+                44
+              ]
+            ],
+            [
+              4286.666,
+              [
+                "js",
+                30,
+                927
+              ]
+            ],
+            [
+              4285.083,
+              [
+                "js",
+                23,
+                27
+              ]
+            ],
+            [
+              4042.125,
+              [
+                "js",
+                23,
+                11
+              ]
+            ],
+            [
+              3984.833,
+              [
+                "js",
+                30,
+                723
+              ]
+            ],
+            [
+              3981.542,
+              [
+                "js",
+                30,
+                640
+              ]
+            ],
+            [
+              3968.75,
+              [
+                "js",
+                23,
+                45
+              ]
+            ],
+            [
+              3967.333,
+              [
+                "js",
+                23,
+                16
+              ]
+            ],
+            [
+              3900.959,
+              [
+                "js",
+                22,
+                54
+              ]
+            ],
+            [
+              3879.875,
+              [
+                "js",
+                30,
+                650
+              ]
+            ],
+            [
+              3844.875,
+              [
+                "js",
+                30,
+                722
+              ]
+            ],
+            [
+              3830.25,
+              [
+                "js",
+                5,
+                21
+              ]
+            ]
+          ],
+          "build_median_ms": 90.4303335
+        },
+        "candidate": {
+          "full_masks": 4099,
+          "measured_keys": 4099,
+          "tbm_us": {
+            "p50": 2011.459,
+            "p90": 2697.8922000000007,
+            "p99": 3606.6375,
+            "p99.9": 3859.948616000011,
+            "p100": 4181.917
+          },
+          "raw_max_us": 5695.5,
+          "build_ms": [
+            90.947125,
+            89.879167,
+            86.835541,
+            100.206417,
+            92.813334,
+            98.939084
+          ],
+          "worst": [
+            [
+              4181.917,
+              [
+                "js",
+                23,
+                44
+              ]
+            ],
+            [
+              3947.833,
+              [
+                "js",
+                30,
+                927
+              ]
+            ],
+            [
+              3934.417,
+              [
+                "js",
+                5,
+                21
+              ]
+            ],
+            [
+              3933.958,
+              [
+                "js",
+                23,
+                27
+              ]
+            ],
+            [
+              3862.125,
+              [
+                "js",
+                30,
+                578
+              ]
+            ],
+            [
+              3839.917,
+              [
+                "js",
+                23,
+                16
+              ]
+            ],
+            [
+              3825.584,
+              [
+                "js",
+                30,
+                722
+              ]
+            ],
+            [
+              3816.625,
+              [
+                "js",
+                30,
+                632
+              ]
+            ],
+            [
+              3797.667,
+              [
+                "js",
+                23,
+                11
+              ]
+            ],
+            [
+              3795.875,
+              [
+                "js",
+                30,
+                951
+              ]
+            ],
+            [
+              3792.25,
+              [
+                "js",
+                22,
+                54
+              ]
+            ],
+            [
+              3783.084,
+              [
+                "js",
+                30,
+                611
+              ]
+            ]
+          ],
+          "build_median_ms": 91.8802295
+        }
+      },
+      "static": {
+        "published": {
+          "full_masks": 4099,
+          "measured_keys": 4099,
+          "tbm_us": {
+            "p50": 19.416,
+            "p90": 29.67520000000001,
+            "p99": 46.916019999999996,
+            "p99.9": 72.96138400000189,
+            "p100": 80.541
+          },
+          "raw_max_us": 164.708,
+          "build_ms": [
+            3703.739417,
+            3580.779583,
+            3541.252833,
+            3688.047,
+            3802.461042,
+            3715.0265
+          ],
+          "worst": [
+            [
+              80.541,
+              [
+                "js",
+                18,
+                53
+              ]
+            ],
+            [
+              78.417,
+              [
+                "js",
+                30,
+                583
+              ]
+            ],
+            [
+              74.959,
+              [
+                "js",
+                18,
+                14
+              ]
+            ],
+            [
+              74.042,
+              [
+                "js",
+                18,
+                55
+              ]
+            ],
+            [
+              73.333,
+              [
+                "js",
+                30,
+                545
+              ]
+            ],
+            [
+              69.541,
+              [
+                "js",
+                30,
+                577
+              ]
+            ],
+            [
+              68.792,
+              [
+                "js",
+                5,
+                13
+              ]
+            ],
+            [
+              66.625,
+              [
+                "js",
+                14,
+                12
+              ]
+            ],
+            [
+              61.458,
+              [
+                "js",
+                18,
+                12
+              ]
+            ],
+            [
+              60.709,
+              [
+                "js",
+                30,
+                543
+              ]
+            ],
+            [
+              58.75,
+              [
+                "js",
+                30,
+                578
+              ]
+            ],
+            [
+              58.708,
+              [
+                "js",
+                18,
+                54
+              ]
+            ]
+          ],
+          "build_median_ms": 3695.8932084999997
+        },
+        "candidate": {
+          "full_masks": 4099,
+          "measured_keys": 4099,
+          "tbm_us": {
+            "p50": 19.917,
+            "p90": 31.083,
+            "p99": 50.50749999999999,
+            "p99.9": 73.93473200000034,
+            "p100": 80.458
+          },
+          "raw_max_us": 161.042,
+          "build_ms": [
+            3532.373459,
+            3650.371959,
+            3678.239709,
+            3651.5938330000004,
+            3642.186541,
+            3621.507292
+          ],
+          "worst": [
+            [
+              80.458,
+              [
+                "js",
+                18,
+                53
+              ]
+            ],
+            [
+              79.833,
+              [
+                "js",
+                30,
+                583
+              ]
+            ],
+            [
+              78.041,
+              [
+                "js",
+                18,
+                14
+              ]
+            ],
+            [
+              74.25,
+              [
+                "js",
+                18,
+                55
+              ]
+            ],
+            [
+              74.0,
+              [
+                "js",
+                5,
+                13
+              ]
+            ],
+            [
+              73.334,
+              [
+                "js",
+                30,
+                545
+              ]
+            ],
+            [
+              72.291,
+              [
+                "js",
+                14,
+                12
+              ]
+            ],
+            [
+              70.583,
+              [
+                "js",
+                30,
+                577
+              ]
+            ],
+            [
+              64.958,
+              [
+                "js",
+                21,
+                6
+              ]
+            ],
+            [
+              63.042,
+              [
+                "js",
+                18,
+                12
+              ]
+            ],
+            [
+              61.375,
+              [
+                "js",
+                30,
+                543
+              ]
+            ],
+            [
+              59.333,
+              [
+                "js",
+                30,
+                578
+              ]
+            ]
+          ],
+          "build_median_ms": 3646.27925
+        }
+      },
+      "jsb": {
+        "published": {
+          "full_masks": 9045,
+          "measured_keys": 9021,
+          "tbm_us": {
+            "p50": 67.957,
+            "p90": 111.917,
+            "p99": 361.53339999999787,
+            "p99.9": 2229.4106400000032,
+            "p100": 2281.874
+          },
+          "raw_max_us": 2481.499,
+          "build_ms": [],
+          "worst": [
+            [
+              2281.874,
+              [
+                "jsb/data/Github_ultra---o21135",
+                1,
+                17
+              ]
+            ],
+            [
+              2280.624,
+              [
+                "jsb/data/Github_ultra---o21135",
+                1,
+                466
+              ]
+            ],
+            [
+              2274.541,
+              [
+                "jsb/data/Github_ultra---o21135",
+                0,
+                473
+              ]
+            ],
+            [
+              2259.625,
+              [
+                "jsb/data/Github_ultra---o21135",
+                1,
+                1049
+              ]
+            ],
+            [
+              2256.25,
+              [
+                "jsb/data/Github_ultra---o21135",
+                0,
+                1172
+              ]
+            ],
+            [
+              2254.043,
+              [
+                "jsb/data/Github_ultra---o21135",
+                0,
+                926
+              ]
+            ],
+            [
+              2254.0,
+              [
+                "jsb/data/Github_ultra---o21135",
+                0,
+                17
+              ]
+            ],
+            [
+              2252.459,
+              [
+                "jsb/data/Github_ultra---o21135",
+                0,
+                1043
+              ]
+            ],
+            [
+              2247.751,
+              [
+                "jsb/data/Github_ultra---o21135",
+                1,
+                933
+              ]
+            ],
+            [
+              2229.459,
+              [
+                "jsb/data/Github_ultra---o21135",
+                0,
+                1240
+              ]
+            ],
+            [
+              2227.041,
+              [
+                "jsb/data/Github_ultra---o21135",
+                0,
+                1097
+              ]
+            ],
+            [
+              2225.791,
+              [
+                "jsb/data/Github_ultra---o21135",
+                1,
+                1180
+              ]
+            ]
+          ]
+        },
+        "candidate": {
+          "full_masks": 9045,
+          "measured_keys": 9021,
+          "tbm_us": {
+            "p50": 68.333,
+            "p90": 112.667,
+            "p99": 361.1509999999955,
+            "p99.9": 2251.6909800000044,
+            "p100": 2301.833
+          },
+          "raw_max_us": 5127.583,
+          "build_ms": [],
+          "worst": [
+            [
+              2301.833,
+              [
+                "jsb/data/Github_ultra---o21135",
+                1,
+                466
+              ]
+            ],
+            [
+              2295.958,
+              [
+                "jsb/data/Github_ultra---o21135",
+                1,
+                17
+              ]
+            ],
+            [
+              2279.083,
+              [
+                "jsb/data/Github_ultra---o21135",
+                1,
+                933
+              ]
+            ],
+            [
+              2278.041,
+              [
+                "jsb/data/Github_ultra---o21135",
+                0,
+                1172
+              ]
+            ],
+            [
+              2269.334,
+              [
+                "jsb/data/Github_ultra---o21135",
+                0,
+                1240
+              ]
+            ],
+            [
+              2268.583,
+              [
+                "jsb/data/Github_ultra---o21135",
+                0,
+                17
+              ]
+            ],
+            [
+              2268.333,
+              [
+                "jsb/data/Github_ultra---o21135",
+                1,
+                1049
+              ]
+            ],
+            [
+              2266.626,
+              [
+                "jsb/data/Github_ultra---o21135",
+                1,
+                1109
+              ]
+            ],
+            [
+              2260.541,
+              [
+                "jsb/data/Github_ultra---o21135",
+                0,
+                473
+              ]
+            ],
+            [
+              2251.751,
+              [
+                "jsb/data/Github_ultra---o21135",
+                1,
+                1112
+              ]
+            ],
+            [
+              2248.75,
+              [
+                "jsb/data/Github_ultra---o21135",
+                1,
+                1056
+              ]
+            ],
+            [
+              2248.584,
+              [
+                "jsb/data/Github_ultra---o21135",
+                0,
+                1043
+              ]
+            ]
+          ]
+        }
+      }
+    }
+  },
+  "raw_tail_recheck": [
+    {
+      "version": "published",
+      "file": "0-published.json",
+      "module_sha256": "b31202cdf46788e6ed5f74c8848947702c71cd5583a8bea2808acbc2fa2c38a2",
+      "mask_keys": 3240,
+      "raw_max_us": 2521.875,
+      "target_runs_us": [
+        [
+          2352.875,
+          11.167
+        ],
+        [
+          2304.458,
+          5.917
+        ],
+        [
+          2251.291,
+          3.125
+        ]
+      ]
+    },
+    {
+      "version": "candidate",
+      "file": "1-candidate.json",
+      "module_sha256": "b62a84073d997d00f81e2a449d984c3aa0577f3a6a2c41cf73fda5ab6a7defea",
+      "mask_keys": 3240,
+      "raw_max_us": 2480.417,
+      "target_runs_us": [
+        [
+          2301.5,
+          6.333
+        ],
+        [
+          2373.834,
+          4.625
+        ],
+        [
+          2430.708,
+          8.583
+        ]
+      ]
+    },
+    {
+      "version": "candidate",
+      "file": "2-candidate.json",
+      "module_sha256": "b62a84073d997d00f81e2a449d984c3aa0577f3a6a2c41cf73fda5ab6a7defea",
+      "mask_keys": 3240,
+      "raw_max_us": 2476.375,
+      "target_runs_us": [
+        [
+          2229.708,
+          3.042
+        ],
+        [
+          2251.167,
+          3.084
+        ],
+        [
+          2315.958,
+          5.125
+        ]
+      ]
+    },
+    {
+      "version": "published",
+      "file": "3-published.json",
+      "module_sha256": "b31202cdf46788e6ed5f74c8848947702c71cd5583a8bea2808acbc2fa2c38a2",
+      "mask_keys": 3240,
+      "raw_max_us": 2499.917,
+      "target_runs_us": [
+        [
+          2295.375,
+          4.208
+        ],
+        [
+          2371.5,
+          12.833
+        ],
+        [
+          2260.042,
+          3.916
+        ]
+      ]
+    }
+  ],
+  "raw_spike": {
+    "problem": "jsb/data/Github_ultra---o21135",
+    "example": 1,
+    "step": 933,
+    "first_raw_pair_ns": [
+      5110125,
+      17458
+    ],
+    "same_case_other_candidate_pairs_ns": [
+      [
+        2276250,
+        3333
+      ],
+      [
+        2310750,
+        4708
+      ],
+      [
+        2275500,
+        3583
+      ],
+      [
+        2454166,
+        13500
+      ],
+      [
+        2334958,
+        6375
+      ]
+    ],
+    "conclusion": "Did not recur in four-process ABBA recheck. Cause not established; original observation retained."
+  },
+  "evidence": {
+    "check-examples.log": {
+      "bytes": 4745,
+      "sha256": "4c1185a386193a260806729ed0fb910a5f37a852b28bba4d3acb9c9dfbaa3cc0"
+    },
+    "screen.log": {
+      "bytes": 15015,
+      "sha256": "980e9fbc460734e9aa28aab9611fbf294ccd8d2667a7628c22f0523adbd0f5bb"
+    },
+    "capture-validation.log": {
+      "bytes": 844,
+      "sha256": "bc350ae9ca7c74f18238bce8292b202f1d9c24905b04904d0a311fda44b46299"
+    },
+    "test-workspace.log": {
+      "bytes": 252777,
+      "sha256": "69c14759374e9616b353a168a83b75c5f7ac4ee2a4fbdcddc7916adeb40246f6"
+    },
+    "package.json": {
+      "bytes": 380,
+      "sha256": "93ff698b968cfde1c0fbec524e8d51e93416d47d21f3a633fe4a997558328116"
+    },
+    "build-python.log": {
+      "bytes": 641,
+      "sha256": "0e3e2dd4213be660388c8b99985c64bcd654e7126933cf65610434fcc5cd8ffd"
+    },
+    "test-doc.log": {
+      "bytes": 538,
+      "sha256": "2f2d822a56acc35c4215b17279203ff3523526b0f2fd47772128a1c1a17dc89f"
+    },
+    "test-python.log": {
+      "bytes": 753,
+      "sha256": "d655f9d483b5f5b8d7eb447c861fc859a586e2b98b0c4e6341f4094973a83fed"
+    },
+    "captures/dynamic-loaded.zst.json": {
+      "bytes": 95616,
+      "sha256": "d73f2129b706b279881e7e2fe79a61f54dd0bc05731424d09cd4fd52abdf73ed"
+    },
+    "captures/summary.json": {
+      "bytes": 861,
+      "sha256": "e43ca17ff027647a6c726bfb505a47f8f7e14a4c6586558c53559a5c843a8be4"
+    },
+    "captures/static-loaded.zst.json": {
+      "bytes": 95616,
+      "sha256": "2cf718870b73e731a4d4549ae0efe85ac8a480c1e3becc32253d7119732e961c"
+    },
+    "captures/static-compiled.log": {
+      "bytes": 5077,
+      "sha256": "ed925885792302c53cd6799d08c6f6fd1119f1c44a706003b9f48b59a3a06ed2"
+    },
+    "captures/dynamic-compiled.log": {
+      "bytes": 5077,
+      "sha256": "ed925885792302c53cd6799d08c6f6fd1119f1c44a706003b9f48b59a3a06ed2"
+    },
+    "captures/dynamic-compiled.zst.json": {
+      "bytes": 95616,
+      "sha256": "3a0de01fc31e0e07a038ea51b20dafcf314fabbebf12ff9b48b615eabbcb34c4"
+    },
+    "captures/static-compiled.zst.json": {
+      "bytes": 95616,
+      "sha256": "22955d8d3947902ef782065cfd09b211e177d8ae33ba2dbe0ea782122115bb4b"
+    },
+    "captures/static-loaded.log": {
+      "bytes": 5077,
+      "sha256": "ed925885792302c53cd6799d08c6f6fd1119f1c44a706003b9f48b59a3a06ed2"
+    },
+    "captures/dynamic-loaded.log": {
+      "bytes": 5077,
+      "sha256": "ed925885792302c53cd6799d08c6f6fd1119f1c44a706003b9f48b59a3a06ed2"
+    },
+    "raw-tail-recheck/3-published.log": {
+      "bytes": 75,
+      "sha256": "1317c21aa0926a2926f409b1ed5f265a98a6138e1efe2ff3660c6495ed30ea94"
+    },
+    "raw-tail-recheck/1-candidate.json": {
+      "bytes": 1399620,
+      "sha256": "0fde7305fffd4d52509d9f7d5e1005abdc596172cf25b80f857037fba1a5ddc1"
+    },
+    "raw-tail-recheck/summary.json": {
+      "bytes": 1541,
+      "sha256": "fc187566fce51ab70620e94edc3f2ff4d2fb7cd4fa2ca474f1109f385be965a9"
+    },
+    "raw-tail-recheck/0-published.log": {
+      "bytes": 52,
+      "sha256": "cbbbcafa8704f47492a99482b527ee35ae7dad70e2c1a52434107561698dd377"
+    },
+    "raw-tail-recheck/2-candidate.json": {
+      "bytes": 1399049,
+      "sha256": "df3ffb518080e64a63ac5393e080963172429f7dbf573ebc284948b2d79627ae"
+    },
+    "raw-tail-recheck/0-published.json": {
+      "bytes": 1399329,
+      "sha256": "3c60a310e959515006e58e992ec89bea4253b849e55fa521818807a94d0b8ea1"
+    },
+    "raw-tail-recheck/1-candidate.log": {
+      "bytes": 75,
+      "sha256": "d56a596172017b645435054bc701bf0659599707a9d68ae9c2f0512a7370069b"
+    },
+    "raw-tail-recheck/3-published.json": {
+      "bytes": 1399323,
+      "sha256": "2d22c67f1f19c31fea9d5410083938425e2c2af6fe9554657974d4d700c506a8"
+    },
+    "raw-tail-recheck/2-candidate.log": {
+      "bytes": 75,
+      "sha256": "01be4f4bf5b6b6a637f7e25e4a24c99c521b790cb2f7b54305d8f2d49af0d4ac"
+    },
+    "premerge-vs-postmerge/jsb-published-1.log": {
+      "bytes": 1807,
+      "sha256": "d24e57d45e5b6ac95577d39d40e6515334525b6d54d43b46135268cfc680f845"
+    },
+    "premerge-vs-postmerge/summary.json": {
+      "bytes": 13339,
+      "sha256": "757fef02518c283460b76ade928e9ceb7ee8e3d557a8678ac5e70f788f9b5c90"
+    },
+    "premerge-vs-postmerge/static-candidate-1.json": {
+      "bytes": 1447888,
+      "sha256": "e8eca3a2f8a7b03b909de834efd9b1a31a945577fe412fe198877f0a3f69ca96"
+    },
+    "premerge-vs-postmerge/jsb-published-2.log": {
+      "bytes": 1828,
+      "sha256": "6f4a99c8e06eb435ffcfb638c22c1b5a9018706247337bc59c56406dafd20d1c"
+    },
+    "premerge-vs-postmerge/jsb-candidate-1.json": {
+      "bytes": 3947830,
+      "sha256": "c6289735ecb80ab1fa457f2946d9350a0426b37e154e9b7f77d616e23ef50d56"
+    },
+    "premerge-vs-postmerge/js-candidate-1.json": {
+      "bytes": 1481544,
+      "sha256": "b000dda7ff50dc6e9b1d4747418614cad5c1bb63269e883b0eef4c7da1854bf0"
+    },
+    "premerge-vs-postmerge/js-published-2.json": {
+      "bytes": 1482038,
+      "sha256": "147b45fa8a9a095a0db51f2b41e494162bbdc5f457354063d511ce2265558f98"
+    },
+    "premerge-vs-postmerge/jsb-published-2.meta.json": {
+      "bytes": 1498,
+      "sha256": "6741e5617c5599dbe0c0be93f1a26462a0826c1c359ad8ebe1cdcd2953e999ef"
+    },
+    "premerge-vs-postmerge/static-published-2.log": {
+      "bytes": 728,
+      "sha256": "a7bf6f17e57b0e3e80776475458137157e50024468986589d4daa59124da482d"
+    },
+    "premerge-vs-postmerge/js-candidate-2.meta.json": {
+      "bytes": 1350,
+      "sha256": "095cfdbc792447365448befa6fd5d81c0221a47563a4c4aa50075132eac00a2f"
+    },
+    "premerge-vs-postmerge/static-published-1.log": {
+      "bytes": 698,
+      "sha256": "c3aef924545166abd7ffd199b93ce0c4356930c4c6e868a1e1ae0abc2480a5cd"
+    },
+    "premerge-vs-postmerge/static-published-2.meta.json": {
+      "bytes": 1357,
+      "sha256": "d00e78a064ddb4cc1ebff52298d97e6dd08aa26df7fd5851f238348ae2af85d7"
+    },
+    "premerge-vs-postmerge/static-published-2.json": {
+      "bytes": 1447696,
+      "sha256": "c7173b51324ea60686c875ef518d6d3ecac6f692ab08a31190732e3b6199fe74"
+    },
+    "premerge-vs-postmerge/js-published-2.log": {
+      "bytes": 725,
+      "sha256": "feb08908352d6539df9e186d1c118822efc698a91a81c3687fbe793412ac1ebb"
+    },
+    "premerge-vs-postmerge/js-published-1.meta.json": {
+      "bytes": 1182,
+      "sha256": "4f30dbda7eb1eb170fe3e7fa977567f6e38679c71fc75076b03a27bc90c36114"
+    },
+    "premerge-vs-postmerge/jsb-candidate-1.meta.json": {
+      "bytes": 1498,
+      "sha256": "4e775a75660d6fee904b6ebe7addfbcb6ce149d4cba51de0b349f5814703c8d9"
+    },
+    "premerge-vs-postmerge/js-published-1.log": {
+      "bytes": 714,
+      "sha256": "0c0fe2a7e9b6cd08d93fa32a28acbc1baffe8e71dfa29aed9a5f530db200e94a"
+    },
+    "premerge-vs-postmerge/jsb-published-2.json": {
+      "bytes": 3948534,
+      "sha256": "d03c7397aac6b8eeb9710c4cbdf73cbb116fe03b487111416b6aed7bb90da096"
+    },
+    "premerge-vs-postmerge/static-candidate-1.meta.json": {
+      "bytes": 1357,
+      "sha256": "a5c72bafed2579c3363c9e61b9595f149410a624a95db60a7b5c029d9e1e8696"
+    },
+    "premerge-vs-postmerge/js-candidate-1.meta.json": {
+      "bytes": 1350,
+      "sha256": "81534a7923a6e2bd00673bf71acb1cd7c9a2ed6388a5b0e231de0cf14a7b33c6"
+    },
+    "premerge-vs-postmerge/jsb-published-1.meta.json": {
+      "bytes": 1329,
+      "sha256": "0d72a960346139c0b4022a3e6f8c586605a8a8243ee84ecc00aba5eb86e7ef88"
+    },
+    "premerge-vs-postmerge/jsb-published-1.json": {
+      "bytes": 3946833,
+      "sha256": "9f0a9fc54e23e4afe47167445f548871572b4c6effd89688b3fa315d9ffa8f36"
+    },
+    "premerge-vs-postmerge/static-published-1.json": {
+      "bytes": 1447149,
+      "sha256": "2332c14a6bebdf091b61c0bce64024cd6c21714b27fac35cde291c6d8e596474"
+    },
+    "premerge-vs-postmerge/static-published-1.meta.json": {
+      "bytes": 1185,
+      "sha256": "1a22c6ad5c2caee1ef7695be9e72744e281918c03d94d19c56ff2112bec94ee6"
+    },
+    "premerge-vs-postmerge/jsb-candidate-2.meta.json": {
+      "bytes": 1498,
+      "sha256": "07ed1a1f832bc1e4b595ca34101ad71b3c7adf1834edf984a26490c257bede19"
+    },
+    "premerge-vs-postmerge/js-published-2.meta.json": {
+      "bytes": 1350,
+      "sha256": "a3d0f4ed0bad2a3c37f6ee79981e406a9730e699b43bb0a1acb5fbca2343b627"
+    },
+    "premerge-vs-postmerge/jsb-candidate-1.log": {
+      "bytes": 1833,
+      "sha256": "f3fea87225c22bbe5110c57bae043087ed2c37850d0141879d72fb996e9c7783"
+    },
+    "premerge-vs-postmerge/static-candidate-2.meta.json": {
+      "bytes": 1357,
+      "sha256": "ea52c04158605f5c645ef747e19fbeac191f8e57d6f77743ac89d0b6c5e29b19"
+    },
+    "premerge-vs-postmerge/js-published-1.json": {
+      "bytes": 1481320,
+      "sha256": "3f2dde7af8923acee218d2f2afa9ba71be4c669c254964625fd115ce16867103"
+    },
+    "premerge-vs-postmerge/jsb-candidate-2.log": {
+      "bytes": 1834,
+      "sha256": "2941ea80a1214fb2184df88de8595c52a780ec20d85788203e9e14ceea0474c0"
+    },
+    "premerge-vs-postmerge/js-candidate-2.log": {
+      "bytes": 731,
+      "sha256": "13601377cd6105061d6064858b0ab0a10a6ac3a9f9d10160102067f8eb5d9cbd"
+    },
+    "premerge-vs-postmerge/js-candidate-1.log": {
+      "bytes": 721,
+      "sha256": "35953bd2d3dde15baca6b3529b843157a0a60eac6688bca97bc9b61cd650b595"
+    },
+    "premerge-vs-postmerge/js-candidate-2.json": {
+      "bytes": 1481789,
+      "sha256": "7d1ccec3f27a7854a63570b3a477b5bcd9624beaa13c34b0dd95c5b01a21b8bd"
+    },
+    "premerge-vs-postmerge/static-candidate-2.log": {
+      "bytes": 760,
+      "sha256": "dea01cbac06c5be79f3a92e67c5c9aa8aa04e5351a38d3566f59a6338a72ccd5"
+    },
+    "premerge-vs-postmerge/jsb-candidate-2.json": {
+      "bytes": 3948030,
+      "sha256": "fed867ce9f4d00427f0d7204cfe451e7a5d40125551f8790a674d4e2dfb33942"
+    },
+    "premerge-vs-postmerge/static-candidate-1.log": {
+      "bytes": 732,
+      "sha256": "ffe98b6ca8a71850d961c81eaf1d73012257f5a9df7891c83d4633cf79af60f7"
+    },
+    "premerge-vs-postmerge/static-candidate-2.json": {
+      "bytes": 1447673,
+      "sha256": "64c4ca9bd8aba1dcfd6333f9f361c6731055b6240d19a27bf7d58e2c0fe190fd"
+    }
+  }
+}

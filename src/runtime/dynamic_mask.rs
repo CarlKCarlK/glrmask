@@ -8688,7 +8688,7 @@ fn cmp_transient_entries(
             (Some(pa), Some(pb)) => {
                 let slice_a = &arena[pa.arena_start as usize..pa.arena_end as usize];
                 let slice_b = &arena[pb.arena_start as usize..pb.arena_end as usize];
-                match slice_a.iter().rev().cmp(slice_b.iter().rev()) {
+                match slice_a.cmp(slice_b) {
                     std::cmp::Ordering::Equal => {}
                     non_eq => return non_eq,
                 }
@@ -8711,15 +8711,10 @@ impl DynamicMaskLookupScratch {
             paths.len().hash(&mut hasher);
             for path in paths {
                 let slice = &self.stack_arena[path.arena_start as usize..path.arena_end as usize];
-                if slice.len() <= 32 {
-                    let mut rev = SmallVec::<[u32; 32]>::new();
-                    rev.extend(slice.iter().rev().copied());
-                    rev.as_slice().hash(&mut hasher);
-                } else {
-                    let mut rev = slice.to_vec();
-                    rev.reverse();
-                    rev.as_slice().hash(&mut hasher);
-                }
+                // Traversal already supplies top-first values. Cache keys are
+                // in-memory only: preserve this exact order in owned keys too,
+                // avoiding a temporary reversed allocation for every deep path.
+                slice.hash(&mut hasher);
                 path.acc.len().hash(&mut hasher);
                 for (state, terminals) in path.acc.iter() {
                     state.hash(&mut hasher);
@@ -8754,7 +8749,7 @@ impl DynamicMaskLookupScratch {
                 if slice.len() != stored_path.0.len() {
                     return false;
                 }
-                if !slice.iter().rev().eq(stored_path.0.iter()) {
+                if slice != stored_path.0.as_slice() {
                     return false;
                 }
                 if path.acc.len() != stored_path.1.len() {
@@ -8790,8 +8785,7 @@ impl DynamicMaskLookupScratch {
             let mut owned_paths = Vec::with_capacity(paths.len());
             for path in paths {
                 let slice = &self.stack_arena[path.arena_start as usize..path.arena_end as usize];
-                let mut stack = slice.to_vec();
-                stack.reverse();
+                let stack = slice.to_vec();
                 let mut exclusion_entries = Vec::with_capacity(path.acc.len());
                 for (excluded_state, terminals) in path.acc.iter() {
                     let term_vec = terminals.iter().copied().collect::<Vec<_>>();
@@ -8865,7 +8859,7 @@ fn dynamic_mask_lookup_query_for_vocab(
             scratch.paths[path_start as usize..path_end as usize].sort_unstable_by(|a, b| {
                 let slice_a = &scratch.stack_arena[a.arena_start as usize..a.arena_end as usize];
                 let slice_b = &scratch.stack_arena[b.arena_start as usize..b.arena_end as usize];
-                slice_a.iter().rev().cmp(slice_b.iter().rev())
+                slice_a.cmp(slice_b)
                     .then_with(|| cmp_terminals_disallowed(&a.acc, &b.acc))
             });
         }
@@ -11299,6 +11293,84 @@ mod tests {
             "one-token-equivalent projected lexer states must share the persistent dynamic-mask cache key",
         );
         assert_eq!(mask_before, direct_mask(&state));
+    }
+
+    #[test]
+    fn dynamic_mask_lookup_top_first_order_preserves_exact_path_keys() {
+        // A literal old-orientation key is the independent reference. Include
+        // empty, inline, heap-sized and maximum-depth stacks; key identity must
+        // retain values at every depth and every correlated exclusion.
+        let mut reference: DynamicMaskStateKey = Vec::new();
+        for entry in 0..7_u32 {
+            let lexer = match entry % 3 {
+                0 => DynamicMaskLexerStateKey::Exact(entry),
+                1 => DynamicMaskLexerStateKey::RecursiveExact(entry),
+                _ => DynamicMaskLexerStateKey::MaskProjection { state: entry, initial: false },
+            };
+            let mut paths = Vec::new();
+            for (case, depth) in [0, 1, 2, 31, 32, 33, 65, 128, 256].into_iter().enumerate() {
+                let stack = (0..depth).map(|i| (i * 17 + case * 3) as u32).collect();
+                let mut exclusions = Vec::new();
+                if case % 3 != 0 {
+                    exclusions.push((entry, (0..case * 5).map(|i| i as u32).collect()));
+                    exclusions.push((entry + 100, vec![0, 255, 1024]));
+                }
+                paths.push((stack, exclusions));
+            }
+            paths.sort();
+            reference.push((lexer, paths));
+        }
+        reference.sort();
+
+        let mut scratch = DynamicMaskLookupScratch {
+            stack_arena: SmallVec::new(), paths: SmallVec::new(), entries: SmallVec::new(),
+        };
+        // Reverse entry/path insertion order, and add a duplicate lexer group.
+        for (lexer, paths) in reference.iter().rev().chain(reference.first()) {
+            let path_start = scratch.paths.len() as u32;
+            for (bottom_first, exclusions) in paths.iter().rev() {
+                let arena_start = scratch.stack_arena.len() as u32;
+                scratch.stack_arena.extend(bottom_first.iter().rev().copied());
+                let mut acc = TerminalsDisallowed::new();
+                for (lexer, terminals) in exclusions {
+                    for terminal in terminals { acc = acc.with_insert(*lexer, *terminal); }
+                }
+                scratch.paths.push(TransientPath {
+                    arena_start, arena_end: scratch.stack_arena.len() as u32, acc,
+                });
+            }
+            let path_end = scratch.paths.len() as u32;
+            scratch.paths[path_start as usize..path_end as usize].sort_unstable_by(|a, b| {
+                scratch.stack_arena[a.arena_start as usize..a.arena_end as usize]
+                    .cmp(&scratch.stack_arena[b.arena_start as usize..b.arena_end as usize])
+                    .then_with(|| cmp_terminals_disallowed(&a.acc, &b.acc))
+            });
+            scratch.entries.push(TransientEntry { lexer_key: *lexer, path_start, path_end });
+        }
+        scratch.entries.sort_unstable_by(|a, b|
+            cmp_transient_entries(a, b, &scratch.paths, &scratch.stack_arena));
+        scratch.entries.dedup_by(|a, b|
+            cmp_transient_entries(a, b, &scratch.paths, &scratch.stack_arena).is_eq());
+        let owned = scratch.to_owned_state_key();
+        assert!(scratch.matches_state(&owned));
+        assert_eq!(scratch.compute_hash(), crate::runtime::artifact::dynamic_mask_state_key_hash(&owned));
+        let mut old_orientation = owned.clone();
+        for (_, paths) in &mut old_orientation {
+            for (stack, _) in paths.iter_mut() { stack.reverse(); }
+            paths.sort();
+        }
+        old_orientation.sort();
+        assert_eq!(old_orientation, reference, "orientation cannot change exact key equivalence");
+
+        let mut changed = owned.clone();
+        let deep = changed[0].1.iter_mut().find(|p| p.0.len() == 256).unwrap();
+        deep.0[128] ^= 1;
+        assert!(!scratch.matches_state(&changed), "all stack values participate in equality");
+        changed = owned.clone();
+        let excluded = changed[0].1.iter_mut().find(|p| !p.1.is_empty()).unwrap();
+        excluded.1[0].1.push(8192);
+        assert!(!scratch.matches_state(&changed), "all exclusions participate in equality");
+        assert!(!scratch.matches_state(&reference), "opposite orientations must not alias");
     }
 
     #[test]
