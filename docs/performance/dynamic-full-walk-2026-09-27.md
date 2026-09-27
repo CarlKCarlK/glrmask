@@ -177,3 +177,39 @@ CFA run uses `make example-js FRAMEWORKS='glrmask_dynamic llguidance_native'
 TIMING_RUNS=6 TIMING_MIN_RUNS=6 TIMING_WARMUP_RUNS=0 BUILD_RUNS=6
 RECORD_TIMING_RUNS=always RUNTIME_TIMING_CLOCK=thread`; select the intended
 GLRMask package with the caller's `PYTHONPATH` and retain the `_raw` sidecar.
+
+## Post-upstream integration check
+
+The runtime release was merged normally with upstream `51f44dce3`, preserving
+its certified parser-read-context changes. Exact combined source `e07744d3a`
+passed 2,269 Rust workspace tests with zero failures and 55 ignored, the
+documentation/example gates, and all 42 Python tests. All four 126-schema
+compiled/loaded captures again match the pinned 77,582-mask streams.
+
+An independent premerge-versus-postmerge ABBA screen used the same corpus,
+three fresh loaded traversals per example per process, and unchanged runtime
+source files. The table uses the same cache-disabled walker-isolation protocol
+as the controlled comparison above, not a fresh llguidance comparison.
+
+| Metric | Premerge | Postmerge |
+| --- | ---: | ---: |
+| Dynamic JS P90, us | 2748.742 | 2697.892 |
+| Dynamic JS P100, us | 4400.750 | 4181.917 |
+| Static JS P90, us | 29.675 | 31.083 |
+| Static JS P100, us | 80.541 | 80.458 |
+| Dynamic JSB guard P90, us | 111.917 | 112.667 |
+| Dynamic JSB guard P100, us | 2281.874 | 2301.833 |
+
+Every full mask agrees: 4,099 JS keys in each mode and 9,045 JSB keys, of
+which 9,021 have matching llguidance timings. A raw 5,127.583 us JSB
+observation at `o21135`, example 1, step 933 is retained. The other five
+candidate repetitions at that position were about 2.28–2.47 ms. A separate
+four-process ABBA recheck of both full examples preserved all 3,240 masks;
+whole-case raw maxima were 2.48–2.52 ms on both versions. The spike did not
+recur, but its cause was not established and the original measurement is not
+deleted. This is not a claim of a hard latency bound.
+
+`dynamic-full-walk-postmerge-2026-09-27.json` records this additional gate,
+all capture hashes, test totals, paired observations, and the retained spike.
+The remaining production JS P100 gap and dynamic-JSB middle overhead
+documented above are still open.
