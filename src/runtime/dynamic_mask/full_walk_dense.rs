@@ -3025,6 +3025,14 @@ fn identity_alphabet_covers_subtree(identity: &[u64; 4], subtree: [u64; 4]) -> b
     subtree.iter().zip(identity).all(|(&needed, &known)| needed & !known == 0)
 }
 
+/// Deferred accounting must still visit every marker. Once polarity is
+/// fixed, a constant subtree needs no writes when its verdict already agrees
+/// with the initialized output bits. Token aliases then require no work either.
+#[inline]
+fn identity_subtree_requires_output(deferred: bool, positive: bool, allowed: bool) -> bool {
+    deferred || positive == allowed
+}
+
 struct FullWalkParserNode {
     gss: ParserStacks,
     admitted: Option<BitSet>,
@@ -6965,14 +6973,6 @@ fn try_full_walk_mask_with_table_from_initial_in_output_scope<
             }
         }
 
-        let scalar_identity_source = if identity_active
-            && scalar_lexer < FULL_WALK_LEXER_TWO_DISTINCT
-        {
-            Some((scalar_lexer, scalar_parser))
-        } else {
-            None
-        };
-        let mut scalar_ordinary_identity = false;
         if op.consumes_byte() {
             let byte = op.byte();
             if profile_walk {
@@ -7053,6 +7053,8 @@ fn try_full_walk_mask_with_table_from_initial_in_output_scope<
             }
             if scalar_lexer == FULL_WALK_LEXER_DEAD {
             } else if scalar_lexer < FULL_WALK_LEXER_TWO_DISTINCT {
+                let scalar_identity_source = (scalar_lexer, scalar_parser);
+                let mut scalar_ordinary_identity = false;
                 let cell = transitions.cell(scalar_lexer, byte);
                 if T::cell_is_dead(cell) {
                     scalar_lexer = FULL_WALK_LEXER_DEAD;
@@ -7291,6 +7293,24 @@ fn try_full_walk_mask_with_table_from_initial_in_output_scope<
                                     }
                                 }
                             }
+                            }
+                        }
+                    }
+                }
+                if identity_active {
+                    let source = scalar_identity_source;
+                    scalar_identity.remember(source, (scalar_lexer, scalar_parser), byte);
+                    if scalar_ordinary_identity
+                        && scalar_identity.state == Some(source)
+                        && !scalar_identity.proof_checked
+                    {
+                        scalar_identity.proof_checked = true;
+                        // Admission succeeded at this exact (lexer, parser)
+                        // pair. All non-finalizing self-edges have the same
+                        // target and parser-conditioned liveness result.
+                        if let Some(classes) = identity_proofs.get(&transitions, tokenizer, source.0) {
+                            for (known, exact) in scalar_identity.bytes.iter_mut().zip(classes.ordinary) {
+                                *known |= exact;
                             }
                         }
                     }
@@ -7740,26 +7760,6 @@ fn try_full_walk_mask_with_table_from_initial_in_output_scope<
             }
         }
 
-        if op.consumes_byte() {
-            if let Some(source) = scalar_identity_source {
-                scalar_identity.remember(source, (scalar_lexer, scalar_parser), op.byte());
-                if identity_active
-                    && scalar_ordinary_identity
-                    && scalar_identity.state == Some(source)
-                    && !scalar_identity.proof_checked
-                {
-                    scalar_identity.proof_checked = true;
-                    // Admission succeeded at this exact (lexer, parser) pair.
-                    // Every non-finalizing self-edge has that same target and
-                    // therefore the same parser-conditioned liveness test.
-                    if let Some(classes) = identity_proofs.get(&transitions, tokenizer, source.0) {
-                        for (known, exact) in scalar_identity.bytes.iter_mut().zip(classes.ordinary) {
-                            *known |= exact;
-                        }
-                    }
-                }
-            }
-        }
         if op.ends_edge() {
             if identity_active {
                 let identity = if scalar_lexer < FULL_WALK_LEXER_TWO_DISTINCT
@@ -7861,38 +7861,40 @@ fn try_full_walk_mask_with_table_from_initial_in_output_scope<
                         // existing deferred/adaptive output polarity. A marker
                         // may represent several original vocabulary aliases.
                         // No descendants' parser/lexer transitions are needed.
-                        for &token_marker in &token_markers[token_marker_index..token_end] {
-                            if deferred_output {
-                                let mutations = dynamic_token_marker_original_count(vocab, token_marker);
-                                let marker_work = dynamic_token_marker_materialization_cost(vocab, token_marker);
-                                if allowed {
-                                    deferred_positive_mutations =
-                                        deferred_positive_mutations.saturating_add(mutations);
-                                    deferred_positive_work = deferred_positive_work.saturating_add(marker_work);
-                                    deferred_allowed_markers.push(token_marker);
-                                } else {
-                                    deferred_negative_mutations =
-                                        deferred_negative_mutations.saturating_add(mutations);
-                                    deferred_negative_work = deferred_negative_work.saturating_add(marker_work);
-                                    deferred_rejected_markers.push(token_marker);
-                                    full_walk_maybe_commit_deferred_positive(
-                                        vocab,
-                                        total_original_tokens,
-                                        &mut deferred_output,
-                                        &mut positive_rebuild,
-                                        deferred_negative_mutations,
-                                        &mut deferred_allowed_markers,
-                                        &mut deferred_rejected_markers,
-                                        &mut deferred_dead_subtrees,
-                                        buf,
-                                    );
+                        if identity_subtree_requires_output(deferred_output, positive_rebuild, allowed) {
+                            for &token_marker in &token_markers[token_marker_index..token_end] {
+                                if deferred_output {
+                                    let mutations = dynamic_token_marker_original_count(vocab, token_marker);
+                                    let marker_work = dynamic_token_marker_materialization_cost(vocab, token_marker);
+                                    if allowed {
+                                        deferred_positive_mutations =
+                                            deferred_positive_mutations.saturating_add(mutations);
+                                        deferred_positive_work = deferred_positive_work.saturating_add(marker_work);
+                                        deferred_allowed_markers.push(token_marker);
+                                    } else {
+                                        deferred_negative_mutations =
+                                            deferred_negative_mutations.saturating_add(mutations);
+                                        deferred_negative_work = deferred_negative_work.saturating_add(marker_work);
+                                        deferred_rejected_markers.push(token_marker);
+                                        full_walk_maybe_commit_deferred_positive(
+                                            vocab,
+                                            total_original_tokens,
+                                            &mut deferred_output,
+                                            &mut positive_rebuild,
+                                            deferred_negative_mutations,
+                                            &mut deferred_allowed_markers,
+                                            &mut deferred_rejected_markers,
+                                            &mut deferred_dead_subtrees,
+                                            buf,
+                                        );
+                                    }
+                                } else if positive_rebuild {
+                                    if allowed {
+                                        mark_dynamic_token_marker(vocab, token_marker, buf);
+                                    }
+                                } else if !allowed {
+                                    clear_dynamic_token_marker(vocab, token_marker, buf);
                                 }
-                            } else if positive_rebuild {
-                                if allowed {
-                                    mark_dynamic_token_marker(vocab, token_marker, buf);
-                                }
-                            } else if !allowed {
-                                clear_dynamic_token_marker(vocab, token_marker, buf);
                             }
                         }
                         identity_subtrees_skipped += 1;
@@ -8158,6 +8160,22 @@ fn try_full_walk_mask_with_table_from_initial_in_output_scope<
 #[cfg(test)]
 mod full_walk_acceleration_tests {
     use super::*;
+
+    #[test]
+    fn identity_output_noop_preserves_deferred_and_both_polarities() {
+        for (deferred, positive, allowed, expected) in [
+            (false, false, false, true),
+            (false, false, true, false),
+            (false, true, false, false),
+            (false, true, true, true),
+            (true, false, false, true),
+            (true, false, true, true),
+            (true, true, false, true),
+            (true, true, true, true),
+        ] {
+            assert_eq!(identity_subtree_requires_output(deferred, positive, allowed), expected);
+        }
+    }
 
     #[test]
     fn cached_identity_policy_changes_only_at_the_exact_node_threshold() {
