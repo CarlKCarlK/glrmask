@@ -61,6 +61,21 @@ trait FullWalkTransitionTable {
 
     fn cell_target(cell: Self::Cell) -> u32;
 
+    /// Exact self-transition classes of an already materialized table row.
+    /// Lazy tables override this: proving an alphabet must not create a large
+    /// collection of speculative derivative states for unused vocabulary bytes.
+    fn proven_identity_byte_classes(
+        &self,
+        _tokenizer: &Tokenizer,
+        state: u32,
+    ) -> Option<FullWalkIdentityByteClasses> {
+        Some(full_walk_identity_byte_classes(state, |byte| {
+            let cell = self.cell(state, byte);
+            (!Self::cell_is_dead(cell))
+                .then(|| (Self::cell_target(cell), Self::cell_has_finalizer(cell)))
+        }))
+    }
+
     #[inline(always)]
     fn transition(&self, state: u32, byte: u8) -> u32 {
         let cell = self.cell(state, byte);
@@ -396,6 +411,33 @@ impl<'a> FullWalkLazyUnion<'a> {
             }
     }
 
+    fn base_identity_byte_classes(
+        &self,
+        tokenizer: &Tokenizer,
+        state: u32,
+    ) -> Option<FullWalkIdentityByteClasses> {
+        if self.base_transitions16.is_some() || self.base_transitions32.is_some() {
+            // Existing dense rows are cheap read-only evidence. Do not call
+            // cell_raw(), which could materialize new union derivatives.
+            return Some(full_walk_identity_byte_classes(state, |byte| {
+                let cell = self.uncached_base_cell(state, byte);
+                (cell != u32::MAX).then(|| (cell & 0x7fff_ffff, cell & 0x8000_0000 != 0))
+            }));
+        }
+        // This query declines virtual/compressed coordinates. Plain physical
+        // transitions and their self-loop range query use the same immutable
+        // byte-transition semantics as dynamic_direct_transition().
+        tokenizer.dynamic_direct_transition_count(state)?;
+        let bytes = Lexer::self_loop_bytes(tokenizer, state).to_words();
+        let mut result = FullWalkIdentityByteClasses::default();
+        if tokenizer.matched_terminal_bitset(state).is_empty() {
+            result.ordinary = bytes;
+        } else {
+            result.finalizing = bytes;
+        }
+        Some(result)
+    }
+
     #[inline(always)]
     fn base_cell(&self, state: u32, byte: u8) -> u32 {
         if let Some(base_transitions) = self.base_transitions16 {
@@ -649,15 +691,24 @@ impl<'a> FullWalkLazyUnion<'a> {
         value
     }
 
-    #[inline]
+    #[inline(always)]
     fn ensure_virtual_metadata(&self, state: u32) -> bool {
         debug_assert!(state >= self.base_state_count);
         let Some(index) = self.checked_extension_index(state) else {
             return false;
         };
-        if unsafe { (&*self.cache.get()).metadata[index].is_some() } {
-            return true;
+        if unsafe { (&*self.cache.get()).metadata[index].is_none() } {
+            self.build_virtual_metadata(index);
         }
+        true
+    }
+
+    // Every finalizer/future lookup hits the small cached branch above. Keep
+    // first-use bitset construction out of those inlined vocabulary-walk
+    // sites, while retaining the checked extension-coordinate boundary.
+    #[cold]
+    #[inline(never)]
+    fn build_virtual_metadata(&self, index: usize) {
         let tokenizer = unsafe { &*self.tokenizer };
         let mut matched = BitSet::new(tokenizer.num_terminals() as usize);
         let mut futures = BitSet::new(tokenizer.num_terminals() as usize);
@@ -690,7 +741,6 @@ impl<'a> FullWalkLazyUnion<'a> {
         if cache.metadata[index].is_none() {
             cache.metadata[index] = Some(metadata);
         }
-        true
     }
 }
 
@@ -705,6 +755,29 @@ impl FullWalkTransitionTable for FullWalkLazyUnion<'_> {
     #[inline(always)] fn cell_is_dead(cell: u32) -> bool { cell == u32::MAX }
     #[inline(always)] fn cell_has_finalizer(cell: u32) -> bool { cell & 0x8000_0000 != 0 }
     #[inline(always)] fn cell_target(cell: u32) -> u32 { cell & 0x7fff_ffff }
+
+    fn proven_identity_byte_classes(
+        &self,
+        tokenizer: &Tokenizer,
+        state: u32,
+    ) -> Option<FullWalkIdentityByteClasses> {
+        if state < self.base_state_count {
+            return self.base_identity_byte_classes(tokenizer, state);
+        }
+        let index = self.checked_extension_index(state)?;
+        let cache = unsafe { &*self.cache.get() };
+        let members = &cache.subsets[index];
+        if members.len() > 8 { return None; }
+        let (&first, rest) = members.split_first()?;
+        let mut result = self.base_identity_byte_classes(tokenizer, first)?;
+        // Every member staying itself is sufficient for the exact union to
+        // stay itself. A union edge finalizes iff any member edge finalizes.
+        // No derivative state is interned by this proof.
+        for &member in rest {
+            result.intersect_union_member(self.base_identity_byte_classes(tokenizer, member)?);
+        }
+        Some(result)
+    }
 
     #[inline(always)]
     fn state_count(&self, _tokenizer: &Tokenizer) -> usize {
@@ -1708,6 +1781,7 @@ pub(super) fn try_scalar_dispatch(
     transitions32: Option<&[u32]>,
     finalizer_code: Option<&[u32]>,
     single_finalizer_continues: Option<&[u8]>,
+    ignored_output: Option<&[u32]>,
 ) -> Result<bool, String> {
     let tokenizer = lexer_scan_cache.tokenizer();
     if !tokenizer.has_scalar_deterministic_dispatch() {
@@ -1725,6 +1799,7 @@ pub(super) fn try_scalar_dispatch(
     if root_branches
         .iter()
         .any(|branch| !branch.initial_prune_guard.is_passed())
+        && !joint_initial_guard_walk_enabled(root_branches)
     {
         let mut merged = vec![0u32; buf.len()];
         let mut scratch = vec![0u32; buf.len()];
@@ -1748,6 +1823,7 @@ pub(super) fn try_scalar_dispatch(
                 transitions32,
                 finalizer_code,
                 single_finalizer_continues,
+                ignored_output,
             )? {
                 return Ok(false);
             }
@@ -1776,7 +1852,8 @@ pub(super) fn try_scalar_dispatch(
     // bytes from the current root configs cannot even cover a slice's
     // first-byte language, that slice cannot help this mask. This gate may
     // conservatively skip an optimization; it never admits a token.
-    let master_may_apply = if vocab.llg_master_trie().is_some()
+    let master_may_apply = if root_branches.iter().all(|branch| branch.initial_prune_guard.is_passed())
+        && vocab.llg_master_trie().is_some()
         && let (Some(safe_plus), Some(whitespace)) = (
             vocab.llg_slice_by_cache_id(LLG_SAFE_PLUS_SLICE as u32),
             vocab.llg_slice_by_cache_id(LLG_WHITESPACE_SLICE as u32),
@@ -1948,7 +2025,7 @@ pub(super) fn try_scalar_dispatch(
 
         let mut scratch = vec![0u32; buf.len()];
         let result = if transformed.len() == 1 {
-            try_full_walk_mask_with_table_from_initial::<_, true>(
+            try_full_walk_mask_with_table_from_initial_in_output_scope::<_, true>(
                 state,
                 vocab,
                 trie,
@@ -1960,9 +2037,10 @@ pub(super) fn try_scalar_dispatch(
                 finalizer_code.unwrap_or(&[]),
                 single_finalizer_continues.unwrap_or(&[]),
                 initial_lexer_state,
+                ignored_output,
             )
         } else {
-            try_full_walk_mask_with_table_from_initial::<_, false>(
+            try_full_walk_mask_with_table_from_initial_in_output_scope::<_, false>(
                 state,
                 vocab,
                 trie,
@@ -1974,6 +2052,7 @@ pub(super) fn try_scalar_dispatch(
                 finalizer_code.unwrap_or(&[]),
                 single_finalizer_continues.unwrap_or(&[]),
                 initial_lexer_state,
+                ignored_output,
             )
         }?;
         if overflowed.get() {
@@ -2064,7 +2143,7 @@ pub(super) fn try_scalar_dispatch(
     let walk_started = profile.then(std::time::Instant::now);
     let mut scratch = vec![0u32; buf.len()];
     let result = if transformed.len() == 1 {
-        try_full_walk_mask_with_table_from_initial::<_, true>(
+        try_full_walk_mask_with_table_from_initial_in_output_scope::<_, true>(
             state,
             vocab,
             trie,
@@ -2077,9 +2156,10 @@ pub(super) fn try_scalar_dispatch(
             single_finalizer_continues
                 .expect("dense subset cache requires Flat16 continuation metadata"),
             initial_lexer_state,
+            ignored_output,
         )
     } else {
-        try_full_walk_mask_with_table_from_initial::<_, false>(
+        try_full_walk_mask_with_table_from_initial_in_output_scope::<_, false>(
             state,
             vocab,
             trie,
@@ -2092,6 +2172,7 @@ pub(super) fn try_scalar_dispatch(
             single_finalizer_continues
                 .expect("dense subset cache requires Flat16 continuation metadata"),
             initial_lexer_state,
+            ignored_output,
         )
     }?;
     if let Some(started) = walk_started {
@@ -2135,6 +2216,7 @@ pub(super) fn try_flat16<const HOT_SINGLE_ROOT: bool>(
     if root_branches
         .iter()
         .any(|branch| !branch.initial_prune_guard.is_passed())
+        && !joint_initial_guard_walk_enabled(root_branches)
     {
         let profile = dynamic_mask_profile_enabled(state.generation);
         let mut merged = vec![0u32; buf.len()];
@@ -2198,6 +2280,7 @@ pub(super) fn try_flat16<const HOT_SINGLE_ROOT: bool>(
     // quotient. Pre-collapse is only needed when multiple roots may be merged
     // into a coordinate that no longer identifies one exact source state.
     let precollapse_master_decision = (root_branches.len() >= 2
+        && root_branches.iter().all(|branch| branch.initial_prune_guard.is_passed())
         && std::env::var_os("GLRMASK_EXPERIMENT_DISABLE_PRECOLLAPSE_MASTER").is_none()).then(|| {
         precollapse_master_decision(
             state,
@@ -2594,13 +2677,322 @@ fn full_walk_guarded_pair_from_branches(
     })
 }
 
-#[derive(Clone)]
+#[derive(Clone, PartialEq, Eq, Hash)]
 enum FullWalkManyState {
     Branches(FullWalkBranches),
     ThreeSameParser {
         lexers: (u32, u32, u32),
         parser_node: u32,
     },
+}
+
+/// Exact identity alphabet for one scalar parser/lexer pair. Scalar lanes
+/// have no pending maximal-munch guard; every other lane uses a different
+/// representation. The certificate is learned only from the complete result
+/// of the authoritative byte executor and cannot outlive its mask walk.
+#[derive(Default)]
+struct FullWalkScalarIdentity {
+    state: Option<(u32, u32)>,
+    bytes: [u64; 4],
+    proof_checked: bool,
+}
+
+impl FullWalkScalarIdentity {
+    #[inline]
+    fn remember(&mut self, source: (u32, u32), target: (u32, u32), byte: u8) {
+        if source != target {
+            return;
+        }
+        if self.state != Some(source) {
+            self.state = Some(source);
+            self.bytes = [0; 4];
+            self.proof_checked = false;
+        }
+        self.bytes[byte as usize >> 6] |= 1u64 << (byte & 63);
+    }
+
+    #[inline]
+    fn alphabet(&self, state: (u32, u32)) -> Option<&[u64; 4]> {
+        (self.state == Some(state)).then_some(&self.bytes)
+    }
+}
+
+/// Lexer-only evidence used to strengthen an already established *whole*
+/// parser/lexer identity. Ordinary and finalizing edges are kept separate:
+/// the latter require the guarded-pair shortcut's exact terminal condition.
+#[derive(Clone, Copy, Default)]
+struct FullWalkIdentityByteClasses {
+    ordinary: [u64; 4],
+    finalizing: [u64; 4],
+}
+
+impl FullWalkIdentityByteClasses {
+    fn intersect_union_member(&mut self, member: Self) {
+        for word in 0..4 {
+            let self_any = self.ordinary[word] | self.finalizing[word];
+            let member_any = member.ordinary[word] | member.finalizing[word];
+            self.ordinary[word] &= member.ordinary[word];
+            self.finalizing[word] = (self_any & member_any) & !self.ordinary[word];
+        }
+    }
+}
+
+fn full_walk_identity_byte_classes(
+    state: u32,
+    mut transition: impl FnMut(u8) -> Option<(u32, bool)>,
+) -> FullWalkIdentityByteClasses {
+    let mut classes = FullWalkIdentityByteClasses::default();
+    for byte in 0..=u8::MAX {
+        let Some((target, finalizing)) = transition(byte) else { continue; };
+        if target != state { continue; }
+        let words = if finalizing { &mut classes.finalizing } else { &mut classes.ordinary };
+        words[byte as usize >> 6] |= 1u64 << (byte & 63);
+    }
+    classes
+}
+
+#[derive(Default)]
+struct FullWalkIdentityProofCache {
+    rows: FxHashMap<u32, Option<FullWalkIdentityByteClasses>>,
+}
+
+/// A marker is irrelevant only when *every* original token alias is outside
+/// this root's output responsibility. Looking at a canonical representative
+/// alone would be unsound when aliases span multiple output words.
+fn full_walk_marker_fully_ignored(
+    marker: u64,
+    ignored: &[u32],
+    aliases_ignored: impl FnOnce(u32) -> bool,
+) -> bool {
+    if marker & DYNAMIC_TOKEN_MARKER_FALLBACK == 0 {
+        let word = (marker >> 32) as usize;
+        let bits = marker as u32;
+        return ignored.get(word).is_some_and(|value| value & bits == bits);
+    }
+    let Some(canonical) = (marker & !DYNAMIC_TOKEN_MARKER_FALLBACK)
+        .checked_sub(1).and_then(|id| u32::try_from(id).ok())
+    else {
+        return false;
+    };
+    aliases_ignored(canonical)
+}
+
+/// Exact prefix counts in the actual walk's canonical endpoint order. This
+/// index is local to one root mask, not keyed by parser states or persisted.
+#[cfg(test)]
+struct FullWalkOutputScope {
+    required_prefix: Vec<u32>,
+}
+
+#[cfg(test)]
+std::thread_local! {
+    pub(super) static TEST_OUTPUT_SCOPE_SKIPPED: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+
+/// Lazy equivalent of the scope prefix index for preorder marker intervals.
+/// The next responsible marker refutes every containing interval without
+/// re-scanning it. As starts advance, each marker is inspected at most once;
+/// markers already bypassed by an exact lexer/parser proof are never inspected.
+/// Backward queries reset the certificate rather than assuming caller order.
+#[derive(Default)]
+struct FullWalkOutputScopeCursor {
+    last_start: usize,
+    ignored_through: usize,
+    next_required: Option<usize>,
+}
+
+impl FullWalkOutputScopeCursor {
+    fn covers(
+        &mut self,
+        markers: &[u64],
+        start: usize,
+        end: usize,
+        mut is_ignored: impl FnMut(u64) -> bool,
+    ) -> bool {
+        if start > end || end > markers.len() { return false; }
+        if start < self.last_start { *self = Self::default(); }
+        self.last_start = start;
+        if start == end { return true; }
+        if let Some(required) = self.next_required {
+            if required >= start { return required >= end; }
+            self.next_required = None;
+        }
+        for index in start.max(self.ignored_through)..end {
+            if !is_ignored(markers[index]) {
+                self.ignored_through = index;
+                self.next_required = Some(index);
+                return false;
+            }
+        }
+        self.ignored_through = self.ignored_through.max(end);
+        true
+    }
+}
+
+#[cfg(test)]
+impl FullWalkOutputScope {
+    fn new(markers: &[u64], mut is_ignored: impl FnMut(u64) -> bool) -> Option<Self> {
+        const MAX_MARKERS: usize = 1 << 20;
+        if markers.len() > MAX_MARKERS { return None; }
+        let mut required_prefix = Vec::new();
+        required_prefix.try_reserve_exact(markers.len().checked_add(1)?).ok()?;
+        let mut required = 0u32;
+        required_prefix.push(required);
+        for &marker in markers {
+            required += u32::from(!is_ignored(marker));
+            required_prefix.push(required);
+        }
+        Some(Self { required_prefix })
+    }
+
+    fn covers(&self, start: usize, end: usize) -> bool {
+        start <= end
+            && self.required_prefix.get(start).zip(self.required_prefix.get(end))
+                .is_some_and(|(left, right)| left == right)
+    }
+}
+
+impl FullWalkIdentityProofCache {
+    fn get<T: FullWalkTransitionTable>(
+        &mut self,
+        transitions: &T,
+        tokenizer: &Tokenizer,
+        lexer: u32,
+    ) -> Option<FullWalkIdentityByteClasses> {
+        if let Some(&classes) = self.rows.get(&lexer) { return classes; }
+        // At most 64 local row proofs, with no persistent or serialized state.
+        if self.rows.len() >= 64 { return None; }
+        let classes = transitions.proven_identity_byte_classes(tokenizer, lexer);
+        self.rows.insert(lexer, classes);
+        classes
+    }
+}
+
+
+/// A cursor into a bounded, mask-local deterministic transition memo. The
+/// direct variant preserves the reference executor when storage is exhausted.
+/// Cached cursors copy only their ID when a vocabulary edge saves/restores its
+/// parent; they do not repeatedly clone the whole ambiguous lexer frontier.
+#[derive(Clone)]
+enum FullWalkManyCursor {
+    Direct(FullWalkManyState),
+    Cached(u16),
+}
+
+impl FullWalkManyCursor {
+    fn id(&self) -> Option<u16> {
+        match self { Self::Cached(id) => Some(*id), Self::Direct(_) => None }
+    }
+}
+
+/// Exact, bounded memoization of complete correlated frontiers in one mask.
+/// Parser/lexer IDs are append-only. Full equality, not hashes, establishes
+/// identity; exhausted storage retains the authoritative direct executor.
+struct FullWalkManyTransitionMemo {
+    limit: usize,
+    states: Vec<FullWalkManyState>,
+    rows: Vec<Box<[u16; 256]>>,
+    identity_bytes: Vec<[u64; 4]>,
+    buckets: FxHashMap<u64, SmallVec<[u16; 2]>>,
+    lookups: usize,
+    hits: usize,
+}
+
+impl FullWalkManyTransitionMemo {
+    const UNKNOWN: u16 = u16::MAX;
+    const MAX_STATES: usize = 1024;
+
+    fn new(limit: usize) -> Self {
+        Self {
+            limit: limit.min(Self::MAX_STATES), states: Vec::new(),
+            rows: Vec::new(), identity_bytes: Vec::new(),
+            buckets: FxHashMap::default(), lookups: 0, hits: 0,
+        }
+    }
+
+    fn view<'a>(&'a self, cursor: &'a FullWalkManyCursor) -> &'a FullWalkManyState {
+        match cursor {
+            FullWalkManyCursor::Direct(state) => state,
+            FullWalkManyCursor::Cached(id) => &self.states[*id as usize],
+        }
+    }
+
+    fn hold(&mut self, state: FullWalkManyState) -> FullWalkManyCursor {
+        let cacheable = match &state {
+            FullWalkManyState::Branches(branches) => branches.len() <= 8
+                && branches.iter().all(|branch| match &branch.prune_guard {
+                    FullWalkPruneGuard::Passed => true,
+                    FullWalkPruneGuard::Pending(memories) => memories.len() <= 4,
+                }),
+            FullWalkManyState::ThreeSameParser { .. } => true,
+        };
+        if self.limit == 0 || !cacheable { return FullWalkManyCursor::Direct(state); }
+        use std::hash::{Hash, Hasher};
+        let mut hasher = rustc_hash::FxHasher::default();
+        state.hash(&mut hasher);
+        let hash = hasher.finish();
+        if let Some(bucket) = self.buckets.get(&hash) {
+            for &id in bucket {
+                if self.states[id as usize] == state {
+                    return FullWalkManyCursor::Cached(id);
+                }
+            }
+        }
+        if self.states.len() >= self.limit { return FullWalkManyCursor::Direct(state); }
+        let id = self.states.len() as u16;
+        self.states.push(state);
+        self.rows.push(Box::new([Self::UNKNOWN; 256]));
+        self.identity_bytes.push([0; 4]);
+        self.buckets.entry(hash).or_default().push(id);
+        FullWalkManyCursor::Cached(id)
+    }
+
+    #[inline]
+    fn cached_transition(&mut self, cursor: &FullWalkManyCursor, byte: u8)
+        -> Option<FullWalkManyCursor>
+    {
+        let source = cursor.id()?;
+        self.lookups += 1;
+        let target = self.rows[source as usize][byte as usize];
+        if target == Self::UNKNOWN { return None; }
+        self.hits += 1;
+        Some(FullWalkManyCursor::Cached(target))
+    }
+
+    fn remember_transition(&mut self, source: Option<u16>, byte: u8, target: &FullWalkManyCursor) {
+        if let (Some(source), Some(target)) = (source, target.id()) {
+            self.rows[source as usize][byte as usize] = target;
+            if source == target {
+                self.identity_bytes[source as usize][byte as usize >> 6] |= 1u64 << (byte & 63);
+            }
+        }
+    }
+
+    #[inline]
+    fn identity_alphabet(&self, cursor: &FullWalkManyCursor) -> Option<&[u64; 4]> {
+        Some(&self.identity_bytes[cursor.id()? as usize])
+    }
+}
+
+/// Cost policy only: shallow single-root frontiers can retain the original
+/// byte loop, while genuinely branching parser work uses identity certificates.
+/// Admission is monotone because parser nodes are append-only within a walk.
+/// Declining never removes a branch or changes a mask bit.
+#[inline(always)]
+fn full_walk_identity_context_profitable(
+    roots: usize, parser_nodes: usize,
+) -> bool {
+    roots >= 2 || parser_nodes >= 32
+}
+
+/// An alphabet of exact self-loops is closed under concatenation. When every
+/// byte in a vocabulary subtree belongs to it, all descendant token endpoints
+/// see exactly the current full parser/lexer/guard state. Unseen bytes never
+/// qualify; this is not a character-class or language approximation.
+#[inline]
+fn identity_alphabet_covers_subtree(identity: &[u64; 4], subtree: [u64; 4]) -> bool {
+    subtree.iter().zip(identity).all(|(&needed, &known)| needed & !known == 0)
 }
 
 struct FullWalkParserNode {
@@ -2617,12 +3009,23 @@ struct FullWalkParserNode {
 struct FullWalkParserCache {
     nodes: Vec<FullWalkParserNode>,
     lexer_state_count: usize,
+    canonicalize: bool,
+    canonical: Option<Box<FullWalkDenseParserCanonical>>,
     profile: bool,
     profile_boundary_calls: usize,
     profile_boundary_misses: usize,
     profile_advance_calls: usize,
     profile_advance_misses: usize,
     profile_inadmissible_finalizers: usize,
+}
+
+/// Bounded exact sharing of complete parser-stack languages within one mask.
+/// Maximal-munch exclusions remain in correlated lexer branches. Unit GSS
+/// accumulators make the semantic key a complete parser-language identity.
+struct FullWalkDenseParserCanonical {
+    keys: crate::ds::leveled_gss::GssSemanticKeyInterner<u32, ()>,
+    nodes: FxHashMap<u32, u32>,
+    hits: usize,
 }
 
 impl FullWalkParserCache {
@@ -2661,6 +3064,8 @@ impl FullWalkParserCache {
             Self {
                 nodes,
                 lexer_state_count,
+                canonicalize: full_walk_acceleration_enabled(),
+                canonical: None,
                 profile,
                 profile_boundary_calls: 0,
                 profile_boundary_misses: 0,
@@ -2670,6 +3075,59 @@ impl FullWalkParserCache {
             },
             root_nodes,
         )
+    }
+
+    fn push_parser_stacks(&mut self, gss: ParserStacks) -> u32 {
+        let id = self.nodes.len() as u32;
+        self.nodes.push(FullWalkParserNode {
+            gss,
+            admitted: None,
+            shared_root_admission: None,
+            admitted_singleton: None,
+            token_boundary_allowed: vec![0; self.lexer_state_count],
+            children: SmallVec::new(),
+            last_child_terminal: TerminalID::MAX,
+            last_child_target: Self::DEAD,
+        });
+        id
+    }
+
+    fn intern_parser_stacks(&mut self, gss: ParserStacks) -> u32 {
+        if !self.canonicalize || self.nodes.len() < 32 {
+            return self.push_parser_stacks(gss);
+        }
+        if self.canonical.is_none() {
+            let mut canonical = FullWalkDenseParserCanonical {
+                keys: crate::ds::leveled_gss::GssSemanticKeyInterner::with_budget(
+                    16_384, 8_192, 16_384,
+                ),
+                nodes: FxHashMap::default(),
+                hits: 0,
+            };
+            for (index, node) in self.nodes.iter().enumerate() {
+                let key = canonical.keys.key(&node.gss);
+                if canonical.keys.is_exhausted() { break; }
+                canonical.nodes.entry(key).or_insert(index as u32);
+            }
+            self.canonical = Some(Box::new(canonical));
+        }
+        let canonical = self.canonical.as_mut().expect("initialized above");
+        if canonical.keys.is_exhausted() {
+            return self.push_parser_stacks(gss);
+        }
+        let key = canonical.keys.key(&gss);
+        // Exhaustion returns an internal sentinel, not a language certificate.
+        // Never alias on that value; leave the original exact path available.
+        if canonical.keys.is_exhausted() {
+            return self.push_parser_stacks(gss);
+        }
+        if let Some(&node) = canonical.nodes.get(&key) {
+            canonical.hits += 1;
+            return node;
+        }
+        let node = self.push_parser_stacks(gss);
+        self.canonical.as_mut().unwrap().nodes.insert(key, node);
+        node
     }
 
     #[inline(always)]
@@ -2753,18 +3211,7 @@ impl FullWalkParserCache {
             self.profile_advance_misses += 1;
         }
         let target = if let Some(gss) = next {
-            let id = self.nodes.len() as u32;
-            self.nodes.push(FullWalkParserNode {
-                gss,
-                admitted: None,
-                shared_root_admission: None,
-                admitted_singleton: None,
-                token_boundary_allowed: vec![0; self.lexer_state_count],
-                children: SmallVec::new(),
-                last_child_terminal: TerminalID::MAX,
-                last_child_target: Self::DEAD,
-            });
-            id
+            self.intern_parser_stacks(gss)
         } else {
             Self::DEAD
         };
@@ -3584,6 +4031,25 @@ enum FullWalkGuardedStepOutcome {
     Many(FullWalkManyState),
 }
 
+/// Record only a completed exact identity transition. In particular, both
+/// parser coordinates and the pending terminal must agree, not just the lexer.
+#[inline]
+fn remember_guarded_identity(
+    before: FullWalkGuardedPair,
+    after: FullWalkGuardedPair,
+    byte: u8,
+    cached: &mut Option<FullWalkGuardedPair>,
+    bytes: &mut [u64; 4],
+) -> bool {
+    if before != after { return false; }
+    if *cached != Some(after) {
+        *cached = Some(after);
+        *bytes = [0; 4];
+    }
+    bytes[byte as usize >> 6] |= 1u64 << (byte & 63);
+    true
+}
+
 #[allow(clippy::too_many_arguments)]
 #[inline(never)]
 fn full_walk_step_guarded_pair_bound<T: FullWalkTransitionTable>(
@@ -3776,7 +4242,6 @@ fn full_walk_step_many_state<T: FullWalkTransitionTable>(
         }
     }
 }
-
 
 
 #[inline(always)]
@@ -5085,6 +5550,31 @@ fn try_full_walk_mask_with_table_from_initial<
     single_finalizer_continues: &[u8],
     initial_lexer_state: u32,
 ) -> Result<bool, String> {
+    try_full_walk_mask_with_table_from_initial_in_output_scope::<T, HOT_SINGLE_ROOT>(
+        state, vocab, trie, llg_master_decision, root_branches, lexer_scan_cache,
+        buf, transitions, finalizer_code, single_finalizer_continues,
+        initial_lexer_state, None,
+    )
+}
+
+#[inline(never)]
+fn try_full_walk_mask_with_table_from_initial_in_output_scope<
+    T: FullWalkTransitionTable,
+    const HOT_SINGLE_ROOT: bool,
+>(
+    state: &ConstraintState<'_>,
+    vocab: &DynamicMaskVocab,
+    trie: &DynamicMaskTrie,
+    llg_master_decision: Option<LlgMasterDecision>,
+    root_branches: &DynamicBranches,
+    lexer_scan_cache: &mut DynamicNfaScanCache<'_>,
+    buf: &mut [u32],
+    transitions: T,
+    finalizer_code: &[u32],
+    single_finalizer_continues: &[u8],
+    initial_lexer_state: u32,
+    ignored_output: Option<&[u32]>,
+) -> Result<bool, String> {
     debug_assert!(trie.full_walk_max_parent_depth() < 255);
 
     let profile_walk = dynamic_mask_profile_enabled(state.generation);
@@ -6194,7 +6684,11 @@ fn try_full_walk_mask_with_table_from_initial<
     // SmallVec. Do not eagerly construct/drop 256 empty SmallVec values on
     // every complete vocabulary walk; materialize only the depths that
     // actually carry a multi state.
-    let mut stack_many: [Option<FullWalkManyState>; 256] = std::array::from_fn(|_| None);
+    let accelerated = full_walk_acceleration_enabled();
+    let mut many_transition_memo = FullWalkManyTransitionMemo::new(
+        if accelerated { FullWalkManyTransitionMemo::MAX_STATES } else { 0 },
+    );
+    let mut stack_many: [Option<FullWalkManyCursor>; 256] = std::array::from_fn(|_| None);
     let mut pair_union_cache = FxHashMap::<(u32, u32), Option<u32>>::default();
     let mut triple_union_cache = FxHashMap::<(u32, u32, u32), Option<u32>>::default();
     if root_branches.len() == 1 && root_branches[0].initial_prune_guard.is_passed() {
@@ -6245,7 +6739,7 @@ fn try_full_walk_mask_with_table_from_initial<
             stack_lexer[0] = lexer_state;
             stack_parser[0] = parser_node;
         } else {
-            stack_many[0] = Some(full_walk_many_state_from_branches(roots));
+            stack_many[0] = Some(many_transition_memo.hold(full_walk_many_state_from_branches(roots)));
         }
     }
 
@@ -6264,7 +6758,14 @@ fn try_full_walk_mask_with_table_from_initial<
     // processed `(state, byte)` and returned the identical compact state.
     let mut guarded_self_loop_state = None::<FullWalkGuardedPair>;
     let mut guarded_self_loop_bytes = [0u64; 4];
-    let mut current_many = FullWalkManyState::Branches(FullWalkBranches::new());
+    let mut guarded_outer_cache_hits = 0usize;
+    let mut identity_proofs = FullWalkIdentityProofCache::default();
+    let mut guarded_proof_state = None::<FullWalkGuardedPair>;
+    let mut scalar_identity = FullWalkScalarIdentity::default();
+    let mut identity_subtrees_skipped = 0usize;
+    let mut identity_subtree_ops_skipped = 0usize;
+    let mut identity_subtree_tokens = 0usize;
+    let mut current_many = FullWalkManyCursor::Direct(FullWalkManyState::Branches(FullWalkBranches::new()));
     let mut partition_root_slot = 0usize;
     // `sparse_root_range` was computed above (Change D) from the same exact
     // single-live-root-byte proof and is reused unchanged here. It stays a
@@ -6315,8 +6816,14 @@ fn try_full_walk_mask_with_table_from_initial<
     } else {
         0
     };
+    let mut output_scope_cursor = FullWalkOutputScopeCursor::default();
+    let mut output_scope_attempted = false;
+    let mut output_scope_visited = 0usize;
+    let mut output_scope_skips = 0usize;
+    let mut output_scope_saved_ops = 0usize;
+    let scope_build_after = if cfg!(test) { 0 } else { 1024 };
     let walk_started = profile_kernel.then(std::time::Instant::now);
-    loop {
+    'walk: loop {
         if sparse_root_range.is_some() {
             let current_op = walk_ops.len() - remaining_ops.as_slice().len();
             if current_op >= sparse_root_range_end as usize {
@@ -6326,6 +6833,9 @@ fn try_full_walk_mask_with_table_from_initial<
         let Some(&op) = remaining_ops.next() else {
             break;
         };
+        let identity_active = accelerated && full_walk_identity_context_profitable(
+            root_branches.len(), parser_cache.nodes.len(),
+        );
         // A surviving scalar non-finalizing byte is retained only after
         // `physical_token_boundary_allowed()` has proved the exact
         // `(parser_node, target_lexer)` coordinate live.  When that same op is
@@ -6388,6 +6898,51 @@ fn try_full_walk_mask_with_table_from_initial<
             }
         }
 
+        if let Some(ignored) = ignored_output {
+            output_scope_visited += 1;
+            if !output_scope_attempted && output_scope_visited >= scope_build_after {
+                output_scope_attempted = true;
+            }
+            if op.starts_edge() && op.consumes_byte()
+                && output_scope_attempted
+            {
+                let op_index = walk_ops.len() - remaining_ops.as_slice().len() - 1;
+                let (child, end_op) = trie.full_walk_dead_subtree(op_index);
+                let root_offset = usize::from(trie.node(0).token_id.is_some());
+                let end_token = trie.subtree_token_index_range(child).end.saturating_sub(root_offset);
+                let covered = output_scope_cursor.covers(
+                    token_markers, token_marker_index, end_token, |marker| {
+                        full_walk_marker_fully_ignored(marker, ignored, |canonical| {
+                            vocab.token_ids(canonical).is_some_and(|aliases| {
+                                aliases.iter().all(|&id| ignored.get(id as usize / 32)
+                                    .is_some_and(|word| word & (1u32 << (id % 32)) != 0))
+                            })
+                        })
+                    },
+                );
+                if covered {
+                    output_scope_skips += 1;
+                    #[cfg(test)]
+                    TEST_OUTPUT_SCOPE_SKIPPED.with(|count| count.set(count.get() + 1));
+                    output_scope_saved_ops += end_op as usize - op_index;
+                    token_marker_index = end_token;
+                    remaining_ops = walk_ops[end_op as usize..].iter();
+                    // No transition/acceptance result is fabricated or cached.
+                    // The next preorder edge restores an existing ancestor;
+                    // skipped frames and don't-care output bits are not read.
+                    continue 'walk;
+                }
+            }
+        }
+
+        let scalar_identity_source = if identity_active
+            && scalar_lexer < FULL_WALK_LEXER_TWO_DISTINCT
+        {
+            Some((scalar_lexer, scalar_parser))
+        } else {
+            None
+        };
+        let mut scalar_ordinary_identity = false;
         if op.consumes_byte() {
             let byte = op.byte();
             if profile_walk {
@@ -6406,7 +6961,7 @@ fn try_full_walk_mask_with_table_from_initial<
                     profile_multi_two_pending_lexer_is_initial += 1;
                 } else if scalar_lexer == FULL_WALK_LEXER_MULTI {
                     profile_multi_lane_bytes += 1;
-                    match &current_many {
+                    match many_transition_memo.view(&current_many) {
                         FullWalkManyState::ThreeSameParser { .. } => {
                             profile_multi_three_same_bytes += 1;
                         }
@@ -6516,6 +7071,7 @@ fn try_full_walk_mask_with_table_from_initial<
                             scalar_parser,
                             target,
                         ) {
+                            scalar_ordinary_identity = scalar_lexer == target;
                             scalar_lexer = target;
                             scalar_endpoint_known_allowed = true;
                         } else {
@@ -6641,7 +7197,7 @@ fn try_full_walk_mask_with_table_from_initial<
                                         current_guarded_pair = guarded;
                                     } else {
                                         scalar_lexer = FULL_WALK_LEXER_MULTI;
-                                        current_many = full_walk_many_state_from_branches(next);
+                                        current_many = many_transition_memo.hold(full_walk_many_state_from_branches(next));
                                     }
                                 }
                             }
@@ -6679,7 +7235,7 @@ fn try_full_walk_mask_with_table_from_initial<
                                             current_guarded_pair = guarded;
                                         } else {
                                             scalar_lexer = FULL_WALK_LEXER_MULTI;
-                                            current_many = full_walk_many_state_from_branches(next);
+                                            current_many = many_transition_memo.hold(full_walk_many_state_from_branches(next));
                                         }
                                     }
                                 } else if let Some((lexer_state, parser_node)) =
@@ -6701,7 +7257,7 @@ fn try_full_walk_mask_with_table_from_initial<
                                         current_guarded_pair = guarded;
                                     } else {
                                         scalar_lexer = FULL_WALK_LEXER_MULTI;
-                                        current_many = full_walk_many_state_from_branches(next);
+                                        current_many = many_transition_memo.hold(full_walk_many_state_from_branches(next));
                                     }
                                 }
                             }
@@ -6804,7 +7360,7 @@ fn try_full_walk_mask_with_table_from_initial<
                                     current_guarded_pair = guarded;
                                 } else {
                                     scalar_lexer = FULL_WALK_LEXER_MULTI;
-                                    current_many = full_walk_many_state_from_branches(next);
+                                    current_many = many_transition_memo.hold(full_walk_many_state_from_branches(next));
                                 }
                             }
                         }
@@ -6900,7 +7456,7 @@ fn try_full_walk_mask_with_table_from_initial<
                                     current_guarded_pair = guarded;
                                 } else {
                                     scalar_lexer = FULL_WALK_LEXER_MULTI;
-                                    current_many = full_walk_many_state_from_branches(next);
+                                    current_many = many_transition_memo.hold(full_walk_many_state_from_branches(next));
                                 }
                             }
                         }
@@ -6909,6 +7465,15 @@ fn try_full_walk_mask_with_table_from_initial<
                 if profile_walk {
                     parser_effect_seen = true;
                 }
+                // The inner bound helper is intentionally out of line and has
+                // a large outcome. Avoid that call entirely on an already
+                // proven identity byte; endpoints still use the unchanged pair.
+                if accelerated
+                    && guarded_self_loop_state == Some(current_guarded_pair)
+                    && guarded_self_loop_bytes[byte as usize >> 6] & (1u64 << (byte & 63)) != 0
+                {
+                    guarded_outer_cache_hits += 1;
+                } else {
                 match full_walk_step_guarded_pair_bound(
                     current_guarded_pair,
                     byte,
@@ -6969,19 +7534,55 @@ fn try_full_walk_mask_with_table_from_initial<
                         current_two = (first, second);
                     }
                     FullWalkGuardedStepOutcome::Guarded(guarded) => {
+                        if accelerated {
+                            // The helper's single-finalizer shortcut returns
+                            // before its old identity recorder. Cover that exact
+                            // shortcut too, rather than relearning it per byte.
+                            remember_guarded_identity(
+                                current_guarded_pair, guarded, byte,
+                                &mut guarded_self_loop_state, &mut guarded_self_loop_bytes,
+                            );
+                            if identity_active
+                                && guarded == current_guarded_pair
+                                && guarded_proof_state != Some(guarded)
+                            {
+                                guarded_proof_state = Some(guarded);
+                                // This is precisely the authoritative helper's
+                                // single-finalizer shortcut, for every byte in
+                                // the certified self-transition class.
+                                if transitions.finalizer_code(guarded.continuing_lexer, finalizer_code)
+                                    == guarded.guard_terminal
+                                    && transitions.single_finalizer_continues(
+                                        guarded.continuing_lexer, single_finalizer_continues)
+                                    && let Some(classes) = identity_proofs.get(
+                                        &transitions, tokenizer, guarded.continuing_lexer)
+                                {
+                                    for (known, exact) in guarded_self_loop_bytes.iter_mut().zip(classes.finalizing) {
+                                        *known |= exact;
+                                    }
+                                }
+                            }
+                        }
                         current_guarded_pair = guarded;
                     }
                     FullWalkGuardedStepOutcome::Many(next) => {
                         scalar_lexer = FULL_WALK_LEXER_MULTI;
-                        current_many = next;
+                        current_many = many_transition_memo.hold(next);
                     }
+                }
                 }
             } else if scalar_lexer == FULL_WALK_LEXER_MULTI {
                 if profile_walk {
                     parser_effect_seen = true;
                 }
+                'advance_many: {
+                let source_id = current_many.id();
+                if let Some(cached) = many_transition_memo.cached_transition(&current_many, byte) {
+                    current_many = cached;
+                    break 'advance_many;
+                }
                 let next = full_walk_step_many_state(
-                    &current_many,
+                    many_transition_memo.view(&current_many),
                     byte,
                     initial_lexer_state,
                     finalizer_code,
@@ -7023,7 +7624,7 @@ fn try_full_walk_mask_with_table_from_initial<
                                         buf,
                                     );
                                 }
-                                continue;
+                                continue 'walk;
                             }
                             [branch] if branch.prune_guard.is_passed() => {
                                 scalar_lexer = branch.lexer_state;
@@ -7056,7 +7657,17 @@ fn try_full_walk_mask_with_table_from_initial<
                                 }
                             }
                             _ => {
-                                if let Some((lexer_state, parser_node)) =
+                                if accelerated
+                                    && let Some(guarded) = full_walk_guarded_pair_from_branches(&next, initial_lexer_state)
+                                {
+                                    // Ambiguity can shrink back to the exact
+                                    // specialized pair. Do not strand that
+                                    // shape in generic multi-branch execution.
+                                    // The existing constructor checks both
+                                    // parser IDs and the complete pending guard.
+                                    scalar_lexer = FULL_WALK_LEXER_GUARDED_PAIR;
+                                    current_guarded_pair = guarded;
+                                } else if let Some((lexer_state, parser_node)) =
                                     full_walk_merge_branches_same_parser(
                                         &transitions,
                                         vocab,
@@ -7069,7 +7680,7 @@ fn try_full_walk_mask_with_table_from_initial<
                                     scalar_parser = parser_node;
                                 } else {
                                     scalar_lexer = FULL_WALK_LEXER_MULTI;
-                                    current_many = FullWalkManyState::Branches(next);
+                                    current_many = many_transition_memo.hold(FullWalkManyState::Branches(next));
                                 }
                             }
                         }
@@ -7088,14 +7699,183 @@ fn try_full_walk_mask_with_table_from_initial<
                             scalar_parser = parser_node;
                         } else {
                             scalar_lexer = FULL_WALK_LEXER_MULTI;
-                            current_many = next;
+                            current_many = many_transition_memo.hold(next);
+                        }
+                    }
+                }
+                if scalar_lexer == FULL_WALK_LEXER_MULTI {
+                    many_transition_memo.remember_transition(source_id, byte, &current_many);
+                }
+                }
+            }
+        }
+
+        if op.consumes_byte() {
+            if let Some(source) = scalar_identity_source {
+                scalar_identity.remember(source, (scalar_lexer, scalar_parser), op.byte());
+                if identity_active
+                    && scalar_ordinary_identity
+                    && scalar_identity.state == Some(source)
+                    && !scalar_identity.proof_checked
+                {
+                    scalar_identity.proof_checked = true;
+                    // Admission succeeded at this exact (lexer, parser) pair.
+                    // Every non-finalizing self-edge has that same target and
+                    // therefore the same parser-conditioned liveness test.
+                    if let Some(classes) = identity_proofs.get(&transitions, tokenizer, source.0) {
+                        for (known, exact) in scalar_identity.bytes.iter_mut().zip(classes.ordinary) {
+                            *known |= exact;
                         }
                     }
                 }
             }
         }
-
         if op.ends_edge() {
+            if identity_active {
+                let identity = if scalar_lexer < FULL_WALK_LEXER_TWO_DISTINCT
+                {
+                    scalar_identity.alphabet((scalar_lexer, scalar_parser))
+                } else if scalar_lexer == FULL_WALK_LEXER_GUARDED_PAIR
+                    && guarded_self_loop_state == Some(current_guarded_pair)
+                {
+                    Some(&guarded_self_loop_bytes)
+                } else if scalar_lexer == FULL_WALK_LEXER_MULTI {
+                    many_transition_memo.identity_alphabet(&current_many)
+                } else {
+                    None
+                };
+                if let Some(identity) = identity {
+                    let op_index = walk_ops.len() - remaining_ops.as_slice().len() - 1;
+                    let (child, subtree_end) = trie.full_walk_dead_subtree(op_index);
+                    let root_offset = usize::from(trie.node(0).token_id.is_some());
+                    let token_end = trie.subtree_token_index_range(child).end.saturating_sub(root_offset);
+                    let saved_ops = subtree_end as usize - op_index - 1;
+                    if saved_ops >= 8
+                        && token_end.saturating_sub(token_marker_index) >= 4
+                        && identity_alphabet_covers_subtree(identity, trie.subtree_bytes(child))
+                    {
+                        let allowed = if scalar_lexer == FULL_WALK_LEXER_DEAD {
+                            false
+                        } else if scalar_lexer < FULL_WALK_LEXER_TWO_DISTINCT {
+                            scalar_endpoint_known_allowed
+                                || parser_cache.token_boundary_allowed_raw(
+                                    state.constraint,
+                                    tokenizer,
+                                    &transitions,
+                                    initial_lexer_state,
+                                    scalar_lexer,
+                                    scalar_parser,
+                                )
+                        } else if scalar_lexer == FULL_WALK_LEXER_TWO_DISTINCT || scalar_lexer == FULL_WALK_LEXER_TWO {
+                            parser_cache.token_boundary_allowed_raw(
+                                state.constraint,
+                                tokenizer,
+                                &transitions,
+                                initial_lexer_state,
+                                current_two.0.0,
+                                current_two.0.1,
+                            ) || parser_cache.token_boundary_allowed_raw(
+                                state.constraint,
+                                tokenizer,
+                                &transitions,
+                                initial_lexer_state,
+                                current_two.1.0,
+                                current_two.1.1,
+                            )
+                        } else if scalar_lexer == FULL_WALK_LEXER_GUARDED_PAIR {
+                            // The pending branch is at the reset lexer state, so a
+                            // model token may end here using the most recent accepted
+                            // terminal without consulting parser/lexer liveness again.
+                            true
+                        } else if scalar_lexer == FULL_WALK_LEXER_MULTI {
+                            match many_transition_memo.view(&current_many) {
+                                FullWalkManyState::Branches(branches) => branches.iter().any(|branch| {
+                                    parser_cache.token_boundary_allowed(
+                                        state.constraint,
+                                        tokenizer,
+                                        &transitions,
+                                        initial_lexer_state,
+                                        branch,
+                                    )
+                                }),
+                                FullWalkManyState::ThreeSameParser {
+                                    lexers,
+                                    parser_node,
+                                } => parser_cache.token_boundary_allowed_raw(
+                                    state.constraint,
+                                    tokenizer,
+                                    &transitions,
+                                    initial_lexer_state,
+                                    lexers.0,
+                                    *parser_node,
+                                ) || parser_cache.token_boundary_allowed_raw(
+                                    state.constraint,
+                                    tokenizer,
+                                    &transitions,
+                                    initial_lexer_state,
+                                    lexers.1,
+                                    *parser_node,
+                                ) || parser_cache.token_boundary_allowed_raw(
+                                    state.constraint,
+                                    tokenizer,
+                                    &transitions,
+                                    initial_lexer_state,
+                                    lexers.2,
+                                    *parser_node,
+                                ),
+                            }
+                        } else {
+                            false
+                        };
+                        // Emit the same canonical markers and maintain the
+                        // existing deferred/adaptive output polarity. A marker
+                        // may represent several original vocabulary aliases.
+                        // No descendants' parser/lexer transitions are needed.
+                        for &token_marker in &token_markers[token_marker_index..token_end] {
+                            if deferred_output {
+                                let mutations = dynamic_token_marker_original_count(vocab, token_marker);
+                                let marker_work = dynamic_token_marker_materialization_cost(vocab, token_marker);
+                                if allowed {
+                                    deferred_positive_mutations =
+                                        deferred_positive_mutations.saturating_add(mutations);
+                                    deferred_positive_work = deferred_positive_work.saturating_add(marker_work);
+                                    deferred_allowed_markers.push(token_marker);
+                                } else {
+                                    deferred_negative_mutations =
+                                        deferred_negative_mutations.saturating_add(mutations);
+                                    deferred_negative_work = deferred_negative_work.saturating_add(marker_work);
+                                    deferred_rejected_markers.push(token_marker);
+                                    full_walk_maybe_commit_deferred_positive(
+                                        vocab,
+                                        total_original_tokens,
+                                        &mut deferred_output,
+                                        &mut positive_rebuild,
+                                        deferred_negative_mutations,
+                                        &mut deferred_allowed_markers,
+                                        &mut deferred_rejected_markers,
+                                        &mut deferred_dead_subtrees,
+                                        buf,
+                                    );
+                                }
+                            } else if positive_rebuild {
+                                if allowed {
+                                    mark_dynamic_token_marker(vocab, token_marker, buf);
+                                }
+                            } else if !allowed {
+                                clear_dynamic_token_marker(vocab, token_marker, buf);
+                            }
+                        }
+                        identity_subtrees_skipped += 1;
+                        identity_subtree_ops_skipped += saved_ops;
+                        identity_subtree_tokens += token_end - token_marker_index;
+                        token_marker_index = token_end;
+                        remaining_ops = walk_ops[subtree_end as usize..].iter();
+                        // The next preorder edge restores its unchanged parent
+                        // from an ancestor slot, so no skipped DFS frame is read.
+                        continue 'walk;
+                    }
+                }
+            }
             if op.child_is_token() {
                 if profile_walk && !parser_effect_seen {
                     profile_pre_effect_token_endpoints += 1;
@@ -7136,7 +7916,7 @@ fn try_full_walk_mask_with_table_from_initial<
                     // terminal without consulting parser/lexer liveness again.
                     true
                 } else if scalar_lexer == FULL_WALK_LEXER_MULTI {
-                    match &current_many {
+                    match many_transition_memo.view(&current_many) {
                         FullWalkManyState::Branches(branches) => branches.iter().any(|branch| {
                             parser_cache.token_boundary_allowed(
                                 state.constraint,
@@ -7234,6 +8014,14 @@ fn try_full_walk_mask_with_table_from_initial<
         }
     }
 
+    if profile_kernel {
+        eprintln!("[glrmask/profile][full_walk_acceleration] generation={} enabled={} memo_states={} memo_lookups={} memo_hits={} outer_hits={} identity_subtrees={} identity_ops={} identity_tokens={} canonical_hits={}",
+            state.generation, accelerated, many_transition_memo.states.len(),
+            many_transition_memo.lookups, many_transition_memo.hits,
+            guarded_outer_cache_hits, identity_subtrees_skipped,
+            identity_subtree_ops_skipped, identity_subtree_tokens,
+            parser_cache.canonical.as_ref().map_or(0, |c| c.hits));
+    }
     if let (Some(kernel_started), Some(walk_started)) = (kernel_started, walk_started) {
         eprintln!(
             "[glrmask/profile][dynamic_kernel_phases] generation={} setup_us={:.1} walk_us={:.1}",
@@ -7284,6 +8072,11 @@ fn try_full_walk_mask_with_table_from_initial<
             }
         }
     }
+    if profile_kernel && ignored_output.is_some() {
+        eprintln!("[glrmask/profile][root_output_scope] generation={} visited={} skips={} saved_ops={}",
+            state.generation, output_scope_visited, output_scope_skips,
+            output_scope_saved_ops);
+    }
     if profile_walk {
         eprintln!(
                 "[glrmask/profile][full_walk_volume] generation={} ops={} byte_ops={} token_endpoints={} finalizing_bytes={} direct_finalizers={} pre_effect_byte_ops={} pre_effect_token_endpoints={} first_effect_frontiers={} scalar_lane_bytes={} two_distinct_lane_bytes={} two_same_lane_bytes={} multi_lane_bytes={} multi_three_same_bytes={} multi_branches_2={} multi_branches_3={} multi_branches_4plus={} multi_two_same_parser={} multi_two_both_passed={} multi_two_one_pending={} multi_two_both_pending={} multi_two_pending_mem1={} multi_two_pending_mem2={} multi_two_pending_mem3plus={} multi_two_guard_eq_passed_lexer={} multi_two_pending_lexer_is_initial={} boundary_calls={} boundary_misses={} parser_advance_calls={} parser_advance_misses={} inadmissible_finalizers={} parser_nodes={} dead_tokens_cleared={} total_ops={} total_tokens={}",
@@ -7331,6 +8124,452 @@ fn try_full_walk_mask_with_table_from_initial<
     update_special_token_mask(state, buf);
     state.clear_late_grammar_placeholder_mask(buf);
     Ok(true)
+}
+
+#[cfg(test)]
+mod full_walk_acceleration_tests {
+    use super::*;
+
+    #[test]
+    fn many_transition_memo_bounds_allocations_and_keeps_exact_direct_states() {
+        let mut disabled = FullWalkManyTransitionMemo::new(0);
+        let state = guarded_state(7, 2);
+        let cursor = disabled.hold(state.clone());
+        assert!(cursor.id().is_none());
+        assert!(disabled.view(&cursor) == &state);
+        assert!(disabled.states.is_empty());
+        assert!(disabled.rows.is_empty());
+
+        let mut bounded = FullWalkManyTransitionMemo::new(usize::MAX);
+        assert_eq!(bounded.limit, FullWalkManyTransitionMemo::MAX_STATES);
+        for parser in 0..FullWalkManyTransitionMemo::MAX_STATES + 3 {
+            let state = guarded_state(parser as u32, 2);
+            let cursor = bounded.hold(state.clone());
+            assert_eq!(cursor.id().is_some(), parser < FullWalkManyTransitionMemo::MAX_STATES);
+            assert!(bounded.view(&cursor) == &state);
+        }
+        assert_eq!(bounded.rows.len(), FullWalkManyTransitionMemo::MAX_STATES);
+        assert_eq!(bounded.states.len(), bounded.rows.len());
+        assert_eq!(bounded.identity_bytes.len(), bounded.rows.len());
+        assert!(bounded.hold(guarded_state(7, 2)).id().is_some(),
+            "existing exact entries remain reusable after capacity is exhausted");
+    }
+
+    #[test]
+    fn root_output_scope_marker_checks_all_aliases_across_output_words() {
+        let direct = (1u64 << 32) | 0b101;
+        assert!(full_walk_marker_fully_ignored(direct, &[0, 0b111], |_| panic!("direct")));
+        assert!(!full_walk_marker_fully_ignored(direct, &[0, 0b001], |_| panic!("direct")));
+        assert!(!full_walk_marker_fully_ignored(direct, &[u32::MAX], |_| panic!("direct")));
+        let aliased = DYNAMIC_TOKEN_MARKER_FALLBACK | 4;
+        for mask in [vec![1, 0], vec![0, 1], vec![1, 1]] {
+            let covered = full_walk_marker_fully_ignored(aliased, &mask, |id| {
+                assert_eq!(id, 3);
+                [0_u32, 32].iter().all(|id| mask[*id as usize / 32] & (1 << (*id % 32)) != 0)
+            });
+            assert_eq!(covered, mask == [1, 1]);
+        }
+        assert!(!full_walk_marker_fully_ignored(DYNAMIC_TOKEN_MARKER_FALLBACK, &[], |_| panic!("invalid")));
+        assert!(!full_walk_marker_fully_ignored(u64::MAX, &[], |_| panic!("invalid")));
+    }
+
+    #[test]
+    fn identity_context_policy_is_monotone_and_only_changes_admission() {
+        for roots in 0..10 {
+            let mut admitted = false;
+            for parser_nodes in 0..256 {
+                let now = full_walk_identity_context_profitable(roots, parser_nodes);
+                assert_eq!(now, roots >= 2 || parser_nodes >= 32);
+                assert!(!admitted || now);
+                admitted |= now;
+            }
+        }
+    }
+
+
+    #[test]
+    fn root_output_scope_cursor_matches_all_intervals_and_scans_each_marker_once() {
+        let markers: Vec<u64> = (0..8).collect();
+        for ignored in 0_u32..256 {
+            let mut cursor = FullWalkOutputScopeCursor::default();
+            let mut visits = [0_usize; 8];
+            for start in 0..=markers.len() {
+                for end in (start..=markers.len()).rev() {
+                    let expected = markers[start..end].iter().all(|&m| ignored & (1 << m) != 0);
+                    let actual = cursor.covers(&markers, start, end, |m| {
+                        visits[m as usize] += 1;
+                        ignored & (1 << m) != 0
+                    });
+                    assert_eq!(actual, expected, "ignored={ignored} interval={start}..{end}");
+                }
+            }
+            assert!(visits.iter().all(|&n| n <= 1), "repeated scans: {visits:?}");
+            // A caller restoring an earlier traversal must not reuse a later
+            // ignored-prefix certificate. Test nonmonotone order too.
+            for start in (0..=markers.len()).rev() {
+                for end in start..=markers.len() {
+                    let expected = markers[start..end].iter().all(|&m| ignored & (1 << m) != 0);
+                    assert_eq!(cursor.covers(&markers, start, end, |m| ignored & (1 << m) != 0), expected);
+                }
+            }
+            assert!(!cursor.covers(&markers, 3, 2, |_| panic!("invalid interval")));
+            assert!(!cursor.covers(&markers, 0, 9, |_| panic!("invalid interval")));
+        }
+        let mut cursor = FullWalkOutputScopeCursor::default();
+        assert!(cursor.covers(&[], 0, 0, |_| panic!("empty range")));
+    }
+
+    #[test]
+    fn root_output_scope_prefix_ranges_match_literal_marker_responsibility() {
+        let markers = [0, 1, 2, 3, 4, 5, 6, 7];
+        for ignored in 0..256u32 {
+            let scope = FullWalkOutputScope::new(&markers, |marker| ignored & (1 << marker) != 0).unwrap();
+            for start in 0..=8 {
+                for end in start..=8 {
+                    assert_eq!(scope.covers(start, end),
+                        (start..end).all(|marker| ignored & (1 << marker) != 0));
+                }
+            }
+            assert!(!scope.covers(4, 3));
+            assert!(!scope.covers(0, 9));
+            assert!(!scope.covers(usize::MAX, usize::MAX));
+        }
+        assert!(FullWalkOutputScope::new(&[], |_| false).unwrap().covers(0, 0));
+    }
+
+    #[test]
+    fn root_output_scope_dont_care_algebra_preserves_guarded_union() {
+        for accepted in 0..16u32 {
+            for blocked in 0..16u32 {
+                let ignored = accepted | blocked;
+                for root in 0..16u32 {
+                    for arbitrary in 0..16u32 {
+                        let partial = (root & !ignored) | (arbitrary & ignored);
+                        assert_eq!(accepted | (partial & !blocked), accepted | (root & !blocked));
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn structural_identity_classes_separate_finalizers_and_never_include_dead_or_changed_targets() {
+        let state = 37;
+        let mut calls = 0;
+        let classes = full_walk_identity_byte_classes(state, |byte| {
+            calls += 1;
+            match byte {
+                0 | 255 => Some((state, false)),
+                b'a'..=b'z' => Some((state, true)),
+                b'A'..=b'Z' => Some((state + 1, false)),
+                b'0'..=b'9' => Some((state + 1, true)),
+                _ => None,
+            }
+        });
+        assert_eq!(calls, 256);
+        for byte in 0..=u8::MAX {
+            let bit = 1u64 << (byte & 63);
+            assert_eq!(classes.ordinary[byte as usize >> 6] & bit != 0,
+                       byte == 0 || byte == 255);
+            assert_eq!(classes.finalizing[byte as usize >> 6] & bit != 0,
+                       byte.is_ascii_lowercase());
+        }
+        let shifted = full_walk_identity_byte_classes(state + 1, |byte| {
+            Some((state, byte % 2 == 0))
+        });
+        assert_eq!(shifted.ordinary, [0; 4]);
+        assert_eq!(shifted.finalizing, [0; 4]);
+    }
+
+    #[test]
+    fn scalar_identity_structural_proof_is_scoped_to_the_complete_pair() {
+        let mut cache = FullWalkScalarIdentity::default();
+        cache.remember((7, 11), (7, 11), b'a');
+        cache.proof_checked = true;
+        cache.bytes = [u64::MAX; 4];
+        cache.remember((7, 11), (7, 11), b'b');
+        assert!(cache.proof_checked);
+        assert!(cache.alphabet((7, 12)).is_none());
+        cache.remember((7, 12), (7, 12), b'a');
+        assert!(!cache.proof_checked);
+        assert_eq!(cache.bytes.iter().map(|word| word.count_ones()).sum::<u32>(), 1);
+        cache.proof_checked = true;
+        cache.remember((8, 12), (8, 12), 255);
+        assert!(!cache.proof_checked);
+        assert_eq!(cache.alphabet((8, 12)), Some(&[0, 0, 0, 1u64 << 63]));
+    }
+
+    #[test]
+    fn identity_classes_of_union_require_every_member_and_keep_finalizer_or() {
+        let mut left = full_walk_identity_byte_classes(1, |byte| match byte {
+            0 | b'a' | b'b' => Some((1, false)),
+            b'c' | 255 => Some((1, true)),
+            _ => None,
+        });
+        let right = full_walk_identity_byte_classes(2, |byte| match byte {
+            b'b' | b'c' => Some((2, false)),
+            b'a' | 255 => Some((2, true)),
+            _ => None,
+        });
+        left.intersect_union_member(right);
+        assert_eq!(left.ordinary, U8Set::single(b'b').to_words());
+        assert_eq!(left.finalizing, U8Set::from_bytes(&[b'a', b'c', 255]).to_words());
+        left.intersect_union_member(FullWalkIdentityByteClasses::default());
+        assert_eq!(left.ordinary, [0; 4]);
+        assert_eq!(left.finalizing, [0; 4]);
+    }
+
+    #[test]
+    fn structural_identity_proof_cache_is_bounded_and_keeps_exact_row_keys() {
+        let tokenizer = crate::automata::lexer::tokenizer::arbitrary_flat32_test_tokenizer();
+        let mut rows = vec![u16::MAX; 65 * 256];
+        for state in 0..65 {
+            rows[state * 256 + b'a' as usize] = state as u16;
+        }
+        let table = FullWalkFlat16 { transitions: &rows };
+        let mut cache = FullWalkIdentityProofCache::default();
+        for state in 0..64 {
+            let classes = cache.get(&table, &tokenizer, state).unwrap();
+            assert_eq!(classes.ordinary, U8Set::single(b'a').to_words());
+            assert_eq!(classes.finalizing, [0; 4]);
+        }
+        assert_eq!(cache.rows.len(), 64);
+        assert!(cache.get(&table, &tokenizer, 64).is_none());
+        assert!(cache.get(&table, &tokenizer, 0).is_some());
+        assert_eq!(cache.rows.len(), 64);
+    }
+
+    #[test]
+    fn scalar_identity_alphabet_requires_both_coordinates_and_resets_on_replacement() {
+        let mut cache = FullWalkScalarIdentity::default();
+        let source = (37, 91);
+        assert!(cache.alphabet(source).is_none());
+        cache.remember(source, (38, 91), b'a');
+        cache.remember(source, (37, 92), b'b');
+        assert!(cache.alphabet(source).is_none());
+        cache.remember(source, source, 0);
+        cache.remember(source, source, 255);
+        assert_eq!(cache.alphabet(source), Some(&[1, 0, 0, 1u64 << 63]));
+        assert!(cache.alphabet((38, 91)).is_none());
+        assert!(cache.alphabet((37, 92)).is_none());
+        let other = (0x8000_0100, 92);
+        cache.remember(other, other, 64);
+        assert!(cache.alphabet(source).is_none());
+        assert_eq!(cache.alphabet(other), Some(&[0, 1, 0, 0]));
+    }
+
+    #[test]
+    fn identity_subtree_alphabet_requires_every_byte_and_exact_memo_self_edges() {
+        let mut identity = [0_u64; 4];
+        identity[b'a' as usize >> 6] |= 1 << (b'a' & 63);
+        identity[3] |= 1 << 63;
+        assert!(identity_alphabet_covers_subtree(&identity, identity));
+        assert!(identity_alphabet_covers_subtree(&identity, [0; 4]));
+        for byte in 0_u16..=255 {
+            let mut alphabet = [0_u64; 4];
+            alphabet[byte as usize >> 6] = 1 << (byte & 63);
+            assert_eq!(identity_alphabet_covers_subtree(&identity, alphabet),
+                byte == u16::from(b'a') || byte == 255);
+        }
+        let mut memo = FullWalkManyTransitionMemo::new(4);
+        let source = memo.hold(guarded_state(7, 2));
+        let other = memo.hold(guarded_state(8, 2));
+        memo.remember_transition(source.id(), b'a', &source);
+        memo.remember_transition(source.id(), b'b', &other);
+        let known = memo.identity_alphabet(&source).unwrap();
+        assert_eq!(known[b'a' as usize >> 6] & (1 << (b'a' & 63)), 1 << (b'a' & 63));
+        assert_eq!(known[b'b' as usize >> 6] & (1 << (b'b' & 63)), 0);
+        assert_eq!(memo.identity_alphabet(&other).unwrap(), &[0; 4]);
+    }
+
+    #[test]
+    fn guarded_identity_covers_fast_returns_without_aliasing_other_coordinates() {
+        let pair = FullWalkGuardedPair {
+            continuing_lexer: 3, continuing_parser: 4, pending_parser: 5, guard_terminal: 6,
+        };
+        let mut cached = None;
+        let mut bytes = [0_u64; 4];
+        assert!(remember_guarded_identity(pair, pair, 255, &mut cached, &mut bytes));
+        assert!(cached == Some(pair));
+        assert_eq!(bytes, [0, 0, 0, 1u64 << 63]);
+        for different in [
+            FullWalkGuardedPair { continuing_lexer: 7, ..pair },
+            FullWalkGuardedPair { continuing_parser: 7, ..pair },
+            FullWalkGuardedPair { pending_parser: 7, ..pair },
+            FullWalkGuardedPair { guard_terminal: 7, ..pair },
+        ] {
+            let old_bytes = bytes;
+            assert!(!remember_guarded_identity(pair, different, 0, &mut cached, &mut bytes));
+            assert!(cached == Some(pair));
+            assert_eq!(bytes, old_bytes);
+        }
+        let other = FullWalkGuardedPair { pending_parser: 8, ..pair };
+        assert!(remember_guarded_identity(other, other, 0, &mut cached, &mut bytes));
+        assert!(cached == Some(other));
+        assert_eq!(bytes, [1, 0, 0, 0]);
+    }
+
+    #[test]
+    fn guarded_reentry_requires_the_complete_correlated_pair_shape() {
+        let passed = FullWalkBranch {
+            lexer_state: 9, parser_node: 17, prune_guard: FullWalkPruneGuard::Passed,
+        };
+        let pending = FullWalkBranch {
+            lexer_state: 3, parser_node: 29,
+            prune_guard: FullWalkPruneGuard::Pending(smallvec::smallvec![(9, 6)]),
+        };
+        let expected = FullWalkGuardedPair {
+            continuing_lexer: 9, continuing_parser: 17, pending_parser: 29, guard_terminal: 6,
+        };
+        for branches in [smallvec::smallvec![passed.clone(), pending.clone()], smallvec::smallvec![pending.clone(), passed.clone()]] {
+            assert!(full_walk_guarded_pair_from_branches(&branches, 3) == Some(expected));
+        }
+        for other in [
+            FullWalkBranch { lexer_state: 4, ..pending.clone() },
+            FullWalkBranch { prune_guard: FullWalkPruneGuard::Pending(smallvec::smallvec![(8, 6)]), ..pending.clone() },
+            FullWalkBranch { prune_guard: FullWalkPruneGuard::Pending(smallvec::smallvec![(9, 6), (9, 7)]), ..pending.clone() },
+        ] {
+            assert!(full_walk_guarded_pair_from_branches(&smallvec::smallvec![passed.clone(), other], 3).is_none());
+        }
+        assert!(full_walk_guarded_pair_from_branches(&smallvec::smallvec![passed.clone(), pending, passed], 3).is_none());
+    }
+
+
+    #[test]
+    fn many_transition_memo_preserves_complete_state_and_byte_keys() {
+        let mut memo = FullWalkManyTransitionMemo::new(8);
+        let state = guarded_state(7, 2);
+        let source = memo.hold(state.clone());
+        let duplicate = memo.hold(state.clone());
+        let target = memo.hold(guarded_state(8, 2));
+        let other_guard = memo.hold(guarded_state(7, 3));
+        assert_eq!(source.id(), duplicate.id());
+        assert_ne!(source.id(), target.id());
+        assert_ne!(source.id(), other_guard.id());
+        assert!(memo.cached_transition(&source, b'a').is_none());
+        memo.remember_transition(source.id(), b'a', &target);
+        let hit = memo.cached_transition(&duplicate, b'a').unwrap();
+        assert!(memo.view(&hit) == &guarded_state(8, 2));
+        assert!(memo.cached_transition(&source, b'b').is_none());
+        assert!(memo.cached_transition(&other_guard, b'a').is_none());
+        assert!(memo.cached_transition(&target, b'a').is_none());
+    }
+
+    #[test]
+    fn many_transition_memo_limit_retains_exact_uncached_fallback() {
+        let mut memo = FullWalkManyTransitionMemo::new(1);
+        let source = memo.hold(guarded_state(7, 2));
+        let uncached = memo.hold(guarded_state(8, 2));
+        assert!(source.id().is_some());
+        assert!(uncached.id().is_none());
+        assert!(memo.view(&uncached) == &guarded_state(8, 2));
+        memo.remember_transition(source.id(), 255, &uncached);
+        assert!(memo.cached_transition(&source, 255).is_none());
+        memo.remember_transition(source.id(), b'a', &source);
+        let repeated = memo.hold(guarded_state(7, 2));
+        assert_eq!(source.id(), repeated.id());
+        assert_eq!(memo.cached_transition(&repeated, b'a').unwrap().id(), source.id());
+        assert_eq!(memo.states.len(), 1);
+        let mut next_mask = FullWalkManyTransitionMemo::new(1);
+        let fresh = next_mask.hold(guarded_state(7, 2));
+        assert!(next_mask.cached_transition(&fresh, b'a').is_none());
+    }
+
+    #[test]
+    fn many_transition_memo_checks_equality_after_hash_collisions() {
+        use std::hash::{Hash, Hasher};
+        let mut memo = FullWalkManyTransitionMemo::new(8);
+        let source = memo.hold(guarded_state(7, 2));
+        let other = guarded_state(8, 2);
+        let mut hash = rustc_hash::FxHasher::default();
+        other.hash(&mut hash);
+        // Force a non-equal candidate into this state's bucket.
+        memo.buckets.insert(hash.finish(), smallvec::smallvec![source.id().unwrap()]);
+        let target = memo.hold(other.clone());
+        assert_ne!(source.id(), target.id());
+        assert!(memo.view(&target) == &other);
+        assert_eq!(memo.hold(other).id(), target.id());
+    }
+
+    #[test]
+    fn many_transition_memo_bounds_large_guard_storage() {
+        let large = FullWalkManyState::Branches(smallvec::smallvec![FullWalkBranch {
+            lexer_state: 3,
+            parser_node: 9,
+            prune_guard: FullWalkPruneGuard::Pending((0..5).map(|x| (x, x)).collect()),
+        }]);
+        let mut memo = FullWalkManyTransitionMemo::new(8);
+        let cursor = memo.hold(large.clone());
+        assert!(cursor.id().is_none());
+        assert!(memo.states.is_empty());
+        assert!(memo.view(&cursor) == &large);
+    }
+
+
+    #[test]
+    fn dense_parser_canonical_preserves_complete_stack_languages() {
+        let (mut cache, _) = FullWalkParserCache::from_roots(&DynamicBranches::new(), 9, false);
+        cache.canonicalize = true;
+        let first = ParserStacks::from_stacks(&[
+            (vec![0, 1, 7], ()), (vec![0, 2, 7], ()),
+        ]);
+        let id = cache.push_parser_stacks(first.clone());
+        // Pass the cost gate without requiring a grammar-specific shape.
+        for value in 1..32 {
+            cache.push_parser_stacks(ParserStacks::from_single_stack(vec![value + 100], ()));
+        }
+        let same = ParserStacks::merge_many([
+            ParserStacks::from_single_stack(vec![0, 2, 7], ()),
+            ParserStacks::from_single_stack(vec![0, 1, 7], ()),
+        ]);
+        assert_eq!(cache.intern_parser_stacks(same), id);
+        let different = ParserStacks::from_single_stack(vec![0, 3, 7], ());
+        let different_id = cache.intern_parser_stacks(different.clone());
+        assert_ne!(different_id, id, "equal parser tops are not an equivalence");
+        assert_eq!(cache.intern_parser_stacks(different), different_id);
+        let empty_word = first.merge(&ParserStacks::from_single_stack(Vec::new(), ()));
+        assert_ne!(cache.intern_parser_stacks(empty_word), id, "empty-stack acceptance is part of the key");
+        assert!(cache.canonical.as_ref().unwrap().hits >= 2);
+    }
+
+    #[test]
+    fn dense_parser_canonical_budget_failure_falls_back_without_aliasing() {
+        let (mut cache, _) = FullWalkParserCache::from_roots(&DynamicBranches::new(), 9, false);
+        cache.canonicalize = true;
+        for value in 0..32 {
+            cache.push_parser_stacks(ParserStacks::from_single_stack(vec![value], ()));
+        }
+        cache.canonical = Some(Box::new(FullWalkDenseParserCanonical {
+            keys: crate::ds::leveled_gss::GssSemanticKeyInterner::with_budget(1, 1, 1),
+            nodes: FxHashMap::from_iter([(0, 0)]),
+            hits: 0,
+        }));
+        let gss = ParserStacks::from_single_stack(vec![88, 99], ());
+        let first = cache.intern_parser_stacks(gss.clone());
+        let second = cache.intern_parser_stacks(gss.clone());
+        assert_ne!(first, 0);
+        assert_ne!(first, second);
+        assert!(cache.nodes[first as usize].gss.ptr_eq(&gss));
+        assert!(cache.nodes[second as usize].gss.ptr_eq(&gss));
+        assert!(cache.canonical.as_ref().unwrap().keys.is_exhausted());
+    }
+
+    fn guarded_state(parser: u32, terminal: TerminalID) -> FullWalkManyState {
+        FullWalkManyState::Branches(smallvec::smallvec![
+            FullWalkBranch {
+                lexer_state: 5,
+                parser_node: parser,
+                prune_guard: FullWalkPruneGuard::Passed,
+            },
+            FullWalkBranch {
+                lexer_state: 0,
+                parser_node: 9,
+                prune_guard: FullWalkPruneGuard::Pending(smallvec::smallvec![(5, terminal)]),
+            },
+        ])
+    }
+
+
 }
 
 #[cfg(test)]
