@@ -2908,13 +2908,39 @@ impl FullWalkIdentityProofCache {
 /// direct variant preserves the reference executor when storage is exhausted.
 /// Cached cursors copy only their ID when a vocabulary edge saves/restores its
 /// parent; they do not repeatedly clone the whole ambiguous lexer frontier.
-#[derive(Clone)]
 enum FullWalkManyCursor {
     Direct(FullWalkManyState),
     Cached(u16),
 }
 
+impl Clone for FullWalkManyCursor {
+    fn clone(&self) -> Self {
+        match self {
+            Self::Direct(state) => Self::Direct(state.clone()),
+            Self::Cached(id) => Self::Cached(*id),
+        }
+    }
+
+    #[inline]
+    fn clone_from(&mut self, source: &Self) {
+        // Most vocabulary stack restores copy only a memo ID. Do not route
+        // that through a temporary large inline frontier and its drop path.
+        match (&mut *self, source) {
+            (Self::Cached(target), Self::Cached(source)) => *target = *source,
+            _ => *self = source.clone(),
+        }
+    }
+}
+
 impl FullWalkManyCursor {
+    #[inline]
+    fn set_cached(&mut self, source: u16) {
+        match self {
+            Self::Cached(target) => *target = source,
+            _ => *self = Self::Cached(source),
+        }
+    }
+
     fn id(&self) -> Option<u16> {
         match self { Self::Cached(id) => Some(*id), Self::Direct(_) => None }
     }
@@ -2956,7 +2982,10 @@ impl FullWalkManyStack {
 struct FullWalkManyTransitionMemo {
     limit: usize,
     states: Vec<FullWalkManyState>,
-    rows: Vec<Box<[u16; 256]>>,
+    // No references into rows escape a lookup. A contiguous growable table
+    // avoids a separate allocation for every memoized frontier; IDs, not
+    // pointers, remain the only row handles. Allocation is still lazy/bounded.
+    rows: Vec<[u16; 256]>,
     identity_bytes: Vec<[u64; 4]>,
     buckets: FxHashMap<u64, SmallVec<[u16; 2]>>,
     lookups: usize,
@@ -3006,7 +3035,7 @@ impl FullWalkManyTransitionMemo {
         if self.states.len() >= self.limit { return FullWalkManyCursor::Direct(state); }
         let id = self.states.len() as u16;
         self.states.push(state);
-        self.rows.push(Box::new([Self::UNKNOWN; 256]));
+        self.rows.push([Self::UNKNOWN; 256]);
         self.identity_bytes.push([0; 4]);
         self.buckets.entry(hash).or_default().push(id);
         FullWalkManyCursor::Cached(id)
@@ -3014,14 +3043,14 @@ impl FullWalkManyTransitionMemo {
 
     #[inline]
     fn cached_transition(&mut self, cursor: &FullWalkManyCursor, byte: u8)
-        -> Option<FullWalkManyCursor>
+        -> Option<u16>
     {
         let source = cursor.id()?;
         self.lookups += 1;
         let target = self.rows[source as usize][byte as usize];
         if target == Self::UNKNOWN { return None; }
         self.hits += 1;
-        Some(FullWalkManyCursor::Cached(target))
+        Some(target)
     }
 
     fn remember_transition(&mut self, source: Option<u16>, byte: u8, target: &FullWalkManyCursor) {
@@ -7662,7 +7691,7 @@ fn try_full_walk_mask_with_table_from_initial_in_output_scope<
                 'advance_many: {
                 let source_id = current_many.id();
                 if let Some(cached) = many_transition_memo.cached_transition(&current_many, byte) {
-                    current_many = cached;
+                    current_many.set_cached(cached);
                     break 'advance_many;
                 }
                 let next = full_walk_step_many_state(
@@ -8260,6 +8289,46 @@ mod full_walk_acceleration_tests {
     }
 
     #[test]
+    fn cached_frontier_copies_and_direct_replacements_preserve_correlations() {
+        let mut memo = FullWalkManyTransitionMemo::new(4);
+        let first = memo.hold(guarded_state(7, 2));
+        let second = memo.hold(guarded_state(8, 3));
+        let direct = FullWalkManyCursor::Direct(guarded_state(9, 4));
+        let mut cursor = direct.clone();
+        for source in [&first, &second, &direct, &direct, &first] {
+            cursor.clone_from(source);
+            assert!(memo.view(&cursor) == memo.view(source));
+        }
+        cursor.set_cached(second.id().unwrap());
+        assert!(memo.view(&cursor) == memo.view(&second));
+        cursor.clone_from(&direct);
+        cursor.set_cached(first.id().unwrap());
+        assert!(memo.view(&cursor) == memo.view(&first));
+        assert!(memo.view(&direct) == &guarded_state(9, 4));
+    }
+
+    #[test]
+    fn contiguous_frontier_rows_preserve_transitions_across_growth() {
+        let mut memo = FullWalkManyTransitionMemo::new(256);
+        let first = memo.hold(guarded_state(7, 2));
+        memo.remember_transition(first.id(), 0, &first);
+        memo.remember_transition(first.id(), 255, &first);
+        for value in 8..263 {
+            let next = memo.hold(guarded_state(value, 2));
+            memo.remember_transition(next.id(), 127, &first);
+        }
+        assert_eq!(memo.rows.len(), 256);
+        assert_eq!(memo.cached_transition(&first, 0), first.id());
+        assert_eq!(memo.cached_transition(&first, 255), first.id());
+        assert!(memo.cached_transition(&first, 127).is_none());
+        for id in 1..256 {
+            let cursor = FullWalkManyCursor::Cached(id);
+            assert_eq!(memo.cached_transition(&cursor, 127), first.id());
+            assert!(memo.cached_transition(&cursor, 255).is_none());
+        }
+    }
+
+    #[test]
     fn many_transition_memo_bounds_allocations_and_keeps_exact_direct_states() {
         let mut disabled = FullWalkManyTransitionMemo::new(0);
         let state = guarded_state(7, 2);
@@ -8578,7 +8647,7 @@ mod full_walk_acceleration_tests {
         assert!(memo.cached_transition(&source, b'a').is_none());
         memo.remember_transition(source.id(), b'a', &target);
         let hit = memo.cached_transition(&duplicate, b'a').unwrap();
-        assert!(memo.view(&hit) == &guarded_state(8, 2));
+        assert!(memo.view(&FullWalkManyCursor::Cached(hit)) == &guarded_state(8, 2));
         assert!(memo.cached_transition(&source, b'b').is_none());
         assert!(memo.cached_transition(&other_guard, b'a').is_none());
         assert!(memo.cached_transition(&target, b'a').is_none());
@@ -8597,7 +8666,7 @@ mod full_walk_acceleration_tests {
         memo.remember_transition(source.id(), b'a', &source);
         let repeated = memo.hold(guarded_state(7, 2));
         assert_eq!(source.id(), repeated.id());
-        assert_eq!(memo.cached_transition(&repeated, b'a').unwrap().id(), source.id());
+        assert_eq!(Some(memo.cached_transition(&repeated, b'a').unwrap()), source.id());
         assert_eq!(memo.states.len(), 1);
         let mut next_mask = FullWalkManyTransitionMemo::new(1);
         let fresh = next_mask.hold(guarded_state(7, 2));
