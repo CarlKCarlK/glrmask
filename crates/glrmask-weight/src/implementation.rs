@@ -1479,43 +1479,38 @@ fn intersect_weight_with_index(sparse: &Weight, index: &WeightIntersectionIndex)
 
 struct CompactRangeBuilder {
     map: WeightMap,
-    pending_start: Option<u32>,
-    pending_end: u32,
-    pending_tokens: SharedTokenSet,
+    pending: Option<WeightRangeEntry>,
 }
 
 impl CompactRangeBuilder {
     fn new() -> Self {
         Self {
             map: WeightMap::new(),
-            pending_start: None,
-            pending_end: 0,
-            pending_tokens: Arc::clone(&EMPTY_RANGESET),
+            pending: None,
         }
     }
 
     fn push(&mut self, start: u32, end: u32, tokens: SharedTokenSet) {
-        match self.pending_start {
-            Some(_)
-                if self.pending_end.checked_add(1) == Some(start)
-                    && same_shared_token_set(&self.pending_tokens, &tokens) =>
+        match self.pending.as_mut() {
+            Some(pending)
+                if pending.end.checked_add(1) == Some(start)
+                    && same_shared_token_set(&pending.tokens, &tokens) =>
             {
-                self.pending_end = end;
+                pending.end = end;
             }
             _ => {
                 self.flush();
-                self.pending_start = Some(start);
-                self.pending_end = end;
-                self.pending_tokens = tokens;
+                self.pending = Some(WeightRangeEntry { start, end, tokens });
             }
         }
     }
 
     fn flush(&mut self) {
-        if let Some(start) = self.pending_start.take() {
-            let tokens = std::mem::replace(&mut self.pending_tokens, Arc::clone(&EMPTY_RANGESET));
+        // Move the owned pending value directly. An absent range needs no
+        // shared empty-set placeholder (and no refcount updates per flush).
+        if let Some(pending) = self.pending.take() {
             self.map
-                .extend_simple(std::iter::once((start..=self.pending_end, tokens)));
+                .extend_simple(std::iter::once((pending.start..=pending.end, pending.tokens)));
         }
     }
 
@@ -3564,6 +3559,78 @@ impl PartialEq for Weight {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn compact_range_builder_preserves_stream_and_token_representatives() {
+        // Keep the original placeholder-based implementation as an oracle.
+        // Comparing raw maps avoids global interning hiding an identity change.
+        struct Reference {
+            map: WeightMap,
+            start: Option<u32>,
+            end: u32,
+            tokens: SharedTokenSet,
+        }
+        impl Reference {
+            fn flush(&mut self) {
+                if let Some(start) = self.start.take() {
+                    let tokens = std::mem::replace(&mut self.tokens, Arc::clone(&EMPTY_RANGESET));
+                    self.map.extend_simple(std::iter::once((start..=self.end, tokens)));
+                }
+            }
+            fn push(&mut self, start: u32, end: u32, tokens: SharedTokenSet) {
+                if self.start.is_some()
+                    && self.end.checked_add(1) == Some(start)
+                    && same_shared_token_set(&self.tokens, &tokens)
+                {
+                    self.end = end;
+                } else {
+                    self.flush();
+                    self.start = Some(start);
+                    self.end = end;
+                    self.tokens = tokens;
+                }
+            }
+        }
+        let a = Arc::new(RangeSetBlaze::from_iter([1_u32..=4, 7..=9]));
+        let equal_a = Arc::new(a.as_ref().clone());
+        let b = Arc::new(RangeSetBlaze::from_iter([3_u32..=8]));
+        assert!(!Arc::ptr_eq(&a, &equal_a));
+        let entries = [
+            (0, 0, Arc::clone(&a)),
+            (1, 2, Arc::clone(&equal_a)),
+            (3, 6, Arc::clone(&b)),
+            (2, 5, Arc::clone(&a)),
+            (9, 11, Arc::clone(&b)),
+            (u32::MAX - 2, u32::MAX - 1, Arc::clone(&a)),
+            (u32::MAX, u32::MAX, Arc::clone(&equal_a)),
+            (3, 3, Arc::clone(&EMPTY_RANGESET)),
+        ];
+        for seed in 0..1024_usize {
+            let mut reference = Reference {
+                map: WeightMap::new(), start: None, end: 0,
+                tokens: Arc::clone(&EMPTY_RANGESET),
+            };
+            let mut actual = CompactRangeBuilder::new();
+            let mut choice = seed;
+            for step in 0..(seed % 33) {
+                let entry = &entries[choice % entries.len()];
+                choice = choice.rotate_right(3).wrapping_add(step * 17 + seed);
+                reference.push(entry.0, entry.1, Arc::clone(&entry.2));
+                actual.push(entry.0, entry.1, Arc::clone(&entry.2));
+                if (seed + step) % 3 == 0 {
+                    reference.flush();
+                    actual.flush();
+                }
+            }
+            reference.flush();
+            actual.flush();
+            assert_eq!(actual.map, reference.map, "stream {seed}");
+            let identities = |map: &WeightMap| map.range_values()
+                .map(|(range, tokens)| (range, Arc::as_ptr(tokens) as usize))
+                .collect::<Vec<_>>();
+            assert_eq!(identities(&actual.map), identities(&reference.map), "token representatives {seed}");
+        }
+    }
 
     #[test]
     fn token_intersection_defaults_to_sweep_and_retains_reference_override() {
