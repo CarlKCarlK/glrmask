@@ -2903,6 +2903,9 @@ pub(crate) enum DynamicMaskLexerStateKey {
     VirtualDenseProjection { runtime: u32, state: u32, initial: bool },
 }
 
+/// Paths are top-first and sorted lexicographically with their correlated
+/// exclusions. The orientation is private to this in-memory cache; reversing
+/// every path is a bijection, so it changes neither key equivalence nor masks.
 pub(crate) type DynamicMaskStateKey = Vec<(
     DynamicMaskLexerStateKey,
     Vec<(Vec<u32>, Vec<(u32, Vec<TerminalID>)>)>,
