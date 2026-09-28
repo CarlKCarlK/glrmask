@@ -275,6 +275,15 @@ pub(super) struct CompositionMetadataSplitParts<'a> {
     pub(super) cache_compressed: bool,
 }
 
+// `bincode::serialize` visits every field twice to precompute the exact size.
+// Metadata is already bounded by the compiled constraint; write it once with
+// the same fixed-width wire encoding instead of rewalking all parser caches.
+fn serialize_metadata<T: Serialize + ?Sized>(value: &T) -> bincode::Result<Vec<u8>> {
+    let mut bytes = Vec::new();
+    bincode::serialize_into(&mut bytes, value)?;
+    Ok(bytes)
+}
+
 pub(super) fn encode_composition_metadata_part(raw: Vec<u8>) -> (usize, Vec<u8>, bool) {
     let raw_len = raw.len();
     if raw_len >= COMPOSITION_METADATA_COMPRESS_MIN_BYTES {
@@ -410,7 +419,7 @@ pub(super) fn encode_composition_metadata(constraint: &Constraint) -> Vec<u8> {
     // larger static parser-template caches. Explicit dynamic A+B needs only
     // the former; keeping it as a separately decodable section avoids paying
     // megabytes of parser-cache decompression/allocation merely to discover B.
-    let link_raw = bincode::serialize(&ConstraintCompositionLinkMetadataRef {
+    let link_raw = serialize_metadata(&ConstraintCompositionLinkMetadataRef {
         composition_reset_tokens_by_terminal: &constraint.composition_reset_tokens_by_terminal,
         unbound_grammar_placeholders: &constraint.unbound_grammar_placeholders,
         composition_grammar_summary: &constraint.composition_grammar_summary,
@@ -418,7 +427,7 @@ pub(super) fn encode_composition_metadata(constraint: &Constraint) -> Vec<u8> {
         boundary_candidate_summary: boundary_candidate_summary_wire(constraint),
     })
     .expect("composition link metadata serialization should succeed");
-    let cache_raw = bincode::serialize(&ConstraintCompositionCacheMetadataRef {
+    let cache_raw = serialize_metadata(&ConstraintCompositionCacheMetadataRef {
         composition_parser_templates_by_terminal:
             &constraint.composition_parser_templates_by_terminal,
         composition_parser_characterizations_by_terminal:
@@ -458,7 +467,7 @@ pub(super) fn encode_composition_metadata_base_for_save(constraint: &Constraint)
         return blob.as_slice().to_vec();
     }
 
-    let link_raw = bincode::serialize(&ConstraintCompositionLinkMetadataRef {
+    let link_raw = serialize_metadata(&ConstraintCompositionLinkMetadataRef {
         composition_reset_tokens_by_terminal: &constraint.composition_reset_tokens_by_terminal,
         unbound_grammar_placeholders: &constraint.unbound_grammar_placeholders,
         composition_grammar_summary: &constraint.composition_grammar_summary,
@@ -608,5 +617,87 @@ pub(crate) fn materialize_composition_metadata_for_compilation(
         }
         self.composition_link_metadata_materialized = true;
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod single_pass_tests {
+    use super::*;
+    use std::cell::Cell;
+
+    #[test]
+    fn metadata_serialization_visits_payload_once() {
+        struct Counted<'a> {
+            visits: &'a Cell<usize>,
+            rows: &'a [Vec<u32>],
+        }
+        impl Serialize for Counted<'_> {
+            fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+                self.visits.set(self.visits.get() + 1);
+                self.rows.serialize(serializer)
+            }
+        }
+        let visits = Cell::new(0);
+        let rows = vec![vec![0, 31, 65_535, 65_536, u32::MAX]; 128];
+        let value = Counted { visits: &visits, rows: &rows };
+        let expected = bincode::serialize(&value).unwrap();
+        assert_eq!(visits.get(), 2);
+        visits.set(0);
+        assert_eq!(serialize_metadata(&value).unwrap(), expected);
+        assert_eq!(visits.get(), 1);
+    }
+
+    #[test]
+    fn metadata_single_pass_preserves_owned_link_wire_and_compression() {
+        for rows in [0, 1, 31, 4096] {
+            let value = ConstraintCompositionLinkMetadata {
+                composition_reset_tokens_by_terminal: vec![vec![0, 65_536, u32::MAX]; rows],
+                unbound_grammar_placeholders: BTreeMap::from([
+                    ("child".to_owned(), 65_536),
+                    ("other".to_owned(), u32::MAX),
+                ]),
+                composition_grammar_summary: None,
+                boundary_trigger: BoundaryTriggerWire::Tokens(vec![0, 31, u32::MAX]),
+                boundary_candidate_summary: BoundaryCandidateSummaryWire::Known {
+                    algorithm_version: 1,
+                    component_semantics: [1; 32],
+                    public_interface: [2; 32],
+                    vocabulary: [3; 32],
+                    tokens: BoundaryOriginalTokenSetWire::Sparse(vec![0, 65_536, u32::MAX]),
+                    precision: 0,
+                },
+            };
+            let expected = bincode::serialize(&value).unwrap();
+            let actual = serialize_metadata(&value).unwrap();
+            assert_eq!(actual, expected);
+            assert_eq!(encode_composition_metadata_part(actual), encode_composition_metadata_part(expected));
+        }
+    }
+
+    #[test]
+    fn metadata_single_pass_preserves_borrowed_cache_wire() {
+        for len in [0, 1, 64, 8192] {
+            let templates = vec![None; len];
+            let characterizations = vec![None; len];
+            let value = ConstraintCompositionCacheMetadataRef {
+                composition_parser_templates_by_terminal: &templates,
+                composition_parser_characterizations_by_terminal: &characterizations,
+            };
+            assert_eq!(serialize_metadata(&value).unwrap(), bincode::serialize(&value).unwrap());
+        }
+    }
+
+    #[test]
+    fn metadata_single_pass_propagates_serialization_errors() {
+        struct Invalid;
+        impl Serialize for Invalid {
+            fn serialize<S: serde::Serializer>(&self, _: S) -> Result<S::Ok, S::Error> {
+                Err(serde::ser::Error::custom("invalid metadata test value"))
+            }
+        }
+        assert_eq!(
+            serialize_metadata(&Invalid).unwrap_err().to_string(),
+            bincode::serialize(&Invalid).unwrap_err().to_string(),
+        );
     }
 }
