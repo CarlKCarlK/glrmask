@@ -131,3 +131,7 @@ Repository tooling under `scripts/refactor_acceptance.py` supports isolated
 baseline/candidate Python extensions, native runtime timing, full-vocabulary mask
 hashes, and alternating ABBA measurements. Its selected cases are a regression
 screen, not a substitute for the canonical CFA distribution or tail acceptance.
+
+## Commitment responsibilities
+
+The commitment lifecycle and execution kernels are described in [Commitment runtime](commit-runtime.md).

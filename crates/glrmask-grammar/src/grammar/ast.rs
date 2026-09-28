@@ -2027,6 +2027,10 @@ impl<'a> Lowerer<'a> {
                 automaton.states[from as usize].epsilons.push(to);
                 Ok(())
             }
+            GrammarExpr::Literal(bytes) if bytes.is_empty() => {
+                automaton.states[from as usize].epsilons.push(to);
+                Ok(())
+            }
             GrammarExpr::Quantified(inner, Quantifier::Optional) => {
                 automaton.states[from as usize].epsilons.push(to);
                 self.emit_direct_regular_expr(automaton, inner, from, to)
@@ -2506,6 +2510,9 @@ impl<'a> Lowerer<'a> {
                     )));
                 }
                 Symbol::Nonterminal(self.nonterminal_id(name))
+            }
+            GrammarExpr::Literal(bytes) if bytes.is_empty() => {
+                return self.lower_expr_terminalish(&GrammarExpr::Epsilon);
             }
             GrammarExpr::Literal(bytes) => Symbol::Terminal(self.literal_terminal_id(bytes)),
             GrammarExpr::SpecialToken(token_id) => Symbol::Terminal(

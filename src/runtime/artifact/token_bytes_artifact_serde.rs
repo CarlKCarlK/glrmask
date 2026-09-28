@@ -5,8 +5,10 @@ use std::sync::Arc;
 use serde::{Deserialize, Serialize};
 
 const LEGACY_MAGIC: &[u8; 4] = b"TBP1";
-const INDEXED_MAGIC: &[u8; 4] = b"TBP2";
-const INDEXED_HEADER_LEN: usize = INDEXED_MAGIC.len() + 1 + 4;
+const PREVIOUS_INDEXED_MAGIC: &[u8; 4] = b"TBP2";
+const INDEXED_MAGIC: &[u8; 4] = b"TBP3";
+const PREVIOUS_INDEXED_HEADER_LEN: usize = 9;
+const INDEXED_HEADER_LEN: usize = 13;
 
 thread_local! {
     static PACKED: Cell<bool> = const { Cell::new(false) };
@@ -39,6 +41,9 @@ pub(crate) struct PackedTokenBytes {
     indexed: Option<PackedTokenBytesIndexed>,
     spans: Box<[(u32, u32)]>,
     sparse_ids: Option<Box<[u32]>>,
+    // Stored explicitly by TBP3: ordinary current-format loads never scan the
+    // vocabulary to recover the token-domain policy.
+    empty_token_ids: Box<[u32]>,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -74,7 +79,7 @@ impl PackedTokenBytes {
         let input = wire
             .get(wire_start..wire_end)
             .ok_or_else(|| "packed token-byte backing range is out of bounds".to_owned())?;
-        if input.starts_with(INDEXED_MAGIC) {
+        if input.starts_with(INDEXED_MAGIC) || input.starts_with(PREVIOUS_INDEXED_MAGIC) {
             return Self::parse_indexed_backed(wire, wire_start, wire_len);
         }
         if !input.starts_with(LEGACY_MAGIC) {
@@ -89,6 +94,7 @@ impl PackedTokenBytes {
         pos += 1;
         let count = take_var_u32(input, &mut pos)? as usize;
         let mut spans = Vec::with_capacity(count);
+        let mut empty_token_ids = Vec::new();
         let mut sparse_ids = sparse.then(|| Vec::with_capacity(count));
         let mut previous_end = 0u64;
         for dense_id in 0..count {
@@ -106,8 +112,8 @@ impl PackedTokenBytes {
                 u32::try_from(dense_id)
                     .map_err(|_| "dense packed token id exceeds u32".to_owned())?
             };
-            let _ = id;
             let len = take_var_u32(input, &mut pos)? as usize;
+            if len == 0 { empty_token_ids.push(id); }
             let start = pos;
             let end = start
                 .checked_add(len)
@@ -133,6 +139,7 @@ impl PackedTokenBytes {
             indexed: None,
             spans: spans.into_boxed_slice(),
             sparse_ids: sparse_ids.map(Vec::into_boxed_slice),
+            empty_token_ids: empty_token_ids.into_boxed_slice(),
         })
     }
 
@@ -147,9 +154,14 @@ impl PackedTokenBytes {
         let input = wire
             .get(wire_start..wire_end)
             .ok_or_else(|| "indexed token-byte backing range is out of bounds".to_owned())?;
-        if input.len() < INDEXED_HEADER_LEN || !input.starts_with(INDEXED_MAGIC) {
+        let current = input.starts_with(INDEXED_MAGIC);
+        let header_len = if current { INDEXED_HEADER_LEN } else { PREVIOUS_INDEXED_HEADER_LEN };
+        if input.len() < header_len
+            || !(current || input.starts_with(PREVIOUS_INDEXED_MAGIC))
+        {
             return Err("invalid indexed token-byte header".to_owned());
         }
+        let empty_count = if current { read_u32_at(input, 9)? as usize } else { 0 };
         let sparse = match input[INDEXED_MAGIC.len()] {
             0 => false,
             1 => true,
@@ -161,7 +173,7 @@ impl PackedTokenBytes {
                 .try_into()
                 .expect("indexed token count has fixed width"),
         ) as usize;
-        let sparse_ids_start = sparse.then_some(INDEXED_HEADER_LEN);
+        let sparse_ids_start = sparse.then_some(header_len);
         let ids_bytes = if sparse {
             count
                 .checked_mul(4)
@@ -169,16 +181,22 @@ impl PackedTokenBytes {
         } else {
             0
         };
-        let offsets_start = INDEXED_HEADER_LEN
+        let offsets_start = header_len
             .checked_add(ids_bytes)
             .ok_or_else(|| "indexed token-byte offsets start overflows".to_owned())?;
         let offsets_bytes = count
             .checked_add(1)
             .and_then(|count| count.checked_mul(4))
             .ok_or_else(|| "indexed token-byte offset table overflows".to_owned())?;
-        let data_start = offsets_start
+        let empty_ids_start = offsets_start
             .checked_add(offsets_bytes)
+            .ok_or_else(|| "indexed token-byte empty-id table start overflows".to_owned())?;
+        let data_start = empty_count.checked_mul(4)
+            .and_then(|bytes| empty_ids_start.checked_add(bytes))
             .ok_or_else(|| "indexed token-byte data start overflows".to_owned())?;
+        if empty_count > count {
+            return Err("too many indexed empty token IDs".to_owned());
+        }
         if data_start > input.len() {
             return Err("truncated indexed token-byte tables".to_owned());
         }
@@ -187,7 +205,7 @@ impl PackedTokenBytes {
         if first_offset != 0 || final_offset != input.len() - data_start {
             return Err("invalid indexed token-byte offset bounds".to_owned());
         }
-        Ok(Self {
+        let mut parsed = Self {
             wire,
             wire_start,
             wire_len,
@@ -199,7 +217,38 @@ impl PackedTokenBytes {
             }),
             spans: Box::new([]),
             sparse_ids: None,
-        })
+            empty_token_ids: Box::new([]),
+        };
+        let mut empty_ids = Vec::with_capacity(empty_count);
+        if current {
+            for index in 0..empty_count {
+                let id = read_u32_at(parsed.wire(), empty_ids_start + index * 4)?;
+                if empty_ids.last().is_some_and(|&previous| previous >= id)
+                    || !parsed.get(id).is_some_and(<[u8]>::is_empty)
+                {
+                    return Err("invalid indexed empty token ID".to_owned());
+                }
+                empty_ids.push(id);
+            }
+        } else {
+            // Compatibility only: TBP2 did not retain this index. Its one-time
+            // scan does not apply to newly produced TBP3 artifacts.
+            for index in 0..count {
+                let bytes = parsed.bytes_at_index(index)
+                    .ok_or_else(|| "invalid legacy indexed token-byte offsets".to_owned())?;
+                if bytes.is_empty() {
+                    empty_ids.push(parsed.token_id_at(index)
+                        .ok_or_else(|| "invalid legacy indexed token ID".to_owned())?);
+                }
+            }
+        }
+        parsed.empty_token_ids = empty_ids.into_boxed_slice();
+        Ok(parsed)
+    }
+
+    #[inline]
+    pub(crate) fn empty_token_ids(&self) -> &[u32] {
+        &self.empty_token_ids
     }
 
     #[inline]
@@ -414,19 +463,21 @@ fn pack(value: &BTreeMap<u32, Vec<u8>>) -> Vec<u8> {
         .enumerate()
         .all(|(expected, actual)| actual as usize == expected);
     let count = value.len();
-    let data_len = value.values().try_fold(0usize, |total, bytes| {
-        total.checked_add(bytes.len())
+    let lengths = value.values().try_fold((0usize, 0usize), |(total, empty), bytes| {
+        total.checked_add(bytes.len()).map(|total| (total, empty + usize::from(bytes.is_empty())))
     });
-    let Some(data_len) = data_len.filter(|&len| u32::try_from(len).is_ok()) else {
+    let Some((data_len, empty_count)) = lengths.filter(|&(len, _)| u32::try_from(len).is_ok()) else {
         return pack_legacy(value);
     };
     let ids_len = if dense { 0 } else { count.saturating_mul(4) };
     let Some(offsets_len) = count.checked_add(1).and_then(|count| count.checked_mul(4)) else {
         return pack_legacy(value);
     };
+    let Some(empty_ids_len) = empty_count.checked_mul(4) else { return pack_legacy(value); };
     let capacity = INDEXED_HEADER_LEN
         .checked_add(ids_len)
         .and_then(|len| len.checked_add(offsets_len))
+        .and_then(|len| len.checked_add(empty_ids_len))
         .and_then(|len| len.checked_add(data_len));
     let Some(capacity) = capacity else {
         return pack_legacy(value);
@@ -439,20 +490,26 @@ fn pack(value: &BTreeMap<u32, Vec<u8>>) -> Vec<u8> {
     let mut out = vec![0u8; capacity];
     out[..INDEXED_MAGIC.len()].copy_from_slice(INDEXED_MAGIC);
     out[INDEXED_MAGIC.len()] = u8::from(!dense);
-    out[INDEXED_MAGIC.len() + 1..INDEXED_HEADER_LEN].copy_from_slice(
+    out[INDEXED_MAGIC.len() + 1..PREVIOUS_INDEXED_HEADER_LEN].copy_from_slice(
         &u32::try_from(count)
             .expect("token vocabulary should fit u32")
             .to_le_bytes(),
     );
 
+    out[9..13].copy_from_slice(&(empty_count as u32).to_le_bytes());
     let ids_start = INDEXED_HEADER_LEN;
     let offsets_start = ids_start + ids_len;
-    let data_start = offsets_start + offsets_len;
+    let mut empty_pos = offsets_start + offsets_len;
+    let data_start = empty_pos + empty_ids_len;
     out[offsets_start..offsets_start + 4].copy_from_slice(&0u32.to_le_bytes());
 
     let mut offset = 0u32;
     let mut data_pos = data_start;
     for (index, (&token_id, bytes)) in value.iter().enumerate() {
+        if bytes.is_empty() {
+            out[empty_pos..empty_pos + 4].copy_from_slice(&token_id.to_le_bytes());
+            empty_pos += 4;
+        }
         if !dense {
             let id_pos = ids_start + index * 4;
             out[id_pos..id_pos + 4].copy_from_slice(&token_id.to_le_bytes());
@@ -468,6 +525,7 @@ fn pack(value: &BTreeMap<u32, Vec<u8>>) -> Vec<u8> {
         offset = next_offset;
     }
     debug_assert_eq!(data_pos, capacity);
+    debug_assert_eq!(empty_pos, data_start);
     out
 }
 
@@ -476,7 +534,7 @@ pub(crate) fn pack_external(value: &BTreeMap<u32, Vec<u8>>) -> Vec<u8> {
 }
 
 fn unpack(input: &[u8]) -> Result<Arc<BTreeMap<u32, Vec<u8>>>, String> {
-    if input.starts_with(INDEXED_MAGIC) {
+    if input.starts_with(INDEXED_MAGIC) || input.starts_with(PREVIOUS_INDEXED_MAGIC) {
         return PackedTokenBytes::parse(input.to_vec()).map(|packed| packed.materialize());
     }
     if !input.starts_with(LEGACY_MAGIC) {
@@ -594,6 +652,8 @@ mod tests {
         assert!(packed.starts_with(INDEXED_MAGIC));
         let view = PackedTokenBytes::parse(packed).unwrap();
         assert_eq!(view.len(), value.len());
+        let expected_empty = value.iter().filter_map(|(&id, bytes)| bytes.is_empty().then_some(id)).collect::<Vec<_>>();
+        assert_eq!(view.empty_token_ids(), expected_empty);
         assert_eq!(
             view.iter()
                 .map(|(id, bytes)| (id, bytes.to_vec()))
@@ -607,6 +667,7 @@ mod tests {
 
         let legacy = pack_legacy(&value);
         let legacy_view = PackedTokenBytes::parse(legacy).unwrap();
+        assert_eq!(legacy_view.empty_token_ids(), expected_empty);
         assert_eq!(
             legacy_view
                 .iter()
@@ -629,4 +690,73 @@ mod tests {
             (1000, b"xyz".to_vec()),
         ]));
     }
+
+    #[test]
+    fn empty_token_index_preserves_sparse_aliases_and_backing_ranges() {
+        let value = BTreeMap::from([
+            (0, vec![]), (7, b"word".to_vec()), (31, vec![]),
+            (63, vec![]), (u32::MAX, vec![]),
+        ]);
+        check_roundtrip(value.clone());
+        let wire = pack(&value);
+        let mut backing = vec![0x55; 7];
+        backing.extend_from_slice(&wire);
+        backing.extend_from_slice(&[0xAA; 3]);
+        let parsed = PackedTokenBytes::parse_backed(Arc::new(backing), 7, wire.len()).unwrap();
+        assert_eq!(parsed.empty_token_ids(), &[0, 31, 63, u32::MAX]);
+        assert_eq!(parsed.get(7), Some(b"word".as_slice()));
+        assert_eq!(parsed.get(32), None);
+    }
+
+    #[test]
+    fn current_empty_token_index_handles_zero_and_no_empty_tokens() {
+        for value in [BTreeMap::new(), BTreeMap::from([(0, b"a".to_vec()), (1, b"b".to_vec())])] {
+            let wire = pack(&value);
+            assert_eq!(read_u32_at(&wire, 9).unwrap(), 0);
+            let parsed = PackedTokenBytes::parse(wire).unwrap();
+            assert!(parsed.empty_token_ids().is_empty());
+            assert_eq!(parsed.materialize().as_ref(), &value);
+        }
+    }
+
+    #[test]
+    fn previous_indexed_vocabulary_recovers_empty_token_ids() {
+        let value = BTreeMap::from([(0, vec![]), (1, b"a".to_vec()), (2, vec![])]);
+        let wire = pack(&value);
+        let offsets_end = INDEXED_HEADER_LEN + (value.len() + 1) * 4;
+        let mut previous = Vec::from(PREVIOUS_INDEXED_MAGIC.as_slice());
+        previous.extend_from_slice(&wire[4..9]);
+        previous.extend_from_slice(&wire[INDEXED_HEADER_LEN..offsets_end]);
+        previous.extend_from_slice(&wire[offsets_end + 8..]);
+        let parsed = PackedTokenBytes::parse(previous).unwrap();
+        assert_eq!(parsed.empty_token_ids(), &[0, 2]);
+        assert_eq!(parsed.materialize().as_ref(), &value);
+    }
+
+    #[test]
+    fn invalid_empty_token_index_entries_are_rejected() {
+        let value = BTreeMap::from([(0, vec![]), (1, b"a".to_vec()), (2, vec![])]);
+        let wire = pack(&value);
+        let empty_start = INDEXED_HEADER_LEN + (value.len() + 1) * 4;
+        for ids in [[0u32, 0], [2, 0], [0, 1], [0, 3]] {
+            let mut bad = wire.clone();
+            bad[empty_start..empty_start + 4].copy_from_slice(&ids[0].to_le_bytes());
+            bad[empty_start + 4..empty_start + 8].copy_from_slice(&ids[1].to_le_bytes());
+            assert!(PackedTokenBytes::parse(bad).is_err(), "accepted {ids:?}");
+        }
+        for count in [4u32, u32::MAX] {
+            let mut bad = wire.clone();
+            bad[9..13].copy_from_slice(&count.to_le_bytes());
+            assert!(PackedTokenBytes::parse(bad).is_err());
+        }
+    }
+
+    #[test]
+    fn truncated_current_empty_token_index_is_rejected() {
+        let wire = pack(&BTreeMap::from([(0, vec![]), (1, b"a".to_vec())]));
+        for length in 0..wire.len() {
+            assert!(PackedTokenBytes::parse(wire[..length].to_vec()).is_err(), "length {length}");
+        }
+    }
+
 }

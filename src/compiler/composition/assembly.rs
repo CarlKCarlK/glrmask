@@ -884,7 +884,7 @@ pub(super) fn build_composed_constraint_unfinalized(
         internal_token_to_tokens,
         deferred_internal_token_to_tokens: OnceLock::new(),
         token_bytes,
-        packed_token_bytes: None,
+        packed_token_bytes: Some(crate::compiler::compile::vocab_packed_token_bytes(vocab)),
         internal_token_bytes,
         token_bytes_dense: Vec::new(),
         internal_token_buf_masks: Vec::new(),

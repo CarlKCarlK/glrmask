@@ -97,7 +97,7 @@ impl Constraint {
         }
         if let Some(packed) = &self.packed_token_bytes {
             // Current artifacts and Vocab's prepared packed-token artifact use
-            // the same canonical TBP2 encoding. Comparing those byte strings is
+            // the same canonical indexed token-byte encoding. Comparing those byte strings is
             // an exact vocabulary equality proof and lets a 128k-token bind use
             // one contiguous memcmp instead of 128k map/offset lookups. The
             // packed Vocab artifact is owned by the caller's Vocab-derived

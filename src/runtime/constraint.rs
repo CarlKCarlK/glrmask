@@ -51,7 +51,10 @@ impl<'a> ConstraintState<'a> {
         );
         if self.constraint.uses_compact_segmented_parser_runtime() {
             match super::dynamic_mask::try_fill_recursive_mask_shared(self, buf) {
-                Ok(true) => return,
+                Ok(true) => {
+                    self.restrict_empty_byte_tokens(buf);
+                    return;
+                },
                 Ok(false) => panic!("recursive composition declined its shared mask provider"),
                 Err(error) => {
                     panic!("shared recursive dynamic mask generation failed: {error}");
@@ -59,6 +62,7 @@ impl<'a> ConstraintState<'a> {
             }
         }
         super::dynamic_mask::fill_mask_dynamic(self, buf);
+        self.restrict_empty_byte_tokens(buf);
     }
 
     pub(crate) fn fill_mask_dynamic_bounded(
@@ -66,7 +70,9 @@ impl<'a> ConstraintState<'a> {
         buf: &mut [u32],
         timeout_ms: u64,
     ) -> Result<(), String> {
-        super::dynamic_mask::fill_mask_dynamic_bounded(self, buf, timeout_ms)
+        super::dynamic_mask::fill_mask_dynamic_bounded(self, buf, timeout_ms)?;
+        self.restrict_empty_byte_tokens(buf);
+        Ok(())
     }
 
 }

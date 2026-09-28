@@ -1,4 +1,5 @@
-﻿pub(crate) mod profile;
+mod token_domain;
+pub(crate) mod profile;
 pub(crate) mod queue;
 mod static_dwa_walk;
 mod single_path;
@@ -409,6 +410,9 @@ fn assert_dynamic_mask_equivalence(state: &ConstraintState<'_>, static_mask: &[u
         return;
     }
 
+    let mut normalized_static = static_mask.to_vec();
+    state.restrict_empty_byte_tokens(&mut normalized_static);
+    let static_mask = normalized_static.as_slice();
     let mut dynamic_mask = vec![0u32; state.constraint.body_mask_len()];
     crate::compiler::composition::boundary::transfer::permit_strict_static_dynamic(|| {
         state.fill_mask_dynamic(&mut dynamic_mask)
@@ -7173,7 +7177,13 @@ impl<'a> ConstraintState<'a> {
         }
     }
 
+    #[inline]
     pub(crate) fn fill_body_mask(&self, buf: &mut [u32]) {
+        self.fill_body_mask_before_token_policy(buf);
+        self.restrict_empty_byte_tokens(buf);
+    }
+
+    fn fill_body_mask_before_token_policy(&self, buf: &mut [u32]) {
         let required = self.constraint.body_mask_len();
         assert!(buf.len() >= required, "mask buffer is smaller than constraint mask");
         let (mask, tail) = buf.split_at_mut(required);
@@ -7396,6 +7406,7 @@ impl<'a> ConstraintState<'a> {
         let total_start = Instant::now();
         if self.try_fill_mask_from_cache(buf) {
             self.clear_late_grammar_placeholder_mask(buf);
+            self.restrict_empty_byte_tokens(buf);
             return MaskProfile {
                 total_ns: elapsed_ns(total_start),
                 cache_hit: 1,
@@ -7433,7 +7444,7 @@ impl<'a> ConstraintState<'a> {
             };
         }
 
-        let profile = self
+        let mut profile = self
             .fill_mask_uncached_maybe_profile(buf, true)
             .unwrap_or_else(|| MaskProfile {
                 total_ns: elapsed_ns(total_start),
@@ -7441,11 +7452,13 @@ impl<'a> ConstraintState<'a> {
             });
         self.update_control_special_token_mask(buf);
         self.clear_late_grammar_placeholder_mask(buf);
+        self.restrict_empty_byte_tokens(buf);
         if !self.constraint.table.control_terminals.is_empty()
             || self.constraint.uses_compact_segmented_parser_runtime()
         {
             self.store_mask_cache_reuse_dense(buf);
         }
+        profile.total_ns = elapsed_ns(total_start);
         profile
     }
 

@@ -265,7 +265,8 @@ impl DynamicConstraint {
                 special_token_terminals,
             },
             dynamic_mask_vocab,
-        )
+                vocab,
+            )
     }
 
     pub(crate) fn from_parts_with_dynamic_vocab_unfinalized(
@@ -296,6 +297,7 @@ impl DynamicConstraint {
             inner: Self::constraint_from_core(
                 payload,
                 dynamic_mask_vocab,
+                Some(crate::compiler::compile::vocab_packed_token_bytes(vocab)),
             ),
             alternatives: Vec::new(),
             composition_grammars: vec![None],
@@ -337,7 +339,8 @@ impl DynamicConstraint {
                 special_token_terminals,
             },
             runtime_dynamic_vocab.vocab,
-        );
+                vocab,
+            );
         result.inner.possible_matches = possible_matches;
         result.inner.possible_matches_complete = complete;
         result.inner.state_to_internal_tsid = id_map.tokenizer_states.original_to_internal;
@@ -350,11 +353,13 @@ impl DynamicConstraint {
     fn from_core(
         payload: DynamicCore,
         dynamic_mask_vocab: DynamicMaskVocab,
+        vocab: &Vocab,
     ) -> Self {
         let mut inner = Self::constraint_from_core(
             payload,
             dynamic_mask_vocab,
-        );
+                Some(crate::compiler::compile::vocab_packed_token_bytes(vocab)),
+            );
         inner.rebuild_dynamic_runtime_caches();
         Self {
             inner,
@@ -367,7 +372,15 @@ impl DynamicConstraint {
     fn constraint_from_core(
         mut payload: DynamicCore,
         dynamic_mask_vocab: DynamicMaskVocab,
+        packed_token_bytes: Option<Arc<crate::runtime::PackedTokenBytes>>,
     ) -> Constraint {
+        // Model-aware constructors and external-vocabulary loads share Vocab's
+        // prepared representation. Self-contained payloads already deserialize
+        // the complete map; build its index once here, never on each mask call.
+        let packed_token_bytes = packed_token_bytes.unwrap_or_else(|| Arc::new(
+            crate::runtime::PackedTokenBytes::from_runtime_entries(&payload.token_bytes)
+                .expect("decoded dynamic vocabulary has valid token bytes"),
+        ));
         let special_token_terminals = payload.special_token_terminals;
         payload
             .tokenizer
@@ -438,7 +451,7 @@ impl DynamicConstraint {
             internal_token_to_tokens: Vec::new(),
             deferred_internal_token_to_tokens: std::sync::OnceLock::new(),
             token_bytes: payload.token_bytes,
-            packed_token_bytes: None,
+            packed_token_bytes: Some(packed_token_bytes),
             internal_token_bytes: BTreeMap::new(),
             token_bytes_dense: Vec::new(),
             internal_token_buf_masks: Vec::new(),
@@ -1390,6 +1403,7 @@ impl DynamicConstraint {
                 special_token_terminals: metadata.special_token_terminals,
             },
                 dynamic_mask_vocab,
+                Some(crate::compiler::compile::vocab_packed_token_bytes(vocab)),
             );
             if let Some(mask_tokenizer) = metadata.mask_tokenizer {
                 inner.dynamic_mask_vocab.set_mask_tokenizer_quotient(
@@ -1528,7 +1542,9 @@ impl DynamicConstraint {
                 fresh.inherit_dynamic_lexer_metadata_from(shared);
                 fresh
             }).unwrap_or_default();
-            let mut inner = Self::constraint_from_core(core, vocab);
+            let mut inner = Self::constraint_from_core(core, vocab,
+                None,
+            );
             inner.late_grammar_slots = late_grammar_slots;
             Self::restore_terminal_observation_classes(&mut inner, terminal_observation_classes)?;
             // An empty row set still means prepared: do not rediscover it at runtime.
@@ -1834,7 +1850,11 @@ impl<'a> DynamicConstraintState<'a> {
                 self.alternatives.len()
             ));
         };
-        state.commit_token_profiled(token_id)
+        let result = state.commit_token_profiled(token_id);
+        if state.is_rejected() {
+            self.alternatives.clear();
+        }
+        result
     }
 
     /// Fill `buf` with the allowed-token mask as a packed bitset.
