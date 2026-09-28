@@ -4436,8 +4436,21 @@ impl<T: Clone + Eq + Hash, A: Merge + Clone + Eq + Hash> LeveledGSS<T, A> {
                     remaining -= values.len() as isize - 1;
                     Some(current.segment_next().clone())
                 } else {
-                    // Would land inside segment — can't use this fast path
-                    return None;
+                    static ENABLED: OnceLock<bool> = OnceLock::new();
+                    if !*ENABLED.get_or_init(|| {
+                        std::env::var_os("GLRMASK_DISABLE_PARTIAL_SEGMENT_POP").is_none()
+                    }) {
+                        return None;
+                    }
+                    // This is the same suffix removal as the generic segment
+                    // case, without allocating its two graph-memo tables.
+                    // Segments are nonempty, non-accepting chains; stopping
+                    // inside one cannot cross an empty path or an accumulator.
+                    let keep = values.len() - remaining as usize;
+                    let lower = new_segment(values.take(keep), current.segment_next().clone());
+                    return Some(Self {
+                        inner: new_interface(lower, interface.acc.clone()),
+                    });
                 }
             } else {
                 match current.children_len() {
@@ -7097,6 +7110,46 @@ mod tests {
     impl Merge for TestAcc {
         fn merge(&self, other: &Self) -> Self {
             Self(self.0.max(other.0))
+        }
+    }
+
+    #[test]
+    fn partial_segment_pop_fast_path_matches_literal_stacks() {
+        for depth in [2, 3, 7, 16, 33, 65, 129] {
+            let values = (0..depth as u32).collect::<Vec<_>>();
+            let source = LeveledGSS::from_single_stack(values.clone(), TestAcc(7));
+            for popped in 1..depth {
+                let fast = source.popn_single_interface_path(popped as isize)
+                    .expect("a pop inside a deterministic segment needs no graph traversal");
+                let expected = vec![(values[..depth - popped].to_vec(), TestAcc(7))];
+                assert_eq!(fast.to_stacks(2), Some(expected.clone()));
+                assert_eq!(source.popn(popped as isize).to_stacks(2), Some(expected));
+            }
+            assert_eq!(source.to_stacks(2), Some(vec![(values, TestAcc(7))]),
+                "popping a shared graph must not mutate its source");
+        }
+    }
+
+    #[test]
+    fn partial_segment_pop_preserves_a_shared_branching_tail() {
+        let stacks = vec![
+            (vec![10_u32, 1], TestAcc(7)),
+            (vec![20, 2], TestAcc(7)),
+            (vec![30, 3], TestAcc(7)),
+        ];
+        let mut source = LeveledGSS::from_stacks(&stacks);
+        for value in 100..120 { source = source.push(value); }
+        for popped in 1..20 {
+            let fast = source.popn_single_interface_path(popped)
+                .expect("only the common top segment is popped, not its branching tail");
+            let mut actual = fast.to_stacks(8).unwrap();
+            let mut expected = stacks.iter().map(|(bottom, acc)| {
+                let mut values = bottom.clone();
+                values.extend(100..120 - popped as u32);
+                (values, acc.clone())
+            }).collect::<Vec<_>>();
+            actual.sort(); expected.sort();
+            assert_eq!(actual, expected);
         }
     }
 
