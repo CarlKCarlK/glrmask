@@ -202,7 +202,7 @@ while generating:
 The main state operations are:
 
 - `mask(size=None)`: return the allowed-token mask.
-- `fill_mask(words)`: fill a caller-owned packed `int32`/`uint32` buffer.
+- `fill_mask(words)`: fill a writable, aligned, contiguous NumPy `int32` buffer of packed mask words. An existing `uint32` array can be passed as `words.view(np.int32)` without copying.
 - `commit_token(token_id)`: advance by one model token.
 - `commit_bytes(data)`: advance by raw bytes.
 - `forced()`: return a forced token sequence when one can be determined.
@@ -230,6 +230,11 @@ constraint = glrmask.Constraint.load(artifact)
 ```
 
 Passing `vocab=` to `Constraint.load` or `UnlinkedConstraint.load` is optional and validates/shares an already-existing exact vocabulary object.
+
+Compiled artifacts are caches, not a stable cross-version interchange format.
+Keep the original grammar and exact vocabulary so incompatible caches can be
+rebuilt. Loading an older compiled artifact does not re-run the compiler or
+automatically incorporate later compiler correctness fixes.
 
 ## Grammar formats
 

@@ -65,14 +65,14 @@
 
 ### Changed
 
-- `DynamicConstraint` once again performs vocabulary/lexer/parser analysis in
-  the decoding path instead of compiling whole-vocabulary token programs or
-  continuation partitions. Dynamic artifact format version 9 no longer stores
-  those precomputed structures; version-7 and version-8 dynamic artifacts must
-  be rebuilt rather than silently restoring the removed backend.
-- Static `Constraint` artifacts now use compressed format version 8. Current
-  code continues to load uncompressed version-7 artifacts; newly saved
-  artifacts require a version-8-capable loader.
+- `DynamicConstraint` performs vocabulary/lexer/parser analysis in the decoding
+  path instead of restoring the removed precomputed token-program backend.
+  Artifacts containing that older backend must be rebuilt.
+- Compiled artifacts retain the public `save()`/`load()` entry points, but their
+  bytes are not a stable cross-version interchange format. Legacy top-level
+  decoders have been removed; unsupported format versions are rejected rather
+  than silently migrated. Keep the original grammar and exact vocabulary so
+  caches can be recompiled, including after compiler correctness fixes.
 - Finite `maxLength` constraints on patterned JSON Schema strings are preserved
   by default even when their estimated pattern/length product is large. The
   complexity budget now selects lowering strategy only; it no longer permits a

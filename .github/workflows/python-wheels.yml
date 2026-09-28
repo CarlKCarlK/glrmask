@@ -7,6 +7,7 @@ on:
       - ".github/workflows/python-wheels.yml"
       - "Cargo.lock"
       - "Cargo.toml"
+      - "crates/**"
       - "python/**"
       - "scripts/check-python-wheel-set.py"
       - "scripts/python-artifact-smoke.py"
