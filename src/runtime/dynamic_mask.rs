@@ -2214,6 +2214,27 @@ struct FullWalkManyTransitionCache {
     max_branches: usize,
 }
 
+/// Materialize only owned DFS depths actually saved by the shared walker.
+/// Cached products retain their small IDs separately and never need a slot.
+#[inline]
+fn full_walk_owned_many_slot<T>(
+    storage: &mut SmallVec<[Option<T>; 8]>,
+    depth: usize,
+    stack_len: usize,
+) -> &mut Option<T> {
+    assert!(depth < stack_len, "owned DFS depth exceeds the trie bound");
+    let needed = depth + 1;
+    if storage.len() < needed {
+        if storage.capacity() < needed {
+            // Grow geometrically without exceeding the certified heap bound.
+            let target = storage.capacity().saturating_mul(2).max(needed).min(stack_len);
+            storage.reserve_exact(target - storage.len());
+        }
+        storage.resize_with(needed, || None);
+    }
+    &mut storage[depth]
+}
+
 impl FullWalkManyTransitionCache {
     const UNKNOWN: u32 = u32::MAX;
     const DEAD: u32 = u32::MAX - 1;
@@ -5369,18 +5390,9 @@ fn try_full_walk_mask_with_table<
         heap_two.resize(stack_len, ((0, 0), (0, 0)));
         heap_two.as_mut_slice()
     };
-    // Multi-branch stack states are uncommon, and `FullWalkManyState` embeds a
-    // SmallVec. Do not eagerly construct/drop 256 empty SmallVec values on
-    // every complete vocabulary walk; materialize only the depths that
-    // actually carry a multi state.
-    let mut inline_many: [Option<FullWalkManyState>; 256] = std::array::from_fn(|_| None);
-    let mut heap_many = Vec::<Option<FullWalkManyState>>::new();
-    let stack_many: &mut [Option<FullWalkManyState>] = if stack_len <= inline_many.len() {
-        &mut inline_many[..stack_len]
-    } else {
-        heap_many.resize_with(stack_len, || None);
-        heap_many.as_mut_slice()
-    };
+    // Most products use compact cache IDs. Reserve only a few owned slots
+    // inline, growing lazily to depths actually saved (not the whole trie).
+    let mut stack_many = SmallVec::<[Option<FullWalkManyState>; 8]>::new();
    let mut pair_union_cache = FxHashMap::<(u32, u32), Option<u32>>::default();
     let mut triple_union_cache = FxHashMap::<(u32, u32, u32), Option<u32>>::default();
     let product_transition_cache_capacity = transitions.product_transition_cache_capacity();
@@ -5453,7 +5465,8 @@ fn try_full_walk_mask_with_table<
             stack_lexer[0] = lexer_state;
             stack_parser[0] = parser_node;
         } else {
-            stack_many[0] = Some(full_walk_many_state_from_branches(roots));
+            *full_walk_owned_many_slot(&mut stack_many, 0, stack_len) =
+                Some(full_walk_many_state_from_branches(roots));
         }
     }
 
@@ -5680,6 +5693,9 @@ fn try_full_walk_mask_with_table<
                 if product_transition_cache_capacity == 0
                     || current_many_id == FullWalkManyTransitionCache::UNKNOWN
                 {
+                    // An uncached MULTI parent is saved either at the root
+                    // or after its incoming edge, before any descendant read.
+                    debug_assert!(parent_depth < stack_many.len());
                     current_many.clone_from(unsafe {
                         stack_many
                             .get_unchecked(parent_depth)
@@ -6695,7 +6711,9 @@ fn try_full_walk_mask_with_table<
                     if product_transition_cache_capacity == 0
                         || current_many_id == FullWalkManyTransitionCache::UNKNOWN
                     {
-                        let slot = stack_many.get_unchecked_mut(parent_depth + 1);
+                        let slot = full_walk_owned_many_slot(
+                            &mut stack_many, parent_depth + 1, stack_len,
+                        );
                         if let Some(existing) = slot.as_mut() {
                             existing.clone_from(&current_many);
                         } else {
@@ -12969,5 +12987,58 @@ mod epsilon_only_reset_config_tests {
         assert_ne!(a,empty);
         assert!(!scan.config_is_fresh_reset[scan.config_index(empty).unwrap()]);
         assert!(scan.config_is_fresh_reset[scan.config_index(a).unwrap()]);
+    }
+}
+
+
+#[cfg(test)]
+mod saved_depth_storage_tests {
+    use super::{full_walk_owned_many_slot, SmallVec};
+
+    #[test]
+    fn untouched_cached_walk_needs_no_slots_and_descending_visits_keep_high_slots() {
+        let mut slots=SmallVec::<[Option<u32>;8]>::new();
+        assert!(slots.is_empty());assert!(!slots.spilled());
+        *full_walk_owned_many_slot(&mut slots,0,11)=Some(7);
+        assert_eq!(slots.len(),1);assert!(!slots.spilled());
+        *full_walk_owned_many_slot(&mut slots,9,11)=Some(31);
+        assert_eq!(slots.len(),10);assert!(slots.capacity()<=11);
+        *full_walk_owned_many_slot(&mut slots,2,11)=Some(9);
+        assert_eq!(slots.len(),10);assert_eq!(slots[0],Some(7));assert_eq!(slots[9],Some(31));
+        *full_walk_owned_many_slot(&mut slots,9,11)=Some(42);
+        assert_eq!(slots[9],Some(42));assert!(slots[1].is_none());
+    }
+
+    #[test]
+    fn deep_saved_path_preserves_every_slot_and_checks_certified_bound() {
+        let mut slots=SmallVec::<[Option<usize>;8]>::new();
+        for depth in 0..513 {
+            *full_walk_owned_many_slot(&mut slots,depth,513)=Some(depth*3);
+            assert_eq!(slots.len(),depth+1);
+            if slots.spilled(){assert!(slots.capacity()<=513);}
+        }
+        for depth in (0..513).rev(){assert_eq!(slots[depth],Some(depth*3));}
+        let mut invalid=SmallVec::<[Option<u32>;8]>::new();
+        let result=std::panic::catch_unwind(std::panic::AssertUnwindSafe(||{
+            let _=full_walk_owned_many_slot(&mut invalid,3,3);
+        }));
+        assert!(result.is_err());assert!(invalid.is_empty());
+    }
+
+    #[test]
+    fn overwritten_and_saved_owned_values_are_dropped_exactly_once() {
+        use std::sync::{Arc,atomic::{AtomicUsize,Ordering}};
+        struct Tracked(Arc<AtomicUsize>);
+        impl Drop for Tracked {fn drop(&mut self){self.0.fetch_add(1,Ordering::SeqCst);}}
+        let drops=Arc::new(AtomicUsize::new(0));
+        {
+            let mut slots=SmallVec::<[Option<Tracked>;8]>::new();
+            *full_walk_owned_many_slot(&mut slots,0,17)=Some(Tracked(drops.clone()));
+            *full_walk_owned_many_slot(&mut slots,16,17)=Some(Tracked(drops.clone()));
+            assert_eq!(drops.load(Ordering::SeqCst),0);
+            *full_walk_owned_many_slot(&mut slots,16,17)=Some(Tracked(drops.clone()));
+            assert_eq!(drops.load(Ordering::SeqCst),1);
+        }
+        assert_eq!(drops.load(Ordering::SeqCst),3);
     }
 }
