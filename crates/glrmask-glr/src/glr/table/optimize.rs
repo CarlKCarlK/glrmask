@@ -6242,6 +6242,64 @@ enum ReduceFrameResult {
     },
 }
 
+/// Union one predecessor frontier without sorting a potentially much larger
+/// multiset of repeated targets. Only representation changes: results retain
+/// the same ascending IDs, and the caller still charges one visit per depth.
+fn predecessor_frontier_union(
+    predecessors: &[PredecessorSet],
+    states: &[u32],
+    bitmap: &mut Vec<u64>,
+    bitmap_enabled: bool,
+) -> Option<StateSubset> {
+    fn sorted_union(predecessors: &[PredecessorSet], states: &[u32]) -> Option<StateSubset> {
+        let mut next = StateSubset::new();
+        for &state in states {
+            next.extend_from_slice(predecessors.get(state as usize)?);
+        }
+        next.sort_unstable();
+        next.dedup();
+        Some(next)
+    }
+
+    const MAX_BITMAP_STATES: usize = 65_536;
+    if !bitmap_enabled || states.len() < 4 || predecessors.len() > MAX_BITMAP_STATES {
+        return sorted_union(predecessors, states);
+    }
+    let words = predecessors.len().div_ceil(64);
+    let mut edges = 0usize;
+    for &state in states {
+        edges = edges.saturating_add(predecessors.get(state as usize)?.len());
+    }
+    // Sparse unions keep the original small-vector path. The threshold pays
+    // for clearing/enumerating the bounded bitmap as well as the second scan.
+    if edges < words.saturating_mul(4).max(64) {
+        return sorted_union(predecessors, states);
+    }
+    bitmap.resize(words, 0);
+    bitmap.fill(0);
+    for &state in states {
+        for &target in &predecessors[state as usize] {
+            let Some(word) = bitmap.get_mut(target as usize / 64) else {
+                // A malformed graph can contain a dangling target that the
+                // reference retains at its last depth. Never silently discard
+                // it or assume every ID fits the valid-state bitmap.
+                return sorted_union(predecessors, states);
+            };
+            *word |= 1u64 << (target % 64);
+        }
+    }
+    let mut next = StateSubset::new();
+    for (index, &word) in bitmap.iter().enumerate() {
+        let mut word = word;
+        while word != 0 {
+            next.push((index * 64 + word.trailing_zeros() as usize) as u32);
+            word &= word - 1;
+        }
+    }
+    Some(next)
+}
+
+
 fn states_at_depth<'a>(
     predecessors: &[PredecessorSet],
     origin_state: u32,
@@ -6249,19 +6307,26 @@ fn states_at_depth<'a>(
     cache: &'a mut FxHashMap<(u32, u32), Option<StateSubset>>,
     budget: &UnitInlineBudget,
 ) -> Option<&'a StateSubset> {
+    states_at_depth_with_bitmap(predecessors, origin_state, depth, cache, budget, true)
+}
+
+fn states_at_depth_with_bitmap<'a>(
+    predecessors: &[PredecessorSet],
+    origin_state: u32,
+    depth: u32,
+    cache: &'a mut FxHashMap<(u32, u32), Option<StateSubset>>,
+    budget: &UnitInlineBudget,
+    bitmap_enabled: bool,
+) -> Option<&'a StateSubset> {
     let cache_key = (origin_state, depth);
     if !cache.contains_key(&cache_key) {
         let mut states = smallvec![origin_state];
+        let mut bitmap = Vec::new();
         for _ in 0..depth {
             if !budget.record_stack_effect_visit() {
                 return None;
             }
-            let mut next = StateSubset::new();
-            for state in states {
-                next.extend_from_slice(predecessors.get(state as usize)?);
-            }
-            next.sort_unstable();
-            next.dedup();
+            let next = predecessor_frontier_union(predecessors, &states, &mut bitmap, bitmap_enabled)?;
             if next.is_empty() {
                 cache.insert(cache_key, None);
                 return None;
@@ -6932,6 +6997,102 @@ mod tests {
             synthetic_states: std::sync::atomic::AtomicUsize::new(0),
             stack_effect_visits: std::sync::atomic::AtomicUsize::new(0),
             abort_code: std::sync::atomic::AtomicU8::new(ABORT_NONE),
+        }
+    }
+
+    #[test]
+    fn bitmap_predecessor_frontiers_match_literal_sort_with_duplicates_and_dangling_ids() {
+        fn reference(predecessors: &[PredecessorSet], states: &[u32]) -> Option<StateSubset> {
+            let mut out = StateSubset::new();
+            for &state in states { out.extend_from_slice(predecessors.get(state as usize)?); }
+            out.sort_unstable();
+            out.dedup();
+            Some(out)
+        }
+        let mut seed = 948752_u64;
+        let mut random = || {
+            seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            seed
+        };
+        let mut bitmap = Vec::new();
+        for n in [0, 1, 2, 7, 63, 64, 65, 257, 1024] {
+            for _ in 0..12 {
+                let mut predecessors = vec![PredecessorSet::new(); n];
+                for row in &mut predecessors {
+                    for _ in 0..(random() as usize % 80) {
+                        row.push((random() as usize % n) as u32);
+                    }
+                }
+                let mut states: Vec<u32> = (0..n.min(20) as u32).rev().collect();
+                for _ in 0..2 {
+                    assert_eq!(predecessor_frontier_union(&predecessors, &states, &mut bitmap, true),
+                               reference(&predecessors, &states));
+                    states.reverse();
+                }
+                if n > 0 {
+                    // A dangling target is returned at the last depth, not
+                    // dropped even when another branch uses the bitmap.
+                    predecessors[0].extend_from_slice(&[n as u32, u32::MAX, 0, 0]);
+                    assert_eq!(predecessor_frontier_union(&predecessors, &states, &mut bitmap, true),
+                               reference(&predecessors, &states));
+                }
+                states.push(n as u32);
+                assert_eq!(predecessor_frontier_union(&predecessors, &states, &mut bitmap, true), None);
+            }
+        }
+        let mut predecessors = vec![PredecessorSet::new(); 65];
+        for row in predecessors.iter_mut().take(8) {
+            row.extend((0..65).rev().chain(0..65));
+        }
+        let states: Vec<_> = (0..8).collect();
+        bitmap.clear();
+        assert_eq!(predecessor_frontier_union(&predecessors, &states, &mut bitmap, true),
+                   reference(&predecessors, &states));
+        assert_eq!(bitmap.len(), 2, "fixture must actually use dense accumulation");
+        // Bits above the last valid state still represent literal dangling IDs.
+        predecessors[0].push(127);
+        assert_eq!(predecessor_frontier_union(&predecessors, &states, &mut bitmap, true),
+                   reference(&predecessors, &states));
+        let mut disabled = Vec::new();
+        predecessor_frontier_union(&predecessors, &states, &mut disabled, false);
+        assert_eq!(disabled.capacity(), 0);
+        let huge = vec![PredecessorSet::new(); 65_537];
+        let mut oversized = Vec::new();
+        assert_eq!(predecessor_frontier_union(&huge, &[0, 1, 2, 3], &mut oversized, true), Some(StateSubset::new()));
+        assert_eq!(oversized.capacity(), 0);
+    }
+
+    #[test]
+    fn bitmap_depth_queries_preserve_cache_failure_and_exact_visit_accounting() {
+        let mut graphs = Vec::new();
+        for n in [1, 8, 65, 257] {
+            let mut graph = vec![PredecessorSet::new(); n];
+            for (state, row) in graph.iter_mut().enumerate() {
+                for offset in 0..n.min(40) {
+                    row.push(((state + offset) % n) as u32);
+                    if offset % 3 == 0 { row.push(((state + offset) % n) as u32); }
+                }
+            }
+            graphs.push(graph.clone());
+            graph[0].push(u32::MAX);
+            graphs.push(graph);
+        }
+        graphs.push(vec![PredecessorSet::new(); 8]);
+        for graph in graphs {
+            for limit in [1, 4, 100_000, usize::MAX] {
+                let mut caches = [FxHashMap::default(), FxHashMap::default()];
+                let mut budgets = [default_unit_inline_budget(), default_unit_inline_budget()];
+                for b in &mut budgets { b.max_ms = u128::MAX; b.max_stack_effect_visits = limit; }
+                for (origin, depth) in [(0, 0), (0, 1), (0, 3), (0, 3), (1, 2), (0, 8), (u32::MAX, 0), (u32::MAX, 1)] {
+                    let left = states_at_depth_with_bitmap(&graph, origin, depth, &mut caches[0], &budgets[0], false).cloned();
+                    let right = states_at_depth_with_bitmap(&graph, origin, depth, &mut caches[1], &budgets[1], true).cloned();
+                    assert_eq!(left, right, "origin={origin} depth={depth} limit={limit}");
+                    assert_eq!(caches[0], caches[1]);
+                    assert_eq!(budgets[0].stack_effect_visits(), budgets[1].stack_effect_visits());
+                    assert_eq!(budgets[0].is_aborted(), budgets[1].is_aborted());
+                    assert_eq!(budgets[0].report().reason, budgets[1].report().reason);
+                }
+            }
         }
     }
 
