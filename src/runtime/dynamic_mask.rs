@@ -1101,6 +1101,12 @@ impl FullWalkHotScalarCache {
     }
 }
 
+mod raw_high_memo;
+
+// Dense lookups remain unchanged for small IDs. High IDs must not allocate
+// arrays proportional to a sparse coordinate merely to cache a few cells.
+const RAW_DENSE_MEMO_LIMIT: u32 = 1024;
+
 /// Strict-walk transition backend for the lexer representation selected by the
 /// ordinary runtime. In a deterministic tokenizer the config id is simply the
 /// raw state id. In an epsilon-NFA tokenizer it is a `DynamicNfaScanCache`
@@ -1110,6 +1116,9 @@ struct FullWalkConfigTransitions<'a, 'b> {
     cache: &'a mut DynamicNfaScanCache<'b>,
     error: Option<String>,
     raw_cell_rows: Vec<Option<Box<[u64; 256]>>>,
+    bounded_high_raw: bool,
+    high_raw_cells: raw_high_memo::TaggedMemo<256>,
+    high_raw_targets: raw_high_memo::TaggedMemo<64>,
     hot_scalar: FullWalkHotScalarCache,
     hot_enabled: bool,
     hot_persist_key: Option<(usize, u64)>,
@@ -1215,6 +1224,12 @@ impl<'a, 'b> FullWalkConfigTransitions<'a, 'b> {
         cache: cache,
         error: None,
         raw_cell_rows: Vec::new(),
+        bounded_high_raw: {
+            static ENABLED: OnceLock<bool> = OnceLock::new();
+            *ENABLED.get_or_init(||env_flag("GLRMASK_BOUNDED_HIGH_RAW_MEMO", false))
+        },
+        high_raw_cells: raw_high_memo::TaggedMemo::new(),
+        high_raw_targets: raw_high_memo::TaggedMemo::new(),
         hot_scalar,
         hot_enabled,
         hot_persist_key,
@@ -1531,6 +1546,13 @@ impl FullWalkTransitionTable for FullWalkConfigTransitions<'_, '_> {
             if self.profile {
                 self.max_raw_state_seen = self.max_raw_state_seen.max(raw_state);
             }
+            if self.bounded_high_raw && raw_state >= RAW_DENSE_MEMO_LIMIT {
+                let key=(u64::from(raw_state)<<8)|u64::from(byte);
+                if let Some(packed)=self.high_raw_cells.get(key) {
+                    if self.profile { self.raw_cell_hits += 1; }
+                    return FullWalkConfigCell { target:packed as u32, has_finalizer:(packed>>32)&1 != 0 };
+                }
+            }
             let raw_index = raw_state as usize;
             if raw_index < self.raw_cell_rows.len()
                 && let Some(row) = unsafe { self.raw_cell_rows.get_unchecked(raw_index) }
@@ -1613,7 +1635,9 @@ impl FullWalkTransitionTable for FullWalkConfigTransitions<'_, '_> {
                 }
             } else {
                 let raw_target_index = raw_target as usize;
-                let cached_target = if raw_target_index < self.raw_target_cells.len() {
+                let cached_target = if self.bounded_high_raw && raw_target >= RAW_DENSE_MEMO_LIMIT {
+                    self.high_raw_targets.get(u64::from(raw_target))
+                } else if raw_target_index < self.raw_target_cells.len() {
                     let packed = self.raw_target_cells[raw_target_index];
                     (packed != UNKNOWN).then_some(packed)
                 } else {
@@ -1640,11 +1664,15 @@ impl FullWalkTransitionTable for FullWalkConfigTransitions<'_, '_> {
                                     .raw_has_finalizer_ns
                                     .saturating_add(started.elapsed().as_nanos() as u64);
                             }
-                            if self.raw_target_cells.len() <= raw_target_index {
-                                self.raw_target_cells.resize(raw_target_index + 1, UNKNOWN);
+                            let packed=u64::from(target) | ((has_finalizer as u64) << 32);
+                            if self.bounded_high_raw && raw_target >= RAW_DENSE_MEMO_LIMIT {
+                                self.high_raw_targets.insert(u64::from(raw_target), packed);
+                            } else {
+                                if self.raw_target_cells.len() <= raw_target_index {
+                                    self.raw_target_cells.resize(raw_target_index + 1, UNKNOWN);
+                                }
+                                self.raw_target_cells[raw_target_index] = packed;
                             }
-                            self.raw_target_cells[raw_target_index] =
-                                u64::from(target) | ((has_finalizer as u64) << 32);
                             FullWalkConfigCell {
                                 target,
                                 has_finalizer,
@@ -1697,16 +1725,18 @@ impl FullWalkTransitionTable for FullWalkConfigTransitions<'_, '_> {
         if self.error.is_none()
             && let Some(raw_state) = raw_state
         {
-            let raw_state = raw_state as usize;
-            if self.raw_cell_rows.len() <= raw_state {
-                self.raw_cell_rows.resize_with(raw_state + 1, || None);
-            }
-            let row = self.raw_cell_rows[raw_state]
-                .get_or_insert_with(|| Box::new([UNKNOWN; 256]));
-            let slot = unsafe { row.get_unchecked_mut(byte as usize) };
-            if *slot == UNKNOWN {
-                *slot = u64::from(returned_cell.target)
-                    | ((returned_cell.has_finalizer as u64) << 32);
+            let packed=u64::from(returned_cell.target) | ((returned_cell.has_finalizer as u64)<<32);
+            if self.bounded_high_raw && raw_state >= RAW_DENSE_MEMO_LIMIT {
+                self.high_raw_cells.insert((u64::from(raw_state)<<8)|u64::from(byte),packed);
+            } else {
+                let raw_state = raw_state as usize;
+                if self.raw_cell_rows.len() <= raw_state {
+                    self.raw_cell_rows.resize_with(raw_state + 1, || None);
+                }
+                let row = self.raw_cell_rows[raw_state]
+                    .get_or_insert_with(|| Box::new([UNKNOWN; 256]));
+                let slot = unsafe { row.get_unchecked_mut(byte as usize) };
+                if *slot == UNKNOWN { *slot = packed; }
             }
         }
         if self.error.is_none()
