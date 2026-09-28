@@ -237,10 +237,13 @@ use assembly::{
 };
 
 mod link;
+// The flattened reference path is used by tests and internal tooling.
+#[allow(deprecated, unused_imports)]
+pub(crate) use link::compose_constraints_owned_parent;
 #[allow(deprecated)]
 pub(crate) use link::{
     SegmentedBoundaryBackend, accepted_original_tokens, accepted_weight_support,
-    compose_constraints_owned_parent, compose_constraints_owned_parent_segmented,
+    compose_constraints_owned_parent_segmented,
     compose_constraints_owned_parent_segmented_shared,
 };
 
