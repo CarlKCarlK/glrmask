@@ -48,7 +48,8 @@ def main() -> None:
         python = venv_python(environment)
         run(str(python), "-m", "pip", "install", "--upgrade", "pip")
         run(str(python), "-m", "pip", "install", str(artifact))
-        run(str(python), str(repo_root / "scripts" / "python-wheel-smoke.py"))
+        # Ignore PYTHONPATH and user-site packages: test the artifact just installed.
+        run(str(python), "-I", str(repo_root / "scripts" / "python-wheel-smoke.py"))
 
     print(f"clean-install smoke test passed: {artifact.name}")
 
