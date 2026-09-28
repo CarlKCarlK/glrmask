@@ -502,7 +502,7 @@ fn with_provider_and_baseline(
         project_resets: std::env::var_os("GLRMASK_PROFILE_SCOPED_RESET_PROJECTION").is_some(),
         epsilon_proofs_remaining: {
             static ENABLED: OnceLock<bool> = OnceLock::new();
-            if *ENABLED.get_or_init(|| env_flag("GLRMASK_EPSILON_ONLY_RESETS", false)) { 4 } else { 0 }
+            if *ENABLED.get_or_init(|| env_flag("GLRMASK_EPSILON_ONLY_RESETS", true)) { 4 } else { 0 }
         },
         #[cfg(test)]
         epsilon_proofs_proved: 0,

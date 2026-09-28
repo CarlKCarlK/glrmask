@@ -1226,7 +1226,7 @@ impl<'a, 'b> FullWalkConfigTransitions<'a, 'b> {
         raw_cell_rows: Vec::new(),
         bounded_high_raw: {
             static ENABLED: OnceLock<bool> = OnceLock::new();
-            *ENABLED.get_or_init(||env_flag("GLRMASK_BOUNDED_HIGH_RAW_MEMO", false))
+            *ENABLED.get_or_init(||env_flag("GLRMASK_BOUNDED_HIGH_RAW_MEMO", true))
         },
         high_raw_cells: raw_high_memo::TaggedMemo::new(),
         high_raw_targets: raw_high_memo::TaggedMemo::new(),
@@ -9392,7 +9392,7 @@ pub(crate) struct PreparedMaskVocabulary {
 impl PreparedMaskVocabulary {
     fn make_vocab(constraint: &Constraint, ids: &[u32]) -> Result<Arc<DynamicMaskVocab>, String> {
         static PACKED: OnceLock<bool> = OnceLock::new();
-        if *PACKED.get_or_init(|| env_flag("GLRMASK_BOUNDARY_PACKED_VOCAB", false)) {
+        if *PACKED.get_or_init(|| env_flag("GLRMASK_BOUNDARY_PACKED_VOCAB", true)) {
             return Self::make_vocab_packed(constraint, ids);
         }
         static BORROW_BYTES: OnceLock<bool> = OnceLock::new();
