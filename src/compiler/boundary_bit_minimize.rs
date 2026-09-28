@@ -565,6 +565,21 @@ fn merge(group: &mut Group, state: &Signature, domain: Mask, masks: &mut Masks) 
     Some(())
 }
 
+/// Called only after `compatible` succeeds. Each state's coefficients are
+/// contained in its needed domain, so containment of domains makes every OR
+/// in merge an identity. Guard keys and nonzero target identities were checked
+/// by compatible; zero targets were canonicalized to state zero beforehand.
+fn merge_domain_is_contained(group: &Group, domain: Mask, masks: &Masks) -> bool {
+    if domain == group.domain || domain == 0 || group.domain == 1 { return true; }
+    if group.domain == 0 { return false; }
+    masks.values[domain as usize].iter().zip(&masks.values[group.domain as usize])
+        .all(|(&a, &b)| a & !b == 0)
+}
+
+#[cfg(test)]
+#[path = "boundary_min_merge_noop_tests.rs"]
+mod merge_noop_tests;
+
 pub fn minimize_finite_bits(
     input: &DWA, rows: usize, default_label: i32,
 ) -> Option<(DWA, BitMinimizeProfile)> {
@@ -812,6 +827,11 @@ fn minimize_prepared_with_observations(
     for s in 0..n {if live[s] {buckets[heights[s]].push(s);}}
     let mut mapped=vec![0u32;n];
     let mut groups=vec![Group{domain:0,signature:Signature{final_mask:0,edges:Vec::new()},guarded:false}];
+    let skip_redundant_merges=crate::compiler::boundary_env::enabled(
+        "GLRMASK_BOUNDARY_MIN_CONTAINED_MERGES");
+    if std::env::var_os("GLRMASK_PROFILE_COMPOSE").is_some() {
+        eprintln!("[glrmask/profile][min_contained_merges] enabled={skip_redundant_merges}");
+    }
     for mut bucket in buckets {
         bucket.sort_unstable_by_key(|&s|std::cmp::Reverse((masks.popcount(needed[s]),states[s].edges.len(),s)));
         let base=groups.len();
@@ -851,7 +871,13 @@ fn minimize_prepared_with_observations(
                 if compatible(&groups[id],&signature,needed[s],states[s].guarded,&masks) {found=Some(id);break;}
             }
             let id=match found {
-                Some(id)=>{merge(&mut groups[id],&signature,needed[s],&mut masks)?;id},
+                Some(id)=>{
+                    if !skip_redundant_merges
+                        || !merge_domain_is_contained(&groups[id],needed[s],&masks) {
+                        merge(&mut groups[id],&signature,needed[s],&mut masks)?;
+                    }
+                    id
+                },
                 None=>{let id=groups.len();groups.push(Group{domain:needed[s],signature:signature.clone(),guarded:states[s].guarded});id},
             };
             mapped[s]=id as u32;
