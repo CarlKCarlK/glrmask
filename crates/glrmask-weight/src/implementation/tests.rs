@@ -1,5 +1,161 @@
 use super::*;
 
+#[test]
+fn compact_range_builder_preserves_stream_and_token_representatives() {
+    // Keep the original placeholder-based implementation as an oracle.
+    // Comparing raw maps avoids global interning hiding an identity change.
+    struct Reference {
+        map: WeightMap,
+        start: Option<u32>,
+        end: u32,
+        tokens: SharedTokenSet,
+    }
+    impl Reference {
+        fn flush(&mut self) {
+            if let Some(start) = self.start.take() {
+                let tokens = std::mem::replace(&mut self.tokens, Arc::clone(&EMPTY_RANGESET));
+                self.map.extend_simple(std::iter::once((start..=self.end, tokens)));
+            }
+        }
+        fn push(&mut self, start: u32, end: u32, tokens: SharedTokenSet) {
+            if self.start.is_some()
+                && self.end.checked_add(1) == Some(start)
+                && same_shared_token_set(&self.tokens, &tokens)
+            {
+                self.end = end;
+            } else {
+                self.flush();
+                self.start = Some(start);
+                self.end = end;
+                self.tokens = tokens;
+            }
+        }
+    }
+    let a = Arc::new(RangeSetBlaze::from_iter([1_u32..=4, 7..=9]));
+    let equal_a = Arc::new(a.as_ref().clone());
+    let b = Arc::new(RangeSetBlaze::from_iter([3_u32..=8]));
+    assert!(!Arc::ptr_eq(&a, &equal_a));
+    let entries = [
+        (0, 0, Arc::clone(&a)),
+        (1, 2, Arc::clone(&equal_a)),
+        (3, 6, Arc::clone(&b)),
+        (2, 5, Arc::clone(&a)),
+        (9, 11, Arc::clone(&b)),
+        (u32::MAX - 2, u32::MAX - 1, Arc::clone(&a)),
+        (u32::MAX, u32::MAX, Arc::clone(&equal_a)),
+        (3, 3, Arc::clone(&EMPTY_RANGESET)),
+    ];
+    for seed in 0..1024_usize {
+        let mut reference = Reference {
+            map: WeightMap::new(), start: None, end: 0,
+            tokens: Arc::clone(&EMPTY_RANGESET),
+        };
+        let mut actual = CompactRangeBuilder::new();
+        let mut choice = seed;
+        for step in 0..(seed % 33) {
+            let entry = &entries[choice % entries.len()];
+            choice = choice.rotate_right(3).wrapping_add(step * 17 + seed);
+            reference.push(entry.0, entry.1, Arc::clone(&entry.2));
+            actual.push(entry.0, entry.1, Arc::clone(&entry.2));
+            if (seed + step) % 3 == 0 {
+                reference.flush();
+                actual.flush();
+            }
+        }
+        reference.flush();
+        actual.flush();
+        assert_eq!(actual.map, reference.map, "stream {seed}");
+        let identities = |map: &WeightMap| map.range_values()
+            .map(|(range, tokens)| (range, Arc::as_ptr(tokens) as usize))
+            .collect::<Vec<_>>();
+        assert_eq!(identities(&actual.map), identities(&reference.map), "token representatives {seed}");
+    }
+}
+
+#[test]
+fn token_intersection_defaults_to_sweep_and_retains_reference_override() {
+    assert_eq!(token_intersection_mode(None), 2);
+    assert_eq!(token_intersection_mode(Some("sweep")), 2);
+    assert_eq!(token_intersection_mode(Some("memo")), 1);
+    for value in ["off", "0", "legacy", "", "unknown"] {
+        assert_eq!(token_intersection_mode(Some(value)), 0);
+    }
+}
+
+#[test]
+fn cached_equal_token_sets_keep_the_callers_left_representative() {
+    // Equal but separately allocated sets occur after artifact remapping.
+    // Canonical subset construction prefers the current left operand,
+    // even when a commutative memo was populated in the opposite order.
+    for sweep in [false, true] {
+        let left = Arc::new(RangeSetBlaze::from_iter([2_u32..=8, 14..=20]));
+        let right = Arc::new(left.as_ref().clone());
+        assert!(!Arc::ptr_eq(&left, &right));
+        let first = shared_token_intersection_cached(&left, &right, sweep).unwrap();
+        assert!(Arc::ptr_eq(&first, &left));
+        let reversed = shared_token_intersection_cached(&right, &left, sweep).unwrap();
+        assert!(Arc::ptr_eq(&reversed, &right), "reversed memo hit changed operand sharing");
+    }
+}
+
+#[test]
+fn token_range_sweep_matches_every_pair_of_small_sets() {
+    let sets = (0_u32..256).map(|bits| {
+        Arc::new(RangeSetBlaze::from_iter((0_u32..8).filter(|bit| bits & (1 << bit) != 0)))
+    }).collect::<Vec<_>>();
+    for left in &sets {
+        for right in &sets {
+            let expected = left.as_ref() & right.as_ref();
+            assert_eq!(*intersect_token_ranges_once(left, right), expected);
+        }
+    }
+}
+
+#[test]
+fn token_range_sweep_preserves_containment_sharing_and_u32_extremes() {
+    let ranges = [
+        vec![], vec![0..=0], vec![u32::MAX..=u32::MAX],
+        vec![0..=u32::MAX], vec![1..=u32::MAX - 1],
+        vec![0..=2, 9..=17, u32::MAX - 2..=u32::MAX],
+        vec![2..=9, 16..=19, u32::MAX - 1..=u32::MAX],
+    ];
+    let sets = ranges.into_iter().map(|ranges| Arc::new(RangeSetBlaze::from_iter(ranges)))
+        .collect::<Vec<_>>();
+    for left in &sets {
+        for right in &sets {
+            let expected = left.as_ref() & right.as_ref();
+            let actual = intersect_token_ranges_once(left, right);
+            assert_eq!(*actual, expected);
+            if left.is_subset(right) {
+                assert!(Arc::ptr_eq(&actual, left));
+            } else if right.is_subset(left) {
+                assert!(Arc::ptr_eq(&actual, right));
+            }
+            for sweep in [false, true] {
+                let expected = shared_token_intersection_legacy(left, right);
+                let actual = shared_token_intersection_cached(left, right, sweep);
+                assert_eq!(actual.as_deref(), expected.as_deref());
+            }
+        }
+    }
+}
+
+#[test]
+fn contained_token_intersection_memo_does_not_retain_operands() {
+    let left = Arc::new(RangeSetBlaze::from_iter([2..=4, 8..=10]));
+    let right = Arc::new(RangeSetBlaze::from_iter([0..=12]));
+    let result = intersect_token_ranges_once(&left, &right);
+    assert!(Arc::ptr_eq(&result, &left));
+    let key = TokenSetOpKey::for_token_sets(TokenSetOpKind::Intersection, &left, &right);
+    let mut memo = WeightOpMemo::default();
+    memo.store_token_set(key, &left, &right, &result);
+    assert_eq!(memo.lookup_token_set(key).as_deref(), Some(left.as_ref()));
+    let weak = Arc::downgrade(&right);
+    drop(right);
+    assert!(weak.upgrade().is_none());
+    assert!(memo.lookup_token_set(key).is_none(), "dead operands invalidate a contained result too");
+}
+
 fn weight_for_tsid(tsid: u32, ranges: &[(u32, u32)]) -> Weight {
     let token_set = rangeset_from_ranges(ranges.iter().map(|(start, end)| *start..=*end));
     Weight::from_token_set_for_tsid(tsid, token_set)

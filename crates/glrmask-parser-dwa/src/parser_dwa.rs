@@ -41,6 +41,51 @@ type TargetContribs = SmallVec<[(u32, Weight); 4]>;
 type DeferredFinalEntries = SmallVec<[(u32, Weight); 4]>;
 type FinalPathWeights = SmallVec<[Weight; 4]>;
 type FinalGroups = SmallVec<[(Weight, FinalPathWeights); 4]>;
+type FinalWeightSignature = SmallVec<[(usize, usize); 4]>;
+
+/// The former key grouped a sorted set of path-weight identities under each
+/// final-weight identity. Sorted unique pairs encode exactly that same key,
+/// without a separate heap allocation for every nested path-weight vector.
+/// The referenced weights remain owned by the NWA and deferred final entries.
+fn final_weight_signature(
+    pairs: impl IntoIterator<Item = (usize, usize)>,
+) -> FinalWeightSignature {
+    let mut key: FinalWeightSignature = pairs.into_iter().collect();
+    key.sort_unstable();
+    key.dedup();
+    key
+}
+
+#[cfg(test)]
+#[test]
+fn flat_final_weight_signatures_match_nested_grouping() {
+    fn reference(pairs: &[(usize, usize)]) -> Vec<(usize, usize)> {
+        let mut groups = BTreeMap::<usize, BTreeSet<usize>>::new();
+        for &(final_weight, path_weight) in pairs {
+            groups.entry(final_weight).or_default().insert(path_weight);
+        }
+        groups.into_iter().flat_map(|(final_weight, paths)| {
+            paths.into_iter().map(move |path_weight| (final_weight, path_weight))
+        }).collect()
+    }
+
+    let mut cache = FxHashMap::<FinalWeightSignature, usize>::default();
+    for len in [0usize, 1, 2, 4, 5, 8, 17, 64, 257] {
+        let pairs = (0..len)
+            .map(|index| ((index * 7) % 11, (index * 13) % 23))
+            .collect::<Vec<_>>();
+        let key = final_weight_signature(pairs.iter().copied());
+        assert_eq!(key.as_slice(), reference(&pairs).as_slice());
+        cache.insert(key.clone(), len);
+        // Input order and repeated contributions cannot change a union's key.
+        let repeated = pairs.iter().rev().chain(pairs.iter()).copied();
+        let repeated_key = final_weight_signature(repeated);
+        assert_eq!(repeated_key, key);
+        assert_eq!(cache.get(&repeated_key), Some(&len));
+    }
+    assert_ne!(final_weight_signature([(1, 2)]), final_weight_signature([(2, 1)]));
+    assert_ne!(final_weight_signature([(1, 2)]), final_weight_signature([(1, 3)]));
+}
 
 struct ParallelSupportScanScratch {
     weight_ops: ScopedWeightOpCache,
@@ -52,6 +97,7 @@ struct ParallelSupportScanScratch {
     touched_dense: Vec<usize>,
     default: TargetContribs,
     sparse: FxHashMap<i32, TargetContribs>,
+    closure_key: SmallVec<[(u32, usize); 8]>,
 }
 
 impl ParallelSupportScanScratch {
@@ -76,7 +122,17 @@ impl ParallelSupportScanScratch {
             touched_dense: Vec::new(),
             default: TargetContribs::new(),
             sparse: FxHashMap::default(),
+            closure_key: SmallVec::new(),
         }
+    }
+
+    /// Borrow a canonical cache key without allocating once per label.
+    /// The caller has already sorted and merged target contributions; pointer
+    /// identities are copied in that exact order, just as in the owned key.
+    fn closure_key_for(&mut self, contributions: &TargetContribs) -> &[(u32, usize)] {
+        self.closure_key.clear();
+        self.closure_key.extend(contributions.iter().map(|(state, weight)| (*state, weight.ptr_key())));
+        &self.closure_key
     }
 
     #[inline]
@@ -131,6 +187,28 @@ impl ParallelSupportScanScratch {
 
 const PROFILE_PARSER_DWA_DETERMINIZE_DETAIL_ENV: &str =
     "GLRMASK_PROFILE_PARSER_DWA_DETERMINIZE_DETAIL";
+
+#[cfg(test)]
+#[test]
+fn parallel_support_borrowed_keys_match_owned_keys_after_spill_and_reuse() {
+    let mut scratch = ParallelSupportScanScratch::new(4);
+    let mut cache = FxHashMap::<Vec<(u32, usize)>, usize>::default();
+    for (iteration, len) in [0usize, 1, 4, 8, 9, 32, 2, 0, 7].into_iter().enumerate() {
+        for reversed in [false, true] {
+            let mut contributions: TargetContribs = (0..len)
+                .map(|state| (state as u32, if state % 2 == 0 { Weight::all() } else { Weight::empty() }))
+                .collect();
+            if reversed { contributions.reverse(); }
+            let owned = contributions.iter().map(|(state, weight)| (*state, weight.ptr_key()))
+                .collect::<Vec<_>>();
+            cache.insert(owned.clone(), iteration);
+            let borrowed = scratch.closure_key_for(&contributions);
+            assert_eq!(borrowed, owned.as_slice());
+            assert_eq!(cache.get(borrowed), Some(&iteration));
+        }
+    }
+    assert!(scratch.closure_key.spilled(), "test must exercise retained heap storage");
+}
 
 #[inline]
 fn add_target_contribution(contribs: &mut TargetContribs, target: u32, add: Weight) {
@@ -2049,8 +2127,10 @@ fn determinize_with_supports_mode(
             .and_then(|value| value.trim().parse::<usize>().ok())
             .unwrap_or(16_384)
         && std::env::var_os("GLRMASK_DISABLE_PARSER_SUPPORT_COMPONENT_CACHE").is_none();
+    // Rows are exclusively inserted between parallel waves and immutably
+    // borrowed within each wave. A second Arc allocation per row is unnecessary.
     let mut component_row_cache =
-        FxHashMap::<(u32, usize), Arc<Vec<(i32, u32, Weight)>>>::default();
+        FxHashMap::<(u32, usize), Vec<(i32, u32, Weight)>>::default();
     let mut union_cache = UnionAllCache {
         ordered_keys: std::env::var_os("GLRMASK_DISABLE_ORDERED_UNION_CACHE_KEY").is_none(),
         profile_enabled: detail.is_some(),
@@ -2207,7 +2287,7 @@ fn determinize_with_supports_mode(
                                 }
                             }
                         }
-                        (key, Arc::new(row))
+                        (key, row)
                     })
                     .collect::<Vec<_>>();
                 if let Some(started) = compute_started {
@@ -2299,11 +2379,7 @@ fn determinize_with_supports_mode(
                                 .get(&(*state_id, weight.ptr_key()))
                                 .cloned(),
                             _ => {
-                                let key = contribs
-                                    .iter()
-                                    .map(|(state_id, weight)| (*state_id, weight.ptr_key()))
-                                    .collect::<Vec<_>>();
-                                closure_cache_ref.get(&key).cloned()
+                                closure_cache_ref.get(scratch.closure_key_for(&contribs)).cloned()
                             }
                         };
                         if let Some(cached) = cached {
@@ -2399,10 +2475,8 @@ fn determinize_with_supports_mode(
                 }
 
                 let cache_key = (*nwa_state_id, path_weight.ptr_key());
-                let cached_row = component_row_cache_enabled.then(|| {
-                    if let Some(row) = component_row_cache.get(&cache_key) {
-                        return Arc::clone(row);
-                    }
+                let cached_row = if component_row_cache_enabled {
+                    Some(component_row_cache.entry(cache_key).or_insert_with(|| {
                     let mut row = Vec::new();
                     for (&label, targets) in &state.transitions {
                         for (target, transition_weight) in targets {
@@ -2413,10 +2487,11 @@ fn determinize_with_supports_mode(
                             }
                         }
                     }
-                    let row = Arc::new(row);
-                    component_row_cache.insert(cache_key, Arc::clone(&row));
                     row
-                });
+                    }))
+                } else {
+                    None
+                };
 
                 if let Some(row) = cached_row {
                     for (label, target, next_weight) in row.iter() {
@@ -2961,36 +3036,16 @@ fn determinize_with_supports_mode(
         }
     }
 
-    let mut final_signature_ids: FxHashMap<Vec<(usize, Vec<usize>)>, usize> = FxHashMap::default();
+    let mut final_signature_ids: FxHashMap<FinalWeightSignature, usize> = FxHashMap::default();
     let mut final_signature_groups: Vec<FinalGroups> = Vec::new();
     let mut final_jobs: Vec<(u32, usize)> = Vec::with_capacity(deferred_final_entries.len());
     let final_grouping_started = (detail.is_some() || fast_support_profile).then(Instant::now);
 
     let build_signature = |entries: &DeferredFinalEntries| {
-        let mut groups: SmallVec<[(usize, SmallVec<[usize; 4]>); 4]> = SmallVec::new();
-        for (nwa_state_id, path_weight) in entries {
-            let Some(state_final) = nwa.states()[*nwa_state_id as usize].final_weight.as_ref() else {
-                continue;
-            };
-            let final_key = state_final.ptr_key();
-            if let Some((_, path_keys)) = groups
-                .iter_mut()
-                .find(|(existing_final_key, _)| *existing_final_key == final_key)
-            {
-                path_keys.push(path_weight.ptr_key());
-            } else {
-                groups.push((final_key, smallvec::smallvec![path_weight.ptr_key()]));
-            }
-        }
-        groups.sort_unstable_by_key(|(final_key, _)| *final_key);
-        groups
-            .into_iter()
-            .map(|(final_key, mut path_keys)| {
-                path_keys.sort_unstable();
-                path_keys.dedup();
-                (final_key, path_keys.into_vec())
-            })
-            .collect::<Vec<_>>()
+        final_weight_signature(entries.iter().filter_map(|(nwa_state_id, path_weight)| {
+            nwa.states()[*nwa_state_id as usize].final_weight.as_ref()
+                .map(|state_final| (state_final.ptr_key(), path_weight.ptr_key()))
+        }))
     };
 
     let parallel_signature_grouping = detail.is_none()
@@ -3086,7 +3141,7 @@ fn determinize_with_supports_mode(
         let detail_enabled = detail.is_some();
         let final_weights_by_signature: Vec<Option<Weight>> = {
             let intern_started_at = Instant::now();
-            let mut component_ids = FxHashMap::<(usize, Vec<usize>), usize>::default();
+            let mut component_ids = FxHashMap::<(usize, SmallVec<[usize; 4]>), usize>::default();
             let mut components = Vec::<(Weight, SmallVec<[Weight; 4]>)>::new();
             let signature_components: Vec<SmallVec<[usize; 8]>> = final_signature_groups
                 .iter()
@@ -3096,7 +3151,7 @@ fn determinize_with_supports_mode(
                         .map(|(final_w, path_weights)| {
                             let key = (
                                 final_w.ptr_key(),
-                                path_weights.iter().map(Weight::ptr_key).collect::<Vec<_>>(),
+                                path_weights.iter().map(Weight::ptr_key).collect::<SmallVec<[usize; 4]>>(),
                             );
                             if let Some(&component_id) = component_ids.get(&key) {
                                 component_id
@@ -4126,6 +4181,8 @@ fn fast_boundary_cancellations_worklist(
 
 #[path = "finite_cancellation.rs"]
 mod finite_cancellation;
+#[path = "finite_signed_graph.rs"]
+mod finite_signed_graph;
 
 struct NativeCancellationResult {
     derived: Vec<FastBoundaryDerivedRow>,
@@ -4142,6 +4199,27 @@ fn fast_boundary_resolve_negative_codes(
     interner: &mut FastBoundaryWeightInterner,
 ) -> Option<()> {
     fast_boundary_resolve_negative_codes_with_topology(states, interner, None)
+}
+
+
+fn fast_boundary_prune_terminal_defaults(
+    states: &mut [FastBoundaryNwaState], interner: &FastBoundaryWeightInterner,
+) {
+    let n = states.len();
+    let terminal = finite_signed_graph::terminal_default_states(states, interner);
+    for state in states.iter_mut() {
+        let final_weight = state.final_weight;
+        for (label, branches) in &mut state.transitions {
+            if *label == DEFAULT_LABEL && final_weight != 0 {
+                branches.retain(|(target, edge_weight)| {
+                    (*target as usize) >= n
+                        || !terminal[*target as usize]
+                        || !interner.is_subset(*edge_weight, final_weight)
+                });
+            }
+        }
+        state.transitions.retain(|(_, branches)| !branches.is_empty());
+    }
 }
 
 fn fast_boundary_resolve_negative_codes_with_topology(
@@ -4226,102 +4304,7 @@ fn fast_boundary_resolve_negative_codes_with_topology(
 
     let finality_ms = elapsed_ms(finality_started);
     let prune_started = Instant::now();
-    let mut terminal = states
-        .iter()
-        .map(|state| {
-            state.final_weight != 0
-                && state.epsilons.is_empty()
-                && !state
-                    .transitions
-                    .iter()
-                    .any(|(label, branches)| *label != DEFAULT_LABEL && !branches.is_empty())
-                && !state
-                    .transitions
-                    .iter()
-                    .any(|(label, branches)| *label == DEFAULT_LABEL && !branches.is_empty())
-        })
-        .collect::<Vec<_>>();
-    let mut dependents = vec![Vec::<usize>::new(); n];
-    let mut remaining = vec![usize::MAX; n];
-    let mut terminal_queue = VecDeque::new();
-    for (state, &is_terminal) in terminal.iter().enumerate() {
-        if is_terminal {
-            terminal_queue.push_back(state);
-        }
-    }
-    for state_id in 0..n {
-        if terminal[state_id] {
-            continue;
-        }
-        let state = &states[state_id];
-        let candidate = state.final_weight != 0
-            && state.epsilons.is_empty()
-            && !state
-                .transitions
-                .iter()
-                .any(|(label, branches)| *label != DEFAULT_LABEL && !branches.is_empty());
-        if !candidate {
-            continue;
-        }
-        let default = state
-            .transitions
-            .iter()
-            .find_map(|(label, branches)| (*label == DEFAULT_LABEL).then_some(branches));
-        let Some(default) = default else {
-            terminal[state_id] = true;
-            terminal_queue.push_back(state_id);
-            continue;
-        };
-        if default
-            .iter()
-            .any(|(_, weight)| !interner.is_subset(*weight, state.final_weight))
-        {
-            continue;
-        }
-        let mut count = 0usize;
-        for (target, _) in default {
-            let target = *target as usize;
-            if target >= n {
-                count += 1;
-            } else if !terminal[target] {
-                dependents[target].push(state_id);
-                count += 1;
-            }
-        }
-        remaining[state_id] = count;
-        if count == 0 {
-            terminal[state_id] = true;
-            terminal_queue.push_back(state_id);
-        }
-    }
-    while let Some(done) = terminal_queue.pop_front() {
-        for dependent in dependents[done].clone() {
-            if terminal[dependent] {
-                continue;
-            }
-            if remaining[dependent] == usize::MAX || remaining[dependent] == 0 {
-                continue;
-            }
-            remaining[dependent] -= 1;
-            if remaining[dependent] == 0 {
-                terminal[dependent] = true;
-                terminal_queue.push_back(dependent);
-            }
-        }
-    }
-    for state in states.iter_mut() {
-        let final_weight = state.final_weight;
-        for (label, branches) in &mut state.transitions {
-            if *label == DEFAULT_LABEL && final_weight != 0 {
-                branches.retain(|(target, edge_weight)| {
-                    (*target as usize) >= n
-                        || !terminal[*target as usize]
-                        || !interner.is_subset(*edge_weight, final_weight)
-                });
-            }
-        }
-        state.transitions.retain(|(_, branches)| !branches.is_empty());
-    }
+    fast_boundary_prune_terminal_defaults(states, interner);
     let prune_ms = elapsed_ms(prune_started);
     if compile_profile_enabled() {
         eprintln!(
@@ -4615,9 +4598,92 @@ fn fast_boundary_singleton_state(
     state
 }
 
+/// Canonicalize target contributions without allocating a second frontier.
+#[inline]
+fn compact_fast_boundary_contribs(
+    contribs: &mut FastBoundaryContribs,
+    interner: &mut FastBoundaryWeightInterner,
+) {
+    if contribs.len() < 2 { return; }
+    contribs.sort_unstable_by_key(|(state, _)| *state);
+    let mut written = 0usize;
+    for read in 0..contribs.len() {
+        let (state, weight) = contribs[read];
+        if written != 0 && contribs[written - 1].0 == state {
+            let previous = contribs[written - 1].1;
+            contribs[written - 1].1 = interner.union(previous, weight);
+        } else {
+            contribs[written] = (state, weight);
+            written += 1;
+        }
+    }
+    contribs.truncate(written);
+}
+
+/// Keep common per-label frontier storage, but do not pin exceptional buffers
+/// across the entire determinization. This changes storage, not frontier keys.
+#[inline]
+fn recycle_fast_boundary_contribs(contribs: &mut FastBoundaryContribs) {
+    if contribs.capacity() > 128 {
+        *contribs = FastBoundaryContribs::new();
+    } else {
+        contribs.clear();
+    }
+}
+
+#[cfg(test)]
+#[test]
+fn recycled_boundary_contribs_preserve_small_buffers_and_release_large_ones() {
+    let mut buffer = FastBoundaryContribs::new();
+    for i in 0..64 { buffer.push((i, 1)); }
+    let pointer = buffer.as_ptr();
+    let capacity = buffer.capacity();
+    let snapshot = buffer.to_vec();
+    recycle_fast_boundary_contribs(&mut buffer);
+    assert!(buffer.is_empty());
+    assert_eq!(buffer.as_ptr(), pointer);
+    assert_eq!(buffer.capacity(), capacity);
+    buffer.push((999, 2));
+    assert_eq!(snapshot[0], (0, 1));
+    assert_eq!(snapshot.len(), 64);
+    for i in 0..512 { buffer.push((i, 3)); }
+    assert!(buffer.capacity() > 128);
+    recycle_fast_boundary_contribs(&mut buffer);
+    assert!(buffer.is_empty());
+    assert!(buffer.capacity() <= 128);
+}
+
+#[cfg(test)]
+#[test]
+fn inplace_boundary_contribs_match_independent_grouped_unions_without_reallocation() {
+    let mut pool = FastBoundaryWeightInterner::new(1, 8).unwrap();
+    let weights = (0..256u64).map(|v| pool.intern(smallvec::smallvec![v])).collect::<Vec<_>>();
+    let mut seed = 73455u64;
+    let mut next = || { seed=seed.wrapping_mul(6364136223846793005).wrapping_add(1); (seed>>32)as usize };
+    for len in 0..128 {
+        for _ in 0..16 {
+            let mut input = FastBoundaryContribs::new();
+            let mut expected = BTreeMap::<u32,u64>::new();
+            for _ in 0..len {
+                let target = (next()%24)as u32;
+                let bits = next()%256;
+                input.push((target,weights[bits]));
+                *expected.entry(target).or_default() |= bits as u64;
+            }
+            let pointer = input.as_ptr();
+            let capacity = input.capacity();
+            compact_fast_boundary_contribs(&mut input, &mut pool);
+            assert_eq!(input.as_ptr(),pointer);
+            assert_eq!(input.capacity(),capacity);
+            let actual=input.iter().map(|&(q,w)|(q,pool.values[w as usize][0])).collect::<Vec<_>>();
+            assert_eq!(actual,expected.into_iter().collect::<Vec<_>>());
+        }
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 fn fast_boundary_process_contribs(
-    mut contribs: FastBoundaryContribs,
+    contribs: &mut FastBoundaryContribs,
     nwa: &[FastBoundaryNwaState],
     interner: &mut FastBoundaryWeightInterner,
     weight_by_state: &mut [FastBoundaryWeightId],
@@ -4640,20 +4706,7 @@ fn fast_boundary_process_contribs(
     if contribs.is_empty() {
         return None;
     }
-    if contribs.len() > 1 {
-        contribs.sort_unstable_by_key(|(state, _)| *state);
-        let mut merged = FastBoundaryContribs::new();
-        for (state, weight) in contribs {
-            if let Some((last_state, last_weight)) = merged.last_mut()
-                && *last_state == state
-            {
-                *last_weight = interner.union(*last_weight, weight);
-            } else {
-                merged.push((state, weight));
-            }
-        }
-        contribs = merged;
-    }
+    compact_fast_boundary_contribs(contribs, interner);
 
     if let [(state, weight)] = contribs.as_slice()
         && nwa[*state as usize].epsilons.is_empty()
@@ -4683,7 +4736,7 @@ fn fast_boundary_process_contribs(
     }
 
     let mut incoming_edge_weight = interner.empty_id();
-    for (_, weight) in &contribs {
+    for (_, weight) in contribs.iter() {
         incoming_edge_weight = interner.union(incoming_edge_weight, *weight);
     }
     if incoming_edge_weight == 0 {
@@ -4692,7 +4745,7 @@ fn fast_boundary_process_contribs(
     let closure = fast_boundary_epsilon_closure(
         nwa,
         interner,
-        &contribs,
+        contribs.as_slice(),
         weight_by_state,
         closure_queue,
         closure_touched,
@@ -4726,7 +4779,14 @@ fn fast_boundary_process_contribs(
     if let Some(key) = singleton_key {
         singleton_closure_cache.insert(key, cached);
     } else {
-        closure_cache.insert(contribs.into_vec(), cached);
+        // Cache keys must outlive the scratch buffer. Retain common capacities
+        // for future labels/subsets; move unusually large allocations instead.
+        let key = if contribs.capacity() > 128 {
+            std::mem::take(contribs).into_vec()
+        } else {
+            contribs.to_vec()
+        };
+        closure_cache.insert(key, cached);
     }
     Some(cached)
 }
@@ -5112,7 +5172,66 @@ fn fast_boundary_add_target(
     }
 }
 
+/// Storage only: both representations expose the same exact ordered slice.
+trait FallbackFrontier: Clone + Eq + std::hash::Hash
+    + std::borrow::Borrow<[(u32, FastBoundaryWeightId)]>
+{
+    fn singleton(state: u32, weight: FastBoundaryWeightId) -> Self;
+    fn from_pairs(pairs: Vec<(u32, FastBoundaryWeightId)>) -> Self;
+    fn as_slice(&self) -> &[(u32, FastBoundaryWeightId)];
+}
+
+impl FallbackFrontier for Vec<(u32, FastBoundaryWeightId)> {
+    fn singleton(state: u32, weight: FastBoundaryWeightId) -> Self { vec![(state, weight)] }
+    fn from_pairs(pairs: Vec<(u32, FastBoundaryWeightId)>) -> Self { pairs }
+    fn as_slice(&self) -> &[(u32, FastBoundaryWeightId)] { self }
+}
+
+type PackedFallbackFrontier = SmallVec<[(u32, FastBoundaryWeightId); 1]>;
+
+impl FallbackFrontier for PackedFallbackFrontier {
+    fn singleton(state: u32, weight: FastBoundaryWeightId) -> Self { smallvec::smallvec![(state, weight)] }
+    fn from_pairs(pairs: Vec<(u32, FastBoundaryWeightId)>) -> Self { SmallVec::from_vec(pairs) }
+    fn as_slice(&self) -> &[(u32, FastBoundaryWeightId)] { self }
+}
+
+struct FallbackSingletons<const PACKED: bool> {
+    dense: Vec<u32>,
+    sparse: FxHashMap<u32, u32>,
+}
+
+impl<const PACKED: bool> FallbackSingletons<PACKED> {
+    fn new(count: usize) -> Self {
+        Self { dense: if PACKED { vec![u32::MAX; count] } else { Vec::new() }, sparse: FxHashMap::default() }
+    }
+    fn get(&self, key: &u32) -> Option<&u32> {
+        if PACKED { self.dense.get(*key as usize).filter(|&&id| id != u32::MAX) }
+        else { self.sparse.get(key) }
+    }
+    fn insert(&mut self, key: u32, value: u32) {
+        if PACKED { self.dense[key as usize] = value; }
+        else { self.sparse.insert(key, value); }
+    }
+}
+
 fn determinize_fast_boundary_with_fallbacks(
+    input: &[FastBoundaryDwaState],
+    possible_by_state: &[FastPossibleOutgoingIds],
+    num_parser_states: u32,
+    interner: &mut FastBoundaryWeightInterner,
+) -> Vec<FastBoundaryDwaState> {
+    // Storage-only fast path; the normal boundary override convention keeps
+    // a reference implementation available with an explicit false/zero value.
+    if crate::optimized_env_flag("GLRMASK_BOUNDARY_PACKED_FALLBACK_SINGLETONS") {
+        determinize_fast_boundary_with_fallbacks_stored::<PackedFallbackFrontier, true>(
+            input, possible_by_state, num_parser_states, interner)
+    } else {
+        determinize_fast_boundary_with_fallbacks_stored::<Vec<_>, false>(
+            input, possible_by_state, num_parser_states, interner)
+    }
+}
+
+fn determinize_fast_boundary_with_fallbacks_stored<F: FallbackFrontier, const PACKED: bool>(
     input: &[FastBoundaryDwaState],
     possible_by_state: &[FastPossibleOutgoingIds],
     num_parser_states: u32,
@@ -5124,11 +5243,11 @@ fn determinize_fast_boundary_with_fallbacks(
     }
     let all = interner.all_id();
     let mut result = vec![FastBoundaryDwaState::default()];
-    let mut normalized_singletons = FxHashMap::<u32, u32>::default();
+    let mut normalized_singletons = FallbackSingletons::<PACKED>::new(input.len());
     normalized_singletons.insert(0, 0);
-    let mut subset_map = FxHashMap::<Vec<(u32, FastBoundaryWeightId)>, u32>::default();
-    subset_map.insert(vec![(0, all)], 0);
-    let mut worklist = VecDeque::from([(0u32, vec![(0u32, all)])]);
+    let mut subset_map = FxHashMap::<F, u32>::default();
+    if !PACKED { subset_map.insert(F::singleton(0, all), 0); }
+    let mut worklist = VecDeque::from([(0u32, F::singleton(0, all))]);
 
     let dense_limit = num_parser_states as usize;
     let mut dense = (0..dense_limit).map(|_| FastBoundaryContribs::new()).collect::<Vec<_>>();
@@ -5143,7 +5262,7 @@ fn determinize_fast_boundary_with_fallbacks(
     while let Some((from_state, subset)) = worklist.pop_front() {
         if !interner.allow_work(1, result.len(), 0) { return Vec::new(); }
         let mut final_weight = 0;
-        for &(state_id, path_weight) in &subset {
+        for &(state_id, path_weight) in subset.as_slice() {
             let state_final = input[state_id as usize].final_weight;
             if state_final != 0 {
                 let contribution = interner.intersection(path_weight, state_final);
@@ -5167,8 +5286,10 @@ fn determinize_fast_boundary_with_fallbacks(
                     let created = result.len() as u32;
                     result.push(FastBoundaryDwaState::default());
                     normalized_singletons.insert(input_target, created);
-                    subset_map.insert(vec![(input_target, all)], created);
-                    worklist.push_back((created, vec![(input_target, all)]));
+                    // Every singleton lookup uses normalized_singletons.
+                    // The general subset map is queried only for length > 1.
+                    if !PACKED { subset_map.insert(F::singleton(input_target, all), created); }
+                    worklist.push_back((created, F::singleton(input_target, all)));
                     created
                 };
                 rewritten.push((label, target, weight));
@@ -5179,7 +5300,7 @@ fn determinize_fast_boundary_with_fallbacks(
         complex_rows += 1;
         default_all.clear();
 
-        for &(input_state, path_weight) in &subset {
+        for &(input_state, path_weight) in subset.as_slice() {
             let state = &input[input_state as usize];
             for &(label, target, transition_weight) in &state.transitions {
                 if label == DEFAULT_LABEL { continue; }
@@ -5247,9 +5368,9 @@ fn determinize_fast_boundary_with_fallbacks(
         let process = |label: i32,
                            mut contribs: FastBoundaryContribs,
                            result: &mut Vec<FastBoundaryDwaState>,
-                           normalized_singletons: &mut FxHashMap<u32, u32>,
-                           subset_map: &mut FxHashMap<Vec<(u32, FastBoundaryWeightId)>, u32>,
-                           worklist: &mut VecDeque<(u32, Vec<(u32, FastBoundaryWeightId)>)>,
+                           normalized_singletons: &mut FallbackSingletons<PACKED>,
+                           subset_map: &mut FxHashMap<F, u32>,
+                           worklist: &mut VecDeque<(u32, F)>,
                            interner: &mut FastBoundaryWeightInterner| {
             if contribs.is_empty() { return; }
             contribs.sort_unstable_by_key(|(state, _)| *state);
@@ -5265,8 +5386,8 @@ fn determinize_fast_boundary_with_fallbacks(
                     let created = result.len() as u32;
                     result.push(FastBoundaryDwaState::default());
                     normalized_singletons.insert(*only_state, created);
-                    subset_map.insert(vec![(*only_state, all)], created);
-                    worklist.push_back((created, vec![(*only_state, all)]));
+                    if !PACKED { subset_map.insert(F::singleton(*only_state, all), created); }
+                    worklist.push_back((created, F::singleton(*only_state, all)));
                     created
                 }
             } else if let Some(&existing) = subset_map.get(contribs.as_slice()) {
@@ -5274,8 +5395,8 @@ fn determinize_fast_boundary_with_fallbacks(
             } else {
                 let created = result.len() as u32;
                 result.push(FastBoundaryDwaState::default());
-                subset_map.insert(contribs.clone().into_vec(), created);
-                worklist.push_back((created, contribs.into_vec()));
+                subset_map.insert(F::from_pairs(contribs.clone().into_vec()), created);
+                worklist.push_back((created, F::from_pairs(contribs.into_vec())));
                 created
             };
             result[from_state as usize].transitions.push((label, target, edge_weight));
@@ -5311,11 +5432,164 @@ fn determinize_fast_boundary_with_fallbacks(
     }
     if compile_profile_enabled() {
         eprintln!(
-            "[glrmask/profile][fast_boundary_fallback] input_states={} output_states={} singleton_rows={} complex_rows={} total_ms={:.3}",
+            "[glrmask/profile][fast_boundary_fallback] input_states={} output_states={} singleton_rows={} complex_rows={} packed_singletons={PACKED} total_ms={:.3}",
             input.len(), result.len(), singleton_rows, complex_rows, elapsed_ms(started_at),
         );
     }
     result
+}
+
+#[cfg(test)]
+mod packed_fallback_tests {
+    use super::*;
+
+    fn shape(states: &[FastBoundaryDwaState]) -> Vec<(u32, Vec<(i32, u32, u32)>)> {
+        states.iter().map(|state| (state.final_weight, state.transitions.clone())).collect()
+    }
+
+    #[test]
+    fn singleton_index_and_spilled_frontiers_preserve_exact_lookup() {
+        let mut dense = FallbackSingletons::<true>::new(257);
+        let mut reference = FallbackSingletons::<false>::new(257);
+        for round in 0..4u32 {
+            for key in 0..257 {
+                assert_eq!(dense.get(&key), reference.get(&key));
+                let value = key * 11 + round;
+                dense.insert(key, value);
+                reference.insert(key, value);
+                assert_eq!(dense.get(&key), reference.get(&key));
+            }
+        }
+        let one = PackedFallbackFrontier::singleton(12, 1);
+        assert!(!one.spilled());
+        let many = PackedFallbackFrontier::from_pairs((0..32).map(|q| (q, q + 1)).collect());
+        assert!(many.spilled());
+        let mut cache = FxHashMap::<PackedFallbackFrontier, usize>::default();
+        cache.insert(one.clone(), 1);
+        cache.insert(many.clone(), 2);
+        assert_eq!(cache.get(one.as_slice()), Some(&1));
+        assert_eq!(cache.get(many.as_slice()), Some(&2));
+        assert_eq!(many.as_slice(), many.clone().as_slice());
+    }
+
+    #[test]
+    fn packed_fallback_matches_all_rows_and_interner_ids_on_generated_dags() {
+        let mut seed = 7812459u64;
+        let mut next = || { seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1); (seed >> 32) as usize };
+        for case in 0..512 {
+            let rows = [1, 4, 44][case % 3];
+            let mut reference = FastBoundaryWeightInterner::new(rows, 4).unwrap();
+            let mut candidate = FastBoundaryWeightInterner::new(rows, 4).unwrap();
+            let mut weights = Vec::new();
+            for bits in 0..16u64 {
+                let value = smallvec::smallvec![bits; rows];
+                let id = reference.intern(value.clone());
+                assert_eq!(id, candidate.intern(value));
+                weights.push(id);
+            }
+            let n = 2 + next() % 13;
+            let mut input = Vec::new();
+            let mut possible = Vec::new();
+            for q in 0..n {
+                let mut state = FastBoundaryDwaState::default();
+                state.final_weight = weights[next() % 16];
+                if q + 1 < n {
+                    for label in [0, 1, 2, DEFAULT_LABEL, 10000] {
+                        if next() % 3 != 0 {
+                            state.transitions.push((label, (q + 1 + next() % (n - q - 1)) as u32, weights[next() % 16]));
+                        }
+                    }
+                }
+                state.transitions.sort_unstable_by_key(|edge| edge.0);
+                input.push(state);
+                possible.push(match next() % 3 {
+                    0 => FastPossibleOutgoingIds::All,
+                    1 => FastPossibleOutgoingIds::Empty,
+                    _ => FastPossibleOutgoingIds::Small(smallvec::smallvec![0, 2, 3]),
+                });
+            }
+            let a = determinize_fast_boundary_with_fallbacks_stored::<Vec<_>, false>(
+                &input, &possible, 4, &mut reference);
+            let b = determinize_fast_boundary_with_fallbacks_stored::<PackedFallbackFrontier, true>(
+                &input, &possible, 4, &mut candidate);
+            assert_eq!(shape(&a), shape(&b), "case={case}");
+            assert_eq!(reference.values, candidate.values, "weights case={case}");
+            assert_eq!(reference.work, candidate.work, "work case={case}");
+        }
+    }
+
+    /// This input is a saved POST-fallback native graph. Replaying fallback on
+    /// it measures bookkeeping only; it is NOT a whole-link performance test.
+    #[test]
+    #[ignore = "diagnostic native replay; requires GLRMASK_FALLBACK_REPLAY_FILE"]
+    fn real_native_replay() {
+        fn u32_at(bytes: &[u8], offset: &mut usize) -> u32 {
+            let end = offset.checked_add(4).unwrap();
+            let value = u32::from_le_bytes(bytes[*offset..end].try_into().unwrap());
+            *offset = end;
+            value
+        }
+        let bytes = std::fs::read(std::env::var_os("GLRMASK_FALLBACK_REPLAY_FILE").unwrap()).unwrap();
+        let mut offset = 0usize;
+        assert_eq!(u32_at(&bytes, &mut offset), 0x46424b31);
+        let alphabet = u32_at(&bytes, &mut offset);
+        let rows = u32_at(&bytes, &mut offset) as usize;
+        let tokens = u32_at(&bytes, &mut offset) as usize;
+        let count = u32_at(&bytes, &mut offset) as usize;
+        let mut weights = Vec::<FastBoundaryWeightValue>::with_capacity(count);
+        for _ in 0..count {
+            let mut value = FastBoundaryWeightValue::new();
+            for _ in 0..rows {
+                let lo = u64::from(u32_at(&bytes, &mut offset));
+                let hi = u64::from(u32_at(&bytes, &mut offset));
+                value.push(lo | hi << 32);
+            }
+            weights.push(value);
+        }
+        let n = u32_at(&bytes, &mut offset) as usize;
+        let mut input = Vec::with_capacity(n);
+        for _ in 0..n {
+            let final_weight = u32_at(&bytes, &mut offset);
+            let edges = u32_at(&bytes, &mut offset);
+            let mut transitions = Vec::with_capacity(edges as usize);
+            for _ in 0..edges {
+                transitions.push((u32_at(&bytes, &mut offset) as i32,
+                    u32_at(&bytes, &mut offset), u32_at(&bytes, &mut offset)));
+            }
+            input.push(FastBoundaryDwaState { final_weight, transitions });
+        }
+        assert_eq!(offset, bytes.len());
+        let possible = (0..n).map(|_| FastPossibleOutgoingIds::Empty).collect::<Vec<_>>();
+        let fresh_pool = || {
+            let mut pool = FastBoundaryWeightInterner::new(rows, tokens).unwrap();
+            for (id, value) in weights.iter().enumerate() { assert_eq!(pool.intern(value.clone()), id as u32); }
+            pool
+        };
+        let mut baseline = fresh_pool();
+        let expected = determinize_fast_boundary_with_fallbacks_stored::<Vec<_>, false>(
+            &input, &possible, alphabet, &mut baseline);
+        let expected_shape = shape(&expected);
+        println!("REPLAY_INPUT states={} edges={} weights={} output={}", n,
+            input.iter().map(|s| s.transitions.len()).sum::<usize>(), weights.len(), expected.len());
+        for round in 0..20 {
+            let order = match round % 3 { 0 => [0, 1, 2], 1 => [2, 0, 1], _ => [1, 2, 0] };
+            for mode in order {
+                let mut pool = fresh_pool();
+                let started = Instant::now();
+                let result = if mode == 2 {
+                    determinize_fast_boundary_with_fallbacks_stored::<PackedFallbackFrontier, true>(
+                        &input, &possible, alphabet, &mut pool)
+                } else {
+                    determinize_fast_boundary_with_fallbacks_stored::<Vec<_>, false>(
+                        &input, &possible, alphabet, &mut pool)
+                };
+                let ms = started.elapsed().as_secs_f64() * 1000.0;
+                assert_eq!(shape(&result), expected_shape);
+                assert_eq!(pool.values, baseline.values);
+                println!("REPLAY,{round},{mode},{ms:.6}");
+            }
+        }
+    }
 }
 
 fn subtract_fast_boundary_finals(
@@ -5375,6 +5649,9 @@ enum SmallBoundaryDeterminizeOutput {
     Compact(SmallBoundaryDwa),
 }
 
+#[path = "finite_parallel_rows.rs"]
+mod finite_parallel_rows;
+
 fn determinize_preconverted_small_boundary_output(
     fast_nwa: &[FastBoundaryNwaState],
     start_states: &[u32],
@@ -5385,6 +5662,27 @@ fn determinize_preconverted_small_boundary_output(
     total_started_at: Instant,
     compact_output: bool,
     finite_output: bool,
+) -> Option<SmallBoundaryDeterminizeOutput> {
+    determinize_preconverted_small_boundary_output_with_parallel_policy(
+        fast_nwa, start_states, dense_positive_label_limit, interner,
+        source_weight_count, conversion_ms, total_started_at, compact_output,
+        finite_output, finite_parallel_rows::Policy::from_environment(
+            finite_output, fast_nwa.len(), dense_positive_label_limit as usize),
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn determinize_preconverted_small_boundary_output_with_parallel_policy(
+    fast_nwa: &[FastBoundaryNwaState],
+    start_states: &[u32],
+    dense_positive_label_limit: u32,
+    interner: &mut FastBoundaryWeightInterner,
+    source_weight_count: usize,
+    conversion_ms: f64,
+    total_started_at: Instant,
+    compact_output: bool,
+    finite_output: bool,
+    parallel_policy: Option<finite_parallel_rows::Policy>,
 ) -> Option<SmallBoundaryDeterminizeOutput> {
 
     let state_count = fast_nwa.len();
@@ -5461,7 +5759,19 @@ fn determinize_preconverted_small_boundary_output(
     let determinize_started_at = Instant::now();
 
     let mut finite_edge_count = 0usize;
-    while let Some((from_state, subset)) = worklist.pop_front() {
+    let mut parallel_profile = finite_parallel_rows::Profile::default();
+    while !worklist.is_empty() {
+        // Evaluate a bounded FIFO packet; only registration mutates shared IDs.
+        if let Some(policy) = parallel_policy
+            && worklist.len() >= policy.threshold
+        {
+            finite_parallel_rows::batch(policy, fast_nwa, dense_limit, interner,
+                &mut singleton_states, &mut subset_map, &mut singleton_closure_cache,
+                &mut closure_cache, &mut out_states, &mut supports, &mut worklist,
+                &mut finite_edge_count, &mut parallel_profile)?;
+            continue;
+        }
+        let (from_state, subset) = worklist.pop_front()?;
         if !interner.allow_work(1, out_states.len(), finite_edge_count) { return None; }
         let mut final_weight = interner.empty_id();
         for &(nwa_state, path_weight) in &subset {
@@ -5472,6 +5782,7 @@ fn determinize_preconverted_small_boundary_output(
             }
         }
         out_states[from_state as usize].final_weight = final_weight;
+
 
         for &(nwa_state, path_weight) in &subset {
             for (label, branches) in &fast_nwa[nwa_state as usize].transitions {
@@ -5502,9 +5813,8 @@ fn determinize_preconverted_small_boundary_output(
         touched_dense.sort_unstable();
         for label in touched_dense.drain(..) {
             dense_touched[label] = false;
-            let contribs = std::mem::take(&mut dense[label]);
             if let Some((to_state, edge_weight)) = fast_boundary_process_contribs(
-                contribs,
+                &mut dense[label],
                 fast_nwa,
                 interner,
                 &mut weight_by_state,
@@ -5522,11 +5832,11 @@ fn determinize_preconverted_small_boundary_output(
                     .transitions
                     .push((label as i32, to_state, edge_weight));
             }
+            recycle_fast_boundary_contribs(&mut dense[label]);
         }
         if !default.is_empty() {
-            let contribs = std::mem::take(&mut default);
             if let Some((to_state, edge_weight)) = fast_boundary_process_contribs(
-                contribs,
+                &mut default,
                 fast_nwa,
                 interner,
                 &mut weight_by_state,
@@ -5544,13 +5854,14 @@ fn determinize_preconverted_small_boundary_output(
                     .transitions
                     .push((DEFAULT_LABEL, to_state, edge_weight));
             }
+            recycle_fast_boundary_contribs(&mut default);
         }
         if !sparse.is_empty() {
             let mut sparse_rows = sparse.drain().collect::<Vec<_>>();
             sparse_rows.sort_unstable_by_key(|(label, _)| *label);
-            for (label, contribs) in sparse_rows {
+            for (label, mut contribs) in sparse_rows {
                 if let Some((to_state, edge_weight)) = fast_boundary_process_contribs(
-                    contribs,
+                    &mut contribs,
                     &fast_nwa,
                     interner,
                     &mut weight_by_state,
@@ -5574,6 +5885,9 @@ fn determinize_preconverted_small_boundary_output(
         if !interner.allow_work(subset.len(), out_states.len(), finite_edge_count) { return None; }
     }
     let determinize_ms = elapsed_ms(determinize_started_at);
+    if parallel_policy.is_some() && compile_profile_enabled() {
+        eprintln!("[glrmask/profile][native_parallel_rows] determinize_ms={determinize_ms:.4} profile={parallel_profile:?}");
+    }
     let compact_post_started_at = Instant::now();
     let compact_fallback = finite_output
         || std::env::var_os("GLRMASK_EXPERIMENT_SMALL_BOUNDARY_COMPACT_FALLBACK").is_some();

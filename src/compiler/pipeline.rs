@@ -788,59 +788,149 @@ pub(crate) fn build_tokenizer(grammar: &GrammarDef) -> Tokenizer {
     )
 }
 
+/// Discover exactly the shared nodes occurring more than once in the fully
+/// expanded expression forest, without expanding that forest. Counts need only
+/// distinguish one occurrence from multiple occurrences. A second incoming DAG
+/// edge repeats a node; all descendants of a repeated node are repeated too.
+fn repeated_shared_factor_nodes(expressions: impl IntoIterator<Item = Expr>) -> Vec<(usize, Arc<Expr>)> {
+    fn collect(expr: &Expr, nodes: &mut FxHashMap<usize, (u8, Arc<Expr>)>) {
+        match expr {
+            Expr::Seq(parts) | Expr::Choice(parts) => {
+                for part in parts { collect(part, nodes); }
+            }
+            Expr::Repeat { expr, .. } => collect(expr, nodes),
+            Expr::Exclude { expr, exclude } => { collect(expr, nodes); collect(exclude, nodes); }
+            Expr::Intersect { expr, intersect } => { collect(expr, nodes); collect(intersect, nodes); }
+            Expr::Shared(inner) => {
+                let key = Arc::as_ptr(inner) as usize;
+                if let Some((count, _)) = nodes.get_mut(&key) {
+                    *count = 2;
+                    return;
+                }
+                nodes.insert(key, (1, Arc::clone(inner)));
+                collect(inner, nodes);
+            }
+            Expr::U8Seq(_) | Expr::U8Class(_) | Expr::Dfa(_) | Expr::Epsilon => {}
+        }
+    }
+    fn propagate(expr: &Expr, nodes: &mut FxHashMap<usize, (u8, Arc<Expr>)>, pending: &mut Vec<Arc<Expr>>) {
+        match expr {
+            Expr::Seq(parts) | Expr::Choice(parts) => {
+                for part in parts { propagate(part, nodes, pending); }
+            }
+            Expr::Repeat { expr, .. } => propagate(expr, nodes, pending),
+            Expr::Exclude { expr, exclude } => {
+                propagate(expr, nodes, pending); propagate(exclude, nodes, pending);
+            }
+            Expr::Intersect { expr, intersect } => {
+                propagate(expr, nodes, pending); propagate(intersect, nodes, pending);
+            }
+            Expr::Shared(inner) => {
+                let (count, _) = nodes.get_mut(&(Arc::as_ptr(inner) as usize))
+                    .expect("all reachable shared nodes were discovered");
+                if *count == 1 {
+                    *count = 2;
+                    pending.push(Arc::clone(inner));
+                }
+            }
+            Expr::U8Seq(_) | Expr::U8Class(_) | Expr::Dfa(_) | Expr::Epsilon => {}
+        }
+    }
+    let mut nodes = FxHashMap::default();
+    for expr in expressions { collect(&expr, &mut nodes); }
+    let mut pending = nodes.values().filter(|(count, _)| *count == 2)
+        .map(|(_, expr)| Arc::clone(expr)).collect::<Vec<_>>();
+    while let Some(expr) = pending.pop() { propagate(&expr, &mut nodes, &mut pending); }
+    nodes.into_iter().filter_map(|(key, (count, expr))| (count == 2).then_some((key, expr))).collect()
+}
+
+#[cfg(test)]
+mod shared_factor_discovery_tests {
+    use super::*;
+    use rustc_hash::FxHashSet;
+
+    fn reference(expr: &Expr, counts: &mut FxHashMap<usize, usize>) {
+        match expr {
+            Expr::Seq(parts) | Expr::Choice(parts) => {
+                for part in parts { reference(part, counts); }
+            }
+            Expr::Repeat { expr, .. } => reference(expr, counts),
+            Expr::Exclude { expr, exclude } => { reference(expr, counts); reference(exclude, counts); }
+            Expr::Intersect { expr, intersect } => { reference(expr, counts); reference(intersect, counts); }
+            Expr::Shared(inner) => {
+                *counts.entry(Arc::as_ptr(inner) as usize).or_default() += 1;
+                reference(inner, counts);
+            }
+            Expr::U8Seq(_) | Expr::U8Class(_) | Expr::Dfa(_) | Expr::Epsilon => {}
+        }
+    }
+
+    #[test]
+    fn shared_factor_discovery_matches_expanded_forest() {
+        for depth in 0..12 {
+            let leaf = Arc::new(Expr::Epsilon);
+            let mut node = Arc::clone(&leaf);
+            for i in 0..depth {
+                node = Arc::new(if i % 2 == 0 {
+                    Expr::Seq(vec![Expr::Shared(Arc::clone(&node)), Expr::Shared(Arc::clone(&node))])
+                } else {
+                    Expr::Intersect {
+                        expr: Box::new(Expr::Shared(Arc::clone(&node))),
+                        intersect: Box::new(Expr::Exclude {
+                            expr: Box::new(Expr::Shared(Arc::clone(&leaf))),
+                            exclude: Box::new(Expr::Shared(Arc::clone(&node))),
+                        }),
+                    }
+                });
+            }
+            for copies in 1..=3 {
+                let roots = (0..copies).map(|_| Expr::Shared(Arc::clone(&node))).collect::<Vec<_>>();
+                let mut counts = FxHashMap::default();
+                for expr in &roots { reference(expr, &mut counts); }
+                let expected = counts.into_iter().filter_map(|(key, count)| (count > 1).then_some(key)).collect::<FxHashSet<_>>();
+                let actual = repeated_shared_factor_nodes(roots).into_iter().map(|(key, _)| key).collect::<FxHashSet<_>>();
+                assert_eq!(actual, expected, "depth={depth} copies={copies}");
+            }
+        }
+    }
+
+    #[test]
+    fn shared_factor_discovery_does_not_expand_exponential_diamond() {
+        let mut node = Arc::new(Expr::Epsilon);
+        for _ in 0..36 {
+            node = Arc::new(Expr::Choice(vec![Expr::Shared(Arc::clone(&node)), Expr::Shared(node)]));
+        }
+        // The forest represents 2^36 leaf occurrences but only37 shared nodes;
+        // exactly the36 descendants of the unique root occur more than once.
+        let repeated = repeated_shared_factor_nodes([Expr::Shared(node)]);
+        assert_eq!(repeated.len(), 36);
+    }
+}
+
 fn prepare_factored_terminal_expressions(grammar: &GrammarDef) -> Vec<Expr> {
     // `Expr::Shared` carries importer/compiler DAG structure. Historically the
     // factoring walk dereferenced it and cloned the factored subtree into every
     // use, turning a small DAG back into a large tree before lexer compilation.
     // Factor repeated shared nodes once and keep the resulting Arc boundary.
     // A kill switch makes the change easy to isolate in production diagnostics.
+    let profile = compile_profile_summary_enabled();
+    let started = profile.then(Instant::now);
+    let mut collect_ms = 0.0;
+    let mut shared_factor_ms = 0.0;
+    let mut repeated_count = 0;
     let shared_cache = if std::env::var_os("GLRMASK_DISABLE_SHARED_FACTORING").is_none() {
-        fn collect_shared(
-            expr: &Expr,
-            counts: &mut FxHashMap<usize, (usize, Arc<Expr>)>,
-        ) {
-            match expr {
-                Expr::Seq(parts) | Expr::Choice(parts) => {
-                    for part in parts {
-                        collect_shared(part, counts);
-                    }
-                }
-                Expr::Repeat { expr, .. } => collect_shared(expr, counts),
-                Expr::Exclude { expr, exclude } => {
-                    collect_shared(expr, counts);
-                    collect_shared(exclude, counts);
-                }
-                Expr::Intersect { expr, intersect } => {
-                    collect_shared(expr, counts);
-                    collect_shared(intersect, counts);
-                }
-                Expr::Shared(inner) => {
-                    let key = Arc::as_ptr(inner) as usize;
-                    counts
-                        .entry(key)
-                        .and_modify(|entry| entry.0 += 1)
-                        .or_insert((1, Arc::clone(inner)));
-                    collect_shared(inner, counts);
-                }
-                Expr::U8Seq(_) | Expr::U8Class(_) | Expr::Dfa(_) | Expr::Epsilon => {}
-            }
-        }
-
-        let mut counts = FxHashMap::<usize, (usize, Arc<Expr>)>::default();
-        for terminal in &grammar.terminals {
-            collect_shared(&terminal_expr(terminal), &mut counts);
-        }
-        let repeated = counts
-            .into_iter()
-            .filter_map(|(key, (count, expr))| (count > 1).then_some((key, expr)))
-            .collect::<Vec<_>>();
+        let repeated = repeated_shared_factor_nodes(grammar.terminals.iter().map(terminal_expr));
+        collect_ms = started.map_or(0.0, elapsed_ms);
+        repeated_count = repeated.len();
         if repeated.is_empty() {
             None
         } else {
+            let shared_started = profile.then(Instant::now);
             let entries = repeated
                 .into_par_iter()
                 .map(|(key, expr)| (key, Arc::new(factor_regex_expr((*expr).clone()))))
                 .collect::<Vec<_>>();
+            shared_factor_ms = shared_started.map_or(0.0, elapsed_ms);
             Some(entries.into_iter().collect::<FxHashMap<_, _>>())
         }
     } else {
@@ -851,7 +941,7 @@ fn prepare_factored_terminal_expressions(grammar: &GrammarDef) -> Vec<Expr> {
         Some(cache) => factor_regex_expr_with_shared_cache(expr, cache),
         None => factor_regex_expr(expr),
     };
-    if should_parallelize_terminal_factoring(grammar) {
+    let result = if should_parallelize_terminal_factoring(grammar) {
         grammar
             .terminals
             .par_iter()
@@ -865,7 +955,12 @@ fn prepare_factored_terminal_expressions(grammar: &GrammarDef) -> Vec<Expr> {
             .map(terminal_expr)
             .map(factor_one)
             .collect()
+    };
+    if let Some(started) = started {
+        eprintln!("[glrmask/profile][shared_terminal_factoring] repeated={} collect_ms={:.3} shared_factor_ms={:.3} total_ms={:.3}",
+            repeated_count, collect_ms, shared_factor_ms, elapsed_ms(started));
     }
+    result
 }
 
 fn build_dynamic_virtual_tokenizer_from_exprs(
@@ -6680,41 +6775,10 @@ fn compile_dynamic_owned_impl(
         let direct_state_count = direct_regular_automaton
             .as_ref()
             .map(|automaton| automaton.states.len());
-        let ((prepared_expressions, factor_ms), (analyzed_grammar, analysis_ms)) = macro_join_if(
-            defer_factoring,
-            "dynamic_factor_and_analysis",
-            || {
-                let started_at = profile.then(Instant::now);
-                let expressions = prefactored_expressions
-                    .unwrap_or_else(|| prepare_factored_terminal_expressions(&prepared_grammar));
-                (expressions, started_at.map_or(0.0, elapsed_ms))
-            },
-            || {
-                let started_at = profile.then(Instant::now);
-                let analyzed_grammar = if direct_regular_automaton.is_none() {
-                    let analyzed = AnalyzedGrammar::from_grammar_def(&prepared_grammar);
-                    if let Err(message) = analyzed.check_dynamic_table_build_normal_form() {
-                        panic!("[glrmask] grammar precondition violations:\n{}", message);
-                    }
-                    Some(analyzed)
-                } else {
-                    None
-                };
-                (analyzed_grammar, started_at.map_or(0.0, elapsed_ms))
-            },
-        );
-        let prepared_has_giant_repeat = prepared_expressions
-            .iter()
-            .any(expression_contains_large_bounded_repeat);
         let num_terminals = prepared_grammar.num_terminals();
         let terminal_display_names = (0..num_terminals)
             .map(|terminal| prepared_grammar.terminal_display_name(terminal))
             .collect::<Vec<_>>();
-        if profile && defer_factoring {
-            eprintln!(
-                "[glrmask/profile][dynamic_factor_overlap] factor_ms={factor_ms:.3} analysis_ms={analysis_ms:.3}"
-            );
-        }
         // Rayon scheduling is a measurable fraction of total build time for
         // genuinely tiny dynamic grammars. Keep those cores sequential; a
         // large lexer can still arise from a compact grammar, but in that case
@@ -6733,23 +6797,49 @@ fn compile_dynamic_owned_impl(
             );
         }
 
-        let (tokenizer_result, ((table, table_ms), (dynamic_mask_vocab, dynamic_vocab_ms))) = macro_join_if(
+        // Both lanes consume the same immutable, fully normalized grammar.
+        // Regex factoring is a prerequisite of lexer construction, not of LR
+        // analysis or table construction. Keep each prerequisite in its own
+        // lane instead of joining factoring/analysis before starting the table.
+        // This avoids a serial factoring barrier for large pattern grammars
+        // without changing either compiled artifact or cloning the grammar.
+        // Tiny grammars retain their prefactored expressions and serial lane.
+        let ((tokenizer_result, factor_ms), ((table, table_ms, analysis_ms), (dynamic_mask_vocab, dynamic_vocab_ms))) = macro_join_if(
             parallel_dynamic_core,
             "dynamic_tokenizer_and_table_vocab",
             || {
-                build_dynamic_tokenizer_lane(
+                let factor_started_at = profile.then(Instant::now);
+                let prepared_expressions = prefactored_expressions
+                    .unwrap_or_else(|| prepare_factored_terminal_expressions(&prepared_grammar));
+                let factor_ms = factor_started_at.map_or(0.0, elapsed_ms);
+                let prepared_has_giant_repeat = prepared_expressions
+                    .iter()
+                    .any(expression_contains_large_bounded_repeat);
+                let result = build_dynamic_tokenizer_lane(
                     &prepared_grammar,
                     &prepared_expressions,
                     prepared_has_giant_repeat,
                     vocab,
                     finalize_runtime,
                     profile,
-                )
+                );
+                (result, factor_ms)
             },
             || macro_join_if(
                 parallel_dynamic_core,
                 "dynamic_table_and_vocab",
                 || {
+                    let analysis_started_at = profile.then(Instant::now);
+                    let analyzed_grammar = if direct_regular_automaton.is_none() {
+                        let analyzed = AnalyzedGrammar::from_grammar_def(&prepared_grammar);
+                        if let Err(message) = analyzed.check_dynamic_table_build_normal_form() {
+                            panic!("[glrmask] grammar precondition violations:\n{}", message);
+                        }
+                        Some(analyzed)
+                    } else {
+                        None
+                    };
+                    let analysis_ms = analysis_started_at.map_or(0.0, elapsed_ms);
                     let started_at = Instant::now();
                     let table = if let Some(state_count) = direct_state_count {
                     GLRTable::direct_regular_runtime_stub(
@@ -6762,7 +6852,7 @@ fn compile_dynamic_owned_impl(
                         default_table_construction,
                     )
                 };
-                    (table, elapsed_ms(started_at))
+                    (table, elapsed_ms(started_at), analysis_ms)
                 },
                 || {
                     let started_at = Instant::now();
@@ -6777,6 +6867,11 @@ fn compile_dynamic_owned_impl(
         );
         let ((tokenizer, mask_tokenizer_quotient, prebuilt_virtual_residual_projection), tokenizer_ms) =
             tokenizer_result?;
+        if profile && defer_factoring {
+            eprintln!(
+                "[glrmask/profile][dynamic_factor_overlap] factor_ms={factor_ms:.3} analysis_ms={analysis_ms:.3} table_overlap=true"
+            );
+        }
 
         let finalize_started_at = profile.then(Instant::now);
         // Build unfinalized so a mask-only finite-token quotient can be
@@ -6825,7 +6920,7 @@ fn compile_dynamic_owned_impl(
                 table_ms,
                 dynamic_vocab_ms,
                 finalize_started_at.map_or(0.0, elapsed_ms),
-                tokenizer_ms.max(table_ms.max(dynamic_vocab_ms)),
+                (factor_ms + tokenizer_ms).max((analysis_ms + table_ms).max(dynamic_vocab_ms)),
                 elapsed_ms(total_started_at),
             );
         }

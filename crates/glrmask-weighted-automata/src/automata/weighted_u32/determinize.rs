@@ -592,7 +592,11 @@ fn determinize_profile_enabled() -> bool {
         .unwrap_or(false)
 }
 
-fn normalize_direct_singletons_enabled(nwa_states: usize) -> bool {
+/// Workspace union builders must share this choice with generic determinization.
+/// Raw weighted language is invariant under normalization, but a parser's
+/// structural DEFAULT_LABEL fallback can distinguish the resulting rows.
+#[doc(hidden)]
+pub fn normalize_direct_singletons_enabled(nwa_states: usize) -> bool {
     if std::env::var_os("GLRMASK_DISABLE_DETERMINIZE_NORMALIZE_SINGLETONS").is_some() {
         return false;
     }

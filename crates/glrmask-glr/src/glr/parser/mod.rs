@@ -3914,7 +3914,12 @@ fn reduce_sources_from_isolated(gss: &ParserGSS, rhs_len: usize) -> ReduceSource
     }
     if let Some(v) = popped.single_top_value() {
         let mut result = SmallVec::new();
-        result.push((v, popped));
+        // A sole *visible* predecessor does not exclude an epsilon stack in
+        // the same GSS. Goto(v, nt) applies only to paths actually ending in v;
+        // retaining the epsilon alternative invents a path and can leak its
+        // accumulator into a valid path. The ordinary sole-top/no-epsilon
+        // case preserves its shared pointer through isolate.
+        result.push((v, popped.isolate(Some(v))));
         return result;
     }
     let top_vals = popped.peek_values();
@@ -4683,12 +4688,165 @@ struct ProviderAdvanceResult {
     accepted: bool,
 }
 
+/// Bounded deterministic reductions on the existing virtual stack.
+/// Only an unambiguous initial reduction enters this lane. After a proved
+/// prefix, branching, guards, acceptance, extra effects or a hidden lower floor
+/// continue in the original traversal with the lookahead still unconsumed.
+/// Primitive failures remain transactional. The budget belongs to the complete
+/// enclosing advance, so a resumed branch cannot obtain a new allowance.
+enum ProviderReductionPrefix {
+    Shifted(ParserGSS),
+    /// No lookahead consumed yet; continue the ordinary reduction frontier.
+    Pending(ParserGSS),
+}
+
+#[inline]
+fn suspend_provider_reductions<const RESUME: bool>(
+    stack: VirtualStack<u32, TerminalsDisallowed>, completed_reductions: usize,
+) -> Option<ProviderReductionPrefix> {
+    // A zero-progress resume would create a loop at the same unsupported action.
+    (RESUME && completed_reductions != 0)
+        .then(|| ProviderReductionPrefix::Pending(stack.into_gss()))
+}
+
+#[cfg(test)]
+fn try_provider_reduction_prefix<P: ParserActionProvider>(
+    provider: &P, stack: VirtualStack<u32, TerminalsDisallowed>,
+    symbol: P::Symbol, first: &ProvidedAction<'_>, remaining_steps: &mut usize,
+) -> Option<ParserGSS> {
+    match try_provider_reduction_prefix_impl::<P, false>(provider, stack, symbol, first, remaining_steps)? {
+        ProviderReductionPrefix::Shifted(result) => Some(result),
+        ProviderReductionPrefix::Pending(_) => unreachable!("transactional policy never resumes"),
+    }
+}
+
+fn try_provider_reduction_prefix_impl<P: ParserActionProvider, const RESUME: bool>(
+    provider: &P,
+    mut stack: VirtualStack<u32, TerminalsDisallowed>,
+    symbol: P::Symbol,
+    first: &ProvidedAction<'_>,
+    remaining_steps: &mut usize,
+) -> Option<ProviderReductionPrefix> {
+    let allowance = *remaining_steps;
+    let mut completed_reductions = 0usize;
+    for step in 0..allowance {
+        *remaining_steps -= 1;
+        let top = *stack.top()?;
+        let later;
+        let provided = if step == 0 { first } else {
+            later = provider.action(top, symbol);
+            match later.as_ref() {
+                Some(action) => action,
+                None => return Some(ProviderReductionPrefix::Shifted(ParserGSS::empty())),
+            }
+        };
+        if !provided.extra_stack_shifts.is_empty() {
+            return suspend_provider_reductions::<RESUME>(stack, completed_reductions);
+        }
+        match &provided.action {
+            ProvidedActionRef::Identity => return Some(ProviderReductionPrefix::Shifted(stack.into_gss())),
+            ProvidedActionRef::Call { parent_target, child_start, replace } => {
+                if *replace && stack.pop(1) != 0 { return None; }
+                stack.push(*parent_target);
+                stack.push(*child_start);
+                return Some(ProviderReductionPrefix::Shifted(stack.into_gss()));
+            }
+            ProvidedActionRef::Return { pop } => {
+                if *pop as usize > stack.len() {
+                    return suspend_provider_reductions::<RESUME>(stack, completed_reductions);
+                }
+                stack.pop(*pop as usize);
+                return Some(ProviderReductionPrefix::Shifted(stack.into_gss()));
+            }
+            ProvidedActionRef::Local { scope, action } => match action {
+                Action::Skip => return Some(ProviderReductionPrefix::Shifted(stack.into_gss())),
+                Action::Shift(target, replace) => {
+                    let Some(target) = provider.scope_state(*scope, *target) else {
+                        return Some(ProviderReductionPrefix::Shifted(ParserGSS::empty()));
+                    };
+                    if *replace {
+                        if !stack.replace_top(target) { return None; }
+                    } else { stack.push(target); }
+                    return Some(ProviderReductionPrefix::Shifted(stack.into_gss()));
+                }
+                Action::Reduce(nonterminal, count) => {
+                    // A reduction needs the concrete predecessor for its goto.
+                    // Do not speculate across a hidden or ambiguous GSS floor.
+                    if *count as usize >= stack.len() {
+                        return suspend_provider_reductions::<RESUME>(stack, completed_reductions);
+                    }
+                    stack.pop(*count as usize);
+                    let predecessor = *stack.top()?;
+                    let Some((target, replace)) = provider.goto_target(
+                        provided.reduction_scope, predecessor, *nonterminal,
+                    ) else { return Some(ProviderReductionPrefix::Shifted(ParserGSS::empty())); };
+                    if replace {
+                        if !stack.replace_top(target) { return None; }
+                    } else { stack.push(target); }
+                    completed_reductions += 1;
+                }
+                _ => return suspend_provider_reductions::<RESUME>(stack, completed_reductions),
+            },
+        }
+    }
+    suspend_provider_reductions::<RESUME>(stack, completed_reductions)
+}
+
+/// Enabled unless an explicit override declines the bounded optimization.
+/// Keeping parsing independent of the process environment permits deterministic
+/// policy tests without changing flags underneath concurrently running tests.
+fn provider_reduction_policy_value(value: Option<&str>) -> bool {
+    value.is_none_or(|value| matches!(value.trim().to_ascii_lowercase().as_str(),
+        "1" | "true" | "yes" | "on"))
+}
+
 fn advance_provider_traversal<P: ParserActionProvider>(
+    provider: &P,
+    closure: ParserGSS,
+    symbol: P::Symbol,
+    mode: ProviderAdvanceMode,
+) -> ProviderAdvanceResult {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    if mode == ProviderAdvanceMode::Advance
+        && *ENABLED.get_or_init(|| provider_reduction_policy_value(std::env::var("GLRMASK_PROVIDER_REDUCTION_PREFIX").ok().as_deref()))
+    {
+        static RESUME: OnceLock<bool> = OnceLock::new();
+        if *RESUME.get_or_init(|| provider_reduction_policy_value(std::env::var("GLRMASK_PROVIDER_RESUME_REDUCTIONS").ok().as_deref())) {
+            advance_provider_traversal_with_policy::<P, true, true>(provider, closure, symbol, mode)
+        } else {
+            advance_provider_traversal_impl::<P, true>(provider, closure, symbol, mode)
+        }
+    } else {
+        advance_provider_traversal_impl::<P, false>(provider, closure, symbol, mode)
+    }
+}
+
+fn advance_provider_traversal_impl<P: ParserActionProvider, const REDUCTION_PREFIX: bool>(
+    provider: &P, closure: ParserGSS, symbol: P::Symbol, mode: ProviderAdvanceMode,
+) -> ProviderAdvanceResult {
+    advance_provider_traversal_with_policy::<P, REDUCTION_PREFIX, false>(provider, closure, symbol, mode)
+}
+
+/// Changing reduction-wave grouping is harmless only under a fixed label.
+/// The current GSS accumulator merge is observable for mixed labels, so do not
+/// reorder those frontiers. An Interface certifies one shared empty label over
+/// its complete lower graph in O(1); unknown representations use the reference.
+#[inline]
+fn provider_reduction_input_is_uniform_empty(stack: &ParserGSS) -> bool {
+    stack.single_interface_lower_id().is_some()
+        && stack.all_accs_satisfy(TerminalsDisallowed::is_empty)
+}
+
+fn advance_provider_traversal_with_policy<P: ParserActionProvider, const REDUCTION_PREFIX: bool, const RESUME: bool>(
     provider: &P,
     mut closure: ParserGSS,
     symbol: P::Symbol,
     mode: ProviderAdvanceMode,
 ) -> ProviderAdvanceResult {
+    let reduction_prefix_eligible = REDUCTION_PREFIX
+        && mode == ProviderAdvanceMode::Advance
+        && provider_reduction_input_is_uniform_empty(&closure);
+    let mut reduction_steps_remaining = 64usize;
     let mut shifted = ParserGSS::empty();
     let mut accepted = false;
     let mut visited = FxHashSet::<u32>::default();
@@ -4702,6 +4860,20 @@ fn advance_provider_traversal<P: ParserActionProvider>(
                 continue;
             };
             let isolated = closure.isolate(Some(state));
+            if reduction_prefix_eligible
+                && reduction_steps_remaining != 0 && provided.extra_stack_shifts.is_empty()
+                && matches!(&provided.action, ProvidedActionRef::Local { action: Action::Reduce(..), .. })
+                && let Some(stack) = isolated.try_virtual_stack()
+                && let Some(advanced) = try_provider_reduction_prefix_impl::<P, RESUME>(
+                    provider, stack, symbol, &provided, &mut reduction_steps_remaining,
+                )
+            {
+                match advanced {
+                    ProviderReductionPrefix::Shifted(stack) => merge_into(&mut shifted, stack),
+                    ProviderReductionPrefix::Pending(stack) => merge_into(&mut next, stack),
+                }
+                continue;
+            }
 
             if mode == ProviderAdvanceMode::Advance {
                 for shift in &provided.extra_stack_shifts {

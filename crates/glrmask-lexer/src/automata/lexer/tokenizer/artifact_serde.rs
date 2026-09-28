@@ -704,6 +704,30 @@ fn from_packed_bytes(input: &[u8]) -> Result<Tokenizer, String> {
 /// fast tokenizer wire, while only transition rows outside compressed
 /// segments are stored explicitly.
 pub fn to_segment_bytes(tokenizer: &Tokenizer) -> Vec<u8> {
+    // Runtime compaction removes owned compressed rows. If those packed
+    // regions are not one contiguous suffix, TKS3 declines and this is the
+    // authoritative fallback. Reading only `dfa`/owned segments here would
+    // silently save empty byte rows while retaining live finalizer/future
+    // metadata. Materialize only metadata and noncompressed rows, retaining
+    // compressed regions as class rows rather than expanding their bytes.
+    if !tokenizer.packed_compressed_transition_segments.is_empty()
+        || tokenizer.packed_runtime_transitions.is_some()
+        || !tokenizer.packed_runtime_transition_segments.is_empty()
+        || tokenizer.packed_runtime_metadata.is_some()
+        || !tokenizer.packed_runtime_metadata_segments.is_empty()
+    {
+        let mut segments = tokenizer.compressed_transition_segments.to_vec();
+        segments.extend(tokenizer.packed_compressed_transition_segments.iter()
+            .map(PackedCompressedTransitionSegment::to_compressed_segment));
+        segments.sort_unstable_by_key(|segment| segment.state_offset);
+        let physical = Tokenizer::from_parts_with_compressed_transitions(
+            tokenizer.materialized_noncompressed_dfa(),
+            tokenizer.num_terminals,
+            None,
+            segments,
+        );
+        return to_segment_bytes(&physical);
+    }
     const HEADER_LEN: usize = 36;
     let states = tokenizer.dfa.states();
     let state_count = states.len();

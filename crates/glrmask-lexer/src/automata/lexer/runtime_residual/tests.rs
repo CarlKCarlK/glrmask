@@ -1247,6 +1247,93 @@ fn master_slice_artifact_round_trips_prepared_runtime_and_rejects_bad_shape() {
     drop(loaded_store);
     drop(original_store);
 
+    // The compact load path deliberately omits relation powers. Its
+    // backwards-DP artifact must also serve the generic (non-body-equal)
+    // slice proof and the repeat-radius BFS, not only ordinary liveness.
+    let mut compact = VirtualResidualRuntime::compact_liveness_oracle_from_master_slice_artifact(&artifact)
+        .expect("valid transferred oracle");
+    assert!(compact.exact_powers.is_empty() && compact.prefix_sums.is_empty());
+    let coordinate = compact.root_coordinate();
+    assert_eq!(compact.has_future_for_slice_proof(coordinate, None), None,
+        "missing proof data must decline, not certify a dead language");
+    loaded.store.lock().unwrap().liveness_oracle = Some(compact);
+
+    for prefix in [b"<".as_slice(), b"<a", b"<bc", b"<b"] {
+        let mut old_state = 1;
+        let mut loaded_state = 1;
+        for &byte in prefix {
+            old_state = original.step(old_state, byte).expect("valid original prefix");
+            loaded_state = loaded.step(loaded_state, byte).expect("valid loaded prefix");
+        }
+        // This alphabet is intentionally not the oracle body (a|bc), so
+        // the specialized exact-body proof must fall through to the BFS.
+        let first = if prefix == b"<b" { b'c' } else { b'a' };
+        let mut repeating = vec![2_u32; 2 * class_count];
+        repeating[first as usize] = 1;
+        repeating[class_count + b'a' as usize] = 1;
+        let repeating_accepting = [false, true];
+        let repeating_productive = [true, true];
+        let expected_radius = original.parser_transparent_byte_dfa_repeat_radius(
+            old_state, 0, class_count, &byte_to_class, &repeating,
+            &repeating_accepting, &repeating_productive, 8, 10_000,
+        );
+        let loaded_radius = loaded.parser_transparent_byte_dfa_repeat_radius(
+            loaded_state, 0, class_count, &byte_to_class, &repeating,
+            &repeating_accepting, &repeating_productive, 8, 10_000,
+        );
+        assert!(expected_radius.is_some());
+        assert_eq!(loaded_radius, expected_radius, "prefix={prefix:?}");
+
+        let finite_states = 5usize;
+        let mut finite = vec![finite_states as u32; finite_states * class_count];
+        finite[first as usize] = 1;
+        for state in 1..finite_states - 1 {
+            finite[state * class_count + b'a' as usize] = (state + 1) as u32;
+        }
+        let finite_productive = vec![true; finite_states];
+        let expected = original.parser_transparent_byte_dfa(
+            old_state, 0, class_count, &byte_to_class, &finite,
+            &finite_productive, true, 10_000,
+        );
+        let actual = loaded.parser_transparent_byte_dfa(
+            loaded_state, 0, class_count, &byte_to_class, &finite,
+            &finite_productive, true, 10_000,
+        );
+        assert_eq!(actual, expected, "finite slice prefix={prefix:?}");
+        assert_eq!(actual, Some(true));
+
+        // Dynamic joint-root and uniform-byte fast paths use different
+        // proof entry points. Exercise them against the genuinely compact
+        // oracle too, rather than accidentally retaining relation powers.
+        let old_coordinate = {
+            let store = original.store.lock().unwrap();
+            original.oracle_coordinate_for_state_locked(&store, old_state).unwrap()
+        };
+        let loaded_coordinate = {
+            let store = loaded.store.lock().unwrap();
+            loaded.oracle_coordinate_for_state_locked(&store, loaded_state).unwrap()
+        };
+        let direct_expected = original.direct_coordinate_parser_transparent_byte_dfa(
+            VirtualResidualDirectCoordinate { runtime_index: original.runtime_index, coordinate: old_coordinate },
+            0, class_count, &byte_to_class, &finite, &finite_productive, true, 10_000,
+        );
+        let direct_actual = loaded.direct_coordinate_parser_transparent_byte_dfa(
+            VirtualResidualDirectCoordinate { runtime_index: loaded.runtime_index, coordinate: loaded_coordinate },
+            0, class_count, &byte_to_class, &finite, &finite_productive, true, 10_000,
+        );
+        assert_eq!(direct_actual, direct_expected, "direct finite slice prefix={prefix:?}");
+        assert_eq!(direct_actual, Some(true));
+        for byte in [b'a', b'c'] {
+            let family = U8Set::single(byte);
+            for horizon in [1, 3] {
+                let expected = original.parser_transparent_byte_family(old_state, family, horizon);
+                let actual = loaded.parser_transparent_byte_family(loaded_state, family, horizon);
+                assert!(expected.is_some());
+                assert_eq!(actual, expected, "byte family prefix={prefix:?} byte={byte} horizon={horizon}");
+            }
+        }
+    }
+
     let mut malformed = artifact;
     malformed.pattern_states += 1;
     assert!(loaded.restore_master_slice_artifact(malformed).is_err());

@@ -157,6 +157,34 @@ pub(super) fn compose_dynamic_recursive_shared_fast(
     }
     let terminal_checks_ms = terminal_checks_started_at.elapsed().as_secs_f64() * 1000.0;
 
+    // Reuse checked component-prepared proper-prefix vocabularies. Unknown
+    // metadata stays unknown: never run the static boundary compiler here and
+    // never treat an unavailable proof as an empty candidate set.
+    let candidate_started = Instant::now();
+    let mut dynamic_candidate_ids = components.iter().map(|component| {
+        if component.boundary_candidate_summary.get().is_some_and(|summary| summary.is_known()) {
+            crate::compiler::composition::boundary::candidates::boundary_candidate_ids(component, vocab).0
+        } else { None }
+    }).collect::<Vec<_>>();
+    let no_ignores = components.iter().all(|component| component.ignore_terminal.is_none()
+        && component.table.skip_terminals.is_empty());
+    if (!global_ignores || no_ignores) && dynamic_candidate_ids[0].is_some() {
+        let entered = children.iter().map(|child| child.constraint).collect::<Vec<_>>();
+        let calls = children.iter().flat_map(|child| std::iter::once(child.placeholder_terminal)
+            .chain(child.additional_placeholder_terminals.iter().copied())).collect::<Vec<_>>();
+        if let Ok(refined) = crate::compiler::composition::boundary::tail::build_root_call_candidates(
+            &parent, &entered, &calls, vocab,
+        ) {
+            dynamic_candidate_ids[0].as_mut().expect("checked above")
+                .retain(|id| refined.candidate_ids.binary_search(id).is_ok());
+        }
+    }
+    if compose_profile_enabled() {
+        eprintln!("[glrmask/profile][dynamic_prepared_boundary_vocabularies] counts={:?} total_ms={:.3}",
+            dynamic_candidate_ids.iter().map(|ids| ids.as_ref().map(Vec::len)).collect::<Vec<_>>(),
+            candidate_started.elapsed().as_secs_f64()*1000.0);
+    }
+
     let tokenizer_span_started_at = Instant::now();
     let mut tokenizer_state_offsets = Vec::with_capacity(components.len());
     let mut next_tokenizer_state = 0u32;
@@ -317,6 +345,14 @@ pub(super) fn compose_dynamic_recursive_shared_fast(
     overlay.segmented_boundary_parser = None;
     overlay.segmented_boundary_terminal_trie = None;
     install_dynamic_direct_boundary_shards(overlay, None);
+    for (component, ids) in overlay.segmented_parser_components.iter_mut().zip(dynamic_candidate_ids) {
+        if let Some(shard) = component.boundary.as_mut() {
+            shard.candidate_tokens = ids.map(Arc::<[u32]>::from);
+        }
+    }
+    overlay.segmented_boundary_shards = overlay.segmented_parser_components.iter()
+        .filter_map(|component| component.boundary.clone()).collect();
+
     // Empty bytes are an explicit "provider-native only" marker. Dynamic
     // recomposition consumes the retained component tree directly. Static or
     // legacy compiler views may reconstruct from the provider in a later path.

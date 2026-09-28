@@ -437,8 +437,17 @@ impl CommitBuffers {
             prune_tokenizer_exec:
                 crate::runtime::commit::tokenizer_scan::ReusableTokenizerExecScratch::with_capacity(if MASK_ONLY { 0 } else { 512 }),
             small_queue: crate::runtime::commit::SmallCommitQueueScratch::default(),
-            flat_frontier:
-                crate::runtime::commit::FlatFrontierScratch::with_preallocated_gss(preallocated_gss),
+            flat_frontier: {
+                static LAZY_MASK_STACKS: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+                if MASK_ONLY && *LAZY_MASK_STACKS.get_or_init(|| {
+                    std::env::var("GLRMASK_LAZY_MASK_COMMIT_SCRATCH")
+                        .map_or(true, |v| matches!(v.as_str(), "1" | "true"))
+                }) {
+                    crate::runtime::commit::FlatFrontierScratch::for_mask_only_shadow()
+                } else {
+                    crate::runtime::commit::FlatFrontierScratch::with_preallocated_gss(preallocated_gss)
+                }
+            },
             linear_stack_original: Vec::with_capacity(if MASK_ONLY { 0 } else { LINEAR_STACK_RESERVE }),
             linear_stack_work: Vec::with_capacity(if MASK_ONLY { 0 } else { LINEAR_STACK_RESERVE }),
             processing_queue: Vec::new(),

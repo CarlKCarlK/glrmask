@@ -4371,6 +4371,10 @@ table: &child.table,
 
     #[test]
     fn hybrid_boundary_policy_is_per_component_and_roundtrips() {
+        // This fixture deliberately executes DynamicDirect shards. Other
+        // tests temporarily arm the process-wide strict-static trap, so its
+        // readers must share the writers' lock as well.
+        let _env_lock = crate::TEST_ENV_LOCK.lock().unwrap();
         let vocab = Vocab::new(vec![
             (0, b"x".to_vec()),
             (1, b"y".to_vec()),
@@ -5198,6 +5202,7 @@ table: &child.table,
 
     #[test]
     fn nested_static_link_matches_dynamic_through_public_compose() {
+        if crate::isolate_environment_test(false) { return; }
         // Production nested static link (acyclic, effectively nonnullable,
         // depth 2) through the PUBLIC compose route: inner Dynamic reference
         // composition, outer StaticParserDwa link, mask-gated corpus
@@ -6065,6 +6070,7 @@ table: &child.table,
 
     #[test]
     fn composed_parent_three_bind_chain_with_nonroot_slot_matches_dynamic() {
+        if crate::isolate_environment_test(false) { return; }
         // Same deep-debug-stack headroom as the branching fixture (measured
         // there): 3-level multibyte static prime/mask exceeds the default 2MB.
         std::thread::Builder::new()
@@ -6517,6 +6523,7 @@ table: &child.table,
 
     #[test]
     fn composed_parent_branching_then_nonroot_extension_matches_dynamic() {
+        if crate::isolate_environment_test(false) { return; }
         // Static prime/mask evaluation recurses per nesting level with large
         // debug scratch frames (pre-existing runtime characteristic: the
         // existing deep tests need >1MB too, measured); this 3-level multibyte
@@ -6923,6 +6930,7 @@ table: &child.table,
 
     #[test]
     fn composed_parent_cross_parent_multislot_static_matches_dynamic() {
+        if crate::isolate_environment_test(false) { return; }
         // Same deep-debug-stack headroom as the other 3-level multibyte
         // static prime/mask fixtures: exceeds the default 2MB.
         std::thread::Builder::new()
@@ -7242,6 +7250,7 @@ table: &child.table,
 
     #[test]
     fn composed_parent_cross_parent_shared_subtree_matches_dynamic() {
+        if crate::isolate_environment_test(false) { return; }
         // Same deep-debug-stack headroom as the sibling 3-level multibyte
         // static prime/mask fixtures: exceeds the default 2MB.
         std::thread::Builder::new()
@@ -7634,6 +7643,7 @@ table: &child.table,
 
     #[test]
     fn composed_parent_extend_with_whitespace_aliases_matches_dynamic() {
+        if crate::isolate_environment_test(false) { return; }
         // Same deep-debug-stack headroom as the branching/three-bind fixtures
         // (measured there): 3-level multibyte static prime/mask exceeds the
         // default 2MB.
@@ -8140,6 +8150,7 @@ table: &child.table,
 
     #[test]
     fn composed_parent_static_extend_after_serialization_round_trip() {
+        if crate::isolate_environment_test(false) { return; }
         // Components and links survive save/load, so a loaded composed parent
         // extends statically with identical results. Multibyte tokens cross
         // CALL (Lx, Ry) and RETURN (xx, yy) on both the pre- and post-serde

@@ -49,6 +49,144 @@ fn default_unit_inline_budget() -> UnitInlineBudget {
 }
 
 #[test]
+fn completed_work_certificate_is_strict_monotone_and_overflow_safe() {
+    let mut budget = default_unit_inline_budget();
+    budget.max_stack_effect_visits = 10;
+    budget.stack_effect_visits.store(3, std::sync::atomic::Ordering::Relaxed);
+    let work = CompletedStackEffectWork::new(&budget).unwrap();
+    assert!(!work.exceeded());
+    work.record_completed(7);
+    assert!(!work.exceeded(), "work exactly at the cap must continue");
+    work.record_completed(1);
+    assert!(work.exceeded());
+    work.record_completed(usize::MAX);
+    assert!(work.exceeded(), "addition must not wrap below the cap");
+
+    budget.max_stack_effect_visits = usize::MAX - 1;
+    let work = CompletedStackEffectWork::new(&budget).unwrap();
+    work.record_completed(usize::MAX);
+    assert!(work.exceeded());
+    budget.max_stack_effect_visits = usize::MAX;
+    assert!(CompletedStackEffectWork::new(&budget).is_none());
+}
+
+#[test]
+fn completed_work_production_policy_keeps_legacy_and_lalr_scheduling() {
+    assert!(completed_work_abort_eligible(GlrTableConstruction::ExperimentalCoreMerged));
+    assert!(!completed_work_abort_eligible(GlrTableConstruction::LegacyRowBisim));
+    assert!(!completed_work_abort_eligible(GlrTableConstruction::Lalr));
+}
+
+#[test]
+fn completed_work_certificate_counts_locally_exhausted_states_concurrently() {
+    let mut budget = default_unit_inline_budget();
+    budget.max_stack_effect_visits = 63;
+    let work = CompletedStackEffectWork::new(&budget).unwrap();
+    let pool = rayon::ThreadPoolBuilder::new().num_threads(4).build().unwrap();
+    pool.install(|| {
+        (0..16).into_par_iter().for_each(|_| {
+            let child = budget.child_with_stack_effect_visit_limit(3);
+            for _ in 0..3 { assert!(child.record_stack_effect_visit()); }
+            assert!(!child.record_stack_effect_visit());
+            work.record_completed(child.stack_effect_visits());
+        });
+    });
+    assert!(work.exceeded());
+    // The certificate never aborts or spends the parent's live budget.
+    // The read-only phase must finish before folding/rollback is selected.
+    assert!(!budget.is_aborted());
+    assert_eq!(budget.stack_effect_visits(), 0);
+}
+
+#[test]
+fn completed_work_abort_preserves_successful_and_rolled_back_tables() {
+    fn table(groups: usize, construction: GlrTableConstruction) -> GLRTable {
+        let n = groups * 5;
+        let mut action = vec![ActionRow::default(); n];
+        let mut goto = vec![GotoRow::default(); n];
+        for group in 0..groups {
+            let base = group * 5;
+            action[base + 1].insert(0, Action::Shift((base + 2) as u32, false));
+            action[base + 2].insert(0, Action::Split {
+                shift: Some(((base + 4) as u32, false)),
+                reduces: vec![(10, 1)], accept: false,
+            });
+            action[base + 3].insert(0, Action::Shift((base + 4) as u32, false));
+            goto[base + 1].insert(10, ((base + 3) as u32, true));
+        }
+        let mut table = GLRTable {
+            action, goto, num_states: n as u32, num_terminals: 1,
+            num_rules: 0, rules: Vec::new(), nonterminal_display_names: Vec::new(),
+            embedded_start: Default::default(),
+            construction, admission_policy: AdmissionPolicy::ExactSimulation,
+            advance: Vec::new(), unconditional_advance: Vec::new(),
+            forwarded_shifts: FxHashSet::default(),
+            control_terminals: Default::default(), skip_terminals: Default::default(),
+            guarded_shift_index: Vec::new(), direct_regular_wide_frontiers: Vec::new(),
+        };
+        table.rebuild_advance_rows_from_actions();
+        table
+    }
+
+    let mut aborts = 0;
+    let mut successes = 0;
+    let mut changed = 0;
+    for threads in [1, 4] {
+        let pool = rayon::ThreadPoolBuilder::new().num_threads(threads).build().unwrap();
+        for construction in [GlrTableConstruction::LegacyRowBisim,
+                             GlrTableConstruction::ExperimentalCoreMerged] {
+            for groups in [1, 8, 64] {
+                for limit in [1, 8, 64, 100_000, usize::MAX] {
+                    let input = table(groups, construction);
+                    let protected = BitSet::new(1);
+                    let mut results = Vec::new();
+                    for stop in [false, true] {
+                        let mut result = input.clone();
+                        let mut budget = default_unit_inline_budget();
+                        budget.max_ms = u128::MAX;
+                        budget.max_stack_effect_visits = limit;
+                        let mut undo = UnitInlineUndo::new(&result);
+                        if limit == 1 {
+                            // Model a prior iteration that already changed
+                            // an original row: certified abort must undo it,
+                            // not merely leave the current phase untouched.
+                            undo.record_cell(&result, 0, 0);
+                            result.action[0].insert(0, Action::Shift(1, false));
+                            result.advance[0].set(0);
+                            budget.stack_effect_visits.store(
+                                1, std::sync::atomic::Ordering::Relaxed,
+                            );
+                        }
+                        pool.install(|| {
+                            result.collapse_sr_unit_reductions_with_completed_work_abort(
+                                &budget, &mut undo, &protected, stop,
+                            );
+                        });
+                        if budget.is_aborted() { undo.rollback(&mut result); }
+                        results.push((result, budget.is_aborted()));
+                    }
+                    assert_eq!(results[0].1, results[1].1,
+                               "abort policy threads={threads} groups={groups} limit={limit}");
+                    assert_eq!(bincode::serialize(&results[0].0).unwrap(),
+                               bincode::serialize(&results[1].0).unwrap(),
+                               "complete table threads={threads} groups={groups} limit={limit}");
+                    if results[0].1 {
+                        aborts += 1;
+                        assert_eq!(results[0].0.action, input.action);
+                        assert_eq!(results[0].0.goto, input.goto);
+                    } else {
+                        successes += 1;
+                        changed += usize::from(results[0].0.action != input.action);
+                    }
+                }
+            }
+        }
+    }
+    assert!(aborts > 0 && successes > 0 && changed > 0,
+            "must cover real aborts and successful nontrivial optimization");
+}
+
+#[test]
 fn control_predecessor_propagation_matches_synchronous_reference() {
     fn next(seed: &mut u64) -> u64 {
         *seed = seed

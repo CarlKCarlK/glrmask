@@ -981,6 +981,7 @@ pub(super) fn restore_boundary_shards(
                     Arc::<[u32]>::from(tokens)
                 });
                 restored_shards.push(crate::runtime::SegmentedBoundaryShard {
+            mask_vocabulary: Default::default(),
                     start_component,
                     start_parser_states,
                     accepts_empty_stack,
@@ -1424,6 +1425,7 @@ pub(super) fn restore_recursive_runtime(
             Arc::<[u32]>::from(tokens)
         });
         restored_shards.push(crate::runtime::SegmentedBoundaryShard {
+            mask_vocabulary: Default::default(),
             start_component: shard.start_component,
             start_parser_states: crate::ds::bitset::BitSet::new(0),
             accepts_empty_stack: shard.accepts_empty_stack,

@@ -219,6 +219,10 @@ pub(crate) struct SegmentedBoundaryShard {
     /// component crossing. `None` means no trigger information is available;
     /// it must never be interpreted as "no crossings".
     pub(crate) candidate_tokens: Option<Arc<[u32]>>,
+    /// Runtime-only immutable vocabulary scoped to this binding. Never key a
+    /// global cache by model IDs alone: IDs can spell different bytes and LR
+    /// coordinates can differ in another binding. Rebuilt on artifact load.
+    pub(crate) mask_vocabulary: Arc<OnceLock<Result<crate::runtime::dynamic_mask::PreparedMaskVocabulary, String>>>,
     pub(crate) backend: SegmentedBoundaryShardBackend,
 }
 

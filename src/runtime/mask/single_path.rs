@@ -15,6 +15,7 @@ use super::{
     Constraint, DenseMaskAcc, DenseTokenMaskCache, MASK_SINGLE_PATH_DIRECT_INLINE_PATH_CAPACITY,
     MASK_SINGLE_PATH_DIRECT_INLINE_STACK_DEPTH, MASK_SINGLE_PATH_DIRECT_MAX_DEPTH,
     MASK_SINGLE_PATH_DIRECT_MAX_PLAN_OPS, MASK_SINGLE_PATH_DIRECT_MAX_TOTAL_PATHS,
+    MASK_SINGLE_PATH_DIRECT_MAX_PATHS_PER_GSS,
     MASK_SINGLE_PATH_DIRECT_MAX_TOTAL_STACK_VALUES, MASK_SINGLE_PATH_DIRECT_MIN_PLAN_STACK_VALUES,
     MASK_SINGLE_PATH_DIRECT_TWO_PASS_MIN_STATE_COUNT, StackWalkEvent,
     intersect_static_dense_with_weight, mask_delta_profile_enabled, mask_inner_profile_enabled,
@@ -231,6 +232,7 @@ impl ConstraintState<'_> {
                                         Some(&mut *buf),
                                         &mut direct_buf_dirty,
                                     );
+                                    if weight.is_full() { break; }
                                 }
                                 SinglePathDirectPlanOp::Intersect(weight) => if dense_is_seed {
                                     if weight.is_full() {
@@ -302,6 +304,7 @@ impl ConstraintState<'_> {
                                     Some(&mut *buf),
                                     &mut direct_buf_dirty,
                                 );
+                                if final_weight.is_full() { return false; }
                             }
                             StackWalkEvent::Top(parser_state) => {
                                 let positive_label = encode_positive_label(parser_state);
@@ -447,7 +450,8 @@ impl ConstraintState<'_> {
                 if mask_single_path_to_stacks_fallback_disabled() {
                     return false;
                 }
-                let remaining = MASK_SINGLE_PATH_DIRECT_MAX_TOTAL_PATHS.saturating_sub(paths.len());
+                let remaining = MASK_SINGLE_PATH_DIRECT_MAX_TOTAL_PATHS.saturating_sub(paths.len())
+                    .min(MASK_SINGLE_PATH_DIRECT_MAX_PATHS_PER_GSS);
                 let complete = gss.for_each_stack_top_first_bounded(
                     remaining,
                     |stack_top_first, terminals_disallowed| {
@@ -498,7 +502,8 @@ impl ConstraintState<'_> {
                         return false;
                     }
                     let remaining =
-                        MASK_SINGLE_PATH_DIRECT_MAX_TOTAL_PATHS.saturating_sub(total_paths);
+                        MASK_SINGLE_PATH_DIRECT_MAX_TOTAL_PATHS.saturating_sub(total_paths)
+                            .min(MASK_SINGLE_PATH_DIRECT_MAX_PATHS_PER_GSS);
                     let complete = gss.for_each_stack_len_bounded(remaining, |stack_len, _| {
                         total_paths += 1;
                         total_stack_values = total_stack_values.saturating_add(stack_len);
@@ -513,7 +518,8 @@ impl ConstraintState<'_> {
                 paths.clear();
                 for (&original_tokenizer_state, gss) in &self.state {
                     let remaining =
-                        MASK_SINGLE_PATH_DIRECT_MAX_TOTAL_PATHS.saturating_sub(paths.len());
+                        MASK_SINGLE_PATH_DIRECT_MAX_TOTAL_PATHS.saturating_sub(paths.len())
+                    .min(MASK_SINGLE_PATH_DIRECT_MAX_PATHS_PER_GSS);
                     let complete = gss.for_each_stack_top_first_bounded(
                         remaining,
                         |stack_top_first, terminals_disallowed| {
@@ -622,6 +628,8 @@ impl ConstraintState<'_> {
                                     return false;
                                 }
                                 plan_ops.push(SinglePathDirectPlanOp::Merge(final_weight));
+                                // Later intersections cannot add tokens to this path.
+                                if final_weight.is_full() { return false; }
                             }
                             StackWalkEvent::Top(parser_state) => {
                                 let positive_label = encode_positive_label(parser_state);

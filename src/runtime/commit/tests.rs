@@ -1,3 +1,5 @@
+use super::advance::{apply_single_top_action_fast, materialize_reduce_chain_outputs};
+use super::small_queue::try_advance_unique_actionable_top_fast;
 use super::*;
 use crate::{Constraint as Constraint, DynamicConstraint, Grammar, Vocab};
 use std::collections::BTreeSet;
@@ -1968,4 +1970,109 @@ fn epsilon_full_width_terminal_with_empty_accumulators_uses_fast_path() {
     assert!(profile.fast_path_total_ns > 0, "profile={profile:?}");
     assert_eq!(profile.n_queue_entries, 0, "profile={profile:?}");
     assert_eq!(profile.n_advances, 1, "profile={profile:?}");
+}
+
+#[test]
+fn reduce_chain_output_factoring_preserves_stacks_and_exclusions() {
+    let plain = TerminalsDisallowed::new();
+    let guarded = plain.clone().with_insert(7, 3);
+    for depth in [1usize, 2, 14, 64, 256] {
+        let prefix: Vec<u32> = (0..depth as u32).collect();
+        let extend = |suffix: &[u32]| {
+            let mut stack = prefix.clone();
+            stack.extend_from_slice(suffix);
+            stack
+        };
+        let cases = vec![
+            vec![],
+            vec![(prefix.clone(), plain.clone())],
+            vec![(prefix.clone(), plain.clone()), (prefix.clone(), plain.clone())],
+            vec![(extend(&[500]), plain.clone()), (extend(&[501]), plain.clone())],
+            vec![(extend(&[500, 502]), plain.clone()), (extend(&[501, 502]), plain.clone())],
+            vec![(prefix.clone(), plain.clone()), (extend(&[501]), plain.clone())],
+            vec![(vec![], plain.clone()), (prefix.clone(), plain.clone())],
+            vec![(prefix.clone(), plain.clone()), (prefix.clone(), guarded.clone())],
+            vec![(extend(&[500]), guarded.clone()), (extend(&[501]), plain.clone())],
+        ];
+        for outputs in cases {
+            let reference = ParserGSS::from_stacks(&outputs);
+            let actual = materialize_reduce_chain_outputs(outputs);
+            assert!(actual.semantically_eq(&reference, 32).unwrap(), "depth={depth}");
+        }
+    }
+}
+
+#[test]
+fn unique_actionable_top_matches_isolation_reference_including_empty_paths() {
+    fn reference(constraint: &Constraint, gss: &ParserGSS, terminal: u32) -> Option<ParserGSS> {
+        if !constraint.table.control_terminals.is_empty() || template_advance_enabled() {
+            return None;
+        }
+        let mut selected = None;
+        for top in gss.peek_values() {
+            let Some(action) = constraint.table.action(top, terminal) else { continue; };
+            if selected.is_some() { return None; }
+            selected = Some((top, action));
+        }
+        let (top, action) = selected?;
+        let isolated = gss.isolate(Some(top));
+        (!isolated.is_empty())
+            .then(|| apply_single_top_action_fast(constraint, &isolated, top, terminal, action))
+            .flatten()
+    }
+    let vocab = Vocab::new(["a", "b", "ab", "ba", ",", " ", "(", ")"]
+        .into_iter().enumerate().map(|(i, token)| (i as u32, token.as_bytes().to_vec())).collect());
+    let grammars = [
+        r#"start start; t A ::= "a" | "ab"; t B ::= "a" | "ba";
+                nt start ::= A B? | B A?;"#,
+        r#"start start; ignore WS; t WS ::= " "+; t A ::= "a"+; t B ::= "a"+ "b"?;
+                nt item ::= A | B; nt start ::= item ("," item)*;"#,
+        r#"start start; t A ::= "a"; nt start ::= A? | "(" start ")";"#,
+    ];
+    let empty = ParserGSS::from_single_stack(Vec::new(), TerminalsDisallowed::new());
+    let mut exclusive = 0usize;
+    let mut with_empty = 0usize;
+    let mut comparisons = 0usize;
+    for source in grammars {
+        let built = Constraint::compile(Grammar::glrm(source), &vocab).unwrap();
+        let loaded = Constraint::load(built.save()).unwrap();
+        for constraint in [&built, &loaded] {
+            let mut frontier = vec![constraint.start()];
+            let mut seen = BTreeSet::new();
+            for depth in 0..=3 {
+                let mut next = Vec::new();
+                for state in frontier {
+                    if !seen.insert(canonical_commit_state(&state.state)) { continue; }
+                    for gss in state.state.values() {
+                        for input in [gss.clone(), gss.merge(&empty)] {
+                            if let Some(top) = input.single_exclusive_top_value() {
+                                exclusive += 1;
+                                assert!(input.ptr_eq(&input.isolate(Some(top))));
+                            } else {
+                                with_empty += 1;
+                            }
+                            for terminal in 0..constraint.table.num_terminals {
+                                let expected = reference(constraint, &input, terminal);
+                                let actual = try_advance_unique_actionable_top_fast(constraint, &input, terminal);
+                                assert_eq!(actual.as_ref().map(canonical_gss), expected.as_ref().map(canonical_gss),
+                                    "terminal={terminal} depth={depth} source={source}");
+                                comparisons += 1;
+                            }
+                        }
+                    }
+                    if depth < 3 {
+                        let mask = state.mask();
+                        for (token, _) in constraint.token_bytes_iter() {
+                            if !token_in_mask(&mask, token) { continue; }
+                            let mut advanced = state.clone();
+                            advanced.commit_token(token).unwrap();
+                            next.push(advanced);
+                        }
+                    }
+                }
+                frontier = next;
+            }
+        }
+    }
+    assert!(exclusive > 0 && with_empty > 0 && comparisons > 20);
 }

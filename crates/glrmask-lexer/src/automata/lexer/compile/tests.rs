@@ -4344,3 +4344,43 @@ use super::partition::{try_product_union_components};
         lookup.insert(inserted.clone(), 2);
         assert_eq!(lookup.get(&inserted), Some(2));
     }
+
+#[test]
+fn factoring_choice_spines_does_not_rewalk_cached_children() {
+    fn contains(expr: &Expr, wanted: &Arc<Expr>) -> bool {
+        match expr {
+            Expr::Shared(inner) => Arc::ptr_eq(inner, wanted) || contains(inner, wanted),
+            Expr::Seq(parts) | Expr::Choice(parts) => parts.iter().any(|part| contains(part, wanted)),
+            Expr::Repeat { expr, .. } => contains(expr, wanted),
+            Expr::Exclude { expr, exclude } => contains(expr, wanted) || contains(exclude, wanted),
+            Expr::Intersect { expr, intersect } => contains(expr, wanted) || contains(intersect, wanted),
+            _ => false,
+        }
+    }
+    let shared = Arc::new(Expr::Repeat {
+        expr: Box::new(Expr::U8Class(U8Set::from_bytes(b"ab"))), min: 1, max: None,
+    });
+    let cached = Arc::new(factor_regex_expr((*shared).clone()));
+    let cache = rustc_hash::FxHashMap::from_iter([(Arc::as_ptr(&shared) as usize, Arc::clone(&cached))]);
+    let literal = |s: &str| Expr::U8Seq(s.as_bytes().to_vec());
+    for suffix in [false, true] {
+        for subset in [false, true] {
+            let mut options = ["a", "b"].into_iter().map(|different| {
+                if suffix {
+                    Expr::Seq(vec![literal(different), Expr::Shared(Arc::clone(&shared)), literal("x")])
+                } else {
+                    Expr::Seq(vec![literal("x"), Expr::Shared(Arc::clone(&shared)), literal(different)])
+                }
+            }).collect::<Vec<_>>();
+            if subset { options.push(literal("z")); }
+            let original = Expr::Choice(options);
+            let factored = super::factor_regex_expr_with_shared_cache(original.clone(), &cache);
+            assert!(contains(&factored, &cached), "choice rewrite must retain the already factored child");
+            for input in ["", "z", "x", "xaa", "xab", "xaba", "xbab", "aax", "abx", "bax", "bbbx", "xc", "cax"] {
+                assert_eq!(terminal_matches(original.clone(), input.as_bytes()),
+                    terminal_matches(factored.clone(), input.as_bytes()),
+                    "suffix={suffix} subset={subset} input={input}");
+            }
+        }
+    }
+}

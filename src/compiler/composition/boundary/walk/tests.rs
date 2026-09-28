@@ -2542,6 +2542,7 @@ fn nullable_static_link_declines_loudly() {
 #[test]
 #[ignore]
 fn walk_static_link_divergent_fixture_matches_dynamic_and_ablates() {
+    if crate::isolate_environment_test(true) { return; }
     fn admits(mask: &[u32], token: u32) -> bool {
         mask.get(token as usize / 32)
             .is_some_and(|word| word & (1u32 << (token % 32)) != 0)
@@ -2812,6 +2813,7 @@ fn strict_baseline_inherits_shard_scope_on_divergent_fixture() {
 /// must coexist with that inner static coverage under the strict trap.
 #[test]
 fn nested_static_link_depth_two_chain_matches_dynamic_and_ablates() {
+    if crate::isolate_environment_test(false) { return; }
     use crate::compiler::glr::parser::ScopedSubgrammarLink;
 
     fn admits(mask: &[u32], token: u32) -> bool {

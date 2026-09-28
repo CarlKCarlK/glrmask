@@ -1,3 +1,166 @@
+#[test]
+fn prepared_boundary_vocabularies_keep_simultaneous_siblings_and_unknown_fallback() {
+    use crate::__private::ConstraintExt;
+    // Both children remain viable after Xa. Each boundary owns a different
+    // vocabulary and frontier, while their lower caller stack is shared.
+    let entries = vec![
+        (0, Vec::new()), (1, b"X".to_vec()), (2, b"a".to_vec()),
+        (3, b"b".to_vec()), (4, b"c".to_vec()), (5, b"!".to_vec()),
+        (6, b"?".to_vec()), (7, b"ab!".to_vec()), (8, b"ac?".to_vec()),
+        (9, b"Xaab!".to_vec()), (10, b"Xaac?".to_vec()),
+        (19, b"a".to_vec()), (31, b"b!".to_vec()), (40, b"c?".to_vec()),
+        (65, b"aab!".to_vec()), (99, b"aac?".to_vec()), (130, b"bad".to_vec()),
+    ];
+    let ids = entries.iter().map(|(id, _)| *id).collect::<Vec<_>>();
+    let vocab = Vocab::new(entries);
+    let parent = Constraint::compile(Grammar::glrm(
+        r#"glrm 1; start root; extern grammar left; extern grammar right;
+                nt root = "X" (left "!" | right "?");"#,
+    ), &vocab).unwrap();
+    let left = Constraint::compile(Grammar::glrm(
+        r#"glrm 1; start left; t A = "a"+; nt left = A "b";"#,
+    ), &vocab).unwrap();
+    let right = Constraint::compile(Grammar::glrm(
+        r#"glrm 1; start right; t A = "a"+; nt right = A "c";"#,
+    ), &vocab).unwrap();
+    let bound = parent.compose_compiled_subgrammars_dynamic(
+        &[("left", &left), ("right", &right)], &vocab,
+    ).unwrap();
+    let saved = bound.save();
+    let mut saw_simultaneous_siblings = false;
+    for mode in 0..4 {
+        let mut constraint = Constraint::load(saved.clone()).unwrap();
+        // Native metadata, all-known conservative domains, one unknown
+        // child, and all unknown. Unknown must widen, never mean empty.
+        if mode != 0 {
+            constraint.serialized_artifact_cache = None;
+            let overlay = constraint.static_dynamic_overlay.as_mut().unwrap();
+            assert_eq!(overlay.segmented_parser_components.len(), 3);
+            for (owner, component) in overlay.segmented_parser_components.iter_mut().enumerate() {
+                let shard = component.boundary.as_mut().unwrap();
+                shard.candidate_tokens = if mode == 3 || (mode == 2 && owner == 2) {
+                    None
+                } else {
+                    Some(Arc::from(ids.clone()))
+                };
+                shard.mask_vocabulary = Default::default();
+            }
+            overlay.segmented_boundary_shards = overlay.segmented_parser_components.iter()
+                .filter_map(|component| component.boundary.clone()).collect();
+        }
+        for prefix in ["", "X", "Xa", "Xaa", "Xaab", "Xaac", "Xaab!", "Xaac?"] {
+            let mut state = constraint.start();
+            state.commit_bytes(prefix.as_bytes()).unwrap();
+            let mut owners = BTreeSet::new();
+            for gss in state.state.values() {
+                for top in gss.peek_values() {
+                    if let Some((owner, _)) = constraint.compact_segmented_parser_component(top) {
+                        if owner != 0 { owners.insert(owner); }
+                    }
+                }
+            }
+            saw_simultaneous_siblings |= owners.len() >= 2;
+            let mut expected = vec![0; constraint.mask_len()];
+            state.fill_recursive_mask_by_exact_full_walk(&mut expected);
+            for _ in 0..3 {
+                assert_eq!(state.mask(), expected, "mode={mode}, prefix={prefix:?}, owners={owners:?}");
+            }
+            // Check each admitted model-token route, not just the token
+            // consumed by one preferred trace. Aliases remain independent.
+            for &id in &ids {
+                if token_allowed(&expected, id) {
+                    let mut branch = state.clone();
+                    branch.commit_token(id).unwrap();
+                }
+            }
+        }
+    }
+    assert!(saw_simultaneous_siblings, "the fixture must exercise two active child owners");
+}
+
+
+#[test]
+fn prepared_mask_vocabulary_partial_baselines_and_evicted_views_are_exact() {
+    let mut entries = vec![(0, Vec::new()), (1,b"X".to_vec()), (2,b"!".to_vec())];
+    for n in 1..=12 {
+        entries.push((10+n, format!("{}!", "a".repeat(n as usize)).into_bytes()));
+    }
+    entries.push((70,b"a!".to_vec()));
+    entries.push((95,b"bad".to_vec()));
+    let ids = entries.iter().map(|(id,_)| *id).collect::<Vec<_>>();
+    let vocab = Vocab::new(entries);
+    let parent = Constraint::compile(Grammar::glrm(
+        r#"glrm 1; start root; extern grammar child; nt root = "X" child "!";"#,
+    ), &vocab).unwrap();
+    let child = Constraint::compile(Grammar::glrm(
+        r#"glrm 1; start child; t A = "a"+; nt child = A;"#,
+    ), &vocab).unwrap();
+    let bound = parent.bind_grammar_dynamic_boundary("child",child).unwrap();
+    let prepared = PreparedMaskVocabulary::new(&bound,&ids).unwrap();
+    let filtered = PreparedMaskVocabulary::new(&bound,&ids).unwrap();
+    let mut state = bound.start(); state.commit_bytes(b"X").unwrap();
+    let mut full = vec![0;bound.mask_len()];
+    state.fill_recursive_mask_by_exact_full_walk(&mut full);
+    let mut seed=0xb3ea1935u32;
+    // More distinct views than the bounded cache can hold. Preserve all
+    // caller bits outside our domain, even padding words and invalid IDs.
+    for round in 0..96 {
+        let mut actual = (0..full.len()+2).map(|_| {
+            seed^=seed<<13; seed^=seed>>17; seed^=seed<<5; seed
+        }).collect::<Vec<_>>();
+        let mut expected=actual.clone();
+        for &id in &ids { expected[id as usize/32] |= full[id as usize/32] & (1<<(id%32)); }
+        let mut reference_view = actual.clone();
+        prepared.or_mask_with_pre_admission(&state,&mut actual).unwrap();
+        filtered.or_mask_filtered(&state,&mut reference_view).unwrap();
+        assert_eq!(actual,expected,"canonical partial baseline round {round}");
+        assert_eq!(reference_view,expected,"filtered partial baseline round {round}");
+    }
+    assert!(!filtered.views.lock().unwrap().is_empty(), "reference must exercise filtered vocabulary storage");
+    assert!(prepared.views.lock().unwrap().is_empty(), "canonical path must not build partial vocabularies");
+    assert!(PreparedMaskVocabulary::new(&bound,&[7]).is_err(),"missing in-range ID is not an empty token");
+    assert!(PreparedMaskVocabulary::new(&bound,&[u32::MAX]).is_err());
+}
+
+
+#[test]
+fn pre_admitted_subtree_pruning_matches_views_and_does_not_poison_full_cache() {
+    let entries = vec![(0,b"P".to_vec()),(2,b"a".to_vec()),(5,b"b".to_vec()),(7,b"c".to_vec()),
+        (9,b"Q".to_vec()),(11,b"abQ".to_vec()),(13,b"acQ".to_vec()),(17,b"bQ".to_vec()),
+        (21,b"cQ".to_vec()),(24,b"x".to_vec()),(31,vec![]),(41,vec![0,255]),(97,b"abQ".to_vec())];
+    let ids = entries.iter().map(|(i,_)| *i).collect::<Vec<_>>();
+    let vocab = Vocab::new(entries);
+    for nullable in [false,true] {
+        let parent = Constraint::compile(Grammar::glrm(
+            r#"glrm 1; start root; extern grammar leaf; nt root = "P" leaf "Q";"#), &vocab).unwrap();
+        let source = if nullable { r#"glrm 1; start x; nt x = ("ab" | "ac")?;"# }
+            else { r#"glrm 1; start x; nt x = "ab" | "ac";"# };
+        let child = crate::ConstraintSpec::builder(Grammar::glrm(source), &vocab).unwrap()
+            .build().unwrap().compile_dynamic().unwrap();
+        let bound = parent.bind_grammar_dynamic_boundary("leaf", child).unwrap();
+        for prefix in [b"".as_slice(),b"P",b"Pa",b"Pab",b"Pac",b"PabQ"] {
+            let mut state = bound.start(); state.commit_bytes(prefix).unwrap();
+            let reference = PreparedMaskVocabulary::new_with_policy(&bound, &ids, PreparedVocabularyPolicy::DeadHeadPreflight).unwrap();
+            let reusable = PreparedMaskVocabulary::new_with_policy(&bound, &ids, PreparedVocabularyPolicy::DeadHeadPreflight).unwrap();
+            for seed in 0..7u32 {
+                let initial = (0..bound.mask_len()).map(|w| match seed {
+                    0=>0,1=>u32::MAX,2=>0x55555555,3=>0xaaaaaaaa,
+                    _=>(w as u32).wrapping_mul(1664525).wrapping_add(seed*101390422),
+                }).collect::<Vec<_>>();
+                let mut a = initial.clone(); let mut b = initial;
+                assert!(reference.or_mask_filtered(&state,&mut a).unwrap());
+                assert!(reusable.or_mask_with_pre_admission(&state,&mut b).unwrap());
+                assert_eq!(a,b,"nullable={nullable} prefix={prefix:?} seed={seed}");
+                let mut full_a=vec![0;bound.mask_len()];let mut full_b=full_a.clone();
+                assert!(reference.or_mask_filtered(&state,&mut full_a).unwrap());
+                assert!(reusable.or_mask_filtered(&state,&mut full_b).unwrap());
+                assert_eq!(full_a,full_b,"partial result must not poison full result cache");
+            }
+            assert!(reusable.views.lock().unwrap().is_empty(),"one canonical trie must suffice");
+        }
+    }
+}
+
 use super::*;
 use crate::{DynamicConstraint, Constraint as Constraint, Grammar, Vocab};
 use std::collections::BTreeSet;
@@ -12,6 +175,66 @@ fn direct_mask(state: &ConstraintState<'_>) -> Vec<u32> {
     let mut mask = vec![0u32; state.constraint.body_mask_len()];
     state.fill_mask_dynamic(&mut mask);
     mask
+}
+
+#[test]
+fn root_output_scope_preserves_overlapping_terminals_and_cross_word_aliases() {
+    struct RestoreScope(bool);
+    impl Drop for RestoreScope {
+        fn drop(&mut self) { TEST_ROOT_OUTPUT_SCOPE_FORCE.with(|flag| flag.set(self.0)); }
+    }
+    let _restore = RestoreScope(TEST_ROOT_OUTPUT_SCOPE_FORCE.with(|flag| flag.replace(true)));
+    full_walk_dense::TEST_OUTPUT_SCOPE_SKIPPED.with(|count| count.set(0));
+    let mut words = Vec::<Vec<u8>>::new();
+    let mut layer = vec![Vec::new()];
+    for _ in 0..3 {
+        let mut next = Vec::new();
+        for prefix in layer {
+            for &byte in b"ab -" {
+                let mut word = prefix.clone();
+                word.push(byte);
+                next.push(word);
+            }
+        }
+        words.extend(next.iter().cloned());
+        layer = next;
+    }
+    let mut entries = words.iter().enumerate()
+        .map(|(id, bytes)| (id as u32, bytes.clone())).collect::<Vec<_>>();
+    entries.push((140, b"a".to_vec()));
+    entries.push((201, b"a".to_vec()));
+    let vocab = Vocab::new(entries);
+    for separated in [false, true] {
+        let groups = if separated {
+            "lexer group a ::= A; lexer group b ::= B; lexer group ws ::= WS;"
+        } else { "" };
+        for pair in [
+            "t A ::= 'a'+; t B ::= 'a'+ 'b';",
+            "t A ::= 'a' 'b'; t B ::= 'a';",
+            "t A ::= 'a'+; t B ::= 'a'+ 'b'?;",
+        ] {
+            let grammar = format!(
+                "start start; ignore WS; t WS ::= (' ' | '-')+; {groups} {pair} nt item ::= A | B; nt start ::= item item? item?;"
+            );
+            let static_constraint = Constraint::from_glrm_grammar(&grammar, &vocab).unwrap();
+            let dynamic = DynamicConstraint::from_glrm_grammar(&grammar, &vocab).unwrap();
+            for prefix in std::iter::once(&[][..]).chain(words.iter().map(Vec::as_slice)) {
+                let mut reference = static_constraint.start();
+                let mut candidate = dynamic.inner.start();
+                let reference_result = reference.commit_bytes(prefix);
+                let candidate_result = candidate.commit_bytes(prefix);
+                assert_eq!(reference_result.is_ok(), candidate_result.is_ok(),
+                    "commit status differs for {prefix:?}: {grammar}");
+                let reference_mask = reference.mask();
+                let candidate_mask = direct_mask(&candidate);
+                assert_eq!(candidate_mask, reference_mask, "scope mismatch for {prefix:?}: {grammar}");
+                assert_eq!(candidate.is_accepting(), reference.is_accepting());
+                assert_eq!(token_allowed(&candidate_mask, 140), token_allowed(&candidate_mask, 201));
+            }
+        }
+    }
+    let skipped = full_walk_dense::TEST_OUTPUT_SCOPE_SKIPPED.with(|count| count.get());
+    assert!(skipped > 0, "fixture must execute output-scope subtree skips, not merely decline them");
 }
 
 /// Check the independent oracle, natural probation/store path, and a
@@ -33,6 +256,316 @@ fn assert_recursive_persistent_roundtrip(state: &ConstraintState<'_>) {
         "cached recursive mask must not walk the vocabulary");
     assert_eq!(&output[..expected.len()], expected.as_slice());
     assert!(output[expected.len()..].iter().all(|&word| word == 0));
+}
+
+
+#[test]
+fn prepared_mask_vocabulary_borrowed_bytes_matches_owned_structure_and_aliases() {
+    let entries=vec![(0,vec![]),(1,b"X".to_vec()),(2,b"a".to_vec()),
+        (3,b"!".to_vec()),(7,vec![]),(19,b"a".to_vec()),(40,b"a!".to_vec()),
+        (50,vec![0,255]),(71,b"Xa!".to_vec()),(83,b"aaa".to_vec())];
+    let ids=entries.iter().map(|(id,_)|*id).chain([9001]).collect::<Vec<_>>();
+    let vocab=Vocab::new(entries);
+    let child=crate::ConstraintSpec::builder(Grammar::glrm(
+        r#"glrm 1; start child; extern token MARK; nt child = MARK "a" | "a";"#),&vocab)
+        .unwrap().bind_token("MARK",[7,9001]).unwrap().build().unwrap().compile().unwrap();
+    let parent=Constraint::compile(Grammar::glrm(
+        r#"glrm 1; start root; extern grammar child; nt root = "X" child "!";"#),&vocab).unwrap();
+    let bound=parent.bind_grammar_dynamic_boundary("child",child).unwrap();
+    let loaded=Constraint::load(bound.save()).unwrap();
+    for constraint in [&bound,&loaded] {
+        for domain in [ids.clone(),vec![],vec![19,2,2,40],vec![0,7,50],vec![9001]] {
+            let owned=PreparedMaskVocabulary::make_vocab_owned_reference(constraint,&domain).unwrap();
+            let borrowed=PreparedMaskVocabulary::make_vocab_borrowed(constraint,&domain).unwrap();
+            assert_eq!(bincode::serialize(owned.trie.as_ref()).unwrap(),
+                bincode::serialize(borrowed.trie.as_ref()).unwrap(),"domain={domain:?}");
+            for &canonical in owned.trie.all_subtree_tokens() {
+                assert_eq!(owned.token_ids(canonical),borrowed.token_ids(canonical));
+            }
+            if let Some(canonical)=owned.trie.node(0).token_id {
+                assert_eq!(owned.token_ids(canonical),borrowed.token_ids(canonical));
+            }
+            for prefix in ["","X","Xa","Xa!"] {
+                let mut state=constraint.start();state.commit_bytes(prefix.as_bytes()).unwrap();
+                let mut a=vec![0;constraint.mask_len()];let mut b=a.clone();
+                assert_eq!(try_fill_recursive_mask_with_vocab(&state,&mut a,&owned).unwrap(),
+                    try_fill_recursive_mask_with_vocab(&state,&mut b,&borrowed).unwrap());
+                assert_eq!(a,b,"domain={domain:?} prefix={prefix:?}");
+            }
+        }
+        assert!(PreparedMaskVocabulary::make_vocab_borrowed(constraint,&[8]).is_err());
+        assert!(PreparedMaskVocabulary::make_vocab_owned_reference(constraint,&[8]).is_err());
+    }
+}
+
+#[test]
+fn prepared_mask_vocabulary_two_byte_proof_never_crosses_a_finalizer() {
+    let vocab=Vocab::new(vec![(0,b"P".to_vec()),(1,b"x".to_vec()),
+        (2,b"xy!".to_vec()),(3,b"x!".to_vec()),(4,b"xz!".to_vec()),
+        (5,b"!".to_vec()),(6,b"z".to_vec())]);
+    for leaf in ["x", "xz"] {
+        let source=format!("glrm 1; start child; nt child = {leaf:?};");
+        let child=Constraint::compile(Grammar::glrm(&source),&vocab).unwrap();
+        let parent=Constraint::compile(Grammar::glrm(
+            r#"glrm 1; start root; extern grammar child; nt root = "P" child "!";"#),&vocab).unwrap();
+        let bound=parent.bind_grammar_dynamic_boundary("child",child).unwrap();
+        let loaded=Constraint::load(bound.save()).unwrap();
+        for constraint in [&bound,&loaded] {
+            let mut state=constraint.start();state.commit_bytes(b"P").unwrap();
+            for id in [1,2,3,4] {
+                for depth in [1,2] {
+                    let domain=PureMaskByteDomain::for_ids_with_depth(constraint,&[id],depth).unwrap();
+                    let called=std::cell::Cell::new(false);
+                    let mut mask=vec![0;constraint.mask_len()];
+                    assert!(fill_pure_byte_mask_with_factory(&state,&mut mask,domain,||{
+                        called.set(true);PreparedMaskVocabulary::make_vocab(constraint,&[id])
+                    }).unwrap());
+                    let expected=if leaf=="x" {id==1 || id==3} else {id==1 || id==4};
+                    assert_eq!(token_allowed(&mask,id),expected,"leaf={leaf} id={id} depth={depth}");
+                    if id==1 || leaf=="x" || depth==1 {
+                        assert!(called.get(),"one-byte candidates and first-byte finalizers must resolve");
+                    } else if id==2 || id==3 {
+                        assert!(!called.get(),"two non-finalizing raw transitions prove the domain empty");
+                    }
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn prepared_mask_vocabulary_dead_head_propagates_deferred_errors_before_success() {
+    struct Fails { calls: usize, fail_at: usize, pending: bool }
+    impl FullWalkTransitionTable for Fails {
+        type Cell = u32;
+        fn cell(&mut self, _:u32, _:u8)->u32 {
+            self.calls+=1;
+            if self.calls>=self.fail_at { self.pending=true; u32::MAX } else { 0 }
+        }
+        fn cell_is_dead(c:u32)->bool { c==u32::MAX }
+        fn cell_has_finalizer(_:u32)->bool { false }
+        fn cell_target(c:u32)->u32 { c }
+        fn root_state(&mut self,_:u32)->Result<u32,String> { Ok(0) }
+        fn validate_mask_result(&mut self)->Result<(),String> {
+            if self.pending {Err("injected transition failure".into())}else{Ok(())}
+        }
+        fn finalizer_code(&self,_:u32)->u32 {u32::MAX}
+        fn single_finalizer_continues(&mut self,_:u32)->bool {false}
+        fn matched_terminals(&self,_:u32)->SmallVec<[TerminalID;4]> {SmallVec::new()}
+        fn future_contains(&mut self,_:u32,_:TerminalID)->bool {true}
+        fn future_intersects(&mut self,_:u32,_:&BitSet)->bool {true}
+        fn merge_states(&mut self,_:&[u32])->Option<u32> {None}
+        fn dense_state_count(&self)->Option<usize> {Some(1)}
+        fn token_boundary_allowed(&mut self,_:&mut FullWalkParserCache,_:&crate::runtime::artifact::Constraint,
+            _:u32,_:u32,_:u32)->bool {false}
+        fn exact_raw_state(&self,_:u32)->Option<u32> {None}
+    }
+    let vocab=Vocab::new(vec![(0,b"a".to_vec())]);
+    let constraint=Constraint::compile(Grammar::glrm(r#"glrm 1; start root; nt root = "a";"#),&vocab).unwrap();
+    let state=constraint.start();
+    let domain=PureMaskByteDomain::for_ids(&constraint,&[0]).unwrap();
+    for fail_at in [1,2] {
+        let mut transitions=Fails{calls:0,fail_at,pending:false};
+        let called=std::cell::Cell::new(false);
+        let mut mask=vec![0;constraint.mask_len()];
+        let result=fill_pure_byte_mask_using_factory(&state,&mut mask,&mut transitions,domain.clone(),||{
+            called.set(true); PreparedMaskVocabulary::make_vocab(&constraint,&[0])
+        });
+        assert_eq!(result.unwrap_err(),"injected transition failure");
+        assert_eq!(called.get(),fail_at==2);
+        assert!(transitions.pending);
+    }
+}
+
+#[test]
+fn prepared_mask_vocabulary_dead_head_skips_factory_then_builds_on_live_prefix() {
+    use super::PreparedVocabularyPolicy;
+    let vocab = Vocab::new(vec![
+        (0, b"P".to_vec()), (1, b"x".to_vec()), (2, b"a!".to_vec()),
+        (3, b"!".to_vec()), (5, b"a".to_vec()), (7, b"a!".to_vec()),
+        (9, b"z".to_vec()),
+    ]);
+    let child = Constraint::compile(Grammar::glrm(
+        r#"glrm 1; start child; nt child = "xa";"#), &vocab).unwrap();
+    let parent = Constraint::compile(Grammar::glrm(
+        r#"glrm 1; start root; extern grammar child; nt root = "P" child "!";"#), &vocab).unwrap();
+    let bound = parent.bind_grammar_dynamic_boundary("child", child).unwrap();
+    let loaded = Constraint::load(bound.save()).unwrap();
+    for constraint in [&bound, &loaded] {
+        let domain = [2, 7];
+        let prepared = PreparedMaskVocabulary::new_with_policy(
+            constraint, &domain, PreparedVocabularyPolicy::DeadHeadPreflight).unwrap();
+        assert!(prepared.vocab.get().is_none());
+        let mut state = constraint.start(); state.commit_bytes(b"P").unwrap();
+        let mut mask = vec![0; constraint.mask_len()];
+        assert!(prepared.or_mask(&state, &mut mask).unwrap());
+        assert!(mask.iter().all(|&word| word == 0));
+        assert!(prepared.vocab.get().is_none(), "all dead heads must not build the base");
+        assert!(prepared.views.lock().unwrap().is_empty(), "nor a filtered trie");
+        let proof = PureMaskByteDomain::for_ids(constraint, &domain).unwrap();
+        let called = std::cell::Cell::new(false);
+        assert!(fill_pure_byte_mask_with_factory(&state, &mut mask, proof, || {
+            called.set(true); PreparedMaskVocabulary::make_vocab(constraint, &domain)
+        }).unwrap());
+        assert!(!called.get(), "supplier callback must not run for a dead domain");
+        state.commit_bytes(b"x").unwrap();
+        assert!(prepared.or_mask(&state, &mut mask).unwrap());
+        assert!(token_allowed(&mask, 2) && token_allowed(&mask, 7));
+        assert!(prepared.vocab.get().is_some(), "first live prefix must resolve the same base");
+        let ready = prepared.vocab.get().unwrap().as_ref().unwrap().clone();
+        mask.fill(0); assert!(prepared.or_mask(&state, &mut mask).unwrap());
+        assert!(Arc::ptr_eq(&ready, prepared.vocab.get().unwrap().as_ref().unwrap()));
+        for policy in [PreparedVocabularyPolicy::Eager, PreparedVocabularyPolicy::LazyOnly,
+                       PreparedVocabularyPolicy::DeadHeadPreflight] {
+            assert!(PreparedMaskVocabulary::new_with_policy(constraint, &[6], policy).is_err(),
+                "unknown IDs must fail even with deferred construction");
+        }
+    }
+}
+
+#[test]
+fn prepared_mask_vocabulary_dead_head_preserves_special_aliases_empty_ids_and_baselines() {
+    use super::PreparedVocabularyPolicy;
+    let entries = vec![
+        (0, b"P".to_vec()), (1, b"x".to_vec()), (2, b"a!".to_vec()),
+        (3, b"!".to_vec()), (5, b"a".to_vec()), (7, b"a!".to_vec()),
+        (8, vec![]), (9, b"z".to_vec()), (20, vec![0, 255]),
+    ];
+    let vocab = Vocab::new(entries);
+    let child = crate::ConstraintSpec::builder(Grammar::glrm(
+        r#"glrm 1; start child; extern token SPECIAL; nt child = "xa" | SPECIAL;"#), &vocab)
+        .unwrap().bind_token("SPECIAL", [2, 9001]).unwrap()
+        .build().unwrap().compile().unwrap();
+    let parent = Constraint::compile(Grammar::glrm(
+        r#"glrm 1; start root; extern grammar child; nt root = "P" child "!";"#), &vocab).unwrap();
+    let bound = parent.bind_grammar_dynamic_boundary("child", child).unwrap();
+    let loaded = Constraint::load(bound.save()).unwrap();
+    for constraint in [&bound, &loaded] {
+        assert!(PureMaskByteDomain::for_ids(constraint, &[2]).is_none());
+        assert!(PureMaskByteDomain::for_ids(constraint, &[9001]).is_none());
+        assert!(PureMaskByteDomain::for_ids(constraint, &[8]).is_none());
+        assert!(PureMaskByteDomain::for_ids(constraint, &[7]).is_some());
+        for domain in [vec![2, 7, 8, 9001], vec![7], vec![2, 9001], vec![], vec![1, 3, 5, 7, 9, 20]] {
+            let reference = PreparedMaskVocabulary::new_with_policy(
+                constraint, &domain, PreparedVocabularyPolicy::Eager).unwrap();
+            let actual = PreparedMaskVocabulary::new_with_policy(
+                constraint, &domain, PreparedVocabularyPolicy::DeadHeadPreflight).unwrap();
+            for prefix in [b"".as_slice(), b"P", b"Px", b"Pxa", b"Pxa!"] {
+                let mut state = constraint.start(); state.commit_bytes(prefix).unwrap();
+                for seed in 0..16u32 {
+                    let mut a = vec![0; constraint.mask_len()];
+                    for &id in &[0u32, 1, 2, 3, 5, 7, 8, 9, 20, 9001] {
+                        if id.wrapping_mul(1664525).wrapping_add(seed) % 5 <= 1 {
+                            a[id as usize / 32] |= 1 << (id % 32);
+                        }
+                    }
+                    let mut b = a.clone();
+                    assert!(reference.or_mask(&state, &mut a).unwrap());
+                    assert!(actual.or_mask(&state, &mut b).unwrap());
+                    assert_eq!(a, b, "domain={domain:?} prefix={prefix:?} seed={seed}");
+                }
+            }
+        }
+        let mut state = constraint.start(); state.commit_bytes(b"P").unwrap();
+        let prepared = PreparedMaskVocabulary::new_with_policy(constraint, &[2, 7, 9001],
+            PreparedVocabularyPolicy::DeadHeadPreflight).unwrap();
+        let mut mask = vec![0; constraint.mask_len()];
+        assert!(prepared.or_mask(&state, &mut mask).unwrap());
+        assert!(token_allowed(&mask, 2) && token_allowed(&mask, 9001));
+        assert!(!token_allowed(&mask, 7), "ordinary byte alias has no special route");
+        assert!(prepared.vocab.get().is_some(), "mixed special domains bypass byte-only proof");
+    }
+}
+
+#[test]
+fn prepared_mask_vocabulary_preserves_domain_aliases_and_reload() {
+    let vocab = Vocab::new(vec![
+        (0, vec![]), (1, b"X".to_vec()), (7, b"a".to_vec()),
+        (19, b"a".to_vec()), (22, b"!".to_vec()), (31, b"a!".to_vec()),
+        (65, b"Xa!".to_vec()), (99, b"b".to_vec()), (130, b"aa".to_vec()),
+    ]);
+    let parent = Constraint::compile(Grammar::glrm(
+        r#"glrm 1; start root; extern grammar child; nt root = "X" child "!";"#,
+    ), &vocab).unwrap();
+    let child = Constraint::compile(Grammar::glrm(
+        r#"glrm 1; start child; t A = "a"+; nt child = A;"#,
+    ), &vocab).unwrap();
+    let bound = parent.bind_grammar_dynamic_boundary("child", child).unwrap();
+    let loaded = Constraint::load(bound.save()).unwrap();
+    for constraint in [&bound, &loaded] {
+        for domain in [vec![], vec![7], vec![19,7,7], vec![0,65,31,22],
+            vec![130,99,65,31,22,19,7,1,0]] {
+            let prepared = PreparedMaskVocabulary::new(constraint, &domain).unwrap();
+            for prefix in ["", "X", "Xa", "Xaa", "Xa!"] {
+                let mut state = constraint.start();
+                state.commit_bytes(prefix.as_bytes()).unwrap();
+                let mut full = vec![0; constraint.mask_len()];
+                state.fill_recursive_mask_by_exact_full_walk(&mut full);
+                for baseline in [vec![0; full.len()], full.clone()] {
+                    let mut expected = baseline.clone();
+                    for &id in &domain {
+                        expected[id as usize / 32] |= full[id as usize / 32] & (1 << (id % 32));
+                    }
+                    for _ in 0..3 {
+                        let mut actual = baseline.clone();
+                        assert!(prepared.or_mask(&state, &mut actual).unwrap());
+                        assert_eq!(actual, expected, "domain={domain:?} prefix={prefix:?}");
+                    }
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn prepared_mask_vocabulary_isolated_across_bindings_and_bytes() {
+    for word in ["a", "b"] {
+        let vocab = Vocab::new(vec![(0,b"X".to_vec()),(1,word.as_bytes().to_vec()),
+            (2,b"!".to_vec()),(3,b"a!".to_vec()),(4,b"b!".to_vec())]);
+        let parent = Constraint::compile(Grammar::glrm(
+            r#"glrm 1; start root; extern grammar child; nt root = "X" child "!";"#,
+        ), &vocab).unwrap();
+        let child = Constraint::compile(Grammar::glrm(
+            &format!("glrm 1; start child; nt child = {word:?};")), &vocab).unwrap();
+        let bound = parent.bind_grammar_dynamic_boundary("child", child).unwrap();
+        let prepared = PreparedMaskVocabulary::new(&bound, &[1,3,4]).unwrap();
+        let mut state = bound.start(); state.commit_bytes(b"X").unwrap();
+        for _ in 0..3 {
+            let mut actual = vec![0; bound.mask_len()];
+            prepared.or_mask(&state, &mut actual).unwrap();
+            assert!(token_allowed(&actual,1));
+            assert_eq!(token_allowed(&actual,3), word=="a");
+            assert_eq!(token_allowed(&actual,4), word=="b");
+            assert!(!token_allowed(&actual,0));
+        }
+    }
+}
+
+#[test]
+fn prepared_mask_vocabulary_preserves_special_and_byte_union() {
+    let vocab = Vocab::new(vec![(0,Vec::new()),(1,b"X".to_vec()),(2,b"a".to_vec()),
+        (3,b"!".to_vec()),(7,Vec::new()),(31,Vec::new()),(40,b"a!".to_vec())]);
+    let child = crate::ConstraintSpec::builder(Grammar::glrm(
+        r#"glrm 1; start child; extern token MARK; nt child = MARK "a" | "a";"#,
+    ), &vocab).unwrap().bind_token("MARK",[7]).unwrap().build().unwrap().compile().unwrap();
+    let parent = Constraint::compile(Grammar::glrm(
+        r#"glrm 1; start root; extern grammar child; nt root = "X" child "!";"#,
+    ), &vocab).unwrap();
+    let bound = parent.bind_grammar_dynamic_boundary("child",child).unwrap();
+    for domain in [vec![0,7,31],vec![0,31,40],vec![7],vec![2,7,40]] {
+        let prepared=PreparedMaskVocabulary::new(&bound,&domain).unwrap();
+        for prefix in ["", "X", "Xa", "Xa!"] {
+            let mut state=bound.start();state.commit_bytes(prefix.as_bytes()).unwrap();
+            let mut full=vec![0;bound.mask_len()];state.fill_recursive_mask_by_exact_full_walk(&mut full);
+            let mut expected=vec![0;full.len()];for &id in &domain {
+                expected[id as usize/32]|=full[id as usize/32]&(1<<(id%32));
+            }
+            for _ in 0..3 {
+                let mut actual=vec![0;full.len()];prepared.or_mask(&state,&mut actual).unwrap();
+                assert_eq!(actual,expected,"special domain={domain:?} prefix={prefix:?}");
+            }
+        }
+    }
 }
 
 #[test]
@@ -524,6 +1057,84 @@ fn dynamic_mask_cache_key_uses_exact_mask_projection_coordinate() {
 }
 
 #[test]
+fn dynamic_mask_lookup_top_first_order_preserves_exact_path_keys() {
+    // A literal old-orientation key is the independent reference. Include
+    // empty, inline, heap-sized and maximum-depth stacks; key identity must
+    // retain values at every depth and every correlated exclusion.
+    let mut reference: DynamicMaskStateKey = Vec::new();
+    for entry in 0..7_u32 {
+        let lexer = match entry % 3 {
+            0 => DynamicMaskLexerStateKey::Exact(entry),
+            1 => DynamicMaskLexerStateKey::RecursiveExact(entry),
+            _ => DynamicMaskLexerStateKey::MaskProjection { state: entry, initial: false },
+        };
+        let mut paths = Vec::new();
+        for (case, depth) in [0, 1, 2, 31, 32, 33, 65, 128, 256].into_iter().enumerate() {
+            let stack = (0..depth).map(|i| (i * 17 + case * 3) as u32).collect();
+            let mut exclusions = Vec::new();
+            if case % 3 != 0 {
+                exclusions.push((entry, (0..case * 5).map(|i| i as u32).collect()));
+                exclusions.push((entry + 100, vec![0, 255, 1024]));
+            }
+            paths.push((stack, exclusions));
+        }
+        paths.sort();
+        reference.push((lexer, paths));
+    }
+    reference.sort();
+
+    let mut scratch = DynamicMaskLookupScratch {
+        stack_arena: SmallVec::new(), paths: SmallVec::new(), entries: SmallVec::new(),
+    };
+    // Reverse entry/path insertion order, and add a duplicate lexer group.
+    for (lexer, paths) in reference.iter().rev().chain(reference.first()) {
+        let path_start = scratch.paths.len() as u32;
+        for (bottom_first, exclusions) in paths.iter().rev() {
+            let arena_start = scratch.stack_arena.len() as u32;
+            scratch.stack_arena.extend(bottom_first.iter().rev().copied());
+            let mut acc = TerminalsDisallowed::new();
+            for (lexer, terminals) in exclusions {
+                for terminal in terminals { acc = acc.with_insert(*lexer, *terminal); }
+            }
+            scratch.paths.push(TransientPath {
+                arena_start, arena_end: scratch.stack_arena.len() as u32, acc,
+            });
+        }
+        let path_end = scratch.paths.len() as u32;
+        scratch.paths[path_start as usize..path_end as usize].sort_unstable_by(|a, b| {
+            scratch.stack_arena[a.arena_start as usize..a.arena_end as usize]
+                .cmp(&scratch.stack_arena[b.arena_start as usize..b.arena_end as usize])
+                .then_with(|| cmp_terminals_disallowed(&a.acc, &b.acc))
+        });
+        scratch.entries.push(TransientEntry { lexer_key: *lexer, path_start, path_end });
+    }
+    scratch.entries.sort_unstable_by(|a, b|
+        cmp_transient_entries(a, b, &scratch.paths, &scratch.stack_arena));
+    scratch.entries.dedup_by(|a, b|
+        cmp_transient_entries(a, b, &scratch.paths, &scratch.stack_arena).is_eq());
+    let owned = scratch.to_owned_state_key();
+    assert!(scratch.matches_state(&owned));
+    assert_eq!(scratch.compute_hash(), crate::runtime::artifact::dynamic_mask_state_key_hash(&owned));
+    let mut old_orientation = owned.clone();
+    for (_, paths) in &mut old_orientation {
+        for (stack, _) in paths.iter_mut() { stack.reverse(); }
+        paths.sort();
+    }
+    old_orientation.sort();
+    assert_eq!(old_orientation, reference, "orientation cannot change exact key equivalence");
+
+    let mut changed = owned.clone();
+    let deep = changed[0].1.iter_mut().find(|p| p.0.len() == 256).unwrap();
+    deep.0[128] ^= 1;
+    assert!(!scratch.matches_state(&changed), "all stack values participate in equality");
+    changed = owned.clone();
+    let excluded = changed[0].1.iter_mut().find(|p| !p.1.is_empty()).unwrap();
+    excluded.1[0].1.push(8192);
+    assert!(!scratch.matches_state(&changed), "all exclusions participate in equality");
+    assert!(!scratch.matches_state(&reference), "opposite orientations must not alias");
+}
+
+#[test]
 fn dynamic_mask_lookup_query_exact_match_with_state_key() {
     let vocab = Vocab::new(vec![
         (0, b"\"".to_vec()),
@@ -794,6 +1405,13 @@ fn full_walk_future_cache_normalizes_hot_and_generic_coordinates() {
     assert!(!table.future_contains(generic, other));
     assert_eq!(table.future_contains_calls, 2, "negative results must be memoized too");
     assert_eq!(table.future_contains_cache.len(), 2);
+    // Guard transitions use the same hot/config aliases. A physical state
+    // with a live WORD continuation cannot be summarized as only virtual
+    // residuals; an absent OTHER continuation is an empty exact set.
+    assert_eq!(table.direct_prune_coordinates(hot, word), None);
+    assert_eq!(table.direct_prune_coordinates(generic, word), None);
+    assert_eq!(table.direct_prune_coordinates(hot, other), Some(SmallVec::new()));
+    assert_eq!(table.direct_prune_coordinates(generic, other), Some(SmallVec::new()));
 }
 
 #[test]
@@ -1900,6 +2518,16 @@ fn recursive_zero_byte_domain_preserves_only_live_exact_special_ids() {
     let bound = parent.bind_grammar_dynamic_boundary("child", child).unwrap();
     let loaded = Constraint::load(bound.save()).unwrap();
     for constraint in [&bound, &loaded] {
+        assert_eq!(constraint.empty_byte_token_ids().collect::<Vec<_>>(), vec![0, 7, 31]);
+        // Domain sanitization must not build a full model-vocabulary trie
+        // just to find zero-byte spellings, including after artifact load.
+        let was_lazy = constraint.lazy_dynamic_mask_vocab.get().is_some();
+        let blank = constraint.start();
+        let mut invalid = vec![0; constraint.mask_len()];
+        for id in [0u32, 7, 31] { set_mask_bit(&mut invalid, id); }
+        blank.clear_late_grammar_placeholder_mask(&mut invalid);
+        assert!(invalid.iter().all(|&word| word == 0));
+        assert_eq!(constraint.lazy_dynamic_mask_vocab.get().is_some(), was_lazy);
         for prefix in ["", "X", "Xa", "Xa!"] {
             let mut state = constraint.start();
             state.commit_bytes(prefix.as_bytes()).unwrap();

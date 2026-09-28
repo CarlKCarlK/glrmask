@@ -2315,6 +2315,27 @@ impl BoundedCodeIntersectionOracle {
             }
         })
     }
+
+    /// Slice proofs also run on compact loaded oracles. Those intentionally
+    /// omit relation powers because the transferred backwards-DP table is an
+    /// exact replacement. Do not accidentally route such a proof through the
+    /// missing powers; unavailable proof data means decline the accelerator,
+    /// never interpret an unsupported query as a dead language.
+    fn has_future_for_slice_proof(
+        &mut self,
+        coordinate: BoundedCodeOracleCoordinate,
+        future: Option<&[BitSet]>,
+    ) -> Option<bool> {
+        if let Some(future) = future {
+            return self.has_future_with_boundary_table(coordinate, future);
+        }
+        let count = self.max.checked_add(1)?;
+        let bits = (usize::BITS - count.leading_zeros()) as usize;
+        if self.exact_powers.len() < bits || self.prefix_sums.len() < bits {
+            return None;
+        }
+        Some(self.has_future(coordinate))
+    }
 }
 
 /// Build only the finite one-token observation component for a certified
@@ -4640,6 +4661,10 @@ impl VirtualResidualRuntime {
             }
         }
 
+        // Compact loaded oracles transfer this exact backwards-liveness table
+        // instead of their relation powers. Direct-coordinate proofs must use
+        // the same representation-aware query as state-indexed slice proofs.
+        let body_boundary_future = store.body_boundary_future_by_completed.as_ref().map(Arc::clone);
         let oracle = store.liveness_oracle.as_mut()?;
         let mut future_cache = FxHashMap::<BoundedCodeOracleCoordinate, bool>::default();
         let mut seen = FxHashSet::<(u32, BoundedCodeOracleCoordinate)>::default();
@@ -4670,7 +4695,9 @@ impl VirtualResidualRuntime {
                 } else if let Some(&future) = future_cache.get(&target) {
                     future
                 } else {
-                    let future = oracle.has_future(target);
+                    let future = oracle.has_future_for_slice_proof(
+                        target, body_boundary_future.as_deref().map(Vec::as_slice),
+                    )?;
                     future_cache.insert(target, future);
                     future
                 };
@@ -5051,6 +5078,7 @@ impl VirtualResidualRuntime {
                 representatives.push(byte);
             }
         }
+        let body_boundary_future = store.body_boundary_future_by_completed.as_ref().map(Arc::clone);
         let oracle = store.liveness_oracle.as_mut()?;
         let mut future_cache = FxHashMap::<BoundedCodeOracleCoordinate, bool>::default();
         let mut seen = FxHashSet::<(u32, BoundedCodeOracleCoordinate)>::default();
@@ -5081,7 +5109,9 @@ impl VirtualResidualRuntime {
                 } else if let Some(&future) = future_cache.get(&target) {
                     future
                 } else {
-                    let future = oracle.has_future(target);
+                    let future = oracle.has_future_for_slice_proof(
+                        target, body_boundary_future.as_deref().map(Vec::as_slice),
+                    )?;
                     future_cache.insert(target, future);
                     future
                 };
@@ -5651,17 +5681,22 @@ impl VirtualResidualRuntime {
                 }
 
                 let target = oracle.step_coordinate(coordinate, byte);
-                let target_live = target.is_some_and(|target| {
+                let target_live = if let Some(target) = target {
                     if oracle.coordinate_accepting(target) {
                         true
                     } else if let Some(&future) = future_cache.get(&target) {
                         future
                     } else {
-                        let future = oracle.has_future(target);
+                        let future = oracle.has_future_for_slice_proof(
+                            target,
+                            body_boundary_future_by_completed.as_deref().map(Vec::as_slice),
+                        )?;
                         future_cache.insert(target, future);
                         future
                     }
-                });
+                } else {
+                    false
+                };
                 if !target_live {
                     first_counterexample = first_counterexample.min(shortest_complete_word);
                     continue;
@@ -5707,9 +5742,14 @@ impl VirtualResidualRuntime {
             return Some(true);
         }
         let coordinate = self.oracle_coordinate_for_state_locked(&store, state)?;
+        let body_boundary_future = store.body_boundary_future_by_completed.as_ref().map(Arc::clone);
         let result = 'proof: {
             let oracle = store.liveness_oracle.as_mut()?;
-            if oracle.coordinate_accepting(coordinate) || !oracle.has_future(coordinate) {
+            if oracle.coordinate_accepting(coordinate)
+                || !oracle.has_future_for_slice_proof(
+                    coordinate, body_boundary_future.as_deref().map(Vec::as_slice),
+                )?
+            {
                 break 'proof Some(false);
             }
 
@@ -5734,7 +5774,11 @@ impl VirtualResidualRuntime {
                     break 'proof Some(false);
                 }
                 for &target in &next {
-                    if oracle.coordinate_accepting(target) || !oracle.has_future(target) {
+                    if oracle.coordinate_accepting(target)
+                        || !oracle.has_future_for_slice_proof(
+                            target, body_boundary_future.as_deref().map(Vec::as_slice),
+                        )?
+                    {
                         break 'proof Some(false);
                     }
                 }

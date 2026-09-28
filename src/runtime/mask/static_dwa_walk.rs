@@ -14,7 +14,8 @@ pub(super) enum StackWalkEvent<W> {
 }
 
 /// Visit every accepting prefix of a top-first parser stack. `visit` returns
-/// false when its path mask becomes empty or a caller's planning budget ends.
+/// false when its path mask becomes empty, is fully accepted, or a caller's
+/// planning budget ends.
 /// In either case already-emitted contributions remain valid. Row providers
 /// own positive/domain/default-label lookup; the kernel never remaps IDs.
 #[inline(always)]
@@ -100,5 +101,69 @@ mod tests {
             },
         );
         assert_eq!(accepted, 0b101);
+    }
+
+    #[test]
+    fn full_final_shortcut_matches_literal_all_prefix_union() {
+        fn random(seed: &mut u64) -> u64 {
+            *seed ^= *seed << 13;
+            *seed ^= *seed >> 7;
+            *seed ^= *seed << 17;
+            *seed
+        }
+        let mut seed = 0x9e37_79b9_7f4a_7c15;
+        for case in 0..512 {
+            let depth = case % 65;
+            let stack: Vec<u32> = (0..depth as u32).collect();
+            let edges: Vec<u64> = (0..depth).map(|_| random(&mut seed) & 0xff).collect();
+            let finals: Vec<Option<u64>> = (0..=depth).map(|_| {
+                let bits = random(&mut seed);
+                match bits % 4 {
+                    0 => None,
+                    1 => Some(u64::MAX),
+                    _ => Some(bits & 0xff),
+                }
+            }).collect();
+            let top_accept = random(&mut seed) & 0xff;
+            let mut expected_union = 0;
+            let mut actual_union = 0;
+            // Different seeds model independently correlated path exclusions
+            // and lexer coordinates. Finishing one path never finishes all.
+            for path_seed in [0, 1, 0x55, 0xaa, 0xff] {
+                let mut expected_path = path_seed;
+                for index in 0..=depth {
+                    if let Some(final_weight) = finals[index] {
+                        expected_union |= expected_path & final_weight;
+                    }
+                    if index == depth { break; }
+                    if index == 0 { expected_union |= expected_path & top_accept; }
+                    expected_path &= edges[index];
+                }
+                let mut actual_path = path_seed;
+                walk_single_stack::<true, _>(
+                    0, &stack,
+                    |state| finals[state as usize],
+                    |state, parser| {
+                        assert_eq!(state, parser);
+                        Some((state + 1, edges[state as usize]))
+                    },
+                    |event| {
+                        match event {
+                            StackWalkEvent::Final(weight) => {
+                                actual_union |= actual_path & weight;
+                                return weight != u64::MAX;
+                            }
+                            StackWalkEvent::Top(_) => actual_union |= actual_path & top_accept,
+                            StackWalkEvent::Intersect(weight) => {
+                                actual_path &= weight;
+                                return actual_path != 0;
+                            }
+                        }
+                        true
+                    },
+                );
+                assert_eq!(actual_union, expected_union, "case={case} seed={path_seed}");
+            }
+        }
     }
 }

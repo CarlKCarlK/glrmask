@@ -649,6 +649,31 @@ fn shared_token_intersection(
     left: &SharedTokenSet,
     right: &SharedTokenSet,
 ) -> Option<SharedTokenSet> {
+    static MODE: Lazy<u8> = Lazy::new(|| {
+        token_intersection_mode(std::env::var("GLRMASK_EXPERIMENT_TOKEN_INTERSECTION").ok().as_deref())
+    });
+    match *MODE {
+        1 => shared_token_intersection_cached(left, right, false),
+        2 => shared_token_intersection_cached(left, right, true),
+        _ => shared_token_intersection_legacy(left, right),
+    }
+}
+
+fn token_intersection_mode(value: Option<&str>) -> u8 {
+    // The one-pass implementation preserves the legacy operand representative
+    // as well as the exact intersection. Keep the original algorithm available
+    // for differential tests and interleaved performance measurements.
+    match value {
+        None | Some("sweep") => 2,
+        Some("memo") => 1,
+        _ => 0,
+    }
+}
+
+fn shared_token_intersection_legacy(
+    left: &SharedTokenSet,
+    right: &SharedTokenSet,
+) -> Option<SharedTokenSet> {
     if same_shared_token_set(left, right) || left.as_ref().is_subset(right.as_ref()) {
         Some(Arc::clone(left))
     } else if right.as_ref().is_subset(left.as_ref()) {
@@ -663,6 +688,74 @@ fn shared_token_intersection(
         store_memoized_token_set_op(TokenSetOpKind::Intersection, left, right, &result);
         (!result.is_empty()).then_some(result)
     }
+}
+
+/// Intersect two canonical disjoint interval sequences in one merge pass.
+/// Cardinality identifies containment without a second traversal: A∩B is a
+/// subset of A and B, so equal finite cardinality proves equality. Arithmetic
+/// is u64, including the complete u32 token domain of size 2^32.
+fn intersect_token_ranges_once(left: &SharedTokenSet, right: &SharedTokenSet) -> SharedTokenSet {
+    let mut li = left.ranges();
+    let mut ri = right.ranges();
+    let mut l = li.next();
+    let mut r = ri.next();
+    let mut ranges = SmallVec::<[std::ops::RangeInclusive<u32>; 8]>::new();
+    let mut cardinality = 0_u64;
+    while let (Some(lr), Some(rr)) = (&l, &r) {
+        let start = (*lr.start()).max(*rr.start());
+        let end = (*lr.end()).min(*rr.end());
+        if start <= end {
+            ranges.push(start..=end);
+            cardinality += u64::from(end) - u64::from(start) + 1;
+        }
+        let left_end = *lr.end();
+        let right_end = *rr.end();
+        if left_end <= right_end { l = li.next(); }
+        if right_end <= left_end { r = ri.next(); }
+    }
+    if cardinality == left.len() {
+        Arc::clone(left)
+    } else if cardinality == right.len() {
+        Arc::clone(right)
+    } else if cardinality == 0 {
+        Arc::clone(&EMPTY_RANGESET)
+    } else {
+        shared_rangeset(RangeSetBlaze::from_sorted_disjoint(
+            CheckSortedDisjoint::new(ranges.into_iter()),
+        ))
+    }
+}
+
+fn shared_token_intersection_cached(
+    left: &SharedTokenSet,
+    right: &SharedTokenSet,
+    single_pass: bool,
+) -> Option<SharedTokenSet> {
+    // Preserve the established Some(empty) result for an empty operand.
+    if Arc::ptr_eq(left, right) || left.is_empty() { return Some(Arc::clone(left)); }
+    if right.is_empty() { return Some(Arc::clone(right)); }
+    if let Some(existing) = lookup_memoized_token_set_op(TokenSetOpKind::Intersection, left, right) {
+        // The memo key is commutative, but the old containment shortcut picks
+        // the current left allocation when the two sets are equal. Preserve
+        // that representative in O(1) so pointer-based graph sharing does not
+        // depend on which call direction populated the cache first.
+        if existing.len() == left.len() { return Some(Arc::clone(left)); }
+        if existing.len() == right.len() { return Some(Arc::clone(right)); }
+        return (!existing.is_empty()).then_some(existing);
+    }
+    let result = if single_pass {
+        intersect_token_ranges_once(left, right)
+    } else if left.len() <= right.len() && left.is_subset(right) {
+        Arc::clone(left)
+    } else if right.len() <= left.len() && right.is_subset(left) {
+        Arc::clone(right)
+    } else {
+        shared_rangeset(left.as_ref() & right.as_ref())
+    };
+    // Containment results are worth caching too: in large parser unions the
+    // same pair otherwise pays for the subset scan on every invocation.
+    store_memoized_token_set_op(TokenSetOpKind::Intersection, left, right, &result);
+    (!result.is_empty()).then_some(result)
 }
 
 fn shared_token_difference(
@@ -1386,43 +1479,38 @@ fn intersect_weight_with_index(sparse: &Weight, index: &WeightIntersectionIndex)
 
 struct CompactRangeBuilder {
     map: WeightMap,
-    pending_start: Option<u32>,
-    pending_end: u32,
-    pending_tokens: SharedTokenSet,
+    pending: Option<WeightRangeEntry>,
 }
 
 impl CompactRangeBuilder {
     fn new() -> Self {
         Self {
             map: WeightMap::new(),
-            pending_start: None,
-            pending_end: 0,
-            pending_tokens: Arc::clone(&EMPTY_RANGESET),
+            pending: None,
         }
     }
 
     fn push(&mut self, start: u32, end: u32, tokens: SharedTokenSet) {
-        match self.pending_start {
-            Some(_)
-                if self.pending_end.checked_add(1) == Some(start)
-                    && same_shared_token_set(&self.pending_tokens, &tokens) =>
+        match self.pending.as_mut() {
+            Some(pending)
+                if pending.end.checked_add(1) == Some(start)
+                    && same_shared_token_set(&pending.tokens, &tokens) =>
             {
-                self.pending_end = end;
+                pending.end = end;
             }
             _ => {
                 self.flush();
-                self.pending_start = Some(start);
-                self.pending_end = end;
-                self.pending_tokens = tokens;
+                self.pending = Some(WeightRangeEntry { start, end, tokens });
             }
         }
     }
 
     fn flush(&mut self) {
-        if let Some(start) = self.pending_start.take() {
-            let tokens = std::mem::replace(&mut self.pending_tokens, Arc::clone(&EMPTY_RANGESET));
+        // Move the owned pending value directly. An absent range needs no
+        // shared empty-set placeholder (and no refcount updates per flush).
+        if let Some(pending) = self.pending.take() {
             self.map
-                .extend_simple(std::iter::once((start..=self.pending_end, tokens)));
+                .extend_simple(std::iter::once((pending.start..=pending.end, pending.tokens)));
         }
     }
 

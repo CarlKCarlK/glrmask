@@ -512,7 +512,7 @@ pub(super) fn apply_single_path_reduce_chain_fast(
                     }
                 }
 
-                return (!out.is_empty()).then(|| ParserGSS::from_stacks(&out));
+                return (!out.is_empty()).then(|| materialize_reduce_chain_outputs(out));
             }
             _ => return None,
         }
@@ -543,4 +543,43 @@ pub(super) fn advance_terminal_match(
     let advanced = apply_future_terminal_disallow(constraint, exec_result, terminal, advanced);
     terminal_result_cache.insert(terminal, advanced.clone());
     (!advanced.is_empty()).then_some(advanced)
+}
+
+/// Preserve a uniform reduction result's shared bottom-of-stack prefix.
+/// Rebuilding the entire concrete-stack trie repeats work for each retained
+/// value, although every output has the same accumulator and usually differs
+/// only in its final one or two states. Mixed accumulators retain the general
+/// builder: exclusions must never be detached from their particular paths.
+pub(super) fn materialize_reduce_chain_outputs(
+    mut outputs: Vec<(Vec<u32>, TerminalsDisallowed)>,
+) -> ParserGSS {
+    if outputs.len() == 1 {
+        let (stack, accumulator) = outputs.pop().unwrap();
+        return ParserGSS::from_single_stack(stack, accumulator);
+    }
+    let Some((first, accumulator)) = outputs.first() else {
+        return ParserGSS::empty();
+    };
+    if outputs.iter().any(|(_, other)| other != accumulator) {
+        return ParserGSS::from_stacks(&outputs);
+    }
+    let mut shared = first.len();
+    for (stack, _) in outputs.iter().skip(1) {
+        shared = first[..shared].iter().zip(stack).take_while(|(a, b)| a == b).count();
+    }
+    if shared == 0 {
+        return ParserGSS::from_stacks(&outputs);
+    }
+
+    let base = ParserGSS::from_single_stack(first[..shared].to_vec(), accumulator.clone());
+    let accepts_prefix = outputs.iter().any(|(stack, _)| stack.len() == shared);
+    if outputs.iter().all(|(stack, _)| stack.len() == shared) {
+        return base;
+    }
+    let branches = base.apply_shared_pop_push_branches(
+        0,
+        outputs.iter().filter(|(stack, _)| stack.len() > shared)
+            .map(|(stack, _)| &stack[shared..]),
+    ).expect("a nonempty single-stack prefix admits every nonempty suffix");
+    if accepts_prefix { base.merge(&branches) } else { branches }
 }

@@ -268,6 +268,10 @@ use templates::{
 #[cfg(test)]
 #[allow(deprecated)]
 pub(crate) use link::{
-    compose_constraints, compose_constraints_owned_parent_segmented_hybrid,
+    compose_constraints,
     compose_constraints_owned_parent_shared, load_vocab,
 };
+
+#[cfg(any(test, feature = "internal-api"))]
+#[allow(deprecated)]
+pub(crate) use link::compose_constraints_owned_parent_segmented_hybrid;

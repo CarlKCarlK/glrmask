@@ -3,8 +3,7 @@
 //! This implementation intentionally does not consult the parser DWA. It walks
 //! the vocabulary byte trie while advancing the lexer and GLR parser directly.
 
-use std::sync::Arc;
-use std::sync::OnceLock;
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 use std::hash::{Hash, Hasher};
 
@@ -222,6 +221,19 @@ trait FullWalkTransitionTable {
 
     fn root_state(&mut self, state: u32) -> Result<u32, String>;
 
+    /// Some lazy transition adapters retain an error until their caller can
+    /// return a Result. A mask must be validated before cache publication.
+    #[inline]
+    fn validate_mask_result(&mut self) -> Result<(), String> { Ok(()) }
+
+    /// Optional exact/overapproximating input projection supplied by the
+    /// transition provider. The byte walker and endpoint checks are unchanged.
+    /// Implementations must preserve all admitted continuations of `parser`.
+    #[inline]
+    fn root_state_for_parser(&mut self, state: u32, _parser: &ParserStacks) -> Result<u32, String> {
+        self.root_state(state)
+    }
+
     #[inline(always)]
     fn walk_initial_state(
         &mut self,
@@ -301,6 +313,12 @@ trait FullWalkTransitionTable {
     /// every radix prefix, so enable it by default for that provider only.
     #[inline(always)]
     fn parser_conditioned_dead_skip_default(&self) -> bool { false }
+
+    /// Output-only pruning: skip a subtree only when all its original aliases
+    /// are already present in the caller's mask. Never publish partial results
+    /// in a cache keyed only by the vocabulary and parser state.
+    #[inline(always)]
+    fn pre_admitted_original_mask(&self) -> Option<&[u32]> { None }
 
     #[inline(always)]
     fn product_transition_cache_capacity(&self) -> usize { 0 }
@@ -657,6 +675,9 @@ struct RecursiveFullWalkTransitions<'a> {
     token_boundary_cache: FxHashMap<(u32, u32), bool>,
     parser_advance_cache: FxHashMap<(u32, TerminalID), SmallVec<[(u32, u32); 4]>>,
     parser_canonicalizer: RecursiveParserCanonicalizer,
+    parser_gss_cache: Vec<Option<ParserGSS>>,
+    cache_parser_gss: bool,
+    pre_admitted_original_mask: Option<&'a [u32]>,
 }
 
 
@@ -673,7 +694,12 @@ struct RecursiveParserSemanticCache {
 
 impl RecursiveParserCanonicalizer {
     fn intern(&mut self, stacks: ParserStacks, cache: &mut FullWalkParserCache) -> u32 {
-        self.intern_with_threshold(stacks, cache, 32)
+        static THRESHOLD: OnceLock<usize> = OnceLock::new();
+        let threshold = *THRESHOLD.get_or_init(|| {
+            std::env::var("GLRMASK_PROFILE_PARSER_INTERN_THRESHOLD").ok()
+                .and_then(|v| v.parse().ok()).unwrap_or(32)
+        });
+        self.intern_with_threshold(stacks, cache, threshold)
     }
 
     fn intern_with_threshold(
@@ -716,6 +742,14 @@ impl RecursiveParserCanonicalizer {
 }
 
 impl<'a> RecursiveFullWalkTransitions<'a> {
+    fn parser_gss(&mut self, node: u32, cache: &FullWalkParserCache) -> ParserGSS {
+        if !self.cache_parser_gss { return with_empty_accumulators(&cache.nodes[node as usize].gss); }
+        self.parser_gss_cache.resize_with(cache.nodes.len(), || None);
+        self.parser_gss_cache[node as usize].get_or_insert_with(|| {
+            with_empty_accumulators(&cache.nodes[node as usize].gss)
+        }).clone()
+    }
+
     fn new(constraint: &'a Constraint) -> Option<Self> {
         let provider = Self::new_for_parser_routing(constraint)?;
         provider.leaves.iter().all(|leaf| {
@@ -749,6 +783,9 @@ impl<'a> RecursiveFullWalkTransitions<'a> {
             token_boundary_cache: FxHashMap::default(),
             parser_advance_cache: FxHashMap::default(),
             parser_canonicalizer: RecursiveParserCanonicalizer::default(),
+            parser_gss_cache: Vec::new(),
+            cache_parser_gss: env_flag("GLRMASK_PROFILE_PARSER_ACC_CACHE", true),
+            pre_admitted_original_mask: None,
 
         })
     }
@@ -920,8 +957,7 @@ impl FullWalkTransitionTable for RecursiveFullWalkTransitions<'_> {
             .iter_ones()
             .any(|terminal| constraint.recursive_terminal_is_ignore(terminal as u32));
         let allowed = ignored || {
-            let parser_gss =
-                with_empty_accumulators(&parser_cache.nodes[parser_node as usize].gss);
+            let parser_gss = self.parser_gss(parser_node, parser_cache);
             constraint
                 .compact_segmented_parser_may_advance_on_any(&parser_gss, &future)
                 .unwrap_or(false)
@@ -941,6 +977,8 @@ impl FullWalkTransitionTable for RecursiveFullWalkTransitions<'_> {
         let leaf = &self.leaves[index];
         leaf.constraint.ignore_terminal == Some(terminal - leaf.terminal_offset)
     }
+
+    fn pre_admitted_original_mask(&self) -> Option<&[u32]> { self.pre_admitted_original_mask }
 
     #[inline(always)]
     fn uses_scoped_reset_routing(&self) -> bool { true }
@@ -972,9 +1010,7 @@ impl FullWalkTransitionTable for RecursiveFullWalkTransitions<'_> {
             return cached.clone();
         }
 
-        let parser_gss = with_empty_accumulators(
-            &parser_cache.nodes[parser_node as usize].gss,
-        );
+        let parser_gss = self.parser_gss(parser_node, parser_cache);
         let advanced = if constraint.recursive_terminal_is_ignore(terminal) {
             // Exact recursive commit closes zero-width CALL/RETURN controls
             // before deciding which leaf owns the tokenizer reset for an
@@ -1455,6 +1491,11 @@ impl FullWalkConfigTransitions<'_, '_> {
 impl FullWalkTransitionTable for FullWalkConfigTransitions<'_, '_> {
     type Cell = FullWalkConfigCell;
 
+    fn validate_mask_result(&mut self) -> Result<(), String> {
+        self.error.as_ref().map_or(Ok(()), |error| Err(error.clone()))
+    }
+
+
     #[inline(always)]
     fn cell(&mut self, state: u32, byte: u8) -> Self::Cell {
         const UNKNOWN: u64 = u64::MAX;
@@ -1890,6 +1931,10 @@ impl FullWalkTransitionTable for FullWalkConfigTransitions<'_, '_> {
         state: u32,
         terminal: TerminalID,
     ) -> Option<SmallVec<[VirtualResidualDirectCoordinate; 4]>> {
+        // A guard can reach a hot scalar alias after its original virtual
+        // residual dies. As in every other metadata query, translate that
+        // alias before treating the ID as a raw-state/subset coordinate.
+        let state = self.generic_config_for_state(state);
         let tokenizer = self.cache.tokenizer();
         let mut direct = SmallVec::<[VirtualResidualDirectCoordinate; 4]>::new();
         for index in 0..self.cache.config_len(state) {
@@ -3635,18 +3680,62 @@ fn full_walk_step_many_state<T: FullWalkTransitionTable>(
 
 
 
-/// Exact direct dynamic-mask path for the complete vocabulary.
-///
-/// This deliberately performs the complete vocabulary walk. It does not use
-/// subtree certificates, segment-effect caches, recognizer-state interning, or
-/// any other mechanism that can omit vocabulary edges. Deterministic lexers use
-/// dense Flat16/Flat32 rows when available. Epsilon-NFA and oversized/sparse
-/// coordinates use the same walk over lazily interned runtime configurations.
-/// The same complete walk is also used for composed constraints. Composition
-/// callers that already hold a static A baseline compute the complete exact
-/// dynamic language into scratch and combine it after the walk; the walker
-/// itself therefore does not need the legacy `repair_used`/component tracking
-/// that existed solely to traverse B-minus-A.
+/// The exact accelerators are default-on. This diagnostic retains the
+/// reference executor without rebuilding or changing the compiled language.
+#[inline]
+fn full_walk_acceleration_enabled() -> bool {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| !std::env::var("GLRMASK_DISABLE_FULL_WALK_ACCELERATION")
+        .ok().is_some_and(|value| matches!(value.trim().to_ascii_lowercase().as_str(),
+            "1" | "true" | "yes" | "on")))
+}
+
+/// Scheduling choice only: both executors retain the complete
+/// lexer/parser/guard correlation. The shared walk advances pending guards
+/// through each candidate byte; the factored walk subtracts the same rejected
+/// words afterwards. Keep the established single-root and large-frontier paths.
+fn joint_initial_guard_walk_enabled(roots: &DynamicBranches) -> bool {
+    // Scope fixtures deliberately exercise the factored-root path even when
+    // a full-suite environment enables joint execution globally. Keep this
+    // override thread-local; parallel tests must not mutate process settings.
+    #[cfg(test)]
+    if TEST_ROOT_OUTPUT_SCOPE_FORCE.with(|enabled| enabled.get()) { return false; }
+    (2..=8).contains(&roots.len())
+        && full_walk_acceleration_enabled()
+        && joint_initial_guard_shape_profitable(
+            roots.len(), roots.iter().any(|root| root.parser_filtered_transparent),
+        )
+}
+
+#[inline]
+fn joint_initial_guard_shape_profitable(root_count: usize, has_transparent_root: bool) -> bool {
+    // A root narrowed by exact parser admission has a dedicated transparent
+    // execution path. Factoring its token-start exclusion preserves that
+    // shortcut; merging it into a guarded generic frontier can turn a cheap
+    // filtered walk into a full-vocabulary traversal. This is a scheduling
+    // choice only: both routes preserve each root's correlated exclusions.
+    (2..=8).contains(&root_count) && !has_transparent_root
+}
+
+#[cfg(test)]
+mod joint_root_scheduling_tests {
+    use super::joint_initial_guard_shape_profitable;
+
+    #[test]
+    fn preserves_transparent_root_specialization_without_grammar_name_exceptions() {
+        for count in 0..=16 {
+            assert_eq!(joint_initial_guard_shape_profitable(count, false), (2..=8).contains(&count));
+            assert!(!joint_initial_guard_shape_profitable(count, true));
+        }
+    }
+}
+
+/// Compute the complete dynamic mask, preserving correlated parser, lexer and
+/// maximal-munch state. Bounded mask-local memoization only reuses exact states;
+/// subtree shortcuts require either a complete-state identity proof or an
+/// explicit output responsibility that the enclosing union will enforce.
+/// Every declined proof or exhausted cache falls back to ordinary traversal.
+/// Dense and lazy lexer providers share the same authoritative byte executor.
 fn try_full_walk_mask(
     state: &ConstraintState<'_>,
     vocab: &DynamicMaskVocab,
@@ -3655,6 +3744,32 @@ fn try_full_walk_mask(
     lexer_scan_cache: &mut DynamicNfaScanCache<'_>,
     buf: &mut [u32],
 ) -> Result<bool, String> {
+    try_full_walk_mask_in_output_scope(
+        state, vocab, trie, root_branches, lexer_scan_cache, buf, None,
+    )
+}
+
+#[cfg(test)]
+std::thread_local! {
+    static TEST_ROOT_OUTPUT_SCOPE_FORCE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+fn root_output_scope_enabled() -> bool {
+    #[cfg(test)]
+    if TEST_ROOT_OUTPUT_SCOPE_FORCE.with(|enabled| enabled.get()) { return true; }
+    full_walk_acceleration_enabled()
+}
+
+fn try_full_walk_mask_in_output_scope(
+    state: &ConstraintState<'_>,
+    vocab: &DynamicMaskVocab,
+    trie: &DynamicMaskTrie,
+    root_branches: &DynamicBranches,
+    lexer_scan_cache: &mut DynamicNfaScanCache<'_>,
+    buf: &mut [u32],
+    ignored_output: Option<&[u32]>,
+) -> Result<bool, String> {
+    debug_assert!(ignored_output.is_none_or(|mask| mask.len() == buf.len()));
     if root_branches.is_empty() {
         buf.fill(0);
         update_special_token_mask(state, buf);
@@ -3675,10 +3790,27 @@ fn try_full_walk_mask(
     if root_branches
         .iter()
         .any(|branch| !branch.initial_prune_guard.is_passed())
+        && !joint_initial_guard_walk_enabled(root_branches)
     {
+        let guarded_root_diagnostic = std::env::var("GLRMASK_DIAG_GUARDED_ROOT_GENERATION")
+            .ok().and_then(|v| v.parse::<u64>().ok()) == Some(state.generation);
+        if guarded_root_diagnostic {
+            for (index, branch) in root_branches.iter().enumerate() {
+                let memories = match &branch.initial_prune_guard {
+                    InitialPruneGuard::Passed => &[][..],
+                    InitialPruneGuard::Pending { memories } => memories.as_ref(),
+                };
+                eprintln!("[glrmask/profile][guarded_root] generation={} index={} config={} exact={:?} gss={} filtered={} transparent={} memories={:?}",
+                    state.generation, index, branch.tokenizer_config,
+                    branch.exact_tokenizer_state, branch.gss.ptr_key(),
+                    branch.parser_filtered_root, branch.parser_filtered_transparent, memories);
+            }
+        }
         let mut merged = vec![0u32; buf.len()];
         let mut scratch = vec![0u32; buf.len()];
-        for branch in root_branches {
+        let scope_enabled = root_output_scope_enabled();
+        let mut scope_mask = if scope_enabled { vec![0u32; buf.len()] } else { Vec::new() };
+        for (root_index, branch) in root_branches.iter().enumerate() {
             scratch.fill(0);
             let blocked = branch
                 .initial_prune_guard
@@ -3687,13 +3819,32 @@ fn try_full_walk_mask(
             let mut unguarded = branch.clone();
             unguarded.initial_prune_guard = InitialPruneGuard::Passed;
             one.push(unguarded);
-            if !try_full_walk_mask(
+            let scoped_output = if scope_enabled && !branch.parser_filtered_transparent {
+                let mut ignored_bits = 0usize;
+                for (index, word) in scope_mask.iter_mut().enumerate() {
+                    *word = merged[index]
+                        | blocked.as_ref().and_then(|mask| mask.get(index)).copied().unwrap_or(0)
+                        | ignored_output.and_then(|mask| mask.get(index)).copied().unwrap_or(0);
+                    ignored_bits += word.count_ones() as usize;
+                }
+                // Skip the index setup when little output is redundant. Tests
+                // exercise the same exact algorithm on tiny vocabularies.
+                let minimum = if cfg!(test) { 0 } else { buf.len().saturating_mul(8) };
+                (ignored_bits >= minimum).then_some(scope_mask.as_slice())
+            } else {
+                ignored_output
+            };
+            // Only this union owns a partial-output contract. Bits already in
+            // `merged` cannot alter its union; blocked bits are removed below.
+            // All other callers keep the ordinary complete-mask interface.
+            if !try_full_walk_mask_in_output_scope(
                 state,
                 vocab,
                 trie,
                 &one,
                 lexer_scan_cache,
                 &mut scratch,
+                scoped_output,
             )? {
                 return Ok(false);
             }
@@ -3701,6 +3852,14 @@ fn try_full_walk_mask(
                 for (word, &blocked) in scratch.iter_mut().zip(blocked.iter()) {
                     *word &= !blocked;
                 }
+            }
+            if guarded_root_diagnostic {
+                let allowed: u32 = scratch.iter().map(|word| word.count_ones()).sum();
+                let previous: u32 = merged.iter().map(|word| word.count_ones()).sum();
+                let new: u32 = scratch.iter().zip(merged.iter())
+                    .map(|(&incoming, &old)| (incoming & !old).count_ones()).sum();
+                eprintln!("[glrmask/profile][guarded_root_output] generation={} index={} allowed={} previous={} new={}",
+                    state.generation, root_index, allowed, previous, new);
             }
             for (dst, &word) in merged.iter_mut().zip(&scratch) {
                 *dst |= word;
@@ -3750,6 +3909,7 @@ fn try_full_walk_mask(
             transitions32,
             finalizer_code,
             single_finalizer_continues,
+            ignored_output,
         )?;
         if used {
             #[cfg(test)]
@@ -5455,8 +5615,13 @@ fn try_full_walk_mask_with_table<
     let condition_initial_only = *CONDITION_CONFIG_SCALAR_INITIAL_ONLY.get_or_init(|| {
         std::env::var_os("GLRMASK_EXPERIMENT_CONFIG_SCALAR_CONDITIONED_INITIAL_ONLY").is_some()
     });
+    static SKIP_PREFIX_PROBES: OnceLock<bool> = OnceLock::new();
+    let skip_prefix_probes = *SKIP_PREFIX_PROBES.get_or_init(|| {
+        std::env::var_os("GLRMASK_PROFILE_SKIP_PREFIX_PROBES").is_some()
+    });
     let condition_walk_enabled = condition_config_scalar
-        && (!condition_initial_only || state.generation == 0);
+        && (!condition_initial_only || state.generation == 0) && !skip_prefix_probes;
+    let condition_dead_skip = condition_dead_skip && !skip_prefix_probes;
     loop {
         if sparse_positive_rebuild {
             let current_op = walk_ops.len() - remaining_ops.as_slice().len();
@@ -5477,6 +5642,17 @@ fn try_full_walk_mask_with_table<
         };
         let parent_depth = op.parent_depth() as usize;
         if op.starts_edge() {
+            if let Some(already) = transitions.pre_admitted_original_mask() {
+                let op_index = walk_ops.len() - remaining_ops.as_slice().len() - 1;
+                let (child, _) = trie.full_walk_dead_subtree(op_index);
+                if vocab.subtree_original_tokens_for(trie, child).iter().all(|&id| {
+                    already.get(id as usize / 32).is_some_and(|&w| w & (1 << (id % 32)) != 0)
+                }) {
+                    full_walk_skip_admitted_subtree_generic(trie, walk_ops,
+                        &mut remaining_ops, &mut token_marker_index);
+                    continue;
+                }
+            }
             scalar_lexer = unsafe { *stack_lexer.get_unchecked(parent_depth) };
             first_match_direct = unsafe { *stack_first_match_direct.get_unchecked(parent_depth) };
             parser_transparent = unsafe { *stack_parser_transparent.get_unchecked(parent_depth) };
@@ -6870,6 +7046,12 @@ struct DynamicConfigExecResult {
     matches: Vec<TokenizerMatch>,
 }
 
+fn dynamic_use_cached_topology() -> bool {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| std::env::var("GLRMASK_DYNAMIC_USE_CACHED_TOPOLOGY")
+        .is_ok_and(|value| matches!(value.as_str(), "1" | "true")))
+}
+
 impl<'a> DynamicNfaScanCache<'a> {
     #[inline]
     fn raw_config(state: u32) -> u32 {
@@ -6919,7 +7101,17 @@ impl<'a> DynamicNfaScanCache<'a> {
             constraint,
             tokenizer,
             use_constraint_fast_transitions,
-            deterministic: !tokenizer.has_epsilon_transitions(),
+            deterministic: !if use_constraint_fast_transitions && dynamic_use_cached_topology() {
+                // This is the exact same tokenizer as the immutable
+                // constraint's fast-transition view. Compile/load already
+                // computed its topology; rescanning every row for each
+                // short-lived scan cache is unnecessary.
+                constraint.tokenizer_has_epsilon_transitions
+            } else {
+                // A projection tokenizer can differ from the constraint's
+                // source. Never use the source flag for that coordinate.
+                tokenizer.has_epsilon_transitions()
+            },
             subset_union_requested: false,
             deadline,
             max_collection_items: deadline.map(|_| 5_000_000),
@@ -8485,7 +8677,7 @@ fn cmp_transient_entries(
             (Some(pa), Some(pb)) => {
                 let slice_a = &arena[pa.arena_start as usize..pa.arena_end as usize];
                 let slice_b = &arena[pb.arena_start as usize..pb.arena_end as usize];
-                match slice_a.iter().rev().cmp(slice_b.iter().rev()) {
+                match slice_a.cmp(slice_b) {
                     std::cmp::Ordering::Equal => {}
                     non_eq => return non_eq,
                 }
@@ -8508,15 +8700,10 @@ impl DynamicMaskLookupScratch {
             paths.len().hash(&mut hasher);
             for path in paths {
                 let slice = &self.stack_arena[path.arena_start as usize..path.arena_end as usize];
-                if slice.len() <= 32 {
-                    let mut rev = SmallVec::<[u32; 32]>::new();
-                    rev.extend(slice.iter().rev().copied());
-                    rev.as_slice().hash(&mut hasher);
-                } else {
-                    let mut rev = slice.to_vec();
-                    rev.reverse();
-                    rev.as_slice().hash(&mut hasher);
-                }
+                // Traversal already supplies top-first values. Cache keys are
+                // in-memory only: preserve this exact order in owned keys too,
+                // avoiding a temporary reversed allocation for every deep path.
+                slice.hash(&mut hasher);
                 path.acc.len().hash(&mut hasher);
                 for (state, terminals) in path.acc.iter() {
                     state.hash(&mut hasher);
@@ -8551,7 +8738,7 @@ impl DynamicMaskLookupScratch {
                 if slice.len() != stored_path.0.len() {
                     return false;
                 }
-                if !slice.iter().rev().eq(stored_path.0.iter()) {
+                if slice != stored_path.0.as_slice() {
                     return false;
                 }
                 if path.acc.len() != stored_path.1.len() {
@@ -8587,8 +8774,7 @@ impl DynamicMaskLookupScratch {
             let mut owned_paths = Vec::with_capacity(paths.len());
             for path in paths {
                 let slice = &self.stack_arena[path.arena_start as usize..path.arena_end as usize];
-                let mut stack = slice.to_vec();
-                stack.reverse();
+                let stack = slice.to_vec();
                 let mut exclusion_entries = Vec::with_capacity(path.acc.len());
                 for (excluded_state, terminals) in path.acc.iter() {
                     let term_vec = terminals.iter().copied().collect::<Vec<_>>();
@@ -8605,13 +8791,19 @@ impl DynamicMaskLookupScratch {
 fn dynamic_mask_lookup_query(
     state: &ConstraintState<'_>,
 ) -> Option<(u64, DynamicMaskLookupScratch)> {
+    dynamic_mask_lookup_query_for_vocab(state, state.constraint.dynamic_mask_vocab_for_runtime())
+}
+
+fn dynamic_mask_lookup_query_for_vocab(
+    state: &ConstraintState<'_>,
+    vocab: &DynamicMaskVocab,
+) -> Option<(u64, DynamicMaskLookupScratch)> {
     let mut remaining = DYNAMIC_MASK_CACHE_MAX_STACKS;
     let mut scratch = DynamicMaskLookupScratch {
         stack_arena: SmallVec::new(),
         paths: SmallVec::new(),
         entries: SmallVec::new(),
     };
-    let vocab = state.constraint.dynamic_mask_vocab_for_runtime();
     let recursive = state.constraint.uses_compact_segmented_parser_runtime();
     let virtual_dense_cache_enabled = !recursive && env_flag(
         "GLRMASK_EXPERIMENT_DYNAMIC_VIRTUAL_DENSE_CACHE_KEY",
@@ -8656,7 +8848,7 @@ fn dynamic_mask_lookup_query(
             scratch.paths[path_start as usize..path_end as usize].sort_unstable_by(|a, b| {
                 let slice_a = &scratch.stack_arena[a.arena_start as usize..a.arena_end as usize];
                 let slice_b = &scratch.stack_arena[b.arena_start as usize..b.arena_end as usize];
-                slice_a.iter().rev().cmp(slice_b.iter().rev())
+                slice_a.cmp(slice_b)
                     .then_with(|| cmp_terminals_disallowed(&a.acc, &b.acc))
             });
         }
@@ -8803,8 +8995,33 @@ pub(crate) fn try_fill_recursive_mask_shared(
     let (mask, tail) = buf.split_at_mut(required);
     tail.fill(0);
     let vocab = state.constraint.dynamic_mask_vocab_for_runtime();
+    try_fill_recursive_mask_with_vocab(state, mask, vocab)
+}
+
+/// Shared exact mask entry point. Vocabulary selection is independent of the
+/// transition provider and the hot full-walk implementation. The persistent
+/// cache belongs to this immutable vocabulary/binding, never to a global ID set.
+fn try_fill_recursive_mask_with_vocab(
+    state: &ConstraintState<'_>, mask: &mut [u32], vocab: &DynamicMaskVocab,
+) -> Result<bool, String> {
+    with_recursive_vocab_mask_cache(state, mask, vocab, |mask| {
+        let filled = if let Some(mut transitions) = RecursiveFullWalkTransitions::new(state.constraint) {
+            fill_recursive_mask_using_vocab(state, mask, &mut transitions, vocab)?
+        } else {
+            recursive_provider::fill_with_vocab(state, mask, vocab)?
+        };
+        Ok(filled)
+    })
+}
+
+fn with_recursive_vocab_mask_cache(
+    state: &ConstraintState<'_>,
+    mask: &mut [u32],
+    vocab: &DynamicMaskVocab,
+    evaluate: impl FnOnce(&mut [u32]) -> Result<bool, String>,
+) -> Result<bool, String> {
     let lookup_query = recursive_persistent_mask_cache_enabled()
-        .then(|| dynamic_mask_lookup_query(state))
+        .then(|| dynamic_mask_lookup_query_for_vocab(state, vocab))
         .flatten();
     if let Some((hash, ref query)) = lookup_query
         && vocab.copy_cached_mask_with_predicate(
@@ -8819,11 +9036,7 @@ pub(crate) fn try_fill_recursive_mask_shared(
     let started = lookup_query
         .as_ref()
         .map(|_| std::time::Instant::now());
-    let filled = if let Some(mut transitions) = RecursiveFullWalkTransitions::new(state.constraint) {
-        fill_recursive_mask_using(state, mask, &mut transitions)?
-    } else {
-        recursive_provider::fill(state, mask)?
-    };
+    let filled = evaluate(mask)?;
     if filled
         && let Some((hash, ref query)) = lookup_query
     {
@@ -8847,7 +9060,12 @@ fn fill_recursive_mask_using<T: FullWalkTransitionTable>(
     let (buf, tail) = buf.split_at_mut(required);
     tail.fill(0);
     let vocab = state.constraint.dynamic_mask_vocab_for_runtime();
-    let trie = vocab.trie.as_ref();
+    fill_recursive_mask_using_vocab(state, buf, transitions, vocab)
+}
+
+fn prepare_recursive_mask_roots<T: FullWalkTransitionTable>(
+    state: &ConstraintState<'_>, transitions: &mut T,
+) -> Result<DynamicBranches, String> {
     let mut roots = DynamicBranches::new();
     for (&lexer_state, gss) in state.state.iter() {
         for (stacks, terminals_disallowed) in gss.partition_by_accumulator() {
@@ -8858,7 +9076,7 @@ fn fill_recursive_mask_using<T: FullWalkTransitionTable>(
                 parser_filtered_root: false,
                 parser_filtered_transparent: false,
                 residual_continuation_terminal: None,
-                tokenizer_config: transitions.root_state(lexer_state)?,
+                tokenizer_config: transitions.root_state_for_parser(lexer_state, &stacks)?,
                 // Scoped recursive states are not source states of the outer
                 // tokenizer. Keeping this None also disables ordinary-only
                 // residual/slice proofs until provider-native proofs exist.
@@ -8871,6 +9089,26 @@ fn fill_recursive_mask_using<T: FullWalkTransitionTable>(
             });
         }
     }
+    Ok(roots)
+}
+
+fn fill_recursive_mask_using_vocab<T: FullWalkTransitionTable>(
+    state: &ConstraintState<'_>, buf: &mut [u32], transitions: &mut T,
+    vocab: &DynamicMaskVocab,
+) -> Result<bool, String> {
+    let roots = prepare_recursive_mask_roots(state, transitions)?;
+    fill_recursive_mask_using_roots(state, buf, transitions, vocab, &roots)
+}
+
+fn fill_recursive_mask_using_roots<T: FullWalkTransitionTable>(
+    state: &ConstraintState<'_>, buf: &mut [u32], transitions: &mut T,
+    vocab: &DynamicMaskVocab, roots: &DynamicBranches,
+) -> Result<bool, String> {
+    let required = state.constraint.body_mask_len();
+    assert!(buf.len() >= required, "mask buffer is smaller than constraint mask");
+    let (buf, tail) = buf.split_at_mut(required);
+    tail.fill(0);
+    let trie = vocab.trie.as_ref();
     if roots.is_empty() {
         buf.fill(0);
         update_special_token_mask(state, buf);
@@ -8882,7 +9120,7 @@ fn fill_recursive_mask_using<T: FullWalkTransitionTable>(
             state,
             vocab,
             trie,
-            &roots,
+            roots,
             buf,
             transitions,
         )
@@ -8891,7 +9129,7 @@ fn fill_recursive_mask_using<T: FullWalkTransitionTable>(
             state,
             vocab,
             trie,
-            &roots,
+            roots,
             buf,
             transitions,
         )
@@ -8911,6 +9149,384 @@ fn fill_recursive_mask_using<T: FullWalkTransitionTable>(
         state.clear_late_grammar_placeholder_mask(buf);
     }
     Ok(filled)
+}
+
+/// Necessary byte-domain metadata; an absent summary means the candidate
+/// set includes special/zero-byte semantics and cannot use this byte-only proof.
+#[derive(Clone, Debug)]
+struct PureMaskByteDomain {
+    heads: [u64; 4],
+    one_byte_heads: [u64; 4],
+    second_bytes: Option<Box<[[u64; 4]]>>,
+    max_token_len: usize,
+}
+
+impl PureMaskByteDomain {
+    fn for_ids(constraint: &Constraint, ids: &[u32]) -> Option<Self> {
+        static DEPTH: OnceLock<usize> = OnceLock::new();
+        let depth = *DEPTH.get_or_init(|| std::env::var("GLRMASK_PREPARED_VOCAB_PREFLIGHT_PREFIX_BYTES")
+            .ok().and_then(|value| value.parse::<usize>().ok()).unwrap_or(2).clamp(1, 2));
+        Self::for_ids_with_depth(constraint, ids, depth)
+    }
+
+    fn for_ids_with_depth(constraint: &Constraint, ids: &[u32], depth: usize) -> Option<Self> {
+        let mut result = Self { heads: [0; 4], one_byte_heads: [0; 4],
+            second_bytes: (depth >= 2).then(|| vec![[0u64; 4]; 256].into_boxed_slice()),
+            max_token_len: 0 };
+        for &id in ids {
+            if constraint.has_special_token_id(id) { return None; }
+            let bytes = constraint.token_bytes_for_id(id)?;
+            let &first = bytes.first()?;
+            result.heads[first as usize / 64] |= 1u64 << (first % 64);
+            result.max_token_len = result.max_token_len.max(bytes.len());
+            if let Some(&second) = bytes.get(1) {
+                if let Some(table) = result.second_bytes.as_mut() {
+                    table[first as usize][second as usize / 64] |= 1u64 << (second % 64);
+                }
+            } else {
+                result.one_byte_heads[first as usize / 64] |= 1u64 << (first % 64);
+            }
+        }
+        Some(result)
+    }
+}
+
+/// Prepare the SAME provider roots as ordinary masking and prove an empty
+/// byte language before asking for an expensive vocabulary. A live first byte
+/// retains the provider caches and uses the existing shared byte walker.
+fn fill_pure_byte_mask_using_factory<T, V, F>(
+    state: &ConstraintState<'_>, buf: &mut [u32], transitions: &mut T,
+    domain: PureMaskByteDomain, factory: F,
+) -> Result<bool, String>
+where
+    T: FullWalkTransitionTable,
+    V: std::ops::Deref<Target = DynamicMaskVocab>,
+    F: FnOnce() -> Result<V, String>,
+{
+    let roots = prepare_recursive_mask_roots(state, transitions)?;
+    let mut live_head = false;
+    'roots: for root in &roots {
+        // Ignoring the initial prune guard is a safe overapproximation. Its
+        // exact original value remains attached when the full walk runs.
+        for (word_index, &word) in domain.heads.iter().enumerate() {
+            let mut bits = word;
+            while bits != 0 {
+                let bit = bits.trailing_zeros();
+                bits &= bits - 1;
+                let byte = (word_index * 64 + bit as usize) as u8;
+                let target = transitions.transition(root.tokenizer_config, byte);
+                if target == u32::MAX { continue; }
+                // Never interpret parser effects here. A one-byte candidate
+                // or ANY finalizer after the first byte declines the optional
+                // second-byte proof and uses the ordinary shared walker.
+                let Some(second_bytes) = domain.second_bytes.as_ref() else {
+                    live_head = true; break 'roots;
+                };
+                if domain.one_byte_heads[word_index] & (1u64 << bit) != 0
+                    || transitions.finalizer_code(target) != u32::MAX
+                { live_head = true; break 'roots; }
+                for (second_word_index, &second_word) in second_bytes[byte as usize].iter().enumerate() {
+                    let mut seconds = second_word;
+                    while seconds != 0 {
+                        let next_bit = seconds.trailing_zeros(); seconds &= seconds - 1;
+                        let next_byte = (second_word_index * 64 + next_bit as usize) as u8;
+                        if transitions.transition(target, next_byte) != u32::MAX {
+                            live_head = true; break 'roots;
+                        }
+                    }
+                }
+            }
+        }
+    }
+    transitions.validate_mask_result()?;
+    if !live_head {
+        // Domain contains exclusively nonempty ordinary byte tokens. Any
+        // provider error must still be checked by the caller's finish().
+        buf.fill(0);
+        return Ok(true);
+    }
+    let vocab = factory()?;
+    if vocab.max_token_byte_len() > domain.max_token_len {
+        return Err("lazy vocabulary exceeds its certified byte horizon".to_owned());
+    }
+    if transitions.pre_admitted_original_mask().is_some() {
+        let result = fill_recursive_mask_using_roots(state, buf, transitions, &vocab, &roots);
+        transitions.validate_mask_result()?;
+        return result;
+    }
+    with_recursive_vocab_mask_cache(state, buf, &vocab, |buf| {
+        let result = fill_recursive_mask_using_roots(state, buf, transitions, &vocab, &roots);
+        // The memo wrapper publishes only after this callback succeeds.
+        transitions.validate_mask_result()?;
+        result
+    })
+}
+
+fn fill_pure_byte_mask_with_factory<V, F>(
+    state: &ConstraintState<'_>, buf: &mut [u32],
+    domain: PureMaskByteDomain, factory: F,
+) -> Result<bool, String>
+where
+    V: std::ops::Deref<Target = DynamicMaskVocab>,
+    F: FnOnce() -> Result<V, String>,
+{
+    if let Some(mut transitions) = RecursiveFullWalkTransitions::new(state.constraint) {
+        fill_pure_byte_mask_using_factory(state, buf, &mut transitions, domain, factory)
+    } else {
+        recursive_provider::fill_with_vocab_factory(state, buf, domain, factory)
+    }
+}
+
+fn fill_recursive_mask_additive_vocab(
+    state: &ConstraintState<'_>, buf: &mut [u32], vocab: &DynamicMaskVocab, already: &[u32],
+) -> Result<bool, String> {
+    if let Some(mut transitions) = RecursiveFullWalkTransitions::new(state.constraint) {
+        transitions.pre_admitted_original_mask = Some(already);
+        fill_recursive_mask_using_vocab(state, buf, &mut transitions, vocab)
+    } else {
+        recursive_provider::fill_with_vocab_additive(state, buf, vocab, already)
+    }
+}
+
+fn fill_recursive_mask_additive_factory<V, F>(
+    state: &ConstraintState<'_>, buf: &mut [u32], domain: PureMaskByteDomain,
+    already: &[u32], factory: F,
+) -> Result<bool, String>
+where V: std::ops::Deref<Target = DynamicMaskVocab>, F: FnOnce() -> Result<V, String> {
+    if let Some(mut transitions) = RecursiveFullWalkTransitions::new(state.constraint) {
+        transitions.pre_admitted_original_mask = Some(already);
+        fill_pure_byte_mask_using_factory(state, buf, &mut transitions, domain, factory)
+    } else {
+        recursive_provider::fill_with_vocab_factory_additive(state, buf, domain, already, factory)
+    }
+}
+
+fn prepared_vocabulary_view_capacity() -> usize {
+    static CAPACITY: OnceLock<usize> = OnceLock::new();
+    *CAPACITY.get_or_init(|| std::env::var("GLRMASK_PREPARED_VOCAB_VIEW_CAPACITY")
+        .ok().and_then(|value| value.parse::<usize>().ok()).unwrap_or(64).clamp(1, 256))
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum PreparedVocabularyPolicy { Eager, LazyOnly, DeadHeadPreflight }
+
+/// A caller-selected vocabulary for the ordinary shared dynamic walk. The
+/// semantic byte/GLR executor is unchanged. This object is runtime-derived and
+/// tied to the immutable constraint whose token IDs and parser states it uses.
+#[derive(Debug)]
+pub(crate) struct PreparedMaskVocabulary {
+    vocab: OnceLock<Result<Arc<DynamicMaskVocab>, String>>,
+    policy: PreparedVocabularyPolicy,
+    original_ids: Vec<u32>,
+    max_original_byte_len: usize,
+    domain_words: Vec<(usize, u32)>,
+    // Views omit only tokens already admitted by the caller. They change data,
+    // not semantics or the walker. Bounded, binding-local, no global ID cache.
+    views: Mutex<FxHashMap<Vec<u32>, Arc<DynamicMaskVocab>>>,
+}
+
+impl PreparedMaskVocabulary {
+    fn make_vocab(constraint: &Constraint, ids: &[u32]) -> Result<Arc<DynamicMaskVocab>, String> {
+        static BORROW_BYTES: OnceLock<bool> = OnceLock::new();
+        if *BORROW_BYTES.get_or_init(|| std::env::var("GLRMASK_PREPARED_VOCAB_BORROW_BYTES")
+            .is_ok_and(|value| matches!(value.as_str(), "1" | "true")))
+        {
+            Self::make_vocab_borrowed(constraint, ids)
+        } else {
+            Self::make_vocab_owned_reference(constraint, ids)
+        }
+    }
+
+    /// Canonicalize immutable byte references. The resulting trie owns its
+    /// edge bytes, and aliases own their original IDs; no borrowed reference
+    /// escapes preparation. Selection and runtime traversal stay unchanged.
+    fn make_vocab_borrowed(constraint: &Constraint, ids: &[u32]) -> Result<Arc<DynamicMaskVocab>, String> {
+        let mut entries = Vec::<(u32, &[u8])>::with_capacity(ids.len());
+        for &token in ids {
+            if let Some(bytes) = constraint.token_bytes_for_id(token) {
+                entries.push((token, bytes));
+            } else if !constraint.has_special_token_id(token) {
+                return Err(format!("candidate token {token} has no byte or special-token semantics"));
+            }
+        }
+        entries.sort_unstable_by(|a,b| a.1.cmp(b.1).then_with(|| a.0.cmp(&b.0)));
+        let mut bytes = Vec::<&[u8]>::with_capacity(entries.len());
+        let mut aliases = Vec::<Vec<u32>>::with_capacity(entries.len());
+        for (id, token) in entries {
+            if bytes.last().is_some_and(|last| *last == token) {
+                aliases.last_mut().expect("alias row exists").push(id);
+            } else { bytes.push(token); aliases.push(vec![id]); }
+        }
+        let refs = bytes.iter().enumerate().map(|(i,b)| (0u16, i, *b)).collect::<Vec<_>>();
+        let trie = Arc::new(DynamicMaskTrie::from_partitioned_token_refs(&refs));
+        Ok(Arc::new(DynamicMaskVocab::from_materialized_ordered(trie, Arc::new(aliases))
+            .with_mask_cache_entry_cap(64)))
+    }
+
+    fn make_vocab_owned_reference(constraint: &Constraint, ids: &[u32]) -> Result<Arc<DynamicMaskVocab>, String> {
+        let mut entries = Vec::<(u32, Vec<u8>)>::with_capacity(ids.len());
+        for &token in ids {
+            if let Some(bytes) = constraint.token_bytes_for_id(token) {
+                // A token can have both byte and special-ID paths; preserve
+                // their union exactly as the ordinary shared engine does.
+                entries.push((token, bytes.to_vec()));
+            } else if !constraint.has_special_token_id(token) {
+                return Err(format!("candidate token {token} has no byte or special-token semantics"));
+            }
+        }
+        entries.sort_unstable_by(|a,b| a.1.cmp(&b.1).then_with(|| a.0.cmp(&b.0)));
+        let mut bytes = Vec::<Vec<u8>>::new();
+        let mut aliases = Vec::<Vec<u32>>::new();
+        for (id, token) in entries {
+            if bytes.last().is_some_and(|last| *last == token) {
+                aliases.last_mut().expect("alias row exists").push(id);
+            } else { bytes.push(token); aliases.push(vec![id]); }
+        }
+        let refs = bytes.iter().enumerate().map(|(i,b)| (0u16, i, b.as_slice())).collect::<Vec<_>>();
+        let trie = Arc::new(DynamicMaskTrie::from_partitioned_token_refs(&refs));
+        Ok(Arc::new(DynamicMaskVocab::from_materialized_ordered(trie, Arc::new(aliases))
+            .with_mask_cache_entry_cap(64)))
+    }
+
+    pub(crate) fn new(constraint: &Constraint, candidates: &[u32]) -> Result<Self, String> {
+        static POLICY: OnceLock<PreparedVocabularyPolicy> = OnceLock::new();
+        let policy = *POLICY.get_or_init(|| {
+            if env_flag("GLRMASK_PREPARED_VOCAB_DEAD_HEAD_PREFLIGHT", true) {
+                PreparedVocabularyPolicy::DeadHeadPreflight
+            } else if env_flag("GLRMASK_PREPARED_VOCAB_DEFER_ONLY", false) {
+                PreparedVocabularyPolicy::LazyOnly
+            } else { PreparedVocabularyPolicy::Eager }
+        });
+        Self::new_with_policy(constraint, candidates, policy)
+    }
+
+    fn new_with_policy(
+        constraint: &Constraint, candidates: &[u32], policy: PreparedVocabularyPolicy,
+    ) -> Result<Self, String> {
+        let mut ids = candidates.to_vec(); ids.sort_unstable(); ids.dedup();
+        let mut domain_words = Vec::<(usize, u32)>::new();
+        let mut max_original_byte_len = 0;
+        for &token in &ids {
+            max_original_byte_len = max_original_byte_len.max(
+                constraint.token_bytes_for_id(token).map_or(0, <[u8]>::len));
+            let word = token as usize / 32;
+            if word >= constraint.mask_len() {
+                return Err(format!("candidate token {token} exceeds the model vocabulary"));
+            }
+            // Invalid IDs remain errors even if no byte head can be consumed.
+            if policy != PreparedVocabularyPolicy::Eager
+                && constraint.token_bytes_for_id(token).is_none()
+                && !constraint.has_special_token_id(token)
+            { return Err(format!("candidate token {token} has no byte or special-token semantics")); }
+            if let Some((last_word, bits)) = domain_words.last_mut() && *last_word == word
+            { *bits |= 1 << (token % 32); }
+            else { domain_words.push((word, 1 << (token % 32))); }
+        }
+        let vocab = OnceLock::new();
+        if policy == PreparedVocabularyPolicy::Eager {
+            let ready = Self::make_vocab(constraint, &ids)?;
+            let _ = vocab.set(Ok(ready));
+        }
+        Ok(Self { vocab, policy, original_ids: ids, max_original_byte_len, domain_words,
+            views: Mutex::new(FxHashMap::default()) })
+    }
+
+    fn cached_vocab(&self, key: &[u32]) -> Result<Option<Arc<DynamicMaskVocab>>, String> {
+        if key.len() == self.original_ids.len() {
+            self.vocab.get().cloned().transpose()
+        } else {
+            Ok(self.views.lock().unwrap_or_else(|e| e.into_inner()).get(key).cloned())
+        }
+    }
+
+    fn resolve_vocab(&self, constraint: &Constraint, key: &[u32]) -> Result<Arc<DynamicMaskVocab>, String> {
+        if key.len() == self.original_ids.len() {
+            return self.vocab.get_or_init(|| Self::make_vocab(constraint, &self.original_ids)).clone();
+        }
+        if let Some(cached) = self.cached_vocab(key)? { return Ok(cached); }
+        let built = Self::make_vocab(constraint, key)?;
+        let mut views = self.views.lock().unwrap_or_else(|e| e.into_inner());
+        if views.len() >= prepared_vocabulary_view_capacity() { views.clear(); }
+        Ok(Arc::clone(views.entry(key.to_vec()).or_insert(built)))
+    }
+
+    fn or_mask_with_pre_admission(&self, state: &ConstraintState<'_>, buf: &mut [u32]) -> Result<bool, String> {
+        if !state.constraint.uses_compact_segmented_parser_runtime() { return Ok(false); }
+        let pending = self.original_ids.iter().copied().filter(|&id| {
+            !buf.get(id as usize / 32).is_some_and(|&w| w & (1 << (id % 32)) != 0)
+        }).collect::<Vec<_>>();
+        if pending.is_empty() { return Ok(true); }
+        let mut scratch = vec![0u32; state.constraint.mask_len()];
+        let filled = if let Some(vocab) = self.cached_vocab(&self.original_ids)? {
+            fill_recursive_mask_additive_vocab(state, &mut scratch, &vocab, buf)?
+        } else if self.policy == PreparedVocabularyPolicy::DeadHeadPreflight
+            && let Some(mut domain) = PureMaskByteDomain::for_ids(state.constraint, &pending)
+        {
+            // Only pending heads need the preflight, but the shared canonical
+            // vocabulary may contain longer already-admitted byte strings.
+            domain.max_token_len = self.max_original_byte_len;
+            fill_recursive_mask_additive_factory(state, &mut scratch, domain, buf, || {
+                self.resolve_vocab(state.constraint, &self.original_ids)
+            })?
+        } else {
+            let vocab = self.resolve_vocab(state.constraint, &self.original_ids)?;
+            fill_recursive_mask_additive_vocab(state, &mut scratch, &vocab, buf)?
+        };
+        if !filled { return Ok(false); }
+        for &(word, bits) in &self.domain_words {
+            if let Some(dst) = buf.get_mut(word) { *dst |= scratch[word] & bits; }
+        }
+        Ok(true)
+    }
+
+    pub(crate) fn or_mask(&self, state: &ConstraintState<'_>, buf: &mut [u32]) -> Result<bool, String> {
+        static PRUNED: OnceLock<bool> = OnceLock::new();
+        if *PRUNED.get_or_init(|| env_flag("GLRMASK_BOUNDARY_PRUNED_FIXED_VOCABULARY", true)) {
+            self.or_mask_with_pre_admission(state, buf)
+        } else {
+            self.or_mask_filtered(state, buf)
+        }
+    }
+
+    fn or_mask_filtered(&self, state: &ConstraintState<'_>, buf: &mut [u32]) -> Result<bool, String> {
+        if !state.constraint.uses_compact_segmented_parser_runtime() { return Ok(false); }
+        let key = self.original_ids.iter().copied().filter(|&id| {
+            !buf.get(id as usize / 32).is_some_and(|w| w & (1 << (id % 32)) != 0)
+        }).collect::<Vec<_>>();
+        if key.is_empty() { return Ok(true); }
+        let mut mask = vec![0u32; state.constraint.mask_len()];
+        let profile = std::env::var_os("GLRMASK_PROFILE_DYNAMIC_BOUNDARY_CANDIDATE_TRIE").is_some();
+        // Includes view selection and actual construction, not only warm walk.
+        let started = profile.then(Instant::now);
+        let nodes = std::cell::Cell::new(0usize);
+        let filled = if let Some(vocab) = self.cached_vocab(&key)? {
+            nodes.set(vocab.trie.node_count());
+            try_fill_recursive_mask_with_vocab(state, &mut mask, &vocab)?
+        } else if self.policy == PreparedVocabularyPolicy::DeadHeadPreflight
+            && let Some(domain) = PureMaskByteDomain::for_ids(state.constraint, &key)
+        {
+            fill_pure_byte_mask_with_factory(state, &mut mask, domain, || {
+                let vocab = self.resolve_vocab(state.constraint, &key)?;
+                nodes.set(vocab.trie.node_count());
+                Ok(vocab)
+            })?
+        } else {
+            let vocab = self.resolve_vocab(state.constraint, &key)?;
+            nodes.set(vocab.trie.node_count());
+            try_fill_recursive_mask_with_vocab(state, &mut mask, &vocab)?
+        };
+        if !filled { return Ok(false); }
+        for &(word, bits) in &self.domain_words {
+            if let Some(dst) = buf.get_mut(word) { *dst |= mask[word] & bits; }
+        }
+        if let Some(started) = started {
+            eprintln!("[glrmask/profile][prepared_mask_vocabulary] tokens={} nodes={} total_ns={}",
+                self.domain_words.iter().map(|(_,bits)| bits.count_ones()).sum::<u32>(),
+                nodes.get(), started.elapsed().as_nanos());
+        }
+        Ok(true)
+    }
+
 }
 
 

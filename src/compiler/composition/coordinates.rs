@@ -757,6 +757,7 @@ pub(super) fn install_segmented_boundary_shards(
             .and_then(|rows| rows.get(component_index))
             .map(|tokens| Arc::<[u32]>::from(tokens.clone()));
         let shard = crate::runtime::SegmentedBoundaryShard {
+            mask_vocabulary: Default::default(),
             start_component: component_index as u32,
             start_parser_states,
             accepts_empty_stack: component_index == 0,
@@ -790,6 +791,7 @@ pub(crate) fn install_published_static_boundary_shards(
                 )
             })?;
         let runtime_shard = crate::runtime::SegmentedBoundaryShard {
+            mask_vocabulary: Default::default(),
             start_component: shard.start_component,
             start_parser_states: segmented_boundary_start_parser_states(component),
             accepts_empty_stack: component_index == 0,
@@ -812,6 +814,7 @@ pub(super) fn install_dynamic_direct_boundary_shards(
     }
     for component_index in 0..overlay.segmented_parser_components.len() {
         let shard = crate::runtime::SegmentedBoundaryShard {
+            mask_vocabulary: Default::default(),
             start_component: component_index as u32,
             start_parser_states: segmented_boundary_start_parser_states(
                 &overlay.segmented_parser_components[component_index],
@@ -837,6 +840,7 @@ pub(super) fn append_dynamic_direct_boundary_shards_for_unselected(
             continue;
         }
         let shard = crate::runtime::SegmentedBoundaryShard {
+            mask_vocabulary: Default::default(),
             start_component: component_index as u32,
             start_parser_states: segmented_boundary_start_parser_states(
                 &overlay.segmented_parser_components[component_index],

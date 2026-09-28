@@ -30,6 +30,7 @@ pub(super) enum DynamicMaskCachePayload {
 
 #[derive(Debug, Default)]
 pub(super) struct DynamicMaskCache {
+    entry_cap: Option<usize>,
     pub(super) entries: Vec<Option<DynamicMaskCacheEntry>>,
     pub(super) by_hash: FxHashMap<u64, SmallVec<[usize; 1]>>,
     pub(super) next_slot: usize,
@@ -71,6 +72,10 @@ pub(crate) struct DynamicLazyUnionCache {
     /// Dedicated packed-key index for the overwhelmingly common two-state
     /// derivatives.  Avoids hashing/cloning a SmallVec on every pair lookup.
     pub(crate) state_by_pair: Option<Box<FxHashMap<u64, u32>>>,
+    /// Exact union of two *input coordinates*, including virtual subsets.
+    /// Distinct from state_by_pair, whose keys contain physical members only.
+    /// Bounded, runtime-only, and cleared with every extension-ID reset.
+    pub(crate) state_by_union_pair: Option<Box<FxHashMap<u64, u32>>>,
     pub(crate) state_by_subset: FxHashMap<SmallVec<[u32; 8]>, u32>,
     pub(crate) subsets: Vec<SmallVec<[u32; 8]>>,
     /// Lazy virtual-state derivatives. Most derived states see only a few
@@ -485,10 +490,8 @@ impl DynamicMaskVocab {
         static CACHE_BUDGET_MIB: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
         let budget_mib = *CACHE_BUDGET_MIB.get_or_init(|| {
             std::env::var("GLRMASK_EXPERIMENT_DYNAMIC_MASK_CACHE_BUDGET_MIB")
-                .ok()
-                .and_then(|s| s.parse::<usize>().ok())
-                .filter(|n| (1..=64).contains(n))
-                .unwrap_or(32)
+                .ok().and_then(|s| s.parse::<usize>().ok())
+                .filter(|n| (1..=64).contains(n)).unwrap_or(32)
         });
         const MIN_MASK_CACHE_ENTRIES: usize = 64;
         const MAX_MASK_CACHE_ENTRIES: usize = 4096;
@@ -499,6 +502,7 @@ impl DynamicMaskVocab {
             .mask_cache
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let max_entries = max_entries.min(cache.entry_cap.unwrap_or(usize::MAX));
         if let Some(slots) = cache.by_hash.get(&hash).cloned() {
             for slot in slots {
                 let matches = cache
@@ -558,5 +562,20 @@ impl DynamicMaskVocab {
         if cache.entries.len() == max_entries && cache.next_slot >= max_entries {
             cache.next_slot = 0;
         }
+    }
+}
+
+
+impl DynamicMaskVocab {
+
+    /// Limit one immutable vocabulary's result memo independently of the
+    /// ordinary full-vocabulary cache budget. Set only before publishing it.
+    pub(crate) fn with_mask_cache_entry_cap(self, cap: usize) -> Self {
+        {
+            let mut cache = self.mask_cache.lock().unwrap_or_else(|e| e.into_inner());
+            assert!(cache.entries.is_empty());
+            cache.entry_cap = Some(cap.clamp(1, 4096));
+        }
+        self
     }
 }

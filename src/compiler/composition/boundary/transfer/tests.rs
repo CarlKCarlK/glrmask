@@ -429,6 +429,7 @@ fn shared_child_link_disagreement_declines_loudly() {
 
 #[test]
 fn strict_static_trap_fires_on_every_dynamic_fallback_entry() {
+    if crate::isolate_environment_test(false) { return; }
     // The trap itself is env-gated so genuine dynamic compositions are
     // unaffected; strict-static tests set the var and every dynamic mask
     // fallback panics loudly instead of contributing hidden admissions.

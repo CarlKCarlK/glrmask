@@ -7,6 +7,7 @@ import numpy as np
 import pytest
 import glrmask as g
 from glrmask import _glrmask as native
+from test_finite_language_masks import accepted_prefix
 
 TOKENS = {0:b'', 1:b'a', 2:b'b', 3:b'c', 4:b'x', 5:b'ab', 6:b'ac',
           31:b'', 63:b'', 300:b'a', 65535:b''}
@@ -42,7 +43,7 @@ def test_empty_aliases_never_enter_byte_masks(mode,loaded,nullable):
         for token in (1,2):
             allowed={i for i,b in TOKENS.items() if b and any(w.startswith(prefix+b) for w in words)}
             mask(value,state,allowed)
-            assert state.is_accepting()==(prefix in words)
+            assert state.is_accepting() == accepted_prefix(set(words), prefix)
             state.commit_token(token);prefix+=TOKENS[token]
         mask(value,state,set())
         assert state.is_accepting()

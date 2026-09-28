@@ -96,14 +96,7 @@ pub(super) struct FlatContinuationDecision {
 
 impl Default for FlatBranchScratch {
     fn default() -> Self {
-        Self {
-            offset: 0,
-            tokenizer_state: 0,
-            stack: Vec::with_capacity(crate::runtime::state::LINEAR_STACK_RESERVE),
-            acc: TerminalsDisallowed::new(),
-            processed: false,
-            initial_pruned: false,
-        }
+        Self::with_stack_capacity(crate::runtime::state::LINEAR_STACK_RESERVE)
     }
 }
 
@@ -132,25 +125,9 @@ impl Default for FlatFrontierScratch {
 }
 
 impl FlatFrontierScratch {
+
     pub(crate) fn with_preallocated_gss(preallocated_gss: usize) -> Self {
-        let mut gss_pool = SmallVec::new();
-        for _ in 0..preallocated_gss.min(FLAT_FRONTIER_GSS_POOL_CAPACITY) {
-            let mut gss = ParserGSS::from_single_stack(vec![0], TerminalsDisallowed::new());
-            let reserved =
-                gss.reserve_single_segment_capacity(crate::runtime::state::LINEAR_STACK_RESERVE);
-            debug_assert!(reserved, "fresh flat-frontier GSS must be reservable");
-            gss_pool.push(gss);
-        }
-        Self {
-            branches: std::array::from_fn(|_| FlatBranchScratch::default()),
-            len: 0,
-            action: FlatActionScratch::default(),
-            continuation_cache: [FlatContinuationDecision::default();
-                FLAT_CONTINUATION_CACHE_CAPACITY],
-            continuation_cache_len: 0,
-            gss_pool,
-            retired_gss: SmallVec::new(),
-        }
+        Self::with_reservation_policy(preallocated_gss, crate::runtime::state::LINEAR_STACK_RESERVE)
     }
 
     pub(crate) fn clear(&mut self) {
@@ -977,4 +954,79 @@ pub(super) fn try_commit_flat_frontier_in_place(
     debug_assert!(frontier.gss_pool.len() <= FLAT_FRONTIER_GSS_POOL_CAPACITY);
     state.entries = new_entries;
     Some(Ok(()))
+}
+
+#[cfg(test)]
+#[test]
+fn mask_only_flat_frontier_keeps_empty_semantics_without_branch_allocations() {
+    let lean = FlatFrontierScratch::for_mask_only_shadow();
+    let commit = FlatFrontierScratch::with_preallocated_gss(0);
+    assert_eq!(lean.len, commit.len);
+    assert_eq!(lean.continuation_cache_len, commit.continuation_cache_len);
+    assert!(lean.gss_pool.is_empty() && commit.gss_pool.is_empty());
+    assert!(lean.retired_gss.is_empty() && commit.retired_gss.is_empty());
+    for (left, right) in lean.branches.iter().zip(&commit.branches) {
+        assert!(left.stack.is_empty() && right.stack.is_empty());
+        assert_eq!(left.stack.capacity(), 0);
+        assert!(right.stack.capacity() >= crate::runtime::state::LINEAR_STACK_RESERVE);
+        assert_eq!(left.offset, right.offset);
+        assert_eq!(left.tokenizer_state, right.tokenizer_state);
+        assert_eq!(left.processed, right.processed);
+        assert_eq!(left.initial_pruned, right.initial_pruned);
+        assert_eq!(left.acc, right.acc);
+    }
+}
+
+
+impl FlatBranchScratch {
+    fn with_stack_capacity(stack_capacity: usize) -> Self {
+        Self {
+            offset: 0,
+            tokenizer_state: 0,
+            stack: Vec::with_capacity(stack_capacity),
+            acc: TerminalsDisallowed::new(),
+            processed: false,
+            initial_pruned: false,
+        }
+    }
+}
+
+
+impl FlatFrontierScratch {
+    /// Read-only mask shadows never execute the flat commit frontier. Avoid
+    /// reserving 128 unused branch stacks as well as the already-omitted GSS
+    /// pool. Logical empty state is identical; ordinary commits keep their
+    /// original branch-stack reservations unchanged.
+    pub(crate) fn for_mask_only_shadow() -> Self {
+        Self::with_reservation_policy(0, 0)
+    }
+}
+
+
+impl FlatFrontierScratch {
+
+    fn with_reservation_policy(preallocated_gss: usize, stack_capacity: usize) -> Self {
+        let mut gss_pool = SmallVec::new();
+        for _ in 0..preallocated_gss.min(FLAT_FRONTIER_GSS_POOL_CAPACITY) {
+            let mut gss = ParserGSS::from_single_stack(
+                vec![0],
+                TerminalsDisallowed::new(),
+            );
+            let reserved = gss.reserve_single_segment_capacity(
+                crate::runtime::state::LINEAR_STACK_RESERVE,
+            );
+            debug_assert!(reserved, "fresh flat-frontier GSS must be reservable");
+            gss_pool.push(gss);
+        }
+        Self {
+            branches: std::array::from_fn(|_| FlatBranchScratch::with_stack_capacity(stack_capacity)),
+            len: 0,
+            action: FlatActionScratch::default(),
+            continuation_cache: [FlatContinuationDecision::default();
+                FLAT_CONTINUATION_CACHE_CAPACITY],
+            continuation_cache_len: 0,
+            gss_pool,
+            retired_gss: SmallVec::new(),
+        }
+    }
 }

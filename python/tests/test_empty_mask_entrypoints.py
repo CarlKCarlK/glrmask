@@ -3,6 +3,7 @@ import numpy as np
 import pytest
 import glrmask as g
 from glrmask import _glrmask as native
+from test_finite_language_masks import accepted_prefix
 from test_empty_mask_domain import TOKENS
 
 @pytest.mark.parametrize('mode',('FAST_BUILD','FAST_RUNTIME','AUTO'))
@@ -27,5 +28,5 @@ def test_all_mask_entrypoints_exclude_empty_byte_aliases(mode,loaded,nullable):
                 elif entry=='timed':native._internal.fill_mask_timed_ns(state,output)
                 else:state.fill_mask(output)
                 np.testing.assert_array_equal(output.view(np.uint32),expected,err_msg=f'{entry=} {prefix=}')
-            assert state.is_accepting()==(prefix in words)
+            assert state.is_accepting() == accepted_prefix(set(words), prefix)
             if next_token is not None:state.commit_token(next_token);prefix+=TOKENS[next_token]

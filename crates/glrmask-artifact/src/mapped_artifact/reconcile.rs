@@ -2,7 +2,7 @@ use std::collections::{BTreeSet, HashMap};
 use std::sync::Arc;
 use std::time::Instant;
 
-use range_set_blaze::{RangeMapBlaze, RangeSetBlaze};
+use range_set_blaze::{CheckSortedDisjointMap, RangeMapBlaze, RangeSetBlaze};
 use rayon::prelude::*;
 use rustc_hash::{FxHashMap, FxHashSet};
 
@@ -1173,6 +1173,7 @@ fn remap_weight_with_injective_maps(
     weight: &Weight,
     tsid_map: &InjectiveLocalMap,
     token_map: &InjectiveLocalMap,
+    precomputed_token_sets: Option<&FxHashMap<usize, SharedTokenSet>>,
     token_cache: &mut HashMap<usize, SharedTokenSet>,
 ) -> Weight {
     // Preserve the generic path for the special universal representation. It
@@ -1183,7 +1184,14 @@ fn remap_weight_with_injective_maps(
 
     let mut entries = Vec::<(u32, SharedTokenSet)>::new();
     for (local_range, tokens) in weight.raw_range_values() {
-        let mapped_tokens = remap_token_set_with_injective_map(tokens, token_map, token_cache);
+        let mapped_tokens = if let Some(precomputed) = precomputed_token_sets {
+            precomputed
+                .get(&(Arc::as_ptr(tokens) as usize))
+                .cloned()
+                .expect("precomputed token remap must cover every source token set")
+        } else {
+            remap_token_set_with_injective_map(tokens, token_map, token_cache)
+        };
         if mapped_tokens.is_empty() {
             continue;
         }
@@ -1201,26 +1209,42 @@ fn remap_weight_with_injective_maps(
         entries.sort_unstable_by_key(|(common_tsid, _)| *common_tsid);
     }
 
-    // Match the general remapper's canonical construction order exactly. The
-    // fast path avoids the `common_tsid_count`-sized scratch vector, not the
-    // final RangeMap / interning boundary.
-    let mut map = RangeMapBlaze::<u32, SharedTokenSet>::new();
-    let mut run_start = entries[0].0;
-    let mut run_end = entries[0].0;
-    let mut run_tokens = Arc::clone(&entries[0].1);
-    for (common_tsid, tokens) in entries.into_iter().skip(1) {
-        if common_tsid == run_end + 1
-            && (Arc::ptr_eq(&run_tokens, &tokens) || run_tokens.as_ref() == tokens.as_ref())
-        {
-            run_end = common_tsid;
+    weight_from_sorted_disjoint_runs(
+        entries.into_iter().map(|(tsid, tokens)| (tsid, tsid, tokens)),
+    )
+}
+
+/// The maps used by the fast remappers are injective or disjoint expansions,
+/// so sorted destination runs cannot overlap. Coalesce the same adjacent runs
+/// as CompactRangeBuilder, then build the tree from the ordered stream once.
+/// The final interning boundary and identifier numbering remain unchanged.
+fn weight_from_sorted_disjoint_runs(
+    runs: impl IntoIterator<Item = (u32, u32, SharedTokenSet)>,
+) -> Weight {
+    let runs = runs.into_iter();
+    // The ordinary builder is cheaper than an extra buffer for tiny weights.
+    if runs.size_hint().1.is_some_and(|maximum| maximum <= 16) {
+        return Weight::from_tsid_runs_shared(runs);
+    }
+    let mut ranges: Vec<(std::ops::RangeInclusive<u32>, SharedTokenSet)> = Vec::new();
+    for (start, end, tokens) in runs {
+        if tokens.is_empty() {
             continue;
         }
-        map.extend_simple(std::iter::once((run_start..=run_end, run_tokens)));
-        run_start = common_tsid;
-        run_end = common_tsid;
-        run_tokens = tokens;
+        if let Some((previous, previous_tokens)) = ranges.last_mut()
+            && previous.end().checked_add(1) == Some(start)
+            && (Arc::ptr_eq(previous_tokens, &tokens)
+                || previous_tokens.as_ref() == tokens.as_ref())
+        {
+            let first = *previous.start();
+            *previous = first..=end;
+        } else {
+            ranges.push((start..=end, tokens));
+        }
     }
-    map.extend_simple(std::iter::once((run_start..=run_end, run_tokens)));
+    let map = RangeMapBlaze::from_sorted_disjoint_map(CheckSortedDisjointMap::new(
+        ranges.iter().map(|(range, tokens)| (range.clone(), tokens)),
+    ));
     finalize_weight_map(map)
 }
 
@@ -1242,14 +1266,14 @@ fn remap_weight_with_disjoint_tsid_runs(
 
     let mut entries = Vec::new();
     for (local_start, local_end, tokens) in weight.range_entries() {
-        let mapped_tokens = if let Some(token_map) = token_map {
-            remap_token_set_with_injective_map(tokens, token_map, token_cache)
-        } else if let Some(precomputed_token_sets) = precomputed_token_sets {
+        let mapped_tokens = if let Some(precomputed_token_sets) = precomputed_token_sets {
             let key = Arc::as_ptr(tokens) as usize;
             precomputed_token_sets
                 .get(&key)
                 .cloned()
                 .expect("precomputed token remap must cover every source token set")
+        } else if let Some(token_map) = token_map {
+            remap_token_set_with_injective_map(tokens, token_map, token_cache)
         } else if let Some(token_run_map) = token_run_map {
             remap_token_set_with_disjoint_runs(tokens, token_run_map, token_cache)
         } else {
@@ -1273,7 +1297,7 @@ fn remap_weight_with_disjoint_tsid_runs(
     if !tsid_map.destination_order_is_monotone {
         entries.sort_unstable_by_key(|(start, _, _)| *start);
     }
-    Some(Weight::from_tsid_ranges_shared(entries))
+    Some(weight_from_sorted_disjoint_runs(entries))
 }
 
 fn local_to_common_is_identity(map: &[Vec<u32>], common_count: usize) -> bool {
@@ -1531,7 +1555,9 @@ pub fn remap_weights_with_maps(
             match (&tsid_map, &token_map) {
         (Some(tsid_map), Some(token_map)) if !weight.is_full() => {
             let mut token_cache = HashMap::<usize, SharedTokenSet>::new();
-            remap_weight_with_injective_maps(weight, tsid_map, token_map, &mut token_cache)
+            remap_weight_with_injective_maps(
+                weight, tsid_map, token_map, precomputed_token_sets, &mut token_cache,
+            )
         }
         _ if !weight.is_full() && tsid_run_map.is_some() => {
             let mut token_cache = HashMap::<usize, SharedTokenSet>::new();
@@ -1928,10 +1954,78 @@ mod tests {
             &weight,
             &InjectiveLocalMap::from_local_to_common(&tsid_map, 4).expect("injective tsids"),
             &InjectiveLocalMap::from_local_to_common(&token_map, 4).expect("injective tokens"),
+            None,
             &mut HashMap::new(),
         );
 
         assert_eq!(entries_key(&fast), entries_key(&general));
+    }
+
+    #[test]
+    fn bulk_sorted_weight_builder_matches_incremental_builder() {
+        let mut seed = 0x5a17_6943u32;
+        for count in [0, 1, 2, 15, 16, 17, 32, 128, 257] {
+            for _ in 0..16 {
+                let mut start = 0u32;
+                let mut runs = Vec::new();
+                for i in 0..count {
+                    seed = seed.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+                    let end = start + (seed >> 8) % 4;
+                    let tokens = if i % 11 == 0 {
+                        RangeSetBlaze::new()
+                    } else {
+                        // Equal values in independent Arcs must coalesce too.
+                        RangeSetBlaze::from_iter([((i / 3) % 7) as u32..=((i / 3) % 7 + 2) as u32])
+                    };
+                    runs.push((start, end, Arc::new(tokens)));
+                    start = end + 1 + (seed >> 16) % 3;
+                }
+                let reference = Weight::from_tsid_ranges_shared(runs.clone());
+                let candidate = weight_from_sorted_disjoint_runs(runs);
+                assert_eq!(entries_key(&candidate), entries_key(&reference));
+                assert_eq!(candidate, reference);
+            }
+        }
+        let tokens = Arc::new(RangeSetBlaze::from_iter([1..=3]));
+        let runs = (0..32).map(|i| {
+            let point = u32::MAX - 64 + i * 2;
+            (point, point, Arc::clone(&tokens))
+        }).collect::<Vec<_>>();
+        assert_eq!(weight_from_sorted_disjoint_runs(runs.clone()),
+            Weight::from_tsid_ranges_shared(runs));
+    }
+
+    #[test]
+    fn injective_token_remaps_use_global_precomputation() {
+        let weight = Weight::from_tsid_ranges_shared([
+            (0, 1, Arc::new(RangeSetBlaze::from_iter([0..=1]))),
+            (2, 3, Arc::new(RangeSetBlaze::from_iter([1..=1, 3..=3]))),
+        ]);
+        let tokens = vec![vec![3], vec![1], vec![0], vec![2]];
+        let token_map = InjectiveLocalMap::from_local_to_common(&tokens, 4).unwrap();
+        let token_runs = DisjointRunLocalMap::from_local_to_common(&tokens, 4).unwrap();
+        let precomputed = weight.range_entries().map(|(_, _, source)| {
+            (Arc::as_ptr(source) as usize,
+             remap_token_set_with_disjoint_runs_uncached(source, &token_runs))
+        }).collect::<FxHashMap<_, _>>();
+
+        let tsids = vec![vec![2], vec![0], vec![3], vec![1]];
+        let tsid_map = InjectiveLocalMap::from_local_to_common(&tsids, 4).unwrap();
+        let mut local_cache = HashMap::new();
+        let mapped = remap_weight_with_injective_maps(
+            &weight, &tsid_map, &token_map, Some(&precomputed), &mut local_cache,
+        );
+        assert_eq!(mapped, remap_weight_general(&weight, &tsids, &tokens, 4));
+        assert!(local_cache.is_empty(), "do not recompute globally mapped token sets");
+
+        let tsids = vec![vec![3, 4], vec![], vec![0, 1, 2], vec![5]];
+        let tsid_runs = DisjointRunLocalMap::from_local_to_common(&tsids, 6).unwrap();
+        let mapped = remap_weight_with_disjoint_tsid_runs(
+            &weight, &tsid_runs, Some(&token_map), Some(&token_runs),
+            Some(&precomputed), &tokens, &mut local_cache,
+        ).unwrap();
+        assert_eq!(mapped, remap_weight_general(&weight, &tsids, &tokens, 6));
+        assert!(local_cache.is_empty(), "disjoint TSID expansions must also use the cache");
     }
 
     #[test]

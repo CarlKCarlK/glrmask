@@ -2730,12 +2730,27 @@ fn union_lookaheads(item_set: &mut LR1ItemSet, core: LR1ItemCore, lookaheads: &B
     entry.union_with_delta(lookaheads)
 }
 
-fn lr1_closure(
+/// Cache only emissions completed in this closure. A first empty request must
+/// still insert the production-entry cores, exactly as the reference does.
+fn emitted_lr1_lookaheads_changed(
+    emitted: &mut FxHashMap<u32, BitSet>,
+    nonterminal: u32,
+    requested: &BitSet,
+) -> bool {
+    use std::collections::hash_map::Entry;
+    match emitted.entry(nonterminal) {
+        Entry::Vacant(entry) => { entry.insert(requested.clone()); true }
+        Entry::Occupied(mut entry) => entry.get_mut().union_with_changed(requested),
+    }
+}
+
+fn lr1_closure<const CACHE_EMISSIONS: bool>(
     mut result: LR1ItemSet,
     grammar: &AnalyzedGrammar,
     suffix_first: &[RuleSuffixFirst],
 ) -> LR1ItemSet {
     let rules = &grammar.rules;
+    let mut emitted_by_nonterminal = FxHashMap::default();
     // Every caller constructs its kernel solely to close it. Consume that
     // kernel directly instead of cloning its ordered map and lookahead bitsets
     // before the fixed point starts.
@@ -2756,6 +2771,11 @@ fn lr1_closure(
             if suffix.nullable[suffix_index] {
                 let mut propagated_lookaheads = base_lookaheads.clone();
                 propagated_lookaheads.union_with(&lookahead_delta);
+                if CACHE_EMISSIONS && grammar.rules_by_lhs[*nt as usize].len() > 1
+                    && !emitted_lr1_lookaheads_changed(&mut emitted_by_nonterminal, *nt, &propagated_lookaheads)
+                {
+                    continue;
+                }
                 for &i in &grammar.rules_by_lhs[*nt as usize] {
                     let sd = grammar.rules[i as usize].rhs.len() as u32;
                     let new_item = LR1ItemCore::new(i, 0, sd);
@@ -2769,6 +2789,11 @@ fn lr1_closure(
                     }
                 }
             } else {
+                if CACHE_EMISSIONS && grammar.rules_by_lhs[*nt as usize].len() > 1
+                    && !emitted_lr1_lookaheads_changed(&mut emitted_by_nonterminal, *nt, base_lookaheads)
+                {
+                    continue;
+                }
                 for &i in &grammar.rules_by_lhs[*nt as usize] {
                     let sd = grammar.rules[i as usize].rhs.len() as u32;
                     let new_item = LR1ItemCore::new(i, 0, sd);
@@ -2919,7 +2944,7 @@ fn lr1_kernel_matches_closed_state(kernel: &LR1ItemSet, closed: &LR1ItemSet) -> 
     closed_kernel.next().is_none()
 }
 
-fn expand_lr1_state(
+fn expand_lr1_state<const CACHE_EMISSIONS: bool>(
     source_items: &LR1ItemSet,
     grammar: &AnalyzedGrammar,
     suffix_first: &[RuleSuffixFirst],
@@ -3006,7 +3031,7 @@ fn expand_lr1_state(
                     preclosed_target: Some(target_id),
                 });
             }
-            let target_items = Arc::new(lr1_closure(adjusted_kernel, grammar, suffix_first));
+            let target_items = Arc::new(lr1_closure::<CACHE_EMISSIONS>(adjusted_kernel, grammar, suffix_first));
             if target_items.is_empty() {
                 None
             } else {
@@ -3033,7 +3058,27 @@ fn build_lr1_item_sets(
     build_lr1_item_sets_with_preclosure_reuse(grammar, preclosure_reuse_enabled)
 }
 
+// The reference path remains available for exact differential validation.
+// Read the diagnostic once per build; no environment lookup enters the closure.
+fn lr1_emission_cache_enabled_for_override(disabled: Option<&str>) -> bool {
+    !disabled.is_some_and(|value| {
+        matches!(value.trim().to_ascii_lowercase().as_str(), "1" | "true" | "yes" | "on")
+    })
+}
+
 fn build_lr1_item_sets_with_preclosure_reuse(
+    grammar: &AnalyzedGrammar,
+    preclosure_reuse_enabled: bool,
+) -> (Vec<LR1ItemSet>, Vec<BTreeMap<Symbol, (u32, bool, bool)>>) {
+    let disabled = std::env::var("GLRMASK_DISABLE_LR1_EMISSION_CACHE").ok();
+    if lr1_emission_cache_enabled_for_override(disabled.as_deref()) {
+        build_lr1_item_sets_impl::<true>(grammar, preclosure_reuse_enabled)
+    } else {
+        build_lr1_item_sets_impl::<false>(grammar, preclosure_reuse_enabled)
+    }
+}
+
+fn build_lr1_item_sets_impl<const CACHE_EMISSIONS: bool>(
     grammar: &AnalyzedGrammar,
     preclosure_reuse_enabled: bool,
 ) -> (Vec<LR1ItemSet>, Vec<BTreeMap<Symbol, (u32, bool, bool)>>) {
@@ -3047,7 +3092,7 @@ fn build_lr1_item_sets_with_preclosure_reuse(
         let mut lookaheads = BitSet::new(lookahead_len);
         lookaheads.set(lookahead_bit(EOF, grammar.num_terminals));
         s.insert(LR1ItemCore::new(0, 0, sd), lookaheads);
-        lr1_closure(s, grammar, &suffix_first)
+        lr1_closure::<CACHE_EMISSIONS>(s, grammar, &suffix_first)
     });
 
     let mut item_sets = vec![initial.clone()];
@@ -3082,7 +3127,7 @@ fn build_lr1_item_sets_with_preclosure_reuse(
         let expanded = frontier
             .par_iter()
             .map(|&state_id| {
-                let successors = expand_lr1_state(
+                let successors = expand_lr1_state::<CACHE_EMISSIONS>(
                     &item_sets[state_id as usize],
                     grammar,
                     &suffix_first,
@@ -3151,7 +3196,7 @@ fn build_lr1_item_sets_with_preclosure_reuse(
     }
     if profile_enabled {
         eprintln!(
-            "[glrmask/profile][lr1_item_sets] states={} successors={} preclosure_reuses={} existing_successors={} new_successors={} expand_ms={:.3} intern_ms={:.3}",
+            "[glrmask/profile][lr1_item_sets] states={} successors={} preclosure_reuses={} existing_successors={} new_successors={} expand_ms={:.3} intern_ms={:.3} cached_emissions={CACHE_EMISSIONS}",
             item_sets.len(),
             successor_count,
             preclosure_reuse_count,
@@ -3571,6 +3616,26 @@ fn build_experimental_core_merged_table(
     item_sets: &[LR1ItemSet],
     transitions: &[BTreeMap<Symbol, (u32, bool, bool)>],
 ) -> Option<GLRTable> {
+    // Both paths produce the same core partition and execution rows. Keep the
+    // materialized path as an explicit diagnostic reference, not the default.
+    let disabled = std::env::var("GLRMASK_DISABLE_DIRECT_CORE_TABLE").ok();
+    if direct_core_table_enabled_for_override(disabled.as_deref()) {
+        return build_core_merged_table_from_items(grammar, item_sets, transitions);
+    }
+    build_core_merged_table_materialized(grammar, item_sets, transitions)
+}
+
+fn direct_core_table_enabled_for_override(disabled: Option<&str>) -> bool {
+    !disabled.is_some_and(|value| {
+        matches!(value.trim().to_ascii_lowercase().as_str(), "1" | "true" | "yes" | "on")
+    })
+}
+
+fn build_core_merged_table_materialized(
+    grammar: &AnalyzedGrammar,
+    item_sets: &[LR1ItemSet],
+    transitions: &[BTreeMap<Symbol, (u32, bool, bool)>],
+) -> Option<GLRTable> {
     let canonical = build_lr1_table(grammar, item_sets, transitions);
     let core_keys = item_sets.iter().map(lr1_core_key).collect::<Vec<_>>();
     let partition = refine_experimental_core_partition(&canonical, &core_keys);
@@ -3582,20 +3647,45 @@ fn build_experimental_core_merged_table(
 }
 
 fn refine_experimental_core_partition(table: &GLRTable, core_keys: &[Vec<Item>]) -> Vec<u32> {
-    let mut class_by_core: BTreeMap<Vec<Item>, u32> = BTreeMap::new();
+    refine_core_partition_with(core_keys, |state, class, partition| {
+        ExperimentalCoreCompatibilitySig::new(table, state, class, partition)
+    })
+}
+
+fn refine_core_partition_with(
+    core_keys: &[Vec<Item>],
+    mut signature: impl FnMut(usize, u32, &[u32]) -> ExperimentalCoreCompatibilitySig,
+) -> Vec<u32> {
+    let mut class_by_core: FxHashMap<&[Item], u32> = FxHashMap::default();
+    class_by_core.reserve(core_keys.len());
     let mut partition = Vec::with_capacity(core_keys.len());
     for key in core_keys {
         let next = class_by_core.len() as u32;
-        partition.push(*class_by_core.entry(key.clone()).or_insert(next));
+        let class = match class_by_core.get(key.as_slice()) {
+            Some(&existing) => existing,
+            None => {
+                class_by_core.insert(key.as_slice(), next);
+                next
+            }
+        };
+        partition.push(class);
     }
 
     loop {
-        let mut sig_to_class: BTreeMap<ExperimentalCoreCompatibilitySig, u32> = BTreeMap::new();
+        let mut sig_to_class: FxHashMap<ExperimentalCoreCompatibilitySig, u32> = FxHashMap::default();
+        sig_to_class.reserve(core_keys.len());
         let mut next_partition = Vec::with_capacity(partition.len());
-        for state in 0..table.num_states as usize {
-            let sig = ExperimentalCoreCompatibilitySig::new(table, state, partition[state], &partition);
+        for state in 0..core_keys.len() {
+            let sig = signature(state, partition[state], &partition);
             let next = sig_to_class.len() as u32;
-            next_partition.push(*sig_to_class.entry(sig).or_insert(next));
+            let class = match sig_to_class.get(&sig) {
+                Some(&existing) => existing,
+                None => {
+                    sig_to_class.insert(sig, next);
+                    next
+                }
+            };
+            next_partition.push(class);
         }
         if next_partition == partition {
             return partition;
@@ -3604,7 +3694,7 @@ fn refine_experimental_core_partition(table: &GLRTable, core_keys: &[Vec<Item>])
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
 struct ExperimentalCoreCompatibilitySig {
     core_class: u32,
     shifts: Vec<(TerminalID, u32, bool, bool)>,
@@ -3612,8 +3702,34 @@ struct ExperimentalCoreCompatibilitySig {
 }
 
 impl ExperimentalCoreCompatibilitySig {
-    fn new(table: &GLRTable, state: usize, core_class: u32, partition: &[u32]) -> Self {
+    fn from_transitions(
+        transitions: &BTreeMap<Symbol, (u32, bool, bool)>,
+        core_class: u32,
+        partition: &[u32],
+    ) -> Self {
+        // Canonical LR table construction copies these exact shift/goto
+        // observations. Reductions and acceptance never participate in core
+        // refinement, so no canonical action rows are needed to obtain the
+        // same fixed point and first-seen class numbering.
         let mut shifts = Vec::new();
+        let mut gotos = Vec::new();
+        for (symbol, &(target, replace, forwarded)) in transitions {
+            match symbol {
+                Symbol::Terminal(terminal) => {
+                    shifts.push((*terminal, partition[target as usize], replace, forwarded));
+                }
+                Symbol::Nonterminal(nonterminal) => {
+                    gotos.push((*nonterminal, partition[target as usize], replace));
+                }
+            }
+        }
+        shifts.sort_unstable();
+        gotos.sort_unstable();
+        Self { core_class, shifts, gotos }
+    }
+
+    fn new(table: &GLRTable, state: usize, core_class: u32, partition: &[u32]) -> Self {
+        let mut shifts = Vec::with_capacity(table.action[state].len());
         for (terminal, action) in &table.action[state] {
             if let Some((target, replace)) = action_shift(action) {
                 shifts.push((
@@ -3638,6 +3754,117 @@ impl ExperimentalCoreCompatibilitySig {
             gotos,
         }
     }
+}
+
+/// Emit the unchanged experimental-core table without first materializing all
+/// canonical LR(1) action rows. This is not an LALR construction: it uses the
+/// same canonical item sets, compatibility refinement, and exact-simulation
+/// admission policy as the materialized reference.
+fn build_core_merged_table_from_items(
+    grammar: &AnalyzedGrammar,
+    item_sets: &[LR1ItemSet],
+    transitions: &[BTreeMap<Symbol, (u32, bool, bool)>],
+) -> Option<GLRTable> {
+    if item_sets.len() != transitions.len() {
+        return None;
+    }
+    let core_keys = item_sets.iter().map(lr1_core_key).collect::<Vec<_>>();
+    let partition = refine_core_partition_with(&core_keys, |state, class, partition| {
+        ExperimentalCoreCompatibilitySig::from_transitions(&transitions[state], class, partition)
+    });
+    let groups = partition.iter().copied().max().map_or(0, |id| id as usize + 1);
+    let mut members = vec![Vec::new(); groups];
+    for (state, &group) in partition.iter().enumerate() {
+        members[group as usize].push(state);
+    }
+
+    let rows = members.into_par_iter().enumerate().map(|(group, members)| {
+        let mut pending = FxHashMap::<TerminalID, PendingAction>::default();
+        let mut goto = FxHashMap::default();
+        let mut forwarded_shifts = Vec::new();
+
+        // Every member has the same remapped shift and goto signature by
+        // construction. Emit it once, including replace/transfer flags.
+        for (symbol, &(target, replace, forwarded)) in &transitions[members[0]] {
+            match symbol {
+                Symbol::Terminal(terminal) => {
+                    pending.entry(*terminal).or_default()
+                        .push_shift(partition[target as usize], replace);
+                    if forwarded {
+                        forwarded_shifts.push((group as u32, *terminal));
+                    }
+                }
+                Symbol::Nonterminal(nonterminal) => {
+                    goto.insert(*nonterminal, (partition[target as usize], replace));
+                }
+            }
+        }
+        // Reductions are the union of completed, non-transferred LR(1) items.
+        // PendingAction::finish performs the same sort/dedup as the reference;
+        // state grouping cannot add a lookahead absent from those exact items.
+        for state in members {
+            for (item, lookaheads) in &item_sets[state] {
+                if item.transferred {
+                    continue;
+                }
+                let rule = &grammar.rules[item.rule as usize];
+                if item.dot as usize != rule.rhs.len() {
+                    continue;
+                }
+                for bit in lookaheads.iter_ones() {
+                    let terminal = bit_lookahead(bit, grammar.num_terminals);
+                    let action = pending.entry(terminal).or_default();
+                    if item.rule == 0 {
+                        action.push_accept();
+                    } else {
+                        action.push_reduce(rule.lhs, item.stack_depth);
+                    }
+                }
+            }
+        }
+        // Use the quotient builder's row representation, not finish_table's
+        // canonical sorted-vector representation. Large execution rows must
+        // keep hash lookup, and small rows keep their existing entry order.
+        let mut actions = pending.into_iter().collect::<Vec<_>>();
+        actions.sort_unstable_by_key(|(terminal, _)| *terminal);
+        let actions = actions.into_iter()
+            .map(|(terminal, action)| (terminal, action.finish()))
+            .collect::<ActionRow>();
+        // The reference inserts the first canonical goto row into the class
+        // map in that row's iteration order. Reproduce this small map step so
+        // observable row ordering/layout does not change with the optimization.
+        let mut class_goto = FxHashMap::default();
+        for (nonterminal, target) in goto {
+            class_goto.insert(nonterminal, target);
+        }
+        let goto = class_goto.into_iter().collect::<GotoRow>();
+        (actions, goto, forwarded_shifts)
+    }).collect::<Vec<_>>();
+
+    let mut action = Vec::with_capacity(groups);
+    let mut goto = Vec::with_capacity(groups);
+    let mut forwarded_shifts = FxHashSet::default();
+    for (actions, gotos, forwarded) in rows {
+        action.push(actions);
+        goto.push(gotos);
+        forwarded_shifts.extend(forwarded);
+    }
+    let mut table = GLRTable {
+        action, goto, forwarded_shifts,
+        num_states: groups as u32,
+        num_terminals: grammar.num_terminals,
+        num_rules: grammar.rules.len() as u32,
+        rules: grammar.rules.clone(),
+        nonterminal_display_names: grammar.nonterminal_display_names.clone(),
+        embedded_start: Default::default(),
+        construction: GlrTableConstruction::ExperimentalCoreMerged,
+        admission_policy: AdmissionPolicy::ExactSimulation,
+        advance: Vec::new(), unconditional_advance: Vec::new(),
+        control_terminals: Default::default(), skip_terminals: Default::default(),
+        guarded_shift_index: Vec::new(), direct_regular_wide_frontiers: Vec::new(),
+    };
+    table.rebuild_advance_rows_from_actions();
+    Some(table)
 }
 
 fn action_shift(action: &Action) -> Option<(u32, bool)> {

@@ -1,8 +1,13 @@
-"""The empty literal is a grammar epsilon, not a zero-byte model token."""
+"""Empty grammar literals must not admit zero-byte model tokens.
+
+The existing standalone-generation policy excludes an empty root output; the
+separate nested-child test retains and verifies the grammar's epsilon language.
+"""
 import numpy as np
 import pytest
 import glrmask as g
 from glrmask import _glrmask as native
+from test_finite_language_masks import accepted_prefix
 
 SOURCES={
     "ebnf": 'start ::= "" | "a"',
@@ -25,7 +30,7 @@ def test_empty_literal_accepts_epsilon_without_admitting_empty_tokens(kind,mode,
             vocab,optimization=getattr(g.Optimization,mode))
         if loaded:value=g.Constraint.load(value.save())
     state=value.start()
-    assert state.is_accepting()
+    assert state.is_accepting() == accepted_prefix({b"", b"a"}, b"")
     assert not state.is_rejected()
     for _ in range(2):
         actual=np.full(value.mask_len()+2,-1,dtype=np.int32)
@@ -34,7 +39,7 @@ def test_empty_literal_accepts_epsilon_without_admitting_empty_tokens(kind,mode,
         for token in (1,63):expected[token//32] |= np.uint32(1 << (token%32))
         np.testing.assert_array_equal(actual.view(np.uint32),expected)
     state.commit_bytes(b"")
-    assert state.is_accepting()
+    assert state.is_accepting() == accepted_prefix({b"", b"a"}, b"")
     state.commit_token(1)
     assert state.is_accepting()
     actual=np.full(value.mask_len()+2,-1,dtype=np.int32)

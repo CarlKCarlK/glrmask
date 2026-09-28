@@ -216,6 +216,13 @@ const DELTA_SEED_MIN_SAVINGS: u64 = 2048;
 const MASK_SINGLE_PATH_DIRECT_MAX_DEPTH: u32 = 64;
 const MASK_SINGLE_PATH_DIRECT_INLINE_PATH_CAPACITY: usize = 64;
 const MASK_SINGLE_PATH_DIRECT_MAX_TOTAL_PATHS: usize = 128;
+// Many independent lexer states with one parser stack are cheap to replay.
+// Expanding many alternatives of ONE GSS is different: it duplicates shared
+// parser suffixes and dense mask operations. Keep small local ambiguity direct,
+// but let the exact indexed-DAG evaluator retain sharing for wider GSSes.
+// This bounds speculation, not the language: an incomplete enumeration returns
+// false before touching the output, and the next evaluator visits the full GSS.
+const MASK_SINGLE_PATH_DIRECT_MAX_PATHS_PER_GSS: usize = 16;
 const MASK_SINGLE_PATH_DIRECT_INLINE_STACK_DEPTH: usize = 64;
 const MASK_SINGLE_PATH_DIRECT_MAX_PLAN_OPS: usize = 1024;
 // Below this much parser-stack work, grouping and compiling plans costs more
@@ -4101,7 +4108,22 @@ impl<'a> ConstraintState<'a> {
         );
     }
 
+    // Keep the diagnostic scope outside the implementation's stack-frame
+    // prologue/epilogue. Otherwise its large shadow-state frame is incorrectly
+    // charged to non-boundary work by whole-minus-dispatch accounting.
+    #[inline(always)]
     fn or_segmented_boundary_shards_mask(
+        &self,
+        overlay: &crate::runtime::StaticDynamicOverlayMetadata,
+        buf: &mut [u32],
+    ) -> bool {
+        #[cfg(any(test, feature = "internal-api"))]
+        let _boundary_cpu = super::boundary_cpu_profile::Span::enter(super::boundary_cpu_profile::Kind::Dispatch);
+        self.or_segmented_boundary_shards_mask_impl(overlay, buf)
+    }
+
+    #[inline(never)]
+    fn or_segmented_boundary_shards_mask_impl(
         &self,
         overlay: &crate::runtime::StaticDynamicOverlayMetadata,
         buf: &mut [u32],
@@ -4112,6 +4134,9 @@ impl<'a> ConstraintState<'a> {
             .any(|component| component.boundary.is_some())
         {
             let mut needs_direct_dynamic = false;
+            // Vocabulary preparation is binding-local and done once; execution
+            // remains the same shared optimized dynamic walker as ordinary masks.
+            let restricted = std::env::var_os("GLRMASK_DISABLE_BOUNDARY_VOCAB").is_none();
             for (component_index, component) in
                 overlay.segmented_parser_components.iter().enumerate()
             {
@@ -4140,6 +4165,8 @@ impl<'a> ConstraintState<'a> {
                         )
                     }
                     crate::runtime::SegmentedBoundaryShardBackend::DynamicDirect => {
+                        #[cfg(any(test, feature = "internal-api"))]
+                        let _dynamic_cpu = super::boundary_cpu_profile::Span::enter(super::boundary_cpu_profile::Kind::Dynamic);
                         if !self.segmented_boundary_shard_may_be_active(shard) {
                             continue;
                         }
@@ -4156,7 +4183,34 @@ impl<'a> ConstraintState<'a> {
                                 "GLRMASK_STRICT_STATIC_TRAP_DYNAMIC: DynamicDirect boundary shard fired on a strict-static path"
                             );
                         }
-                        needs_direct_dynamic = true;
+                        let handled = restricted && shard.candidate_tokens.as_deref().is_some_and(|ids| {
+                            let prepared = shard.mask_vocabulary.get_or_init(|| {
+                                super::dynamic_mask::PreparedMaskVocabulary::new(self.constraint, ids)
+                            });
+                            prepared.as_ref().ok().is_some_and(|vocab| {
+                                if std::env::var_os("GLRMASK_DISABLE_BOUNDARY_FRONTIER_SELECTION").is_some() {
+                                    return vocab.or_mask(self, buf).expect("exact vocabulary mask failed");
+                                }
+                                let Some(frontier) = self.segmented_boundary_initial_frontier(shard)
+                                    else { return false; };
+                                if frontier.is_empty() { return true; }
+                                if std::env::var_os("GLRMASK_PROFILE_DYNAMIC_BOUNDARY_CANDIDATE_TRIE").is_some() {
+                                    eprintln!("[glrmask/profile][boundary_initial_frontier] component={} before={} after={}",
+                                        shard.start_component, self.state.len(), frontier.len());
+                                }
+                                let view = ConstraintState {
+                                    terminated: self.terminated,
+                                    constraint: self.constraint,
+                                    state: frontier,
+                                    buffers: CommitBuffers::for_mask_only_shadow(),
+                                    generation: self.generation,
+                                    mask_cache: Mutex::new(None),
+                                    mask_scratch: Arc::clone(&self.mask_scratch),
+                                };
+                                vocab.or_mask(&view, buf).expect("exact vocabulary mask failed")
+                            })
+                        });
+                        needs_direct_dynamic |= !handled;
                         true
                     }
                 };
@@ -4169,6 +4223,8 @@ impl<'a> ConstraintState<'a> {
                 }
             }
             if needs_direct_dynamic {
+                #[cfg(any(test, feature = "internal-api"))]
+                let _fallback_cpu = super::boundary_cpu_profile::Span::enter(super::boundary_cpu_profile::Kind::Dynamic);
                 // A DynamicDirect shard owned a live stack on a path that also
                 // evaluated static shards. The per-shard arm above already
                 // traps loudly under the strict flag; this second trap names
@@ -4651,37 +4707,49 @@ impl<'a> ConstraintState<'a> {
         &self,
         shard: &crate::runtime::SegmentedBoundaryShard,
     ) -> bool {
-        let mut active = false;
+        // Ownership depends only on the top, not on an enumeration of entire
+        // stacks. peek_values is an exact union over all GSS top alternatives.
         for gss in self.state.values() {
-            let complete = gss.for_each_stack_top_first_bounded(128, |top_first, _| {
-                if active {
-                    return;
-                }
-                match top_first.first().copied() {
-                    Some(top) => {
-                        active = if self.constraint.uses_compact_segmented_parser_runtime() {
-                            self.constraint
-                                .compact_segmented_parser_component(top)
-                                .is_some_and(|(component, _)| {
-                                    component == shard.start_component as usize
-                                })
-                        } else {
-                            shard.start_parser_states.contains(top as usize)
-                        };
-                    }
-                    None => {
-                        active = shard.accepts_empty_stack;
-                    }
-                }
-            });
-            if !complete {
-                return true;
-            }
-            if active {
-                return true;
+            if shard.accepts_empty_stack && !gss.isolate(None).is_empty() { return true; }
+            for top in gss.peek_values() {
+                let belongs = if self.constraint.uses_compact_segmented_parser_runtime() {
+                    self.constraint.compact_segmented_parser_component(top)
+                        .is_some_and(|(owner, _)| owner == shard.start_component as usize)
+                } else { shard.start_parser_states.contains(top as usize) };
+                if belongs { return true; }
             }
         }
         false
+    }
+
+    /// Select the initial relation belonging to one vocabulary shard. Keep
+    /// whole lower stacks and exclusion accumulators; never enumerate or cut
+    /// stack paths. This is input selection for the ordinary shared walker.
+    fn segmented_boundary_initial_frontier(
+        &self,
+        shard: &crate::runtime::SegmentedBoundaryShard,
+    ) -> Option<ParserStateMap> {
+        if !self.constraint.uses_compact_segmented_parser_runtime() { return None; }
+        let mut selected = ParserStateMap::default();
+        for (&lexer, gss) in self.state.iter() {
+            if gss.is_empty() { continue; }
+            let tops = gss.peek_values();
+            let mut keep = SmallVec::<[u32; 4]>::new();
+            for &top in &tops {
+                let (owner, _) = self.constraint.compact_segmented_parser_component(top)?;
+                if owner == shard.start_component as usize { keep.push(top); }
+            }
+            let empty = gss.isolate(None);
+            let branch = if keep.len() == tops.len() && (shard.accepts_empty_stack || empty.is_empty()) {
+                gss.clone()
+            } else {
+                let mut branch = if shard.accepts_empty_stack { empty } else { ParserGSS::empty() };
+                for top in keep { branch = branch.merge(&gss.isolate(Some(top))); }
+                branch
+            };
+            if !branch.is_empty() { selected.insert_flat_alternative(lexer, branch); }
+        }
+        Some(selected)
     }
 
     /// OR exact component-trigger candidates into `buf`. Trigger parser labels
@@ -5556,7 +5624,13 @@ impl<'a> ConstraintState<'a> {
                 *slot &= !(1u32 << bit);
             }
         }
+        self.enforce_empty_byte_token_domain(buf);
     }
+    /// Use the same exact token-domain rule as ordinary and profiled masking.
+    fn enforce_empty_byte_token_domain(&self, buf: &mut [u32]) {
+        self.restrict_empty_byte_tokens(buf);
+    }
+
 
     fn fill_blocked_seed_dense(
         &self,
@@ -7206,7 +7280,14 @@ impl<'a> ConstraintState<'a> {
                     })
                 })
         });
-        if authoritative_dynamic_direct {
+        let prepared_boundary_domain = std::env::var_os("GLRMASK_DISABLE_BOUNDARY_VOCAB").is_none()
+            && overlay.is_some_and(|overlay| overlay.segmented_parser_components.iter().any(|component| {
+                component.boundary.as_ref().is_some_and(|shard| {
+                    matches!(shard.backend, crate::runtime::SegmentedBoundaryShardBackend::DynamicDirect)
+                        && shard.candidate_tokens.is_some()
+                })
+            }));
+        if authoritative_dynamic_direct && !prepared_boundary_domain {
             // DynamicDirect already computes the complete exact composed
             // language. Do not first construct component A masks only to OR the
             // same full language over them again. This is explicitly dynamic
@@ -7227,7 +7308,12 @@ impl<'a> ConstraintState<'a> {
                 self.clear_late_grammar_placeholder_mask(mask);
                 return;
             }
-            if self.try_fill_mask_segmented_single_paths(mask) {
+            let filled = if authoritative_dynamic_direct {
+                crate::compiler::composition::boundary::transfer::permit_strict_static_dynamic(|| {
+                    self.try_fill_mask_segmented_single_paths(mask)
+                })
+            } else { self.try_fill_mask_segmented_single_paths(mask) };
+            if filled {
                 self.update_control_special_token_mask(mask);
                 self.clear_late_grammar_placeholder_mask(mask);
                 self.store_mask_cache_reuse_dense(mask);
@@ -7241,10 +7327,14 @@ impl<'a> ConstraintState<'a> {
             // hidden dynamic mask on a claimed static path: trap loudly under
             // the strict-static flag instead of silently contributing exact
             // dynamic admissions.
-            crate::compiler::composition::boundary::transfer::strict_static_trap_dynamic(
-                "authoritative_segmented_projection_decline",
-            );
-            self.fill_mask_dynamic(mask);
+            if authoritative_dynamic_direct {
+                crate::compiler::composition::boundary::transfer::permit_strict_static_dynamic(|| self.fill_mask_dynamic(mask));
+            } else {
+                crate::compiler::composition::boundary::transfer::strict_static_trap_dynamic(
+                    "authoritative_segmented_projection_decline",
+                );
+                self.fill_mask_dynamic(mask);
+            }
             self.clear_late_grammar_placeholder_mask(mask);
             return;
         }

@@ -434,3 +434,15 @@ impl Constraint {
             })
     }
 }
+
+
+impl Constraint {
+    /// Original zero-byte IDs, using the retained index in compiled/loaded data.
+    /// The map fallback supports deliberately hand-built internal constraints.
+    pub(crate) fn empty_byte_token_ids(&self) -> impl Iterator<Item = u32> + '_ {
+        self.packed_token_bytes.iter().flat_map(|packed| packed.empty_token_ids().iter().copied())
+            .chain(self.packed_token_bytes.is_none().then_some(&self.token_bytes)
+                .into_iter().flat_map(|tokens| tokens.iter()
+                    .filter_map(|(&id, bytes)| bytes.is_empty().then_some(id))))
+    }
+}

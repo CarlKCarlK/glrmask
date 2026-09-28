@@ -1,0 +1,1989 @@
+{
+  "source_commit": "90aad8081a257219db13681e9eac3d489388f02c",
+  "base_commit": "bde3090733dc35570f7d8d173efbbda82586ed40",
+  "package": {
+    "base": "bde3090733dc35570f7d8d173efbbda82586ed40",
+    "sha256": "31dce8f2c9f0b3aa87780e5b1f413e8ab90e799c36b3483284fa1dc819f4dc54",
+    "sources": {
+      "src/runtime/dynamic_mask.rs": "3dd7fd5c856109485bb3866dc5920677e89494e5f9f5057cc8b07ece8b4498e2",
+      "src/runtime/artifact.rs": "7a4aad3646d24c4f021951e6ac635a71a6ccc4ae3ce524699db5c8bb288e47a7"
+    },
+    "commit": "90aad8081a257219db13681e9eac3d489388f02c"
+  },
+  "validation": {
+    "rust_passed": 2270,
+    "rust_failed": 0,
+    "rust_ignored": 55,
+    "python_passed": 42,
+    "doctest_passed": true
+  },
+  "paired_cache_on": {
+    "cache": "on",
+    "repetitions_per_side": 6,
+    "scope": "Only LL-success builds; only exact LL-measured (problem,example,step) runtime keys",
+    "metric": "mask_i+commit_i, minimum complete same-run pair over equal fresh-state repetitions",
+    "candidate_sha256": "31dce8f2c9f0b3aa87780e5b1f413e8ab90e799c36b3483284fa1dc819f4dc54",
+    "published_sha256": "ee7b92d09cbf2fbae189370da911b71810ff75ee93616e781902c823e662a3f5",
+    "groups": {
+      "js": {
+        "published": {
+          "full_masks": 4099,
+          "measured_keys": 4099,
+          "tbm_us": {
+            "p50": 760.125,
+            "p90": 2630.55,
+            "p99": 3742.0098199999998,
+            "p99.9": 4787.0886340000225,
+            "p100": 4991.458
+          },
+          "raw_max_us": 5954.208,
+          "build_ms": [
+            100.42258299999999,
+            91.13208300000001,
+            89.840708,
+            115.191417,
+            87.838125,
+            107.02954100000001
+          ],
+          "worst": [
+            [
+              4991.458,
+              [
+                "js",
+                30,
+                578
+              ]
+            ],
+            [
+              4957.083,
+              [
+                "js",
+                30,
+                567
+              ]
+            ],
+            [
+              4915.667,
+              [
+                "js",
+                30,
+                579
+              ]
+            ],
+            [
+              4823.791,
+              [
+                "js",
+                30,
+                577
+              ]
+            ],
+            [
+              4791.417,
+              [
+                "js",
+                30,
+                580
+              ]
+            ],
+            [
+              4747.25,
+              [
+                "js",
+                18,
+                36
+              ]
+            ],
+            [
+              4711.333,
+              [
+                "js",
+                30,
+                581
+              ]
+            ],
+            [
+              4515.833,
+              [
+                "js",
+                30,
+                583
+              ]
+            ],
+            [
+              4293.958,
+              [
+                "js",
+                30,
+                576
+              ]
+            ],
+            [
+              4268.375,
+              [
+                "js",
+                30,
+                566
+              ]
+            ],
+            [
+              4197.333,
+              [
+                "js",
+                23,
+                44
+              ]
+            ],
+            [
+              4187.25,
+              [
+                "js",
+                30,
+                564
+              ]
+            ]
+          ],
+          "build_median_ms": 95.777333
+        },
+        "candidate": {
+          "full_masks": 4099,
+          "measured_keys": 4099,
+          "tbm_us": {
+            "p50": 748.334,
+            "p90": 2627.0998000000004,
+            "p99": 3585.9188399999994,
+            "p99.9": 4066.4923480000034,
+            "p100": 4205.042
+          },
+          "raw_max_us": 5254.167,
+          "build_ms": [
+            95.581583,
+            98.89983400000001,
+            93.438042,
+            101.9385,
+            86.064625,
+            96.749292
+          ],
+          "worst": [
+            [
+              4205.042,
+              [
+                "js",
+                30,
+                578
+              ]
+            ],
+            [
+              4181.5,
+              [
+                "js",
+                23,
+                44
+              ]
+            ],
+            [
+              4128.375,
+              [
+                "js",
+                18,
+                36
+              ]
+            ],
+            [
+              4094.0,
+              [
+                "js",
+                30,
+                579
+              ]
+            ],
+            [
+              4067.166,
+              [
+                "js",
+                30,
+                927
+              ]
+            ],
+            [
+              4060.292,
+              [
+                "js",
+                30,
+                577
+              ]
+            ],
+            [
+              4013.083,
+              [
+                "js",
+                30,
+                567
+              ]
+            ],
+            [
+              3994.041,
+              [
+                "js",
+                30,
+                580
+              ]
+            ],
+            [
+              3904.75,
+              [
+                "js",
+                18,
+                48
+              ]
+            ],
+            [
+              3903.458,
+              [
+                "js",
+                30,
+                581
+              ]
+            ],
+            [
+              3853.958,
+              [
+                "js",
+                18,
+                42
+              ]
+            ],
+            [
+              3848.792,
+              [
+                "js",
+                18,
+                45
+              ]
+            ]
+          ],
+          "build_median_ms": 96.1654375
+        }
+      },
+      "static": {
+        "published": {
+          "full_masks": 4099,
+          "measured_keys": 4099,
+          "tbm_us": {
+            "p50": 19.291,
+            "p90": 29.25,
+            "p99": 46.12584,
+            "p99.9": 71.44375000000156,
+            "p100": 81.0
+          },
+          "raw_max_us": 110.541,
+          "build_ms": [
+            3533.5892910000002,
+            3585.88025,
+            3669.947459,
+            3497.157208,
+            3554.706333,
+            3652.683375
+          ],
+          "worst": [
+            [
+              81.0,
+              [
+                "js",
+                30,
+                583
+              ]
+            ],
+            [
+              78.292,
+              [
+                "js",
+                18,
+                53
+              ]
+            ],
+            [
+              73.667,
+              [
+                "js",
+                18,
+                14
+              ]
+            ],
+            [
+              72.417,
+              [
+                "js",
+                30,
+                545
+              ]
+            ],
+            [
+              71.75,
+              [
+                "js",
+                18,
+                55
+              ]
+            ],
+            [
+              68.625,
+              [
+                "js",
+                5,
+                13
+              ]
+            ],
+            [
+              68.583,
+              [
+                "js",
+                30,
+                577
+              ]
+            ],
+            [
+              66.333,
+              [
+                "js",
+                14,
+                12
+              ]
+            ],
+            [
+              61.833,
+              [
+                "js",
+                18,
+                12
+              ]
+            ],
+            [
+              61.0,
+              [
+                "js",
+                3,
+                116
+              ]
+            ],
+            [
+              60.917,
+              [
+                "js",
+                30,
+                543
+              ]
+            ],
+            [
+              59.125,
+              [
+                "js",
+                30,
+                578
+              ]
+            ]
+          ],
+          "build_median_ms": 3570.2932915
+        },
+        "candidate": {
+          "full_masks": 4099,
+          "measured_keys": 4099,
+          "tbm_us": {
+            "p50": 19.541,
+            "p90": 30.058600000000023,
+            "p99": 47.25084,
+            "p99.9": 73.04625000000019,
+            "p100": 81.916
+          },
+          "raw_max_us": 119.166,
+          "build_ms": [
+            3570.66275,
+            3736.888542,
+            3511.430833,
+            3706.8177910000004,
+            3738.535791,
+            3649.024625
+          ],
+          "worst": [
+            [
+              81.916,
+              [
+                "js",
+                30,
+                583
+              ]
+            ],
+            [
+              80.25,
+              [
+                "js",
+                18,
+                53
+              ]
+            ],
+            [
+              76.917,
+              [
+                "js",
+                18,
+                55
+              ]
+            ],
+            [
+              75.125,
+              [
+                "js",
+                18,
+                14
+              ]
+            ],
+            [
+              73.083,
+              [
+                "js",
+                30,
+                545
+              ]
+            ],
+            [
+              72.708,
+              [
+                "js",
+                30,
+                577
+              ]
+            ],
+            [
+              71.166,
+              [
+                "js",
+                5,
+                13
+              ]
+            ],
+            [
+              69.208,
+              [
+                "js",
+                14,
+                12
+              ]
+            ],
+            [
+              62.541,
+              [
+                "js",
+                3,
+                116
+              ]
+            ],
+            [
+              61.708,
+              [
+                "js",
+                30,
+                578
+              ]
+            ],
+            [
+              61.625,
+              [
+                "js",
+                18,
+                12
+              ]
+            ],
+            [
+              61.167,
+              [
+                "js",
+                30,
+                543
+              ]
+            ]
+          ],
+          "build_median_ms": 3677.921208
+        }
+      },
+      "jsb": {
+        "published": {
+          "full_masks": 9045,
+          "measured_keys": 9021,
+          "tbm_us": {
+            "p50": 38.833,
+            "p90": 115.626,
+            "p99": 336.3001999999991,
+            "p99.9": 2209.8560000000043,
+            "p100": 2265.833
+          },
+          "raw_max_us": 2447.208,
+          "build_ms": [],
+          "worst": [
+            [
+              2265.833,
+              [
+                "jsb/data/Github_ultra---o21135",
+                0,
+                473
+              ]
+            ],
+            [
+              2250.499,
+              [
+                "jsb/data/Github_ultra---o21135",
+                1,
+                17
+              ]
+            ],
+            [
+              2247.041,
+              [
+                "jsb/data/Github_ultra---o21135",
+                0,
+                17
+              ]
+            ],
+            [
+              2235.167,
+              [
+                "jsb/data/Github_ultra---o21135",
+                1,
+                1180
+              ]
+            ],
+            [
+              2235.084,
+              [
+                "jsb/data/Github_ultra---o21135",
+                1,
+                466
+              ]
+            ],
+            [
+              2234.083,
+              [
+                "jsb/data/Github_ultra---o21135",
+                0,
+                1172
+              ]
+            ],
+            [
+              2228.793,
+              [
+                "jsb/data/Github_ultra---o21135",
+                1,
+                1049
+              ]
+            ],
+            [
+              2227.209,
+              [
+                "jsb/data/Github_ultra---o21135",
+                0,
+                926
+              ]
+            ],
+            [
+              2226.249,
+              [
+                "jsb/data/Github_ultra---o21135",
+                0,
+                1043
+              ]
+            ],
+            [
+              2209.916,
+              [
+                "jsb/data/Github_ultra---o21135",
+                0,
+                1240
+              ]
+            ],
+            [
+              2206.916,
+              [
+                "jsb/data/Github_ultra---o21135",
+                1,
+                1251
+              ]
+            ],
+            [
+              2204.709,
+              [
+                "jsb/data/Github_ultra---o21135",
+                1,
+                933
+              ]
+            ]
+          ]
+        },
+        "candidate": {
+          "full_masks": 9045,
+          "measured_keys": 9021,
+          "tbm_us": {
+            "p50": 38.959,
+            "p90": 116.541,
+            "p99": 341.2995999999999,
+            "p99.9": 2237.026180000001,
+            "p100": 2321.333
+          },
+          "raw_max_us": 2519.708,
+          "build_ms": [],
+          "worst": [
+            [
+              2321.333,
+              [
+                "jsb/data/Github_ultra---o21135",
+                1,
+                17
+              ]
+            ],
+            [
+              2306.126,
+              [
+                "jsb/data/Github_ultra---o21135",
+                1,
+                466
+              ]
+            ],
+            [
+              2301.791,
+              [
+                "jsb/data/Github_ultra---o21135",
+                1,
+                1270
+              ]
+            ],
+            [
+              2282.583,
+              [
+                "jsb/data/Github_ultra---o21135",
+                1,
+                1049
+              ]
+            ],
+            [
+              2281.667,
+              [
+                "jsb/data/Github_ultra---o21135",
+                1,
+                1251
+              ]
+            ],
+            [
+              2270.167,
+              [
+                "jsb/data/Github_ultra---o21135",
+                1,
+                933
+              ]
+            ],
+            [
+              2263.167,
+              [
+                "jsb/data/Github_ultra---o21135",
+                0,
+                17
+              ]
+            ],
+            [
+              2260.75,
+              [
+                "jsb/data/Github_ultra---o21135",
+                0,
+                1043
+              ]
+            ],
+            [
+              2253.25,
+              [
+                "jsb/data/Github_ultra---o21135",
+                0,
+                473
+              ]
+            ],
+            [
+              2237.042,
+              [
+                "jsb/data/Github_ultra---o21135",
+                1,
+                1056
+              ]
+            ],
+            [
+              2236.251,
+              [
+                "jsb/data/Github_ultra---o21135",
+                1,
+                1180
+              ]
+            ],
+            [
+              2233.708,
+              [
+                "jsb/data/Github_ultra---o21135",
+                0,
+                1172
+              ]
+            ]
+          ]
+        }
+      }
+    }
+  },
+  "independent_reverse_guard": {
+    "cache": "on",
+    "repetitions_per_side": 6,
+    "scope": "Only LL-success builds; only exact LL-measured (problem,example,step) runtime keys",
+    "metric": "mask_i+commit_i, minimum complete same-run pair over equal fresh-state repetitions",
+    "candidate_sha256": "31dce8f2c9f0b3aa87780e5b1f413e8ab90e799c36b3483284fa1dc819f4dc54",
+    "published_sha256": "ee7b92d09cbf2fbae189370da911b71810ff75ee93616e781902c823e662a3f5",
+    "groups": {
+      "static": {
+        "candidate": {
+          "full_masks": 4099,
+          "measured_keys": 4099,
+          "tbm_us": {
+            "p50": 19.541,
+            "p90": 29.875,
+            "p99": 48.38083999999999,
+            "p99.9": 72.78698200000002,
+            "p100": 78.833
+          },
+          "raw_max_us": 312.584,
+          "build_ms": [
+            3533.1578750000003,
+            3540.4804169999998,
+            3531.9615839999997,
+            3587.200292,
+            3832.495833,
+            3545.2079580000004,
+            3478.8867090000003,
+            3515.868958,
+            3514.387917,
+            3445.7215419999998
+          ],
+          "worst": [
+            [
+              78.833,
+              [
+                "js",
+                30,
+                583
+              ]
+            ],
+            [
+              77.5,
+              [
+                "js",
+                18,
+                53
+              ]
+            ],
+            [
+              74.667,
+              [
+                "js",
+                18,
+                55
+              ]
+            ],
+            [
+              73.084,
+              [
+                "js",
+                18,
+                14
+              ]
+            ],
+            [
+              72.791,
+              [
+                "js",
+                30,
+                545
+              ]
+            ],
+            [
+              72.75,
+              [
+                "js",
+                30,
+                577
+              ]
+            ],
+            [
+              69.167,
+              [
+                "js",
+                14,
+                12
+              ]
+            ],
+            [
+              67.209,
+              [
+                "js",
+                5,
+                13
+              ]
+            ],
+            [
+              62.583,
+              [
+                "js",
+                21,
+                6
+              ]
+            ],
+            [
+              60.917,
+              [
+                "js",
+                18,
+                12
+              ]
+            ],
+            [
+              60.833,
+              [
+                "js",
+                30,
+                543
+              ]
+            ],
+            [
+              59.791,
+              [
+                "js",
+                30,
+                578
+              ]
+            ]
+          ],
+          "build_median_ms": 3532.5597295
+        },
+        "published": {
+          "full_masks": 4099,
+          "measured_keys": 4099,
+          "tbm_us": {
+            "p50": 19.25,
+            "p90": 29.30780000000002,
+            "p99": 45.45966,
+            "p99.9": 70.7361340000007,
+            "p100": 77.375
+          },
+          "raw_max_us": 303.166,
+          "build_ms": [
+            3692.285833,
+            3640.055708,
+            3711.0015,
+            3522.905792,
+            3542.9202499999997,
+            3697.711083,
+            3554.8580420000003,
+            3584.573417,
+            3417.320084,
+            3609.2799160000004
+          ],
+          "worst": [
+            [
+              77.375,
+              [
+                "js",
+                30,
+                583
+              ]
+            ],
+            [
+              75.958,
+              [
+                "js",
+                18,
+                53
+              ]
+            ],
+            [
+              72.542,
+              [
+                "js",
+                30,
+                545
+              ]
+            ],
+            [
+              72.167,
+              [
+                "js",
+                18,
+                14
+              ]
+            ],
+            [
+              70.875,
+              [
+                "js",
+                5,
+                13
+              ]
+            ],
+            [
+              69.458,
+              [
+                "js",
+                30,
+                577
+              ]
+            ],
+            [
+              69.333,
+              [
+                "js",
+                18,
+                55
+              ]
+            ],
+            [
+              69.167,
+              [
+                "js",
+                14,
+                12
+              ]
+            ],
+            [
+              60.875,
+              [
+                "js",
+                30,
+                543
+              ]
+            ],
+            [
+              59.958,
+              [
+                "js",
+                18,
+                12
+              ]
+            ],
+            [
+              59.291,
+              [
+                "js",
+                3,
+                116
+              ]
+            ],
+            [
+              58.375,
+              [
+                "js",
+                30,
+                578
+              ]
+            ]
+          ],
+          "build_median_ms": 3596.9266665000005
+        }
+      },
+      "jsb": {
+        "candidate": {
+          "full_masks": 9045,
+          "measured_keys": 9021,
+          "tbm_us": {
+            "p50": 38.375,
+            "p90": 115.209,
+            "p99": 334.4501999999998,
+            "p99.9": 2221.6658200000056,
+            "p100": 2260.958
+          },
+          "raw_max_us": 2393.125,
+          "build_ms": [],
+          "worst": [
+            [
+              2260.958,
+              [
+                "jsb/data/Github_ultra---o21135",
+                1,
+                17
+              ]
+            ],
+            [
+              2259.499,
+              [
+                "jsb/data/Github_ultra---o21135",
+                0,
+                473
+              ]
+            ],
+            [
+              2254.126,
+              [
+                "jsb/data/Github_ultra---o21135",
+                0,
+                17
+              ]
+            ],
+            [
+              2250.041,
+              [
+                "jsb/data/Github_ultra---o21135",
+                1,
+                466
+              ]
+            ],
+            [
+              2243.209,
+              [
+                "jsb/data/Github_ultra---o21135",
+                0,
+                1172
+              ]
+            ],
+            [
+              2242.082,
+              [
+                "jsb/data/Github_ultra---o21135",
+                0,
+                1043
+              ]
+            ],
+            [
+              2241.458,
+              [
+                "jsb/data/Github_ultra---o21135",
+                1,
+                1049
+              ]
+            ],
+            [
+              2241.458,
+              [
+                "jsb/data/Github_ultra---o21135",
+                1,
+                933
+              ]
+            ],
+            [
+              2233.167,
+              [
+                "jsb/data/Github_ultra---o21135",
+                1,
+                1180
+              ]
+            ],
+            [
+              2221.75,
+              [
+                "jsb/data/Github_ultra---o21135",
+                0,
+                1240
+              ]
+            ],
+            [
+              2217.541,
+              [
+                "jsb/data/Github_ultra---o21135",
+                0,
+                926
+              ]
+            ],
+            [
+              2210.749,
+              [
+                "jsb/data/Github_ultra---o21135",
+                0,
+                1097
+              ]
+            ]
+          ]
+        },
+        "published": {
+          "full_masks": 9045,
+          "measured_keys": 9021,
+          "tbm_us": {
+            "p50": 38.791,
+            "p90": 115.334,
+            "p99": 335.0999999999999,
+            "p99.9": 2206.858500000001,
+            "p100": 2275.917
+          },
+          "raw_max_us": 2441.626,
+          "build_ms": [],
+          "worst": [
+            [
+              2275.917,
+              [
+                "jsb/data/Github_ultra---o21135",
+                0,
+                473
+              ]
+            ],
+            [
+              2256.083,
+              [
+                "jsb/data/Github_ultra---o21135",
+                0,
+                17
+              ]
+            ],
+            [
+              2247.333,
+              [
+                "jsb/data/Github_ultra---o21135",
+                1,
+                17
+              ]
+            ],
+            [
+              2232.792,
+              [
+                "jsb/data/Github_ultra---o21135",
+                1,
+                466
+              ]
+            ],
+            [
+              2230.584,
+              [
+                "jsb/data/Github_ultra---o21135",
+                1,
+                1180
+              ]
+            ],
+            [
+              2228.584,
+              [
+                "jsb/data/Github_ultra---o21135",
+                0,
+                1172
+              ]
+            ],
+            [
+              2225.708,
+              [
+                "jsb/data/Github_ultra---o21135",
+                1,
+                1049
+              ]
+            ],
+            [
+              2217.5,
+              [
+                "jsb/data/Github_ultra---o21135",
+                0,
+                1043
+              ]
+            ],
+            [
+              2208.125,
+              [
+                "jsb/data/Github_ultra---o21135",
+                1,
+                933
+              ]
+            ],
+            [
+              2206.876,
+              [
+                "jsb/data/Github_ultra---o21135",
+                0,
+                926
+              ]
+            ],
+            [
+              2206.001,
+              [
+                "jsb/data/Github_ultra---o21135",
+                0,
+                1240
+              ]
+            ],
+            [
+              2204.916,
+              [
+                "jsb/data/Github_ultra---o21135",
+                1,
+                1251
+              ]
+            ]
+          ]
+        }
+      }
+    }
+  },
+  "fresh_llguidance": {
+    "scope": "same-machine make example-js, original grammar; only exact LL-measured keys",
+    "metric": "mask_i + commit_i within each run; minimum of six complete pairs per position",
+    "cache_policy": "production defaults, no exact-mask-cache diagnostic override",
+    "llguidance_grammar": "llguidance uses a different grammar; masks are not assumed equal across engines",
+    "provenance": {
+      "argv": [
+        "make",
+        "-C",
+        "/Users/isaacbreen/Projects2/worktrees/cfa-js-grammar-345436h-20260927",
+        "--no-print-directory",
+        "example-js",
+        "PYTHON=/Users/isaacbreen/Projects2/worktrees/glrmask-lr-build-345436i-20260927/.venv/bin/python",
+        "FRAMEWORKS=glrmask_dynamic llguidance_native",
+        "RUNTIME_TIMING_CLOCK=thread",
+        "TIMING_RUNS=6",
+        "TIMING_MIN_RUNS=6",
+        "TIMING_WARMUP_RUNS=0",
+        "BUILD_RUNS=6",
+        "MAX_EXAMPLES=-1",
+        "RECORD_TIMING_RUNS=always",
+        "DISCREPANCY_BUDGET=0",
+        "TIMING_SUMMARY_STATS=p50 p90 p99 max",
+        "OUTPUT=/Users/isaacbreen/Projects2/worktrees/glrmask-lr-build-345436i-20260927/.benchmarks/dynamic-tail/cfa-key-order-ll.json.zst",
+        "ARGS=--target-build-time 10 --max-disputed-token-ids 0"
+      ],
+      "env": {
+        "PYTHONPATH": "/Users/isaacbreen/Projects2/worktrees/glrmask-lr-build-345436i-20260927/.benchmarks/dynamic-tail/key-order-python:/Users/isaacbreen/Projects2/worktrees/cfa-js-grammar-345436h-20260927",
+        "GLRMASK_LLGUIDANCE_COMPAT": "1",
+        "CFA_RUNTIME_TIMING_CLOCK": "thread",
+        "MIMALLOC_PURGE_DELAY": "-1"
+      },
+      "package": {
+        "base": "bde3090733dc35570f7d8d173efbbda82586ed40",
+        "sha256": "31dce8f2c9f0b3aa87780e5b1f413e8ab90e799c36b3483284fa1dc819f4dc54",
+        "sources": {
+          "src/runtime/dynamic_mask.rs": "3dd7fd5c856109485bb3866dc5920677e89494e5f9f5057cc8b07ece8b4498e2",
+          "src/runtime/artifact.rs": "7a4aad3646d24c4f021951e6ac635a71a6ccc4ae3ce524699db5c8bb288e47a7"
+        }
+      }
+    },
+    "artifact_sha256": {
+      "cfa-key-order-ll.json.zst": "65cda0ad4d1412bf95533f49a2214145bb40a9a20bd22d596838e0ecce726021",
+      "cfa-key-order-ll_raw.json.zst": "20761db8d94f7e830c1d8661a64440165cad6b047ed4a2449c482c29e9c1a815"
+    },
+    "clock": "thread",
+    "groups": {
+      "glrmask_dynamic": {
+        "measured_positions": 4099,
+        "raw_observations": 24594,
+        "tbm_us": {
+          "p50": 786.001,
+          "p90": 2710.4168,
+          "p95": 3027.8167,
+          "p99": 3739.52502,
+          "p99.9": 4197.575500000021,
+          "p100": 4355.5
+        },
+        "raw_max_us": 8053.459000000001,
+        "build_ms": [
+          100.866167,
+          88.722042,
+          92.44187500000001,
+          111.915959,
+          91.856709,
+          100.15637500000001
+        ],
+        "build_median_ms": 96.299125,
+        "build_min_ms": 88.722042,
+        "worst": [
+          [
+            4355.5,
+            [
+              23,
+              44
+            ]
+          ],
+          [
+            4302.626,
+            [
+              18,
+              48
+            ]
+          ],
+          [
+            4292.0830000000005,
+            [
+              18,
+              36
+            ]
+          ],
+          [
+            4230.25,
+            [
+              30,
+              578
+            ]
+          ],
+          [
+            4201.667,
+            [
+              18,
+              45
+            ]
+          ],
+          [
+            4159.917,
+            [
+              18,
+              42
+            ]
+          ],
+          [
+            4135.417,
+            [
+              23,
+              45
+            ]
+          ],
+          [
+            4116.290999999999,
+            [
+              30,
+              579
+            ]
+          ],
+          [
+            4113.125,
+            [
+              30,
+              577
+            ]
+          ],
+          [
+            4054.9990000000003,
+            [
+              30,
+              567
+            ]
+          ],
+          [
+            4019.167,
+            [
+              30,
+              580
+            ]
+          ],
+          [
+            4009.1240000000003,
+            [
+              23,
+              11
+            ]
+          ],
+          [
+            3999.4990000000003,
+            [
+              18,
+              39
+            ]
+          ],
+          [
+            3955.584,
+            [
+              30,
+              927
+            ]
+          ],
+          [
+            3947.5000000000005,
+            [
+              30,
+              561
+            ]
+          ]
+        ]
+      },
+      "llguidance_native": {
+        "measured_positions": 4099,
+        "raw_observations": 24594,
+        "tbm_us": {
+          "p50": 1073.4589999999998,
+          "p90": 2739.9338000000002,
+          "p95": 2851.8744,
+          "p99": 3066.152,
+          "p99.9": 3244.9008660000004,
+          "p100": 3504.3749999999995
+        },
+        "raw_max_us": 4223.458,
+        "build_ms": [
+          4.0825000032782555,
+          3.968167002312839,
+          3.773125004954636,
+          3.9224170614033937,
+          3.757457947358489,
+          3.90008301474154
+        ],
+        "build_median_ms": 3.911250038072467,
+        "build_min_ms": 3.757457947358489,
+        "worst": [
+          [
+            3504.3749999999995,
+            [
+              0,
+              82
+            ]
+          ],
+          [
+            3320.25,
+            [
+              0,
+              42
+            ]
+          ],
+          [
+            3310.542,
+            [
+              22,
+              45
+            ]
+          ],
+          [
+            3292.707,
+            [
+              0,
+              122
+            ]
+          ],
+          [
+            3244.958,
+            [
+              15,
+              3
+            ]
+          ],
+          [
+            3244.375,
+            [
+              8,
+              9
+            ]
+          ],
+          [
+            3243.25,
+            [
+              17,
+              104
+            ]
+          ],
+          [
+            3236.2090000000003,
+            [
+              9,
+              53
+            ]
+          ],
+          [
+            3221.916,
+            [
+              8,
+              10
+            ]
+          ],
+          [
+            3218.875,
+            [
+              9,
+              66
+            ]
+          ],
+          [
+            3192.75,
+            [
+              21,
+              88
+            ]
+          ],
+          [
+            3178.042,
+            [
+              9,
+              64
+            ]
+          ],
+          [
+            3177.7509999999997,
+            [
+              30,
+              582
+            ]
+          ],
+          [
+            3177.0829999999996,
+            [
+              22,
+              48
+            ]
+          ],
+          [
+            3174.084,
+            [
+              2,
+              39
+            ]
+          ]
+        ]
+      }
+    }
+  },
+  "captures": {
+    "static-compiled": {
+      "masks": 77582,
+      "schemas": 126,
+      "decoded_bytes": 1245309451,
+      "sha256": "351dab2120aadea63c7515ff1c12630fd8857184817eb0f87dfaa1e30932ece2",
+      "compressed_bytes": 5292137
+    },
+    "static-loaded": {
+      "masks": 77582,
+      "schemas": 126,
+      "decoded_bytes": 1245309451,
+      "sha256": "351dab2120aadea63c7515ff1c12630fd8857184817eb0f87dfaa1e30932ece2",
+      "compressed_bytes": 5292137
+    },
+    "dynamic-compiled": {
+      "masks": 77582,
+      "schemas": 126,
+      "decoded_bytes": 1245309459,
+      "sha256": "e92ae58e35267945ea771421e735e574c34d2aa2f9d8b751454859d4d0ef33e6",
+      "compressed_bytes": 5297312
+    },
+    "dynamic-loaded": {
+      "masks": 77582,
+      "schemas": 126,
+      "decoded_bytes": 1245309459,
+      "sha256": "e92ae58e35267945ea771421e735e574c34d2aa2f9d8b751454859d4d0ef33e6",
+      "compressed_bytes": 5297312
+    }
+  },
+  "evidence": {
+    "screen.py": {
+      "bytes": 7881,
+      "sha256": "750742522c53824cbd148b47b9bba880c6bcd86d83e8d45ae2f14b2f93d69a30"
+    },
+    "kernel-30-578.log": {
+      "bytes": 366,
+      "sha256": "52ff03c55fa247760b3e731b27ca53e689276603dbf6c920dd119d362ad76471"
+    },
+    "validate_captures.py": {
+      "bytes": 2820,
+      "sha256": "f77672d7c33d6dfa9aa0f80da1ddb960630f626f7117e51b030f7fe0bfc820a9"
+    },
+    "native-a2.log": {
+      "bytes": 75,
+      "sha256": "dc1354ce86f575fcec3a51122b2b3cca03c283512d2681afde8053adc5611ab4"
+    },
+    "test-key-order-doc.log": {
+      "bytes": 296,
+      "sha256": "5fb78d66eda008adabccf4858a486c44a9f8c8ea047c280293fcf2744317b1b3"
+    },
+    "tokens-23-44.txt": {
+      "bytes": 241,
+      "sha256": "5729fdfaf5c3ab1cfc62836a0e83e1df286c0697631b4501719abfdb8518ccd6"
+    },
+    "tokens-24-6.txt": {
+      "bytes": 182,
+      "sha256": "bbc6e44678c70447abaaf6014ec1df8127872709daecb3559b9c1882c8abd689"
+    },
+    "native-a1.log": {
+      "bytes": 75,
+      "sha256": "d9fd058b3d5328063ee798d32c6d2715a3f678b58429f12f0bbee9832440d1e7"
+    },
+    "native-libraries.txt": {
+      "bytes": 301,
+      "sha256": "103da01da57f26ab320c5dd48e9f25db7ea7c5bad7a868c2ffc37ac04ec7e035"
+    },
+    "targets.json": {
+      "bytes": 68565,
+      "sha256": "5dd463249b7e5c990185935e5747e362d84309a0f4a43928653ca74678aec2ea"
+    },
+    "cfa-key-order-ll.log": {
+      "bytes": 13501,
+      "sha256": "8eb4953937c2f80d045e41b93bbe3c42b1f8e5ef21309737fc0cf08d083d2329"
+    },
+    "build-baseline.log": {
+      "bytes": 5660,
+      "sha256": "0b9aaa5f55b13ac7a549f93b84344cd4e5d2fbb4e1b831298226cec52157271f"
+    },
+    "sample-walk-only.log": {
+      "bytes": 75,
+      "sha256": "0e43ea71e1224577aa21d85743698a54f4e0c171508926ce75550190826a55a8"
+    },
+    "sample-native.log": {
+      "bytes": 76,
+      "sha256": "f868f140935a1ba8a1ca0f5728dcbe701d50027393352188902cd4f18dc43191"
+    },
+    "baseline-package.json": {
+      "bytes": 226,
+      "sha256": "a8101740ae6b0f6e4cb8f8d62ae3ff7167f9bd2eabd884ebd23cd2eaf4b35896"
+    },
+    "cfa-key-order-ll-summary.log": {
+      "bytes": 6433,
+      "sha256": "4fa35353f589762146291f0b1fad9053560043782dc7cc070059d19014add5ce"
+    },
+    "tokens-30-577.txt": {
+      "bytes": 6976,
+      "sha256": "f030288fe29acadffedd80352f77780503cfae074563d98a2b58fa364de2dbbb"
+    },
+    "test-key-order-workspace.log": {
+      "bytes": 256483,
+      "sha256": "e8820910c13e56ed417c23bcd44acea3602cd15e3e8ab88481c7bbcdb47717e7"
+    },
+    "key-order-package.json": {
+      "bytes": 414,
+      "sha256": "2240a0abf6f96bb13c9eea6bf88273aedc49627e4576fba5ffc8c7e4802ab2e5"
+    },
+    "cfa-key-order-ll.meta.json": {
+      "bytes": 1495,
+      "sha256": "4ded2911a146256ec2aead30c30e5f41667b22a24bf7c2329e38f954f576a22e"
+    },
+    "tokens-30-578.txt": {
+      "bytes": 6976,
+      "sha256": "f030288fe29acadffedd80352f77780503cfae074563d98a2b58fa364de2dbbb"
+    },
+    "package.json": {
+      "bytes": 358,
+      "sha256": "f2170e3b5f6631b7b7efbba09f8c9eae7538374a870e1ab08f3cff65480d1a94"
+    },
+    "tokens-30-579.txt": {
+      "bytes": 6976,
+      "sha256": "f030288fe29acadffedd80352f77780503cfae074563d98a2b58fa364de2dbbb"
+    },
+    "test-key-order-python.log": {
+      "bytes": 753,
+      "sha256": "8a01a9bb241766780d8e504be177133c0020fbc76b16ce66c5dd51279ddd5366"
+    },
+    "summarize_cfa.py": {
+      "bytes": 4328,
+      "sha256": "dd0d840714ee3b2b51f83ee453add4dbc71c51ce96a88c0856e5be7e8de3e4b5"
+    },
+    "probe.py": {
+      "bytes": 10446,
+      "sha256": "ec069e0cbae0a2cf6266f09f5b3a42e151ed95ec385357399d0c3fd9a42e3cb0"
+    },
+    "capture-key-order.log": {
+      "bytes": 844,
+      "sha256": "bc350ae9ca7c74f18238bce8292b202f1d9c24905b04904d0a311fda44b46299"
+    },
+    "build-key-order.log": {
+      "bytes": 854,
+      "sha256": "8483742649e61bedd484a70f53f0e554bd477696ffb27ce3103951c8e7fa21d4"
+    },
+    "native-b1.log": {
+      "bytes": 75,
+      "sha256": "10182bda3053a62f9f822aba886a4bc494c320f64d69dbf573c717b1082a0d69"
+    },
+    "cfa-key-order-ll-summary.json": {
+      "bytes": 6433,
+      "sha256": "4fa35353f589762146291f0b1fad9053560043782dc7cc070059d19014add5ce"
+    },
+    "screen-key-order.log": {
+      "bytes": 15101,
+      "sha256": "56ad09cf82585053bf7a0a5ab587a7d68aceebfdb9bf932ad2ef903c31556d8e"
+    },
+    "sample-walk-only.txt": {
+      "bytes": 486167,
+      "sha256": "2891275a22d011d48c32afc73e4a801b696bb4bbc37e30a766312a2dc466838c"
+    },
+    "tokens-18-36.txt": {
+      "bytes": 294,
+      "sha256": "6a0b22e69f17dcc2b152c315140cb5f18cfee3d73b404fd23887bba8b14c0cdc"
+    },
+    "native-b2.log": {
+      "bytes": 75,
+      "sha256": "8d99c5dcb9d806ec01eba2f21eb5d270fefed0fd8bdb2e8b74312ed3c41ccad1"
+    },
+    "screen-key-order-guard-reverse.log": {
+      "bytes": 10365,
+      "sha256": "fb24fca09560852899529bcec8686524411dd2a7a634c89ede749da0ec5c8420"
+    },
+    "sample-native.txt": {
+      "bytes": 124798,
+      "sha256": "e8015fad0c4f386dcb977d103e15dfa50884736485e536c0a393fe4b03a8317c"
+    },
+    "test-key-order.log": {
+      "bytes": 5893,
+      "sha256": "08d723e91e94c0cd1c1ada297d1c4166d5e5e648c7d51278cd9eaadf45af79f2"
+    },
+    "captures/dynamic-loaded.zst.json": {
+      "bytes": 95611,
+      "sha256": "77ca9bcfa5ddd943bd7a1d3287675dac8000fd50b5e3b57c5238ae02e5bf2639"
+    },
+    "captures/summary.json": {
+      "bytes": 861,
+      "sha256": "e43ca17ff027647a6c726bfb505a47f8f7e14a4c6586558c53559a5c843a8be4"
+    },
+    "captures/static-loaded.zst.json": {
+      "bytes": 95611,
+      "sha256": "d290039747c77d450e211f31d248ea161921de10d851eed28ac674c8d1099260"
+    },
+    "captures/static-compiled.log": {
+      "bytes": 5077,
+      "sha256": "ed925885792302c53cd6799d08c6f6fd1119f1c44a706003b9f48b59a3a06ed2"
+    },
+    "captures/dynamic-compiled.log": {
+      "bytes": 5077,
+      "sha256": "ed925885792302c53cd6799d08c6f6fd1119f1c44a706003b9f48b59a3a06ed2"
+    },
+    "captures/dynamic-compiled.zst.json": {
+      "bytes": 95611,
+      "sha256": "8ae852664cab5cd5d5e5edf4498a4b596c3aba9e475623563cd8c7b81638c61c"
+    },
+    "captures/static-compiled.zst.json": {
+      "bytes": 95611,
+      "sha256": "e6a44bbc73cdae94a95ccc3b669810a03217ccf60c7f2bf100d01491e89ec744"
+    },
+    "captures/static-loaded.log": {
+      "bytes": 5077,
+      "sha256": "ed925885792302c53cd6799d08c6f6fd1119f1c44a706003b9f48b59a3a06ed2"
+    },
+    "captures/dynamic-loaded.log": {
+      "bytes": 5077,
+      "sha256": "ed925885792302c53cd6799d08c6f6fd1119f1c44a706003b9f48b59a3a06ed2"
+    },
+    "key-order-guard-reverse/jsb-published-1.log": {
+      "bytes": 1830,
+      "sha256": "27e1b25b89731371a9c18e06d33539d3e6df898e68a1697fd99307c23605c2dc"
+    },
+    "key-order-guard-reverse/summary.json": {
+      "bytes": 9398,
+      "sha256": "4abb7dd7ea7b08c64b5c2ef5a7916b93bb83eacced18bd2170f3a469914c9063"
+    },
+    "key-order-guard-reverse/static-candidate-1.json": {
+      "bytes": 1447321,
+      "sha256": "e3fd6a2b12eb1f344cc8f5831d0cf1cf361266bbf2201c886fa27bf8352aa834"
+    },
+    "key-order-guard-reverse/jsb-published-2.log": {
+      "bytes": 1829,
+      "sha256": "c21b945c33245aedcc06fbae023a248b4d57b9dcb25d59322a95a87dc17d0576"
+    },
+    "key-order-guard-reverse/jsb-candidate-1.json": {
+      "bytes": 3942364,
+      "sha256": "496d312d815679d47e6ff8d7028c719564c02771a3f21ac4ecf4efc37d1ea172"
+    },
+    "key-order-guard-reverse/jsb-published-2.meta.json": {
+      "bytes": 1440,
+      "sha256": "c80749f3bb08f592e46a8463f0ec586f2f397669257dc51628868ef8a54233f7"
+    },
+    "key-order-guard-reverse/static-published-2.log": {
+      "bytes": 761,
+      "sha256": "d403cc20346dedc689ecf5f06fd8a358175cf7d90db16b46a4260d359e427fc4"
+    },
+    "key-order-guard-reverse/static-published-1.log": {
+      "bytes": 774,
+      "sha256": "3abc11e7ed44589b362617677fd435f86b8d377a0163200f5fdd88e7dd159204"
+    },
+    "key-order-guard-reverse/static-published-2.meta.json": {
+      "bytes": 1294,
+      "sha256": "f89d7415c36087930f69485cd39a53d7ff9e49637c940848693da5897cec6640"
+    },
+    "key-order-guard-reverse/static-published-2.json": {
+      "bytes": 1447522,
+      "sha256": "654f6e73dc8c425247c5c1de81e7e058c1a8479b0e048ef08dac6dcb68f52dd5"
+    },
+    "key-order-guard-reverse/jsb-candidate-1.meta.json": {
+      "bytes": 1274,
+      "sha256": "94dd852d89575b013ee761c0f4fe2956f8ecdab1c756c4f87408eff54a9d4060"
+    },
+    "key-order-guard-reverse/jsb-published-2.json": {
+      "bytes": 3943132,
+      "sha256": "8e12305c2fa175b4ec0698efe8a5735efc6b09398a20536cf21a4323772cfc02"
+    },
+    "key-order-guard-reverse/static-candidate-1.meta.json": {
+      "bytes": 1125,
+      "sha256": "998a2ce78baedfe53e77826a800a81a48c1d1d025174f5b3f4ff25e185e0396a"
+    },
+    "key-order-guard-reverse/jsb-published-1.meta.json": {
+      "bytes": 1440,
+      "sha256": "a03bfab68a6e202883f316fe8ef881c589aa46a197eca12769b16c351eed8007"
+    },
+    "key-order-guard-reverse/jsb-published-1.json": {
+      "bytes": 3942619,
+      "sha256": "737d7d3663f6ff6b1a999bc6cd1597328480fc8a60053ff81b52f1d2fa2c86f0"
+    },
+    "key-order-guard-reverse/static-published-1.json": {
+      "bytes": 1447500,
+      "sha256": "b75be60c66283036e00ab241feef999588330e714fd6b294d218e82b164dc6ef"
+    },
+    "key-order-guard-reverse/static-published-1.meta.json": {
+      "bytes": 1294,
+      "sha256": "a68853c2437a37b00ece81a18f54d66cf31d796e094acffde35f7d169fd5a251"
+    },
+    "key-order-guard-reverse/jsb-candidate-2.meta.json": {
+      "bytes": 1440,
+      "sha256": "a050e8f0c10f4d7ac1a7ae980da54ac3711323d6258439c9005983fcaed81ded"
+    },
+    "key-order-guard-reverse/jsb-candidate-1.log": {
+      "bytes": 1811,
+      "sha256": "cbce1f46f37456db70fe85d30e90b1f5a13cdcf145ec9b0f320c84433ffa8d9c"
+    },
+    "key-order-guard-reverse/static-candidate-2.meta.json": {
+      "bytes": 1294,
+      "sha256": "7e35002a6140bcb9f12bf190c47f6add56f19a071ba5de7127155da8bd7d2e34"
+    },
+    "key-order-guard-reverse/jsb-candidate-2.log": {
+      "bytes": 1831,
+      "sha256": "56a500b9dbe93aa6b48d24d3bb48f59b317762d418e7eb1c40c914c2953b5938"
+    },
+    "key-order-guard-reverse/static-candidate-2.log": {
+      "bytes": 801,
+      "sha256": "8e8686b5219b000f50e84d78abeba25579bd344dc9e0c61bb4853bd1c71168a2"
+    },
+    "key-order-guard-reverse/jsb-candidate-2.json": {
+      "bytes": 3942505,
+      "sha256": "ea2258319c27b506fe96d3939ac327a3de303450df4a7308c1553e9058a2a2b7"
+    },
+    "key-order-guard-reverse/static-candidate-1.log": {
+      "bytes": 752,
+      "sha256": "1576a111bf7cbec97c6d28e336eefd8ef14c2057f2f79e83db4031ec13b3c106"
+    },
+    "key-order-guard-reverse/static-candidate-2.json": {
+      "bytes": 1447883,
+      "sha256": "44148250182e1407fdced0ee7bbdfe459bf3c40d80e43b3296ba7dae43675d26"
+    },
+    "key-order-cache-on/jsb-published-1.log": {
+      "bytes": 1809,
+      "sha256": "c7c8adcd7263d3defa92907f873ec1ec8104ef29a2356ffb7f9a7deb4c6665d8"
+    },
+    "key-order-cache-on/summary.json": {
+      "bytes": 13405,
+      "sha256": "49d52728810a623f6d088d6240323ae875b0f8eadd8f0082c5cff0024b1f2971"
+    },
+    "key-order-cache-on/static-candidate-1.json": {
+      "bytes": 1447458,
+      "sha256": "f45fbefa6a2b57d180ad6c60e3189bc070e7c687d597bbd3bcc285d8ab572133"
+    },
+    "key-order-cache-on/jsb-published-2.log": {
+      "bytes": 1829,
+      "sha256": "441df1ba57ac433e48ac981e5cf7df415c951b30d474d69a5030d32866ede281"
+    },
+    "key-order-cache-on/jsb-candidate-1.json": {
+      "bytes": 3943453,
+      "sha256": "aa00c63f9269efe6214cb6a53f38b94a1a3e970e0406ca3aff46438f5059c228"
+    },
+    "key-order-cache-on/js-candidate-1.json": {
+      "bytes": 1464156,
+      "sha256": "a8316ced7cb6d208c0eff90d9c2d9f082a98a3e5dc15040cb831e641dc41dbad"
+    },
+    "key-order-cache-on/js-published-2.json": {
+      "bytes": 1464314,
+      "sha256": "2ef9026c1690b9a8648484870f7c54a5d8b6c873ea7787592b109ddf325a29ce"
+    },
+    "key-order-cache-on/jsb-published-2.meta.json": {
+      "bytes": 1430,
+      "sha256": "73a544762daf3eab1a8b4872c05f2c6617d5fe4a8f9b9c5ac8b86f2643a47c2e"
+    },
+    "key-order-cache-on/static-published-2.log": {
+      "bytes": 753,
+      "sha256": "637a43cc8df63d4e7584aac5dca3d48d60eb2fca61d2139301d6e0c92101ce4f"
+    },
+    "key-order-cache-on/js-candidate-2.meta.json": {
+      "bytes": 1277,
+      "sha256": "8071bfef609fcbfe6245dc4aad623f3760e928c1bd480fc1b2a8618c7528e718"
+    },
+    "key-order-cache-on/static-published-1.log": {
+      "bytes": 702,
+      "sha256": "f9b9f4833194a1bdf4882d2835c0ac35195a4aeb632dc3cc155a31d24b588189"
+    },
+    "key-order-cache-on/static-published-2.meta.json": {
+      "bytes": 1284,
+      "sha256": "f390dcf007ee395d170819738fcd3c1cabea8f5b2692f33a18dffae207ea4b64"
+    },
+    "key-order-cache-on/static-published-2.json": {
+      "bytes": 1447393,
+      "sha256": "24e58692a17e772b9e5b22185fd4111166f4bb985fab7e846a764e486faf1894"
+    },
+    "key-order-cache-on/js-published-2.log": {
+      "bytes": 741,
+      "sha256": "7ff062e20c9dc9d135ad9d72fca383fccf0c17857c791deee843ee154a3d4d96"
+    },
+    "key-order-cache-on/js-published-1.meta.json": {
+      "bytes": 1117,
+      "sha256": "e8fc86a288a3056275d8025e85940aa34017c14a9cb44f5498684066fb2e0b56"
+    },
+    "key-order-cache-on/jsb-candidate-1.meta.json": {
+      "bytes": 1430,
+      "sha256": "e406b7b04cad063eed3b43b8b0db8b334d38e07ec39c1179d961a89c162b5849"
+    },
+    "key-order-cache-on/js-published-1.log": {
+      "bytes": 717,
+      "sha256": "a38f7f2bd2565090da285ddaeaae58880c4c3cd44ea1bb936ebffbaf82142ba4"
+    },
+    "key-order-cache-on/jsb-published-2.json": {
+      "bytes": 3942885,
+      "sha256": "d8a5849759f1e207b26eccac9e7cb3753b6824377849e19f74ba9d2b3e5af28a"
+    },
+    "key-order-cache-on/static-candidate-1.meta.json": {
+      "bytes": 1284,
+      "sha256": "d2971da77b9e842cdd9c49ee4bbaa2cf621c25c4610845cb831418feadeffabf"
+    },
+    "key-order-cache-on/js-candidate-1.meta.json": {
+      "bytes": 1277,
+      "sha256": "d5dd1bd19bc350dc5c81183bf45c9a9bbde2dff04e7dda1d4090a52c2b615835"
+    },
+    "key-order-cache-on/jsb-published-1.meta.json": {
+      "bytes": 1269,
+      "sha256": "c7db6ca1f1a1cae47ed87f7727c4aa617a64c94cd401da00c3c805929b116adf"
+    },
+    "key-order-cache-on/jsb-published-1.json": {
+      "bytes": 3942228,
+      "sha256": "b92718d3396c572549b21fa08d39150d1b97858bb3e8a2435cea5bee95326b23"
+    },
+    "key-order-cache-on/static-published-1.json": {
+      "bytes": 1447036,
+      "sha256": "9663ffe39ab076cf866c4960b0bf5158a7f0b323e7799922e005a0573cab9849"
+    },
+    "key-order-cache-on/static-published-1.meta.json": {
+      "bytes": 1120,
+      "sha256": "4f7092795e804981b2757eade23c68a415c3f4ed130635907bc074ee7b73ecf7"
+    },
+    "key-order-cache-on/jsb-candidate-2.meta.json": {
+      "bytes": 1430,
+      "sha256": "5ddba8180d8201607481a00125c84d8d3cf63941b453ba5d59ee05904a8243e9"
+    },
+    "key-order-cache-on/js-published-2.meta.json": {
+      "bytes": 1277,
+      "sha256": "29a1ee0db75c5f3c8a3e22667221812984408a71d06684c958a4249d1df95523"
+    },
+    "key-order-cache-on/jsb-candidate-1.log": {
+      "bytes": 1830,
+      "sha256": "33e793a230b2fe00040534838b3bf02183b019782b47f6f3cef31898e354a98a"
+    },
+    "key-order-cache-on/static-candidate-2.meta.json": {
+      "bytes": 1284,
+      "sha256": "2ebfd549e17f2f57901d5cd09c379892884873c95c7549e1699c926d8ed04d7e"
+    },
+    "key-order-cache-on/js-published-1.json": {
+      "bytes": 1464122,
+      "sha256": "ab41cf152da296b60e2bd3aa1610e2565a12387a6c1a4d8efb147863ff6d4546"
+    },
+    "key-order-cache-on/jsb-candidate-2.log": {
+      "bytes": 1830,
+      "sha256": "4921a54af45b2505a0c6144f9087ff2e3d66b44cfcf30460ce4f175e08f0415f"
+    },
+    "key-order-cache-on/js-candidate-2.log": {
+      "bytes": 732,
+      "sha256": "5b8109eb66cd009b5757d99499abd5b4f344a3ecc52e75f04a8533cf9c37542c"
+    },
+    "key-order-cache-on/js-candidate-1.log": {
+      "bytes": 729,
+      "sha256": "74dc5c6611c70bfaeba830759f692058bd36cb51004f8221a55c6719a75bec9a"
+    },
+    "key-order-cache-on/js-candidate-2.json": {
+      "bytes": 1464331,
+      "sha256": "bfe8338ee81b42e5a1794832882018dfcb053acd844da4868bc5e1d95473a63f"
+    },
+    "key-order-cache-on/static-candidate-2.log": {
+      "bytes": 750,
+      "sha256": "f2970e2350fda0c1b0750e0884bc9039083a7f84b88401a51eca234d29f0c281"
+    },
+    "key-order-cache-on/jsb-candidate-2.json": {
+      "bytes": 3943061,
+      "sha256": "2355d781619253de987e17cb29e6b72365cf6eb4a179564614c4d334f364cd55"
+    },
+    "key-order-cache-on/static-candidate-1.log": {
+      "bytes": 752,
+      "sha256": "bb0301de31c1597d80a996a122412cd90c86ca9fa63ce2e7743f016a26bc4428"
+    },
+    "key-order-cache-on/static-candidate-2.json": {
+      "bytes": 1447608,
+      "sha256": "bc91ba3482b187270862f452d1c56ce08beb6ac01ece1f9899a93cf8bef28095"
+    }
+  }
+}

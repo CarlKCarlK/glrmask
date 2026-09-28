@@ -1,13 +1,15 @@
 use super::{
     add_completed_lr0_reductions, build_experimental_core_merged_table, build_lalr_table,
-    build_lalr_table_impl, compute_lalr_item_lookaheads,
+    build_lalr_table_impl, build_lr1_table, compute_lalr_item_lookaheads,
     build_lr0_item_sets, build_lr1_item_sets,
     build_lr1_item_sets_with_preclosure_reuse, build_table,
     build_table_with_default_construction, grouped_item_lookahead_counts,
     finish_table_with_early_identity_quotient, initialize_pending_and_goto,
-    pending_table_has_conflict, slr_reductions_would_conflict,
-    selected_glr_table_construction, try_build_direct_regular_table,
-    try_build_direct_regular_table_reference,
+    lr1_core_key, pending_table_has_conflict, refine_experimental_core_partition,
+    selected_glr_table_construction, slr_reductions_would_conflict,
+    try_build_direct_regular_table, try_build_direct_regular_table_reference,
+    union_experimental_core_rows, ExperimentalCoreCompatibilitySig, Item,
+    BitSet, FxHashMap, LR1ItemCore, LR1ItemSet,
 };
 use crate::compiler::glr::accumulator::TerminalsDisallowed;
 use crate::compiler::glr::analysis::AnalyzedGrammar;
@@ -1114,4 +1116,393 @@ fn probe_normal_grammar_compiler_nullable_recursive_growing_stack() {
             eprintln!("[GRAMMAR_SCC_PROBE] goto state={state} nt={nt} target={target} replace={replace}");
         }
     }
+}
+
+fn refine_experimental_core_partition_btree_reference(
+    table: &GLRTable,
+    core_keys: &[Vec<Item>],
+) -> Vec<u32> {
+    let mut class_by_core: BTreeMap<Vec<Item>, u32> = BTreeMap::new();
+    let mut partition = Vec::with_capacity(core_keys.len());
+    for key in core_keys {
+        let next = class_by_core.len() as u32;
+        partition.push(*class_by_core.entry(key.clone()).or_insert(next));
+    }
+
+    loop {
+        let mut sig_to_class: BTreeMap<ExperimentalCoreCompatibilitySig, u32> = BTreeMap::new();
+        let mut next_partition = Vec::with_capacity(partition.len());
+        for state in 0..table.num_states as usize {
+            let sig = ExperimentalCoreCompatibilitySig::new(table, state, partition[state], &partition);
+            let next = sig_to_class.len() as u32;
+            next_partition.push(*sig_to_class.entry(sig).or_insert(next));
+        }
+        if next_partition == partition {
+            return partition;
+        }
+        partition = next_partition;
+    }
+}
+
+fn js_like_statement_grammar() -> AnalyzedGrammar {
+    analyzed(
+        vec![
+            Rule { lhs: 0, rhs: vec![Symbol::Nonterminal(1)] },
+            Rule { lhs: 1, rhs: vec![Symbol::Nonterminal(2), Symbol::Nonterminal(1)] },
+            Rule { lhs: 1, rhs: Vec::new() },
+            Rule { lhs: 2, rhs: vec![Symbol::Nonterminal(3)] },
+            Rule { lhs: 2, rhs: vec![Symbol::Nonterminal(4)] },
+            Rule { lhs: 2, rhs: vec![Symbol::Nonterminal(5)] },
+            Rule { lhs: 2, rhs: vec![Symbol::Nonterminal(6)] },
+            Rule {
+                lhs: 3,
+                rhs: vec![
+                    Symbol::Terminal(2),
+                    Symbol::Terminal(0),
+                    Symbol::Terminal(3),
+                    Symbol::Nonterminal(7),
+                    Symbol::Terminal(4),
+                ],
+            },
+            Rule {
+                lhs: 3,
+                rhs: vec![
+                    Symbol::Terminal(2),
+                    Symbol::Terminal(0),
+                    Symbol::Terminal(4),
+                ],
+            },
+            Rule {
+                lhs: 4,
+                rhs: vec![
+                    Symbol::Terminal(5),
+                    Symbol::Terminal(6),
+                    Symbol::Nonterminal(7),
+                    Symbol::Terminal(7),
+                    Symbol::Nonterminal(2),
+                ],
+            },
+            Rule {
+                lhs: 4,
+                rhs: vec![
+                    Symbol::Terminal(5),
+                    Symbol::Terminal(6),
+                    Symbol::Nonterminal(7),
+                    Symbol::Terminal(7),
+                    Symbol::Nonterminal(2),
+                    Symbol::Terminal(8),
+                    Symbol::Nonterminal(2),
+                ],
+            },
+            Rule {
+                lhs: 5,
+                rhs: vec![Symbol::Nonterminal(7), Symbol::Terminal(4)],
+            },
+            Rule {
+                lhs: 5,
+                rhs: vec![Symbol::Terminal(13), Symbol::Nonterminal(7), Symbol::Terminal(4)],
+            },
+            Rule {
+                lhs: 5,
+                rhs: vec![Symbol::Terminal(4)],
+            },
+            Rule {
+                lhs: 6,
+                rhs: vec![Symbol::Terminal(9), Symbol::Nonterminal(1), Symbol::Terminal(10)],
+            },
+            Rule { lhs: 7, rhs: vec![Symbol::Nonterminal(8)] },
+            Rule {
+                lhs: 8,
+                rhs: vec![Symbol::Nonterminal(8), Symbol::Terminal(11), Symbol::Nonterminal(9)],
+            },
+            Rule { lhs: 8, rhs: vec![Symbol::Nonterminal(9)] },
+            Rule {
+                lhs: 9,
+                rhs: vec![Symbol::Nonterminal(9), Symbol::Terminal(12), Symbol::Nonterminal(10)],
+            },
+            Rule { lhs: 9, rhs: vec![Symbol::Nonterminal(10)] },
+            Rule { lhs: 10, rhs: vec![Symbol::Terminal(0)] },
+            Rule { lhs: 10, rhs: vec![Symbol::Terminal(1)] },
+            Rule {
+                lhs: 10,
+                rhs: vec![Symbol::Terminal(6), Symbol::Nonterminal(7), Symbol::Terminal(7)],
+            },
+            Rule {
+                lhs: 10,
+                rhs: vec![
+                    Symbol::Terminal(0),
+                    Symbol::Terminal(6),
+                    Symbol::Nonterminal(7),
+                    Symbol::Terminal(7),
+                ],
+            },
+        ],
+        0,
+        14,
+    )
+}
+
+#[test]
+fn experimental_core_partition_fast_path_matches_btree_reference() {
+    let mut grammars = vec![
+        multi_lookahead_grammar(),
+        mysterious_conflict_grammar(),
+        recursive_ambiguous_grammar(),
+        template_like_grammar(),
+        large_left_linear_grammar(),
+        unit_chain_grammar(),
+        ambiguous_unit_chain_grammar(),
+        nullable_unit_chain_grammar(),
+        js_like_statement_grammar(),
+    ];
+    for n in 1..=5 {
+        for branches in 1..=3 {
+            for recursive in [false, true] {
+                grammars.push(generated_unit_dag_grammar(n, branches, true, recursive));
+            }
+        }
+    }
+
+    for (idx, grammar) in grammars.into_iter().enumerate() {
+        let (item_sets, transitions) = build_lr1_item_sets(&grammar);
+        let canonical = build_lr1_table(&grammar, &item_sets, &transitions);
+        let core_keys = item_sets.iter().map(lr1_core_key).collect::<Vec<_>>();
+
+        let btree_partition =
+            refine_experimental_core_partition_btree_reference(&canonical, &core_keys);
+        let fast_partition = refine_experimental_core_partition(&canonical, &core_keys);
+
+        assert_eq!(
+            fast_partition, btree_partition,
+            "partition mismatch on grammar index {idx}",
+        );
+
+        let fast_table =
+            build_experimental_core_merged_table(&grammar, &item_sets, &transitions);
+        let btree_table = union_experimental_core_rows(canonical.clone(), &btree_partition);
+
+        assert_eq!(
+            fast_table.as_ref().map(|t| t.num_states),
+            btree_table.as_ref().map(|t| t.num_states),
+            "num_states mismatch on grammar index {idx}",
+        );
+        assert_eq!(
+            fast_table.as_ref().map(|t| &t.action),
+            btree_table.as_ref().map(|t| &t.action),
+            "action table mismatch on grammar index {idx}",
+        );
+        assert_eq!(
+            fast_table.as_ref().map(|t| &t.goto),
+            btree_table.as_ref().map(|t| &t.goto),
+            "goto table mismatch on grammar index {idx}",
+        );
+        assert_eq!(
+            fast_table.as_ref().map(|t| &t.forwarded_shifts),
+            btree_table.as_ref().map(|t| &t.forwarded_shifts),
+            "forwarded_shifts mismatch on grammar index {idx}",
+        );
+    }
+}
+
+#[test]
+fn direct_core_table_is_default_and_reference_override_is_explicit() {
+    for value in [None, Some(""), Some("0"), Some("false"), Some("off")] {
+        assert!(super::direct_core_table_enabled_for_override(value));
+    }
+    for value in ["1", "true", "yes", "on", " TRUE "] {
+        assert!(!super::direct_core_table_enabled_for_override(Some(value)));
+    }
+}
+
+#[test]
+fn emitted_lr1_lookaheads_keep_first_empty_request_and_exact_subsets() {
+    for len in [0, 1, 64, 65, 257] {
+        let mut emitted = FxHashMap::default();
+        let empty = BitSet::new(len);
+        assert!(super::emitted_lr1_lookaheads_changed(&mut emitted, 11, &empty));
+        assert!(!super::emitted_lr1_lookaheads_changed(&mut emitted, 11, &empty));
+        for bit in 0..len {
+            let mut request = BitSet::new(len);
+            request.set(bit);
+            assert!(super::emitted_lr1_lookaheads_changed(&mut emitted, 11, &request));
+            assert!(!super::emitted_lr1_lookaheads_changed(&mut emitted, 11, &request));
+        }
+        assert_eq!(emitted[&11].count_ones(), len);
+        // A different nonterminal has not emitted anything yet.
+        assert!(super::emitted_lr1_lookaheads_changed(&mut emitted, 12, &empty));
+    }
+}
+
+#[test]
+fn emitted_lr1_closure_preserves_zero_lookahead_entry_cores() {
+    let grammar = AnalyzedGrammar::from_grammar_def(&GrammarDef {
+        rules: vec![
+            Rule { lhs: 0, rhs: vec![Symbol::Nonterminal(1)] },
+            Rule { lhs: 1, rhs: vec![Symbol::Nonterminal(2)] },
+            Rule { lhs: 1, rhs: vec![Symbol::Nonterminal(3)] },
+            Rule { lhs: 2, rhs: vec![Symbol::Terminal(0)] },
+            Rule { lhs: 3, rhs: vec![Symbol::Terminal(1)] },
+        ],
+        start: 0,
+        terminals: vec![
+            Terminal::Literal { id: 0, bytes: b"a".to_vec() },
+            Terminal::Literal { id: 1, bytes: b"b".to_vec() },
+        ],
+        ..GrammarDef::default()
+    });
+    let rule = grammar.rules.iter().position(|r| matches!(r.rhs.as_slice(),
+        [Symbol::Nonterminal(nt)] if grammar.rules_by_lhs[*nt as usize].len() > 1
+    )).expect("multi-production nonterminal in singleton suffix");
+    let mut seed = LR1ItemSet::new();
+    for depth in [7, 9] {
+        seed.insert(LR1ItemCore::new(rule as u32, 0, depth),
+                    BitSet::new(grammar.num_terminals as usize + 1));
+    }
+    let suffix = super::rule_suffix_first_sets(&grammar);
+    let reference = super::lr1_closure::<false>(seed.clone(), &grammar, &suffix);
+    let candidate = super::lr1_closure::<true>(seed, &grammar, &suffix);
+    assert!(candidate.len() > 2, "first empty emission must create entry cores");
+    assert_eq!(candidate, reference);
+}
+
+#[test]
+fn lr1_emission_cache_is_default_with_explicit_reference_override() {
+    for disabled in [None, Some(""), Some("0"), Some("false"), Some("off")] {
+        assert!(super::lr1_emission_cache_enabled_for_override(disabled));
+    }
+    for disabled in ["1", "true", "yes", "on", " TRUE "] {
+        assert!(!super::lr1_emission_cache_enabled_for_override(Some(disabled)));
+    }
+}
+
+#[test]
+fn cached_lr1_emissions_preserve_canonical_items_edges_and_complete_tables() {
+    let mut grammars = vec![
+        multi_lookahead_grammar(), mysterious_conflict_grammar(),
+        recursive_ambiguous_grammar(), template_like_grammar(),
+        large_left_linear_grammar(), unit_chain_grammar(),
+        ambiguous_unit_chain_grammar(), nullable_unit_chain_grammar(),
+        js_like_statement_grammar(),
+    ];
+    for depth in 1..=5 {
+        for branches in 1..=3 {
+            for nullable in [false, true] {
+                for recursive in [false, true] {
+                    grammars.push(generated_unit_dag_grammar(depth, branches, nullable, recursive));
+                }
+            }
+        }
+    }
+    for (index, grammar) in grammars.iter().enumerate() {
+        for reuse in [false, true] {
+            let (old_items, old_edges) = super::build_lr1_item_sets_impl::<false>(grammar, reuse);
+            let (new_items, new_edges) = super::build_lr1_item_sets_impl::<true>(grammar, reuse);
+            assert_eq!(new_items, old_items, "canonical items grammar={index} reuse={reuse}");
+            assert_eq!(new_edges, old_edges, "canonical edges grammar={index} reuse={reuse}");
+            let reference = super::build_core_merged_table_from_items(grammar, &old_items, &old_edges).unwrap();
+            let candidate = super::build_core_merged_table_from_items(grammar, &new_items, &new_edges).unwrap();
+            assert_eq!(bincode::serialize(&candidate).unwrap(), bincode::serialize(&reference).unwrap(),
+                       "complete table grammar={index} reuse={reuse}");
+        }
+    }
+}
+
+#[test]
+fn direct_core_table_matches_materialized_canonical_rows() {
+    let mut grammars = vec![
+        multi_lookahead_grammar(), mysterious_conflict_grammar(),
+        recursive_ambiguous_grammar(), template_like_grammar(),
+        large_left_linear_grammar(), unit_chain_grammar(),
+        ambiguous_unit_chain_grammar(), nullable_unit_chain_grammar(),
+        js_like_statement_grammar(),
+    ];
+    for depth in 1..=5 {
+        for branches in 1..=3 {
+            for nullable in [false, true] {
+                for recursive in [false, true] {
+                    grammars.push(generated_unit_dag_grammar(
+                        depth, branches, nullable, recursive,
+                    ));
+                }
+            }
+        }
+    }
+    let mut reduced_cases = 0;
+    for (index, grammar) in grammars.iter().enumerate() {
+        let (items, transitions) = build_lr1_item_sets(grammar);
+        let canonical = build_lr1_table(grammar, &items, &transitions);
+        let cores = items.iter().map(lr1_core_key).collect::<Vec<_>>();
+        let partition = refine_experimental_core_partition(&canonical, &cores);
+        // Check the signature correspondence independently of the shared
+        // partition loop, including identity and final quotient targets.
+        for targets in [(0..items.len() as u32).collect::<Vec<_>>(), partition] {
+            for (state, row) in transitions.iter().enumerate() {
+                assert_eq!(
+                    ExperimentalCoreCompatibilitySig::from_transitions(
+                        row, targets[state], &targets,
+                    ),
+                    ExperimentalCoreCompatibilitySig::new(
+                        &canonical, state, targets[state], &targets,
+                    ),
+                    "signature grammar={index} state={state}",
+                );
+            }
+        }
+        let reference = super::build_core_merged_table_materialized(grammar, &items, &transitions)
+            .expect("materialized table");
+        let direct = super::build_core_merged_table_from_items(grammar, &items, &transitions)
+            .expect("direct table");
+        assert_eq!(direct.action, reference.action, "actions grammar={index}");
+        assert_eq!(direct.goto, reference.goto, "gotos grammar={index}");
+        for (left, right) in direct.action.iter().zip(&reference.action) {
+            let (super::ActionRow::Sparse(left), super::ActionRow::Sparse(right)) = (left, right)
+                else { panic!("fresh core tables must retain sparse rows"); };
+            assert_eq!(std::mem::discriminant(left), std::mem::discriminant(right),
+                       "runtime action-row representation grammar={index}");
+        }
+        for (left, right) in direct.goto.iter().zip(&reference.goto) {
+            assert_eq!(std::mem::discriminant(left), std::mem::discriminant(right),
+                       "runtime goto-row representation grammar={index}");
+        }
+        assert_eq!(direct.advance, reference.advance, "admission grammar={index}");
+        assert_eq!(direct.unconditional_advance, reference.unconditional_advance);
+        assert_eq!(direct.forwarded_shifts, reference.forwarded_shifts);
+        let direct_bytes = bincode::serialize(&direct).unwrap();
+        let reference_bytes = bincode::serialize(&reference).unwrap();
+        assert!(direct_bytes == reference_bytes,
+                "complete serialized table grammar={index}, first difference={:?}, lengths={}/{}",
+                direct_bytes.iter().zip(&reference_bytes).position(|(a, b)| a != b),
+                direct_bytes.len(), reference_bytes.len());
+        reduced_cases += usize::from(direct.num_states < canonical.num_states);
+    }
+    assert!(reduced_cases > 0, "must exercise canonical states merged into fewer rows");
+}
+
+#[test]
+fn direct_core_table_preserves_replace_and_forwarded_shift_flags() {
+    let grammar = js_like_statement_grammar();
+    let (items, original) = build_lr1_item_sets(&grammar);
+    for salt in 0..4 {
+        let mut transitions = original.clone();
+        for (state, row) in transitions.iter_mut().enumerate() {
+            for (offset, (_, (_, replace, forwarded))) in row.iter_mut().enumerate() {
+                *replace = (state + offset + salt) % 3 == 0;
+                *forwarded = (state + offset + salt) % 2 == 0;
+            }
+        }
+        let reference = super::build_core_merged_table_materialized(&grammar, &items, &transitions)
+            .expect("materialized flagged table");
+        let direct = super::build_core_merged_table_from_items(&grammar, &items, &transitions)
+            .expect("direct flagged table");
+        assert_eq!(direct.action, reference.action);
+        assert_eq!(direct.goto, reference.goto);
+        assert_eq!(direct.advance, reference.advance);
+        assert_eq!(direct.forwarded_shifts, reference.forwarded_shifts);
+        let direct_bytes = bincode::serialize(&direct).unwrap();
+        let reference_bytes = bincode::serialize(&reference).unwrap();
+        assert!(direct_bytes == reference_bytes,
+                "flagged complete table salt={salt}, first difference={:?}",
+                direct_bytes.iter().zip(&reference_bytes).position(|(a, b)| a != b));
+    }
+    assert!(super::build_core_merged_table_from_items(&grammar, &items, &[]).is_none());
 }

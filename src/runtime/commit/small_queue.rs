@@ -708,6 +708,14 @@ pub(super) fn try_advance_unique_actionable_top_fast(
     if !constraint.table.control_terminals.is_empty() || template_advance_enabled() {
         return None;
     }
+    // If every nonempty path has this top, isolate(Some(top)) is precisely
+    // the original immutable GSS. Avoid enumerating/copying the top set and
+    // retaining an extra Arc. The caller must not retry a declined action:
+    // repeating it on this same GSS cannot make the shortcut more applicable.
+    if let Some(top) = gss.single_exclusive_top_value() {
+        let action = constraint.table.action(top, terminal)?;
+        return apply_single_top_action_fast(constraint, gss, top, terminal, action);
+    }
     let mut selected = None;
     for top in gss.peek_values() {
         let Some(action) = constraint.table.action(top, terminal) else {
@@ -1069,19 +1077,6 @@ pub(super) fn commit_bytes_small_queue_fast_path(
                         &gss_at_offset,
                         matched.terminal_id,
                     ) {
-                    advanced
-                } else if !has_linker_controls
-                    && !template_advance_enabled()
-                    && let Some(top_state) = gss_at_offset.single_exclusive_top_value()
-                    && let Some(action) = constraint.table.action(top_state, matched.terminal_id)
-                    && let Some(advanced) = apply_single_top_action_fast(
-                        constraint,
-                        &gss_at_offset,
-                        top_state,
-                        matched.terminal_id,
-                        action,
-                    )
-                {
                     advanced
                 } else {
                     let Some(advanced) = advance_parser_stacks_if_possible(

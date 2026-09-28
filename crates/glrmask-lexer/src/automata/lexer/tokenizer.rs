@@ -1603,6 +1603,41 @@ pub(super) struct PackedCompressedTransitionSegment {
 }
 
 impl PackedCompressedTransitionSegment {
+    /// Re-encode each class row, not its expanded byte row. TKS2 can represent
+    /// separated compressed regions that the contiguous-suffix TKS3 wire
+    /// deliberately declines. Packed deltas are relative to the current row;
+    /// the older segment wire stores targets relative to the component base.
+    fn to_compressed_segment(&self) -> CompressedTransitionSegment {
+        let mut offsets = Vec::with_capacity(self.state_count as usize + 1);
+        let mut classes = Vec::new();
+        let mut targets = Vec::new();
+        offsets.push(0);
+        for local_state in 0..self.state_count {
+            let state = self.state_offset + local_state;
+            let (begin, end) = self.row_range(state)
+                .expect("validated packed segment covers every state");
+            for index in begin..end {
+                let target = i64::from(local_state) + i64::from(
+                    self.delta(index).expect("validated packed segment has every delta"),
+                );
+                assert!(target >= 0 && target < i64::from(self.state_count),
+                    "packed segment target must remain in its component");
+                classes.push(self.classes.as_slice()[index]);
+                targets.push(target as u32);
+            }
+            offsets.push(u32::try_from(classes.len()).expect("compressed segment entry count exceeds u32"));
+        }
+        CompressedTransitionSegment {
+            state_offset: self.state_offset,
+            state_count: self.state_count,
+            byte_to_class: Arc::from(self.byte_to_class.as_slice()),
+            class_members: Arc::clone(&self.class_members),
+            row_offsets: Arc::from(offsets.into_boxed_slice()),
+            entries: CompressedTransitionEntries::from_parts(classes, targets),
+            expanded_transition_count: self.expanded_transition_count,
+        }
+    }
+
     #[inline]
     fn contains_state(&self, state: u32) -> bool {
         state >= self.state_offset && state - self.state_offset < self.state_count
@@ -5027,7 +5062,10 @@ impl Tokenizer {
         }
     }
 
-    fn materialized_dfa(&self) -> DFA {
+    /// Restore physical state metadata and ordinary rows only. Compressed
+    /// regions are left in their sidecars so serializers need not expand a
+    /// small class alphabet into hundreds of byte transitions per state.
+    fn materialized_noncompressed_dfa(&self) -> DFA {
         let mut dfa = self.dfa.clone();
         while dfa.num_states() < self.num_states() as usize {
             dfa.add_state();
@@ -5103,6 +5141,11 @@ impl Tokenizer {
                 }
             }
         }
+        dfa
+    }
+
+    fn materialized_dfa(&self) -> DFA {
+        let mut dfa = self.materialized_noncompressed_dfa();
         for segment in self.compressed_transition_segments.iter() {
             for local_state in 0..segment.state_count {
                 let state = segment.state_offset + local_state;
