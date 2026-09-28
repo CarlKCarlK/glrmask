@@ -818,3 +818,43 @@ fn partition_by_accumulator_preserves_path_correlation() {
     assert_eq!(first, vec![(vec![1, 2], ()), (vec![4], ())]);
     assert_eq!(second, vec![(vec![1, 3], ())]);
 }
+
+#[test]
+fn partial_segment_pop_fast_path_matches_literal_stacks() {
+    for depth in [2, 3, 7, 16, 33, 65, 129] {
+        let values = (0..depth as u32).collect::<Vec<_>>();
+        let source = LeveledGSS::from_single_stack(values.clone(), TestAcc(7));
+        for popped in 1..depth {
+            let fast = source.popn_single_interface_path(popped as isize)
+                .expect("a pop inside a deterministic segment needs no graph traversal");
+            let expected = vec![(values[..depth - popped].to_vec(), TestAcc(7))];
+            assert_eq!(fast.to_stacks(2), Some(expected.clone()));
+            assert_eq!(source.popn(popped as isize).to_stacks(2), Some(expected));
+        }
+        assert_eq!(source.to_stacks(2), Some(vec![(values, TestAcc(7))]),
+            "popping a shared graph must not mutate its source");
+    }
+}
+
+#[test]
+fn partial_segment_pop_preserves_a_shared_branching_tail() {
+    let stacks = vec![
+        (vec![10_u32, 1], TestAcc(7)),
+        (vec![20, 2], TestAcc(7)),
+        (vec![30, 3], TestAcc(7)),
+    ];
+    let mut source = LeveledGSS::from_stacks(&stacks);
+    for value in 100..120 { source = source.push(value); }
+    for popped in 1..20 {
+        let fast = source.popn_single_interface_path(popped)
+            .expect("only the common top segment is popped, not its branching tail");
+        let mut actual = fast.to_stacks(8).unwrap();
+        let mut expected = stacks.iter().map(|(bottom, acc)| {
+            let mut values = bottom.clone();
+            values.extend(100..120 - popped as u32);
+            (values, acc.clone())
+        }).collect::<Vec<_>>();
+        actual.sort(); expected.sort();
+        assert_eq!(actual, expected);
+    }
+}

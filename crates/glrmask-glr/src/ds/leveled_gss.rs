@@ -4436,8 +4436,21 @@ impl<T: Clone + Eq + Hash, A: Merge + Clone + Eq + Hash> LeveledGSS<T, A> {
                     remaining -= values.len() as isize - 1;
                     Some(current.segment_next().clone())
                 } else {
-                    // Would land inside segment — can't use this fast path
-                    return None;
+                    static ENABLED: OnceLock<bool> = OnceLock::new();
+                    if !*ENABLED.get_or_init(|| {
+                        std::env::var_os("GLRMASK_DISABLE_PARTIAL_SEGMENT_POP").is_none()
+                    }) {
+                        return None;
+                    }
+                    // This is the same suffix removal as the generic segment
+                    // case, without allocating its two graph-memo tables.
+                    // Segments are nonempty, non-accepting chains; stopping
+                    // inside one cannot cross an empty path or an accumulator.
+                    let keep = values.len() - remaining as usize;
+                    let lower = new_segment(values.take(keep), current.segment_next().clone());
+                    return Some(Self {
+                        inner: new_interface(lower, interface.acc.clone()),
+                    });
                 }
             } else {
                 match current.children_len() {
