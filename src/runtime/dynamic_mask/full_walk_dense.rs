@@ -3262,12 +3262,92 @@ fn full_walk_row_liveness_bound(
     }
 }
 
+/// Bounded replacement cache for the exact physical liveness predicate.
+/// Tags include the complete lexer ID; collisions only discard cached work.
+/// Parser IDs select disjoint rows and remain append-only within one walk.
+struct FullWalkBoundaryDirectCache {
+    rows: Vec<[u64; 16]>,
+}
+
+impl FullWalkBoundaryDirectCache {
+    fn new() -> Self { Self { rows: Vec::new() } }
+
+    fn push_row(&mut self) { self.rows.push([0; 16]); }
+
+    #[inline(always)]
+    fn get(&self, parser: usize, lexer: u32) -> u8 {
+        let cell = self.rows[parser][lexer as usize & 15];
+        if cell >> 2 == u64::from(lexer) { (cell & 3) as u8 } else { 0 }
+    }
+
+    #[inline(always)]
+    fn set(&mut self, parser: usize, lexer: u32, value: u8) {
+        debug_assert!(value == 1 || value == 2);
+        self.rows[parser][lexer as usize & 15] = (u64::from(lexer) << 2) | u64::from(value);
+    }
+
+    /// Called once, before the first externally cached dense row pointer.
+    /// Afterwards the owner discards this cache and uses dense rows forever.
+    fn expand_into(self, rows: &mut [Vec<u8>], width: usize) {
+        assert_eq!(self.rows.len(), rows.len());
+        for (row, cells) in rows.iter_mut().zip(self.rows.iter()) {
+            row.resize(width, 0);
+            for &cell in cells {
+                let value = (cell & 3) as u8;
+                if value != 0 {
+                    let lexer = (cell >> 2) as usize;
+                    assert!(lexer < width, "only cache states in this walk's fixed domain");
+                    row[lexer] = value;
+                }
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod boundary_direct_cache_tests {
+    use super::FullWalkBoundaryDirectCache;
+
+    #[test]
+    fn full_tags_and_parser_rows_prevent_false_cache_hits() {
+        let mut cache = FullWalkBoundaryDirectCache::new();
+        cache.push_row(); cache.push_row();
+        assert_eq!(cache.get(0, 0), 0);
+        cache.set(0, 0, 2); cache.set(1, 0, 1);
+        assert_eq!(cache.get(0, 0), 2); assert_eq!(cache.get(1, 0), 1);
+        cache.set(0, 16, 1);
+        assert_eq!(cache.get(0, 0), 0); assert_eq!(cache.get(0, 16), 1);
+        assert_eq!(cache.get(1, 0), 1);
+        cache.set(0, u32::MAX, 2);
+        assert_eq!(cache.get(0, u32::MAX), 2);
+        assert_eq!(cache.get(0, 15), 0);
+    }
+
+    #[test]
+    fn dense_promotion_preserves_all_retained_cells_and_unknowns() {
+        for width in [17, 63, 129, 257, 1025] {
+            let mut cache = FullWalkBoundaryDirectCache::new();
+            let mut rows = vec![Vec::new(); 23];
+            for node in 0..rows.len() {
+                cache.push_row();
+                for lexer in 0..width as u32 {
+                    cache.set(node, lexer, 1 + ((node as u32 + lexer) % 2) as u8);
+                }
+            }
+            let expected: Vec<Vec<u8>> = (0..rows.len()).map(|node|
+                (0..width as u32).map(|lexer| cache.get(node, lexer)).collect()).collect();
+            cache.expand_into(&mut rows, width);
+            assert_eq!(rows, expected);
+            assert!(rows.iter().all(|row| row.len() == width));
+        }
+    }
+}
+
 struct FullWalkParserNode {
     gss: ParserStacks,
     admitted: Option<BitSet>,
     shared_root_admission: SharedRootAdmission,
     admitted_singleton: Option<TerminalID>,
-    token_boundary_allowed: Vec<u8>,
     children: SmallVec<[(TerminalID, u32); 16]>,
     last_child_terminal: TerminalID,
     last_child_target: u32,
@@ -3275,6 +3355,9 @@ struct FullWalkParserNode {
 
 struct FullWalkParserCache {
     row_liveness_enabled: bool,
+    // Hot row headers are separate; individual row buffers never move.
+    boundary_rows: Vec<Vec<u8>>,
+    direct_boundary_rows: Option<FullWalkBoundaryDirectCache>,
     nodes: Vec<FullWalkParserNode>,
     lexer_state_count: usize,
     canonicalize: bool,
@@ -3306,6 +3389,12 @@ impl FullWalkParserCache {
         profile: bool,
     ) -> (Self, SmallVec<[u32; 4]>) {
         let mut nodes = Vec::<FullWalkParserNode>::new();
+        let mut boundary_rows = Vec::new();
+        static COMPACT_ROWS: OnceLock<bool> = OnceLock::new();
+        let compact = *COMPACT_ROWS.get_or_init(||
+            !env_flag("GLRMASK_DISABLE_COMPACT_BOUNDARY_ROWS", false))
+            && lexer_state_count > std::mem::size_of::<[u64; 16]>();
+        let mut direct_boundary_rows = compact.then(FullWalkBoundaryDirectCache::new);
         let mut root_nodes = SmallVec::<[u32; 4]>::new();
         for branch in root_branches {
             if let Some((index, _)) = nodes
@@ -3322,11 +3411,13 @@ impl FullWalkParserCache {
                 admitted: None,
                 shared_root_admission: branch.shared_root_admission.clone(),
                 admitted_singleton: None,
-                token_boundary_allowed: vec![0; lexer_state_count],
                 children: SmallVec::new(),
                 last_child_terminal: TerminalID::MAX,
                 last_child_target: Self::DEAD,
             });
+            if let Some(cache) = direct_boundary_rows.as_mut() { cache.push_row(); }
+            boundary_rows.push(if direct_boundary_rows.is_some() { Vec::new() }
+                else { vec![0; lexer_state_count] });
             root_nodes.push(id);
         }
         let canonicalize = full_walk_acceleration_enabled();
@@ -3334,6 +3425,8 @@ impl FullWalkParserCache {
             && full_walk_identity_context_profitable(root_branches.len(), nodes.len());
         (
             Self {
+                boundary_rows,
+                direct_boundary_rows,
                 row_liveness_enabled: {
                     static ENABLED: OnceLock<bool> = OnceLock::new();
                     *ENABLED.get_or_init(|| !env_flag("GLRMASK_DISABLE_ROW_LIVENESS", false))
@@ -3361,11 +3454,13 @@ impl FullWalkParserCache {
             admitted: None,
             shared_root_admission: None,
             admitted_singleton: None,
-            token_boundary_allowed: vec![0; self.lexer_state_count],
             children: SmallVec::new(),
             last_child_terminal: TerminalID::MAX,
             last_child_target: Self::DEAD,
         });
+        if let Some(cache) = self.direct_boundary_rows.as_mut() { cache.push_row(); }
+        self.boundary_rows.push(if self.direct_boundary_rows.is_some() { Vec::new() }
+            else { vec![0; self.lexer_state_count] });
         // Nodes are append-only. Update this monotone policy at the mutation,
         // not by re-reading two lengths for every byte in the vocabulary walk.
         self.identity_proofs_enabled |= self.canonicalize && self.nodes.len() >= 32;
@@ -3571,11 +3666,10 @@ impl FullWalkParserCache {
         }
         let node = parser_node as usize;
         let lexer = lexer_state as usize;
-        let cached = unsafe {
-            *self.nodes
-                .get_unchecked(node)
-                .token_boundary_allowed
-                .get_unchecked(lexer)
+        let cached = if let Some(cache) = self.direct_boundary_rows.as_ref() {
+            cache.get(node, lexer_state)
+        } else {
+            unsafe { *self.boundary_rows.get_unchecked(node).get_unchecked(lexer) }
         };
         if cached != 0 {
             return cached == 2;
@@ -3605,11 +3699,11 @@ impl FullWalkParserCache {
             .ignore_terminal
             .is_some_and(|terminal| transitions.future_contains(tokenizer, lexer_state, terminal))
             || parser_future_allowed;
-        unsafe {
-            *self.nodes
-                .get_unchecked_mut(node)
-                .token_boundary_allowed
-                .get_unchecked_mut(lexer) = if allowed { 2 } else { 1 };
+        let value = if allowed { 2 } else { 1 };
+        if let Some(cache) = self.direct_boundary_rows.as_mut() {
+            cache.set(node, lexer_state, value);
+        } else {
+            unsafe { *self.boundary_rows.get_unchecked_mut(node).get_unchecked_mut(lexer) = value; }
         }
         allowed
     }
@@ -3621,11 +3715,15 @@ impl FullWalkParserCache {
     /// this cache.  The dense hot walker keeps this pointer alongside its
     /// scalar state so a cached liveness hit is one byte load.
     #[inline(always)]
-    fn physical_boundary_row_ptr(&self, parser_node: u32) -> *const u8 {
+    fn physical_boundary_row_ptr(&mut self, parser_node: u32) -> *const u8 {
+        // Promotion happens once before ANY raw pointer escapes. Later cache
+        // writes and newly appended rows remain dense; published buffers never move.
+        if let Some(cache) = self.direct_boundary_rows.take() {
+            cache.expand_into(&mut self.boundary_rows, self.lexer_state_count);
+        }
         unsafe {
-            self.nodes
+            self.boundary_rows
                 .get_unchecked(parser_node as usize)
-                .token_boundary_allowed
                 .as_ptr()
         }
     }
@@ -8332,6 +8430,14 @@ fn try_full_walk_mask_with_table_from_initial_in_output_scope<
     // Diagnostics must not be included in the measured traversal interval.
     let walk_elapsed = walk_started.map(|start| start.elapsed());
     if profile_kernel {
+        eprintln!("[glrmask/profile][physical_boundary_direct] slots={} bytes={}",
+            parser_cache.direct_boundary_rows.as_ref().map_or(0, |_| 16),
+            parser_cache.direct_boundary_rows.as_ref().map_or(0, |cache| cache.rows.len() * 128));
+        eprintln!("[glrmask/profile][physical_boundary_storage] nodes={} allocated_rows={} bytes={} eager_bytes={}",
+            parser_cache.nodes.len(),
+            parser_cache.boundary_rows.iter().filter(|row| !row.is_empty()).count(),
+            parser_cache.boundary_rows.iter().map(Vec::len).sum::<usize>(),
+            parser_cache.nodes.len().saturating_mul(parser_cache.lexer_state_count));
         eprintln!("[glrmask/profile][live_branch_witness] generation={} subtrees={} rows={}", state.generation, live_witness_subtrees, witness_proofs.rows.len());
         eprintln!("[glrmask/profile][full_walk_acceleration] generation={} enabled={} memo_states={} memo_lookups={} memo_hits={} outer_hits={} identity_subtrees={} identity_ops={} identity_tokens={} canonical_hits={}",
             state.generation, accelerated, many_transition_memo.states.len(),
@@ -8449,6 +8555,25 @@ fn try_full_walk_mask_with_table_from_initial_in_output_scope<
 #[cfg(test)]
 mod full_walk_acceleration_tests {
     use super::*;
+
+    #[test]
+    fn boundary_direct_promotion_precedes_stable_pointer_publication() {
+        let (mut cache, _) = FullWalkParserCache::from_roots(&DynamicBranches::new(), 257, false);
+        cache.direct_boundary_rows = Some(FullWalkBoundaryDirectCache::new());
+        let first = cache.push_parser_stacks(ParserStacks::empty());
+        let second = cache.push_parser_stacks(ParserStacks::empty());
+        cache.direct_boundary_rows.as_mut().unwrap().set(first as usize, 5, 2);
+        cache.direct_boundary_rows.as_mut().unwrap().set(second as usize, 6, 1);
+        assert!(cache.boundary_rows.iter().all(Vec::is_empty));
+        let ptr = cache.physical_boundary_row_ptr(first);
+        assert!(cache.direct_boundary_rows.is_none());
+        assert_eq!(unsafe { *ptr.add(5) }, 2);
+        assert_eq!(cache.boundary_rows[second as usize][6], 1);
+        for _ in 0..256 { cache.push_parser_stacks(ParserStacks::empty()); }
+        assert_eq!(cache.physical_boundary_row_ptr(first), ptr);
+        cache.boundary_rows[first as usize][5] = 1;
+        assert_eq!(unsafe { *ptr.add(5) }, 1);
+    }
 
     #[test]
     fn live_branch_witness_survives_finalizers_and_changing_alternatives() {
@@ -8639,6 +8764,7 @@ mod full_walk_acceleration_tests {
                             &DynamicBranches::new(), constraint.tokenizer.num_states() as usize, false,
                         );
                         cache.row_liveness_enabled = true;
+                        cache.direct_boundary_rows = Some(FullWalkBoundaryDirectCache::new());
                         let node = cache.push_parser_stacks(stacks.clone());
                         let admitted = exact_parser_admission_for_stacks(constraint, &stacks);
                         for lexer in 0..constraint.tokenizer.num_states() {
