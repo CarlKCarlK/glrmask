@@ -4838,10 +4838,42 @@ fn provider_reduction_input_is_uniform_empty(stack: &ParserGSS) -> bool {
 
 fn advance_provider_traversal_with_policy<P: ParserActionProvider, const REDUCTION_PREFIX: bool, const RESUME: bool>(
     provider: &P,
-    mut closure: ParserGSS,
+    closure: ParserGSS,
     symbol: P::Symbol,
     mode: ProviderAdvanceMode,
 ) -> ProviderAdvanceResult {
+    static LIGHT_START: OnceLock<bool> = OnceLock::new();
+    if *LIGHT_START.get_or_init(|| std::env::var("GLRMASK_PROVIDER_LIGHT_START")
+        .is_ok_and(|value| matches!(value.as_str(), "1" | "true")))
+    {
+        advance_provider_traversal_with_initialization::<P, REDUCTION_PREFIX, RESUME, true>(
+            provider, closure, symbol, mode,
+        )
+    } else {
+        advance_provider_traversal_with_initialization::<P, REDUCTION_PREFIX, RESUME, false>(
+            provider, closure, symbol, mode,
+        )
+    }
+}
+
+// Reuse the first queried action so live frontiers do not pay for a second
+// probe. A missing action for the sole visible top is exactly the reference
+// first wave with no shifted/reduced/accepted output. An epsilon alternative
+// has no visible top and cannot add a transition for this symbol either.
+fn advance_provider_traversal_with_initialization<
+    P: ParserActionProvider, const REDUCTION_PREFIX: bool, const RESUME: bool,
+    const LIGHT_START: bool,
+>(
+    provider: &P, mut closure: ParserGSS, symbol: P::Symbol, mode: ProviderAdvanceMode,
+) -> ProviderAdvanceResult {
+    let mut first_action = if LIGHT_START {
+        if let Some(state) = closure.single_top_value() {
+            match provider.action(state, symbol) {
+                Some(provided) => Some((state, provided)),
+                None => return ProviderAdvanceResult { shifted: ParserGSS::empty(), accepted: false },
+            }
+        } else { None }
+    } else { None };
     let reduction_prefix_eligible = REDUCTION_PREFIX
         && mode == ProviderAdvanceMode::Advance
         && provider_reduction_input_is_uniform_empty(&closure);
@@ -4849,15 +4881,21 @@ fn advance_provider_traversal_with_policy<P: ParserActionProvider, const REDUCTI
     let mut shifted = ParserGSS::empty();
     let mut accepted = false;
     let mut visited = FxHashSet::<u32>::default();
-    let mut key_interner = GssSemanticKeyInterner::<u32, TerminalsDisallowed>::new();
+    // Only Completion reduction cycles use semantic keys. Advance and
+    // immediately resolved Completion queries must not initialize that table.
+    let mut key_interner = (!LIGHT_START)
+        .then(GssSemanticKeyInterner::<u32, TerminalsDisallowed>::new);
 
     loop {
         let mut next = ParserGSS::empty();
 
         for state in closure.peek_values() {
-            let Some(provided) = provider.action(state, symbol) else {
-                continue;
+            let provided = if first_action.as_ref().is_some_and(|(top, _)| *top == state) {
+                first_action.take().map(|(_, provided)| provided)
+            } else {
+                provider.action(state, symbol)
             };
+            let Some(provided) = provided else { continue; };
             let isolated = closure.isolate(Some(state));
             if reduction_prefix_eligible
                 && reduction_steps_remaining != 0 && provided.extra_stack_shifts.is_empty()
@@ -4937,7 +4975,7 @@ fn advance_provider_traversal_with_policy<P: ParserActionProvider, const REDUCTI
                             };
                             if mode == ProviderAdvanceMode::Completion {
                                 if !branch.is_empty() {
-                                    let key = key_interner.key(&branch);
+                                    let key = key_interner.get_or_insert_with(GssSemanticKeyInterner::new).key(&branch);
                                     if visited.insert(key) {
                                         merge_into(&mut next, branch);
                                     }
@@ -6127,6 +6165,133 @@ mod tests {
     use smallvec::SmallVec;
 
     #[test]
+    fn provider_light_start_matches_eager_on_scopes_branches_guards_and_labels() {
+        fn compare<P: ParserActionProvider>(provider: &P, stack: &ParserGSS, symbol: P::Symbol) {
+            fn policy<P: ParserActionProvider, const R: bool, const S: bool>(
+                provider: &P, stack: &ParserGSS, symbol: P::Symbol, mode: super::ProviderAdvanceMode,
+            ) {
+                let expected = super::advance_provider_traversal_with_initialization::<P,R,S,false>(provider,stack.clone(),symbol,mode);
+                let actual = super::advance_provider_traversal_with_initialization::<P,R,S,true>(provider,stack.clone(),symbol,mode);
+                let a=actual.shifted.to_stacks(4096).expect("bounded fixture");
+                let b=expected.shifted.to_stacks(4096).expect("bounded fixture");
+                assert_eq!(a.len(),b.len());
+                assert!(a.iter().all(|x|b.contains(x)),"stack paths or accumulator labels changed");
+                assert_eq!(actual.accepted,expected.accepted);
+            }
+            for mode in [super::ProviderAdvanceMode::Advance,super::ProviderAdvanceMode::Completion] {
+                policy::<P,false,false>(provider,stack,symbol,mode);
+                policy::<P,true,false>(provider,stack,symbol,mode);
+                policy::<P,true,true>(provider,stack,symbol,mode);
+            }
+        }
+        struct Components<'a>(&'a GLRTable);
+        impl ParserComponentTableSource for Components<'_> {
+            fn component_count(&self) -> usize { 2 }
+            fn component_table(&self, component: u32) -> Option<&GLRTable> {
+                (component < 2).then_some(self.0)
+            }
+        }
+        for pop in [0, 1, 2, 5, 40] {
+            for replace in [false, true] {
+                let rows = [
+                    vec![(0, Action::Shift(7, replace))],
+                    vec![(0, Action::Reduce(0, pop))],
+                    vec![(0, Action::ReplaceShifts(vec![4, 5].into()))],
+                    vec![(0, Action::GuardedStackShifts(vec![GuardedStackShift {
+                        pop: 1,
+                        pushes: vec![7],
+                        guards: vec![StackShiftGuard { pop: 0, states: vec![3].into() }],
+                    }]))],
+                    vec![(0, Action::StackShifts(vec![
+                        StackShift { pop: 0, pushes: vec![7] },
+                        StackShift { pop: 1, pushes: vec![5, 7] },
+                        StackShift { pop: 20, pushes: vec![7] },
+                    ]))],
+                    vec![(0, Action::Split {
+                        shift: Some((7, replace)), reduces: vec![(0, pop)], accept: true,
+                    })],
+                    vec![(0, Action::Skip)],
+                    vec![(0, Action::Shift(7, false))],
+                ];
+                let gotos = (0..8).map(|_| vec![(0, (7, replace))]).collect::<Vec<_>>();
+                let table = build_test_table(8, 2,
+                    &rows.iter().map(Vec::as_slice).collect::<Vec<_>>(),
+                    &gotos.iter().map(Vec::as_slice).collect::<Vec<_>>());
+                let ordinary = GLRTableActionProvider::new(&table);
+                let components = Components(&table);
+                let scoped = DisjointComponentActionProvider::with_state_offsets(
+                    &components, &[], &[0, 8],
+                ).unwrap();
+                for depth in [0, 1, 2, 6, 48] {
+                    for top in 0..8 {
+                        let mut values = vec![0; depth];
+                        if let Some(last) = values.last_mut() { *last = top; }
+                        let plain = TerminalsDisallowed::new();
+                        let guarded = plain.with_insert(23, 11);
+                        let first = ParserGSS::from_single_stack(values.clone(), plain.clone());
+                        let second = ParserGSS::from_single_stack(values.iter().map(|x| (x + 1) % 8).collect(), guarded.clone());
+                        compare(&ordinary, &first, 0);
+                        compare(&ordinary, &first.merge(&second), 0);
+                        compare(&ordinary, &first, 1);
+                        let scoped_values = values.iter().map(|x| x + 8).collect();
+                        let scoped_stack = ParserGSS::from_single_stack(scoped_values, guarded);
+                        compare(&scoped, &scoped_stack, ScopedParserSymbol::Terminal { component: 1, terminal: 0 });
+                        compare(&scoped, &scoped_stack, ScopedParserSymbol::Terminal { component: 0, terminal: 0 });
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn provider_light_start_reuses_positive_probe_and_preserves_query_order() {
+        use std::cell::RefCell;
+        struct Counting { shift: Action, reduce: Action, queries: RefCell<Vec<(u32,u32)>> }
+        impl ParserActionProvider for Counting {
+            type Symbol=u32;
+            fn action(&self,state:u32,symbol:u32)->Option<ProvidedAction<'_>> {
+                self.queries.borrow_mut().push((state,symbol));
+                let action=match (state,symbol) {
+                    (0,0)|(1,1)=>&self.shift,
+                    (0,1)=>&self.reduce,
+                    _=>return None,
+                };
+                Some(ProvidedAction {action:ProvidedActionRef::Local {scope:0,action},
+                    reduction_scope:0,extra_stack_shifts:SmallVec::new()})
+            }
+            fn scope_state(&self,scope:u32,state:u32)->Option<u32>{(scope==0&&state<4).then_some(state)}
+            fn goto_target(&self,scope:u32,from:u32,nt:u32)->Option<(u32,bool)>{
+                (scope==0&&from==0&&nt==0).then_some((1,false))
+            }
+            fn state_count_hint(&self)->usize{4}
+        }
+        let p=Counting {shift:Action::Shift(2,false),reduce:Action::Reduce(0,0),queries:RefCell::new(Vec::new())};
+        let a=TerminalsDisallowed::new();let guarded=a.with_insert(17,9);
+        let inputs=[
+            ParserGSS::empty(),
+            ParserGSS::from_single_stack(vec![],a.clone()),
+            ParserGSS::from_single_stack(vec![0],a.clone()),
+            ParserGSS::from_stacks(&[(vec![3,0],a.clone()),(vec![2,0],guarded.clone())]),
+            ParserGSS::from_stacks(&[(vec![],a.clone()),(vec![0],guarded.clone())]),
+            ParserGSS::from_stacks(&[(vec![0],a.clone()),(vec![1],guarded.clone())]),
+        ];
+        for stack in inputs {
+            for mode in [super::ProviderAdvanceMode::Advance,super::ProviderAdvanceMode::Completion] {
+                for symbol in 0..3 {
+                    p.queries.borrow_mut().clear();
+                    let expected=super::advance_provider_traversal_with_initialization::<_,false,false,false>(&p,stack.clone(),symbol,mode);
+                    let sequence=p.queries.borrow().clone();p.queries.borrow_mut().clear();
+                    let actual=super::advance_provider_traversal_with_initialization::<_,false,false,true>(&p,stack.clone(),symbol,mode);
+                    assert_eq!(*p.queries.borrow(),sequence,"positive probe duplicated or action order changed");
+                    let x=actual.shifted.to_stacks(64).unwrap();let y=expected.shifted.to_stacks(64).unwrap();
+                    assert_eq!(x.len(),y.len());assert!(x.iter().all(|v|y.contains(v)));
+                    assert_eq!(actual.accepted,expected.accepted);
+                }
+            }
+        }
+    }
+
+    #[test]
     fn provider_reduction_prefix_preserves_scopes_branches_guards_and_accumulators() {
         fn compare<P: ParserActionProvider>(provider: &P, stack: &ParserGSS, symbol: P::Symbol) {
             for mode in [super::ProviderAdvanceMode::Advance, super::ProviderAdvanceMode::Completion] {
@@ -6205,6 +6370,71 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn provider_light_start_controls_and_extra_effects_match_eager() {
+        struct Controls { ordinary: Action }
+        impl ParserActionProvider for Controls {
+            type Symbol = u32;
+            fn action(&self, _: u32, symbol: u32) -> Option<ProvidedAction<'_>> {
+                let action = match symbol {
+                    0 => ProvidedActionRef::Identity,
+                    1 => ProvidedActionRef::Call { parent_target: 10, child_start: 20, replace: false },
+                    2 => ProvidedActionRef::Call { parent_target: 10, child_start: 20, replace: true },
+                    3 => ProvidedActionRef::Return { pop: 1 },
+                    4 => ProvidedActionRef::Return { pop: 5 },
+                    5 => ProvidedActionRef::Local { scope: 1, action: &self.ordinary },
+                    6 => ProvidedActionRef::Local { scope: 99, action: &self.ordinary },
+                    _ => return None,
+                };
+                Some(ProvidedAction {
+                    action, reduction_scope: 1,
+                    extra_stack_shifts: if symbol == 5 {
+                        smallvec::smallvec![StackShift { pop: 0, pushes: vec![31] }]
+                    } else { SmallVec::new() },
+                })
+            }
+            fn scope_state(&self, scope: u32, state: u32) -> Option<u32> {
+                (scope == 1).then_some(state + 100)
+            }
+            fn goto_target(&self, _: u32, _: u32, _: u32) -> Option<(u32, bool)> { None }
+            fn state_count_hint(&self) -> usize { 128 }
+        }
+        let provider = Controls { ordinary: Action::Shift(5, false) };
+        for n in 0..12 {
+            let a = ParserGSS::from_single_stack((0..n).collect(), TerminalsDisallowed::new());
+            let b = ParserGSS::from_single_stack((5..n+5).collect(), TerminalsDisallowed::new().with_insert(5,7));
+            for stack in [a.clone(), a.merge(&b)] {
+                for symbol in 0..8 {
+                    let expected = super::advance_provider_traversal_with_initialization::<_, true, true, false>(
+                        &provider, stack.clone(), symbol, super::ProviderAdvanceMode::Advance,
+                    );
+                    let actual = super::advance_provider_traversal_with_initialization::<_, true, true, true>(
+                        &provider, stack.clone(), symbol, super::ProviderAdvanceMode::Advance,
+                    );
+                    let mut keys = GssSemanticKeyInterner::<u32, TerminalsDisallowed>::new();
+                    assert_eq!(keys.key(&actual.shifted), keys.key(&expected.shifted), "n={n} symbol={symbol}");
+                }
+            }
+        }
+    }
+
+
+    #[test]
+    fn provider_light_start_completion_cycle_uses_the_same_semantic_visited_set() {
+        let rows=[vec![],vec![(0,Action::Reduce(0,1))]];
+        let gotos=[vec![(0,(1,false))],vec![]];
+        let table=build_test_table(2,1,&rows.iter().map(Vec::as_slice).collect::<Vec<_>>(),
+            &gotos.iter().map(Vec::as_slice).collect::<Vec<_>>());
+        let provider=GLRTableActionProvider::new(&table);
+        let input=ParserGSS::from_single_stack(vec![0,1],TerminalsDisallowed::new().with_insert(3,5));
+        let expected=super::advance_provider_traversal_with_initialization::<_,false,false,false>(
+            &provider,input.clone(),0,super::ProviderAdvanceMode::Completion);
+        let actual=super::advance_provider_traversal_with_initialization::<_,false,false,true>(
+            &provider,input,0,super::ProviderAdvanceMode::Completion);
+        assert!(!expected.accepted && !actual.accepted);
+        assert!(expected.shifted.is_empty() && actual.shifted.is_empty());
     }
 
     #[test]
