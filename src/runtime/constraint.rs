@@ -1,3 +1,5 @@
+mod boundary_reset_support;
+
 use crate::automata::lexer::{
     tokenizer::{Tokenizer, TokenizerStateSet},
     Lexer,

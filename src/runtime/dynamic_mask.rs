@@ -7463,6 +7463,17 @@ impl<'a> DynamicNfaScanCache<'a> {
         Ok(reset)
     }
 
+    /// Exact lexer coordinate for a parser reset that accepts the current token
+    /// boundary but has no positive-byte continuation. This uses the ordinary
+    /// config/fresh-reset representation; it is not a second lexer engine.
+    fn fresh_empty_reset_config(&mut self) -> Result<u32, String> {
+        if self.deterministic {
+            return Err("empty fresh reset is only valid in the NFA-config coordinate".to_owned());
+        }
+        let empty=self.intern_config(Vec::new())?;
+        self.fresh_reset_config(empty)
+    }
+
     fn step_config(&mut self, config: u32, byte: u8) -> Result<Option<u32>, String> {
         if self.profile_transition_work {
             self.profile_step_calls += 1;
@@ -12794,4 +12805,56 @@ nt start ::= A;
         }
     }
 
+}
+
+
+#[cfg(test)]
+mod epsilon_only_reset_config_tests {
+    use super::*;
+    use crate::{Constraint,Grammar,Vocab};
+
+    fn fixture()->Constraint {
+        let vocab=Vocab::new(vec![(0,b"a".to_vec()),(1,b"b".to_vec()),(2,b"ab".to_vec())]);
+        Constraint::compile(Grammar::glrm(
+            r#"glrm 1; start s; t A = "a"; t B = "b"; nt s = A B | A;"#,
+        ),&vocab).unwrap()
+    }
+
+    #[test]
+    fn fresh_empty_reset_preserves_only_boundary_acceptance() {
+        let c=fixture();
+        let mut scan=DynamicNfaScanCache::new(&c,None);
+        // Exercise the config representation even if this tiny fixture's
+        // physical tokenizer is deterministic.
+        scan.deterministic=false;
+        let ordinary_empty=scan.intern_config(Vec::new()).unwrap();
+        let fresh=scan.fresh_empty_reset_config().unwrap();
+        assert_ne!(fresh,ordinary_empty);
+        let fi=scan.config_index(fresh).unwrap();
+        let oi=scan.config_index(ordinary_empty).unwrap();
+        assert!(scan.config_is_fresh_reset[fi]);
+        assert!(!scan.config_is_fresh_reset[oi]);
+        assert_eq!(scan.config_len(fresh),0);
+        assert!(!scan.config_has_finalizer(fresh));
+        assert!(scan.config_matched[fi].is_empty());
+        assert!(scan.config_futures[fi].is_empty());
+        assert_eq!(scan.residual_config(fresh).unwrap(),None);
+        for byte in 0u8..=u8::MAX {
+            assert_eq!(scan.step_config(fresh,byte).unwrap(),None,"byte={byte}");
+        }
+    }
+
+    #[test]
+    fn fresh_empty_reset_is_memoized_and_ordinary_empty_stays_nonfresh() {
+        let c=fixture();
+        let mut scan=DynamicNfaScanCache::new(&c,None);
+        scan.deterministic=false;
+        let a=scan.fresh_empty_reset_config().unwrap();
+        let b=scan.fresh_empty_reset_config().unwrap();
+        assert_eq!(a,b);
+        let empty=scan.intern_config(Vec::new()).unwrap();
+        assert_ne!(a,empty);
+        assert!(!scan.config_is_fresh_reset[scan.config_index(empty).unwrap()]);
+        assert!(scan.config_is_fresh_reset[scan.config_index(a).unwrap()]);
+    }
 }
