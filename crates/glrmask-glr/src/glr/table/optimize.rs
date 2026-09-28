@@ -6242,6 +6242,64 @@ enum ReduceFrameResult {
     },
 }
 
+/// Union one predecessor frontier without sorting a potentially much larger
+/// multiset of repeated targets. Only representation changes: results retain
+/// the same ascending IDs, and the caller still charges one visit per depth.
+fn predecessor_frontier_union(
+    predecessors: &[PredecessorSet],
+    states: &[u32],
+    bitmap: &mut Vec<u64>,
+    bitmap_enabled: bool,
+) -> Option<StateSubset> {
+    fn sorted_union(predecessors: &[PredecessorSet], states: &[u32]) -> Option<StateSubset> {
+        let mut next = StateSubset::new();
+        for &state in states {
+            next.extend_from_slice(predecessors.get(state as usize)?);
+        }
+        next.sort_unstable();
+        next.dedup();
+        Some(next)
+    }
+
+    const MAX_BITMAP_STATES: usize = 65_536;
+    if !bitmap_enabled || states.len() < 4 || predecessors.len() > MAX_BITMAP_STATES {
+        return sorted_union(predecessors, states);
+    }
+    let words = predecessors.len().div_ceil(64);
+    let mut edges = 0usize;
+    for &state in states {
+        edges = edges.saturating_add(predecessors.get(state as usize)?.len());
+    }
+    // Sparse unions keep the original small-vector path. The threshold pays
+    // for clearing/enumerating the bounded bitmap as well as the second scan.
+    if edges < words.saturating_mul(4).max(64) {
+        return sorted_union(predecessors, states);
+    }
+    bitmap.resize(words, 0);
+    bitmap.fill(0);
+    for &state in states {
+        for &target in &predecessors[state as usize] {
+            let Some(word) = bitmap.get_mut(target as usize / 64) else {
+                // A malformed graph can contain a dangling target that the
+                // reference retains at its last depth. Never silently discard
+                // it or assume every ID fits the valid-state bitmap.
+                return sorted_union(predecessors, states);
+            };
+            *word |= 1u64 << (target % 64);
+        }
+    }
+    let mut next = StateSubset::new();
+    for (index, &word) in bitmap.iter().enumerate() {
+        let mut word = word;
+        while word != 0 {
+            next.push((index * 64 + word.trailing_zeros() as usize) as u32);
+            word &= word - 1;
+        }
+    }
+    Some(next)
+}
+
+
 fn states_at_depth<'a>(
     predecessors: &[PredecessorSet],
     origin_state: u32,
@@ -6249,19 +6307,26 @@ fn states_at_depth<'a>(
     cache: &'a mut FxHashMap<(u32, u32), Option<StateSubset>>,
     budget: &UnitInlineBudget,
 ) -> Option<&'a StateSubset> {
+    states_at_depth_with_bitmap(predecessors, origin_state, depth, cache, budget, true)
+}
+
+fn states_at_depth_with_bitmap<'a>(
+    predecessors: &[PredecessorSet],
+    origin_state: u32,
+    depth: u32,
+    cache: &'a mut FxHashMap<(u32, u32), Option<StateSubset>>,
+    budget: &UnitInlineBudget,
+    bitmap_enabled: bool,
+) -> Option<&'a StateSubset> {
     let cache_key = (origin_state, depth);
     if !cache.contains_key(&cache_key) {
         let mut states = smallvec![origin_state];
+        let mut bitmap = Vec::new();
         for _ in 0..depth {
             if !budget.record_stack_effect_visit() {
                 return None;
             }
-            let mut next = StateSubset::new();
-            for state in states {
-                next.extend_from_slice(predecessors.get(state as usize)?);
-            }
-            next.sort_unstable();
-            next.dedup();
+            let next = predecessor_frontier_union(predecessors, &states, &mut bitmap, bitmap_enabled)?;
             if next.is_empty() {
                 cache.insert(cache_key, None);
                 return None;
