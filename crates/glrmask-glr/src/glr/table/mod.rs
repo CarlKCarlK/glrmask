@@ -155,7 +155,7 @@ pub mod artifact_serde {
         EXTERNAL_TABLE_SERDE.with(|mode| mode.replace(enabled))
     }
 
-    fn external_serde_enabled() -> bool {
+    pub fn external_serde_enabled() -> bool {
         EXTERNAL_TABLE_SERDE.with(Cell::get)
     }
 

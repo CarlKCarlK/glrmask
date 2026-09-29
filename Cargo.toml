@@ -227,3 +227,8 @@ resolver = "2"
 [[test]]
 name = "integer_multiple_exact"
 path = "tests/regressions/json_schema/integer_multiple_exact.rs"
+
+[[test]]
+name = "template_parser_artifact"
+path = "tests/template_parser_artifact.rs"
+required-features = ["internal-api"]

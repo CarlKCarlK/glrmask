@@ -54,6 +54,9 @@ const PREVIOUS_STATIC_RESIDUAL_CONSTRAINT_VERSION: u16 = 27;
 const PREVIOUS_STATIC_PROJECTION_CONSTRAINT_VERSION: u16 = 28;
 const PREVIOUS_BOUNDARY_SUMMARYLESS_CONSTRAINT_VERSION: u16 = 29;
 const CONSTRAINT_VERSION: u16 = 30;
+// V31 retains S30 framing but replaces the LR section with a TPR1 acyclic
+// parser program. Ordinary LR artifacts deliberately continue writing V30.
+const TEMPLATE_CONSTRAINT_VERSION: u16 = 31;
 const CONSTRAINT_HEADER_LEN: usize = CONSTRAINT_MAGIC.len() + 2 + 8;
 const COMPRESSED_PAYLOAD_HEADER_LEN: usize = 8;
 const CONSTRAINT_COMPRESSION_LEVEL: i32 = 1;
@@ -108,6 +111,7 @@ fn uses_external_runtime_sections(version: u16) -> bool {
     matches!(
         version,
         CONSTRAINT_VERSION
+            | TEMPLATE_CONSTRAINT_VERSION
             | PREVIOUS_BOUNDARY_SUMMARYLESS_CONSTRAINT_VERSION
             | PREVIOUS_STATIC_PROJECTION_CONSTRAINT_VERSION
             | PREVIOUS_STATIC_RESIDUAL_CONSTRAINT_VERSION
@@ -1029,6 +1033,9 @@ fn encode_composition_metadata(constraint: &Constraint) -> Vec<u8> {
 }
 
 fn encode_composition_metadata_for_save(constraint: &Constraint) -> Vec<u8> {
+    // Composition is explicitly unsupported by this standalone backend. Do
+    // not retain dead compiler/LR caches in an otherwise table-free artifact.
+    if constraint.has_template_parser() { return Vec::new(); }
     let bytes=encode_composition_metadata_base_for_save(constraint);
     if let Some(wire)=crate::compiler::boundary_precomputed_completion::saved_wire(constraint) {
         crate::compiler::boundary_precomputed_completion::wrap_envelope(bytes,wire)
@@ -1715,7 +1722,7 @@ fn encode_token_mask_cache(constraint: &Constraint) -> Vec<u8> {
         bincode::serialize_into(
             &mut tail,
             &TokenMaskCacheIrregularV5Ref {
-                guarded_shift_index: &constraint.table.guarded_shift_index,
+                guarded_shift_index: constraint.table.as_lr().map_or(&[], |table| table.guarded_shift_index.as_slice()),
                 seed_terminal_dense: &seed_terminal_dense,
                 seed_universe_dense: &constraint.seed_universe_dense,
                 quad_group_sparse_masks: &constraint.quad_group_sparse_masks,
@@ -1729,7 +1736,7 @@ fn encode_token_mask_cache(constraint: &Constraint) -> Vec<u8> {
         bincode::serialize_into(
             &mut tail,
             &TokenMaskCacheIrregularRef {
-                guarded_shift_index: &constraint.table.guarded_shift_index,
+                guarded_shift_index: constraint.table.as_lr().map_or(&[], |table| table.guarded_shift_index.as_slice()),
                 seed_terminal_dense: &constraint.seed_terminal_dense,
                 seed_universe_dense: &constraint.seed_universe_dense,
                 quad_group_sparse_masks: &constraint.quad_group_sparse_masks,
@@ -2092,7 +2099,13 @@ fn install_token_mask_cache(
             word_group_sparse_masks,
             word_group_prefix_buf_masks,
         } => {
-            constraint.table.guarded_shift_index = irregular.guarded_shift_index;
+            if constraint.has_template_parser() {
+                if !irregular.guarded_shift_index.is_empty() {
+                    return Err("table-free artifact contains an LR guarded-shift cache".into());
+                }
+            } else {
+                constraint.table.guarded_shift_index = irregular.guarded_shift_index;
+            }
             constraint.seed_terminal_dense = irregular.seed_terminal_dense;
             constraint.seed_universe_dense = irregular.seed_universe_dense.into();
             constraint.word_group_sparse_masks = word_group_sparse_masks;
@@ -2113,7 +2126,13 @@ fn install_token_mask_cache(
             tail: cache,
             word_group_prefix_buf_masks,
         } => {
-            constraint.table.guarded_shift_index = cache.guarded_shift_index;
+            if constraint.has_template_parser() {
+                if !cache.guarded_shift_index.is_empty() {
+                    return Err("table-free artifact contains an LR guarded-shift cache".into());
+                }
+            } else {
+                constraint.table.guarded_shift_index = cache.guarded_shift_index;
+            }
             constraint.seed_terminal_dense = cache.seed_terminal_dense;
             constraint.seed_universe_dense = cache.seed_universe_dense.into();
             constraint.word_group_sparse_masks = cache.word_group_sparse_masks;
@@ -5880,7 +5899,6 @@ impl Constraint {
     /// Current artifacts use a compact sectioned representation and retain
     /// runtime-native sections where doing so materially reduces load latency.
     pub fn save(&self) -> Vec<u8> {
-        assert!(!self.has_template_parser(), "template-only persistence is not implemented yet; refusing an LR artifact");
         let exact_only_token_ids = self
             .late_bind_vocab
             .get()
@@ -5903,6 +5921,7 @@ impl Constraint {
     }
 
     pub(crate) fn save_body(&self) -> Vec<u8> {
+        let artifact_version = if self.has_template_parser() { TEMPLATE_CONSTRAINT_VERSION } else { CONSTRAINT_VERSION };
         if let Some(bytes) = &self.serialized_artifact_cache {
             return clone_serialized_artifact(bytes.as_slice());
         }
@@ -6280,11 +6299,13 @@ impl Constraint {
                     },
                     || {
                         let started = profile.then(std::time::Instant::now);
-                        let rules = self.retained_table_rules()
-                            .expect("validated retained grammar rules must remain readable");
-                        let bytes = crate::compiler::glr::table::artifact_serde::to_compact_bytes_with_rules(
-                            &self.table, rules,
-                        );
+                        let bytes = if let Some(parser) = &self.template_parser {
+                            crate::runtime::parser_backend::wire::encode(parser)
+                        } else {
+                            let rules = self.retained_table_rules()
+                                .expect("validated retained grammar rules must remain readable");
+                            crate::compiler::glr::table::artifact_serde::to_compact_bytes_with_rules(&self.table, rules)
+                        };
                         if let Some(started) = started {
                             eprintln!(
                                 "[glrmask/profile][constraint_save_section] name=table ms={:.3} bytes={}",
@@ -6312,10 +6333,12 @@ impl Constraint {
                             let metadata = ConstraintArtifactCurrentRuntimeRef {
                                 terminal_live_states: &self.terminal_live_states,
                                 segmented_runtime: segmented_runtime_artifact_ref(self),
-                                dynamic_mask_vocab: self
-                                    .uses_dynamic_runtime()
-                                    .then(|| self.dynamic_mask_vocab.to_vocab_artifact())
-                                    .flatten(),
+                                dynamic_mask_vocab: self.uses_dynamic_runtime().then(|| {
+                                    // The template-only artifact is also the self-contained
+                                    // O2 persistence body; preserve its proven mask quotient.
+                                    if self.has_template_parser() { self.dynamic_mask_vocab.to_artifact() }
+                                    else { self.dynamic_mask_vocab.to_vocab_artifact() }
+                                }).flatten(),
                                 virtual_runtimes: self
                                     .tokenizer
                                     .has_any_virtual_runtime()
@@ -6495,7 +6518,7 @@ impl Constraint {
             let mut pos = 0usize;
             header[pos..pos + CONSTRAINT_MAGIC.len()].copy_from_slice(&CONSTRAINT_MAGIC);
             pos += CONSTRAINT_MAGIC.len();
-            header[pos..pos + 2].copy_from_slice(&CONSTRAINT_VERSION.to_le_bytes());
+            header[pos..pos + 2].copy_from_slice(&artifact_version.to_le_bytes());
             pos += 2;
             header[pos..pos + 8].copy_from_slice(&(payload_len as u64).to_le_bytes());
             pos += 8;
@@ -6696,7 +6719,7 @@ impl Constraint {
         }
         let mut bytes = Vec::with_capacity(CONSTRAINT_HEADER_LEN + payload_len);
         bytes.extend_from_slice(&CONSTRAINT_MAGIC);
-        bytes.extend_from_slice(&CONSTRAINT_VERSION.to_le_bytes());
+        bytes.extend_from_slice(&artifact_version.to_le_bytes());
         let payload_len_offset = bytes.len();
         bytes.extend_from_slice(&0u64.to_le_bytes());
         bytes.extend_from_slice(&V30_SECTION_MAGIC);
@@ -6934,6 +6957,7 @@ impl Constraint {
                 | PREVIOUS_STATIC_PROJECTION_CONSTRAINT_VERSION
                 | PREVIOUS_BOUNDARY_SUMMARYLESS_CONSTRAINT_VERSION
                 | CONSTRAINT_VERSION
+                | TEMPLATE_CONSTRAINT_VERSION
         ) {
             let decompress_started = profile.then(std::time::Instant::now);
             return Err(crate::GlrMaskError::Serialization(format!(
@@ -7057,7 +7081,7 @@ impl Constraint {
                 token_mask_cache_section,
                 composition_metadata_section,
             ) =
-                if version == CONSTRAINT_VERSION {
+                if matches!(version, CONSTRAINT_VERSION | TEMPLATE_CONSTRAINT_VERSION) {
                     let (weight, dwa, table, core, runtime, token_bytes, original_map, tokenizer, internal_masks, token_mask_cache, composition_metadata) = v30_sections(serialized)
                         .map_err(crate::GlrMaskError::Serialization)?;
                     (
@@ -7321,6 +7345,10 @@ impl Constraint {
                             rayon::join(
                                 || {
                                     let started = profile.then(std::time::Instant::now);
+                                    if version == TEMPLATE_CONSTRAINT_VERSION {
+                                        return crate::runtime::parser_backend::wire::decode(table_section)
+                                            .map(|seed| (crate::runtime::parser_backend::ParserTableStorage::absent(), None, Some(seed)));
+                                    }
                                     let result = if uses_external_runtime_sections(version) {
                                         let backing = current_backing.as_ref().ok_or_else(|| {
                                             "current GLR table has no artifact backing".to_owned()
@@ -7351,14 +7379,14 @@ impl Constraint {
                                     if let Some(started) = started {
                                         eprintln!("[glrmask/profile][constraint_section] name=table ms={:.3}", started.elapsed().as_secs_f64() * 1000.0);
                                     }
-                                    result
+                                    result.map(|decoded| (decoded.table.into(), decoded.deferred_rules, None))
                                 },
                                 || -> Result<Option<DecodedConstraintRuntime>, String> {
                                     let Some(runtime_section) = runtime_section else {
                                         return Ok(None);
                                     };
                                     let started = profile.then(std::time::Instant::now);
-                                    let result = if version == CONSTRAINT_VERSION
+                                    let result = if matches!(version, CONSTRAINT_VERSION | TEMPLATE_CONSTRAINT_VERSION)
                                         || version == PREVIOUS_BOUNDARY_SUMMARYLESS_CONSTRAINT_VERSION
                                     {
                                         current_backing
@@ -8013,9 +8041,8 @@ impl Constraint {
                 },
             );
             let parser_dwa = dwa_result.map_err(crate::GlrMaskError::Serialization)?;
-            let decoded_table = table_result.map_err(crate::GlrMaskError::Serialization)?;
-            let table = decoded_table.table;
-            let deferred_table_rules_blob = decoded_table.deferred_rules;
+            let (table, deferred_table_rules_blob, template_parser_seed) =
+                table_result.map_err(crate::GlrMaskError::Serialization)?;
             let runtime = runtime_result.map_err(crate::GlrMaskError::Serialization)?;
             let tokenizer = tokenizer_result.map_err(crate::GlrMaskError::Serialization)?;
             let original_token_map =
@@ -8088,7 +8115,10 @@ impl Constraint {
             }
             let attach_dwa_ms = attach_dwa_started
                 .map_or(0.0, |started| started.elapsed().as_secs_f64() * 1000.0);
-            constraint.table = table.into();
+            constraint.table = table;
+            if let Some(seed) = template_parser_seed {
+                seed.install(&mut constraint).map_err(crate::GlrMaskError::Serialization)?;
+            }
             constraint.deferred_table_rules_blob = deferred_table_rules_blob;
             constraint.deferred_table_rules = Default::default();
             let invert_started = profile.then(std::time::Instant::now);
@@ -8308,14 +8338,14 @@ impl Constraint {
         let deserialize_ms = deserialize_started
             .map_or(0.0, |started| started.elapsed().as_secs_f64() * 1000.0);
         if !constraint.parser_state_domain_labels.is_empty() {
-            if constraint.parser_state_domain_labels.len() != constraint.table.num_states as usize {
+            if constraint.parser_state_domain_labels.len() != constraint.parser_symbol_count() as usize {
                 return Err(crate::GlrMaskError::Serialization(format!(
                     "parser-state domain map has {} entries for {} parser states",
                     constraint.parser_state_domain_labels.len(),
-                    constraint.table.num_states,
+                    constraint.parser_symbol_count(),
                 )));
             }
-            let first_synthetic = constraint.table.num_states as i64;
+            let first_synthetic = constraint.parser_symbol_count() as i64;
             let default_label = crate::compiler::glr::labels::DEFAULT_LABEL as i64;
             for &label in &constraint.parser_state_domain_labels {
                 if label == i32::MAX {
@@ -8325,7 +8355,7 @@ impl Constraint {
                 if label64 < first_synthetic || label64 >= default_label {
                     return Err(crate::GlrMaskError::Serialization(format!(
                         "invalid parser-state domain label {label} for {} parser states",
-                        constraint.table.num_states,
+                        constraint.parser_symbol_count(),
                     )));
                 }
             }
@@ -8379,7 +8409,7 @@ impl Constraint {
                 Some(owned_artifact.unwrap_or_else(|| std::sync::Arc::new(bytes.to_vec())))
             });
         }
-        if version != CONSTRAINT_VERSION && constraint.boundary_candidate_summary.get().is_none() {
+        if !matches!(version, CONSTRAINT_VERSION | TEMPLATE_CONSTRAINT_VERSION) && constraint.boundary_candidate_summary.get().is_none() {
             let _ = constraint.boundary_candidate_summary.set(
                 crate::runtime::BoundaryCandidateSummary::Unknown {
                     reason: crate::runtime::SummaryUnavailable::LegacyArtifact,
@@ -9155,9 +9185,9 @@ mod tests {
     fn current_constraint_artifact_preserves_parser_state_domain_labels() {
         let mut constraint = ignored_constraint();
         constraint.parser_state_domain_labels =
-            vec![i32::MAX; constraint.table.num_states as usize];
+            vec![i32::MAX; constraint.parser_symbol_count() as usize];
         if let Some(first) = constraint.parser_state_domain_labels.first_mut() {
-            *first = constraint.table.num_states as i32;
+            *first = constraint.parser_symbol_count() as i32;
         }
         let loaded = Constraint::load(&constraint.save()).unwrap();
         assert_eq!(

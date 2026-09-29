@@ -6,6 +6,8 @@
 //! Tokenizer execution, GSS ownership, delayed exclusions and mask generation
 //! remain in their existing shared implementations.
 
+pub(crate) mod wire;
+
 use std::collections::{BTreeMap, BTreeSet};
 use std::ops::{ControlFlow, Deref, DerefMut};
 use std::sync::Arc;
@@ -61,14 +63,24 @@ impl DerefMut for ParserTableStorage {
 // dummy executable LR table in this adapter.
 pub(crate) mod table_serde {
     use super::ParserTableStorage;
-    use serde::{Deserializer, Serializer};
+    use serde::{Deserialize, Deserializer, Serialize, Serializer};
     pub fn serialize<S: Serializer>(table: &ParserTableStorage, serializer: S) -> Result<S::Ok, S::Error> {
+        if crate::compiler::glr::table::artifact_serde::external_serde_enabled() {
+            return 0u8.serialize(serializer);
+        }
         match table.as_lr() {
             Some(table) => crate::compiler::glr::table::artifact_serde::serialize(table, serializer),
             None => Err(serde::ser::Error::custom("template-only table requires its dedicated artifact section")),
         }
     }
     pub fn deserialize<'de, D: Deserializer<'de>>(deserializer: D) -> Result<ParserTableStorage, D::Error> {
+        if crate::compiler::glr::table::artifact_serde::external_serde_enabled() {
+            let marker = u8::deserialize(deserializer)?;
+            if marker != 0 { return Err(serde::de::Error::custom("invalid external parser placeholder")); }
+            // The real parser arrives in its dedicated section. An absent
+            // placeholder cannot accidentally execute an empty LR table.
+            return Ok(ParserTableStorage::absent());
+        }
         crate::compiler::glr::table::artifact_serde::deserialize(deserializer).map(Into::into)
     }
 }

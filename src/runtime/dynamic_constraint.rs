@@ -48,6 +48,9 @@ const LEGACY_DYNAMIC_CONSTRAINT_VERSION_V18: u16 = 18;
 // dynamic-mask subtree certificates. As documented above, the pre-release
 // wire is intentionally allowed to replace the previous current layout.
 const DYNAMIC_CONSTRAINT_VERSION: u16 = 20;
+// Template backends use the same table-free Constraint body as static mode.
+// This avoids a second parser codec and cannot restore an LR fallback.
+const TEMPLATE_DYNAMIC_CONSTRAINT_VERSION: u16 = 21;
 const DYNAMIC_CONSTRAINT_HEADER_LEN: usize = DYNAMIC_CONSTRAINT_MAGIC.len() + 2 + 8;
 const DYNAMIC_TRANSFER_MAGIC: [u8; 8] = *b"GLRDXF\0\0";
 const DYNAMIC_TRANSFER_VERSION_V1: u16 = 1;
@@ -1662,6 +1665,11 @@ impl DynamicConstraint {
     }
 
     fn build_external_vocab_artifact_bytes(&self) -> Vec<u8> {
+        // Until the new parser section supports an external vocabulary slot,
+        // retain a self-contained artifact rather than silently writing LR data.
+        if self.inner.has_template_parser() || self.alternatives.iter().any(Constraint::has_template_parser) {
+            return self.save();
+        }
         let profile_transfer = std::env::var_os("GLRMASK_PROFILE_SERIALIZATION").is_some();
         let total_started = profile_transfer.then(std::time::Instant::now);
         let sections_started = profile_transfer.then(std::time::Instant::now);
@@ -1750,6 +1758,8 @@ impl DynamicConstraint {
     }
 
     /// Compact transfer artifact that deliberately omits vocabulary bytes.
+    /// Experimental template-only backends currently keep their self-contained
+    /// vocabulary in this representation; `load_with_vocab` still validates it.
     /// Pair with `load_with_vocab`. This is the natural persisted format for
     /// APIs (such as Python) whose load operation already requires a Vocab.
     pub fn save_with_external_vocab(&self) -> Vec<u8> {
@@ -2875,8 +2885,57 @@ impl DynamicConstraint {
         Ok(Self::from_alternatives(std::mem::take(&mut alternatives)))
     }
 
+    fn save_template_alternatives(&self) -> Vec<u8> {
+        let constraints = std::iter::once(&self.inner).chain(&self.alternatives);
+        let count = self.alternatives.len().checked_add(1).expect("dynamic alternative count");
+        let mut payload = Vec::new();
+        payload.extend_from_slice(&u32::try_from(count).expect("dynamic alternative count fits u32").to_le_bytes());
+        for constraint in constraints {
+            assert!(constraint.has_template_parser(), "mixed LR/template dynamic artifacts are unsupported");
+            let bytes = constraint.save();
+            payload.extend_from_slice(&(bytes.len() as u64).to_le_bytes());
+            payload.extend_from_slice(&bytes);
+        }
+        let mut bytes = Vec::with_capacity(DYNAMIC_CONSTRAINT_HEADER_LEN + payload.len());
+        bytes.extend_from_slice(&DYNAMIC_CONSTRAINT_MAGIC);
+        bytes.extend_from_slice(&TEMPLATE_DYNAMIC_CONSTRAINT_VERSION.to_le_bytes());
+        bytes.extend_from_slice(&(payload.len() as u64).to_le_bytes());
+        bytes.extend_from_slice(&payload);
+        bytes
+    }
+
+    fn load_template_alternatives(payload: &[u8]) -> crate::Result<Self> {
+        let error = |message: &str| crate::GlrMaskError::Serialization(message.into());
+        let count = payload.get(..4).ok_or_else(|| error("truncated template dynamic count"))?;
+        let count = u32::from_le_bytes(count.try_into().unwrap()) as usize;
+        if count == 0 || count > payload.len().saturating_sub(4) / 26 {
+            return Err(error("invalid template dynamic alternative count"));
+        }
+        let mut offset = 4usize;
+        let mut constraints = Vec::new();
+        for _ in 0..count {
+            let header_end = offset.checked_add(8).ok_or_else(|| error("template dynamic offset overflow"))?;
+            let length = payload.get(offset..header_end).ok_or_else(|| error("truncated template dynamic descriptor"))?;
+            let length = usize::try_from(u64::from_le_bytes(length.try_into().unwrap()))
+                .map_err(|_| error("template dynamic length does not fit this platform"))?;
+            let end = header_end.checked_add(length).ok_or_else(|| error("template dynamic length overflow"))?;
+            let body = payload.get(header_end..end).ok_or_else(|| error("truncated template dynamic alternative"))?;
+            let constraint = Constraint::load(body)?;
+            if !constraint.has_template_parser() || !constraint.uses_dynamic_runtime() {
+                return Err(error("template dynamic alternative is not a table-free dynamic constraint"));
+            }
+            constraints.push(constraint);
+            offset = end;
+        }
+        if offset != payload.len() { return Err(error("trailing template dynamic bytes")); }
+        Ok(Self::from_constraints(constraints))
+    }
+
     /// Serialize this dynamic constraint to a versioned binary artifact.
     pub fn save(&self) -> Vec<u8> {
+        if self.inner.has_template_parser() || self.alternatives.iter().any(Constraint::has_template_parser) {
+            return self.save_template_alternatives();
+        }
         if std::env::var_os("GLRMASK_PROFILE_DYNAMIC_ARTIFACT").is_some() {
             for (index, constraint) in std::iter::once(&self.inner)
                 .chain(self.alternatives.iter())
@@ -3444,6 +3503,7 @@ impl DynamicConstraint {
                 | LEGACY_DYNAMIC_CONSTRAINT_VERSION_V17
                 | LEGACY_DYNAMIC_CONSTRAINT_VERSION_V18
                 | DYNAMIC_CONSTRAINT_VERSION
+                | TEMPLATE_DYNAMIC_CONSTRAINT_VERSION
         ) {
             return Err(crate::GlrMaskError::Serialization(format!(
                 "unsupported dynamic constraint artifact version {version}",
@@ -3465,6 +3525,7 @@ impl DynamicConstraint {
             ));
         }
         match version {
+            TEMPLATE_DYNAMIC_CONSTRAINT_VERSION => Self::load_template_alternatives(&bytes[DYNAMIC_CONSTRAINT_HEADER_LEN..]),
             1 => {
                 let payload: LegacyDynamicConstraintPayloadV1 =
                     bincode::deserialize(&bytes[DYNAMIC_CONSTRAINT_HEADER_LEN..])

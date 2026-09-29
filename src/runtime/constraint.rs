@@ -4110,7 +4110,7 @@ impl Constraint {
         if let Some(bounded64) = bounded64 {
             let quotient_multiplicity = vocab.mask_projection_state_multiplicities();
             let mut parser_rows_by_terminal = vec![0usize; self.parser_terminal_count() as usize];
-            for row in &self.table.advance {
+            for row in (0..self.parser_symbol_count()).filter_map(|top| self.parser_advance_row(top)) {
                 for terminal in row.iter() {
                     if let Some(count) = parser_rows_by_terminal.get_mut(terminal) {
                         *count += 1;
@@ -4426,7 +4426,7 @@ impl Constraint {
         if std::env::var_os("GLRMASK_PROFILE_DYNAMIC_PROJECTION_CANDIDATES").is_some() {
             let started = std::time::Instant::now();
             let mut parser_rows_by_terminal = vec![0usize; self.parser_terminal_count() as usize];
-            for row in &self.table.advance {
+            for row in (0..self.parser_symbol_count()).filter_map(|top| self.parser_advance_row(top)) {
                 for terminal in row.iter() {
                     if let Some(count) = parser_rows_by_terminal.get_mut(terminal) {
                         *count += 1;
@@ -6613,7 +6613,7 @@ impl Constraint {
                 }
             }
             let mut parser_rows_by_terminal = vec![0usize; self.parser_terminal_count() as usize];
-            for row in &self.table.advance {
+            for row in (0..self.parser_symbol_count()).filter_map(|top| self.parser_advance_row(top)) {
                 for terminal in row.iter() {
                     if let Some(count) = parser_rows_by_terminal.get_mut(terminal) {
                         *count += 1;
@@ -7200,7 +7200,7 @@ impl Constraint {
         // admitted by at least one singleton LR row. This sidecar was already
         // paid for by production before parser-relative commit reuse consumed it.
         let mut singleton_rows = vec![0usize; self.parser_terminal_count() as usize];
-        for row in &self.table.advance {
+        for row in (0..self.parser_symbol_count()).filter_map(|top| self.parser_advance_row(top)) {
             let mut terminals = row.iter();
             let Some(terminal) = terminals.next() else {
                 continue;
@@ -7288,7 +7288,7 @@ impl Constraint {
             const SMALL_PARSER_ROW_LIMIT: usize = 8;
             const REPEATED_MIXED_FAMILY_MIN_STATES: usize = 8;
             let mut small_rows = vec![0usize; self.parser_terminal_count() as usize];
-            for row in &self.table.advance {
+            for row in (0..self.parser_symbol_count()).filter_map(|top| self.parser_advance_row(top)) {
                 let row_len = row.iter().count();
                 if (1..=SMALL_PARSER_ROW_LIMIT).contains(&row_len) {
                     for terminal in row.iter() {
@@ -7504,12 +7504,9 @@ impl Constraint {
 
     pub(crate) fn rebuild_dynamic_runtime_caches(&mut self) {
         self.tokenizer_has_epsilon_transitions = self.tokenizer.has_epsilon_transitions();
-        if self.table.unconditional_advance.len() != self.parser_symbol_count() as usize
-            || self
-                .table
-                .unconditional_advance
-                .iter()
-                .any(|row| row.len() != self.parser_terminal_count() as usize)
+        if !self.has_template_parser() && (self.table.unconditional_advance.len() != self.parser_symbol_count() as usize
+            || self.table.unconditional_advance.iter()
+                .any(|row| row.len() != self.parser_terminal_count() as usize))
         {
             self.table.rebuild_unconditional_advance_rows();
         }
@@ -7521,7 +7518,7 @@ impl Constraint {
         // dynamic compile/load latency and allocations.
         self.terminal_live_states.clear();
         let started_at = profile.then(std::time::Instant::now);
-        if self.table.guarded_shift_index.len() != self.parser_symbol_count() as usize {
+        if !self.has_template_parser() && self.table.guarded_shift_index.len() != self.parser_symbol_count() as usize {
             if self.table.has_guarded_stack_shifts() {
                 self.table.rebuild_guarded_shift_index();
             } else {
@@ -8455,6 +8452,7 @@ impl Constraint {
     fn compute_direct_regular_wide_frontier_acceptance(
         &self,
     ) -> Vec<DirectRegularWideFrontierAcceptance> {
+        if self.has_template_parser() { return Vec::new(); }
         // Loaded current-format constraints can execute exact acceptance
         // directly from packed Weight ids. These summaries are only an
         // optimization over materialized Weight objects; rebuilding them would
@@ -8588,6 +8586,7 @@ impl Constraint {
     fn compute_direct_regular_parser_state_acceptance(
         &self,
     ) -> Vec<DirectRegularParserStateAcceptance> {
+        if self.has_template_parser() { return Vec::new(); }
         if self.packed_non_dwa_weights.is_some() {
             return Vec::new();
         }
@@ -9478,7 +9477,7 @@ impl Constraint {
         let mut packed_weight_token_sets =
             crate::automata::weighted::dwa::take_packed_decode_token_set_inventory();
         self.tokenizer_has_epsilon_transitions = self.tokenizer.has_epsilon_transitions();
-        self.table.rebuild_unconditional_advance_rows();
+        if !self.has_template_parser() { self.table.rebuild_unconditional_advance_rows(); }
         let profile = std::env::var_os("GLRMASK_PROFILE_COMPILE").is_some()
             || std::env::var_os("GLRMASK_PROFILE_COMPILE_SUMMARY").is_some();
         let total_started_at = profile.then(std::time::Instant::now);
@@ -9594,7 +9593,7 @@ impl Constraint {
         // anywhere a dynamic full walk is explicitly requested. DynamicConstraint
         // prepares its own execution coordinate in rebuild_dynamic_runtime_caches().
         let guarded_shift_started_at = profile.then(std::time::Instant::now);
-        if self.table.guarded_shift_index.len() != self.parser_symbol_count() as usize {
+        if !self.has_template_parser() && self.table.guarded_shift_index.len() != self.parser_symbol_count() as usize {
             if self.table.num_rules == 0 {
                 self.table.guarded_shift_index =
                     vec![FxHashMap::default(); self.parser_symbol_count() as usize];
@@ -9643,11 +9642,7 @@ impl Constraint {
         if profile {
             eprintln!(
                 "[glrmask/profile][runtime_finalize_guarded_split] guarded_index_ms={guarded_index_ms:.3} state_relation_ms={state_relation_ms:.3} fast_template_ms={fast_template_ms:.3} guarded_cells={}",
-                self.table
-                    .guarded_shift_index
-                    .iter()
-                    .map(|row| row.len())
-                    .sum::<usize>(),
+                self.table.as_lr().map_or(0, |table| table.guarded_shift_index.iter().map(|row| row.len()).sum::<usize>()),
             );
         }
         // This mapping is a derived cache. Reset it before scheduling the
