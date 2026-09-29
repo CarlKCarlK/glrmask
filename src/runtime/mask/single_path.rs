@@ -12,7 +12,8 @@ use crate::runtime::constraint::RuntimeWeightRef;
 use crate::runtime::state::ConstraintState;
 
 use super::{
-    Constraint, DenseMaskAcc, DenseTokenMaskCache, MASK_SINGLE_PATH_DIRECT_INLINE_PATH_CAPACITY,
+    Constraint, DenseMaskAcc, DenseTokenMaskCache, DELTA_SEED_MIN_SAVINGS,
+    MASK_SINGLE_PATH_DIRECT_INLINE_PATH_CAPACITY,
     MASK_SINGLE_PATH_DIRECT_INLINE_STACK_DEPTH, MASK_SINGLE_PATH_DIRECT_MAX_DEPTH,
     MASK_SINGLE_PATH_DIRECT_MAX_PLAN_OPS, MASK_SINGLE_PATH_DIRECT_MAX_TOTAL_PATHS,
     MASK_SINGLE_PATH_DIRECT_MAX_PATHS_PER_GSS,
@@ -412,7 +413,9 @@ impl ConstraintState<'_> {
             return false;
         }
 
-        if merged.iter().any(|&word| word != 0) {
+        let reused_dense = !direct_buf_dirty
+            && self.try_replay_monotone_dense_cache(&merged, buf);
+        if !reused_dense && merged.iter().any(|&word| word != 0) {
             let buf_zeroed = !direct_buf_dirty;
             self.constraint.or_internal_dense_to_buf_fast_with_scratch(
                 &merged,
@@ -427,6 +430,67 @@ impl ConstraintState<'_> {
             self.store_mask_cache(buf, &merged);
         }
         restore_scratch(merged, output_scratch, single_path_aux, single_path_acc);
+        true
+    }
+
+    /// Reuse only a cached pure internal-token projection. All additional
+    /// output contributions clear the cached bitmap, and the caller declines
+    /// this path when it has already written direct final-mask contributions.
+    /// Equality or an addition-only bitmap proves that old output bits remain
+    /// valid; any removal declines before the output is touched.
+    fn try_replay_monotone_dense_cache(&self, merged: &[u64], buf: &mut [u32]) -> bool {
+        if self.constraint.final_mask_mapping.internal_len() != 0 || merged.is_empty() {
+            return false;
+        }
+        let count = self.constraint.internal_token_count();
+        if count == 0 || merged.len() != count.div_ceil(64) {
+            return false;
+        }
+        let cache = self.mask_cache.lock().unwrap();
+        let Some(previous) = cache.as_ref().filter(|previous| {
+            previous.mask.len() == buf.len() && previous.merged_dense.len() == merged.len()
+        }) else {
+            return false;
+        };
+        let tail_bits = count % 64;
+        if tail_bits != 0
+            && ((merged[merged.len() - 1] | previous.merged_dense[merged.len() - 1])
+                >> tail_bits) != 0
+        {
+            return false;
+        }
+        if previous.merged_dense == merged {
+            buf.copy_from_slice(&previous.mask);
+            return true;
+        }
+
+        let mut added_cost = 0u64;
+        for (wi, (&current, &old)) in merged.iter().zip(&previous.merged_dense).enumerate() {
+            if old & !current != 0 {
+                return false;
+            }
+            let added = current & !old;
+            if added == 0 {
+                continue;
+            }
+            let remaining = count - wi * 64;
+            let valid = if remaining >= 64 { u64::MAX } else { (1u64 << remaining) - 1 };
+            added_cost = added_cost.saturating_add(
+                self.constraint.internal_bits_grouped_buf_op_cost(wi, added, valid, buf.len())
+                    as u64,
+            );
+        }
+        // Keep the established conservative delta-versus-rebuild margin.
+        // These are work estimates; no mask admission depends on their value.
+        let delta_cost = (buf.len() as u64).saturating_add(added_cost);
+        let rebuild_cost = self.constraint.estimate_internal_dense_to_buf_cost(merged);
+        if rebuild_cost.saturating_sub(delta_cost) <= DELTA_SEED_MIN_SAVINGS
+            || delta_cost.saturating_mul(2) >= rebuild_cost
+        {
+            return false;
+        }
+        buf.copy_from_slice(&previous.mask);
+        self.constraint.apply_internal_dense_delta_to_buf(&previous.merged_dense, merged, buf);
         true
     }
 
