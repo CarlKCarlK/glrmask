@@ -16,7 +16,7 @@ use crate::automata::lexer::tokenizer::{
     TokenizerStateSet, VirtualResidualDirectCoordinate,
 };
 use crate::compiler::glr::accumulator::TerminalsDisallowed;
-use crate::compiler::glr::parser::{advance_stacks, stack_admissible_terminals, ParserGSS};
+use crate::compiler::glr::parser::{advance_stacks, ParserGSS};
 use crate::ds::bitset::BitSet;
 use crate::ds::leveled_gss::LeveledGSS;
 use crate::ds::u8set::U8Set;
@@ -63,7 +63,7 @@ fn raw_terminal_radius_enabled() -> bool {
 fn exact_parser_admission_for_stacks(constraint: &Constraint, stacks: &ParserStacks) -> BitSet {
     let parser_gss = with_empty_accumulators(stacks);
     constraint.direct_regular_admissible_terminals(&parser_gss).unwrap_or_else(|| {
-        let candidates = BitSet::all(constraint.table.num_terminals as usize);
+        let candidates = BitSet::all(constraint.parser_terminal_count() as usize);
         super::commit::exact_admitted_terminals_for_candidates(
             constraint, &parser_gss, &candidates,
         )
@@ -121,19 +121,19 @@ fn parser_row_projection_candidates(
 ) -> Option<(BitSet, bool)> {
     if constraint.uses_sparse_direct_regular_runtime()
         || constraint.uses_compact_segmented_parser_runtime()
-        || !constraint.table.control_terminals.is_empty()
+        || constraint.parser_has_controls()
     {
         return None;
     }
     let top = stacks.single_top_value()?;
-    let row = constraint.table.advance_row(top)?;
-    let terminal_count = constraint.table.num_terminals as usize;
+    let row = constraint.parser_advance_row(top)?;
+    let terminal_count = constraint.parser_terminal_count() as usize;
     // The advance row may also contain EOF. Never put it in a lexer filter.
     let mut candidates = BitSet::new(terminal_count);
     for terminal in row.iter_ones().take_while(|&terminal| terminal < terminal_count) {
         candidates.set(terminal);
     }
-    let exact = constraint.table.unconditional_advance_row(top).is_some_and(|row| {
+    let exact = constraint.parser_unconditional_row(top).is_some_and(|row| {
         candidates.iter_ones().all(|terminal| row.contains(terminal))
     });
     Some((candidates, exact))
@@ -772,7 +772,7 @@ impl<'a> RecursiveFullWalkTransitions<'a> {
                 lexer_count: leaf.tokenizer.num_states(),
                 terminal_offset: layout.outer_terminal_count
                     .checked_add(layout.leaf_terminal_offsets[leaf_index])?,
-                terminal_count: leaf.table.num_terminals,
+                terminal_count: leaf.parser_terminal_count(),
                 reset: constraint.recursive_tokenizer_reset_state(leaf_index)?,
             });
         }
@@ -2689,11 +2689,11 @@ impl FullWalkParserCache {
         if Some(terminal) != constraint.ignore_terminal
             && !constraint.uses_sparse_direct_regular_runtime()
             && !constraint.uses_compact_segmented_parser_runtime()
-            && constraint.table.control_terminals.is_empty()
+            && !constraint.parser_has_controls()
             && self.nodes[node_index]
                 .gss
                 .single_top_value()
-                .is_some_and(|top| constraint.table.action(top, terminal).is_none())
+                .is_some_and(|top| !constraint.parser_advance_row_allows(top, terminal))
         {
             self.nodes[node_index].children.push((terminal, Self::DEAD));
             self.nodes[node_index].last_child_terminal = terminal;
@@ -8553,7 +8553,10 @@ fn parser_child(
     // The actual structural advance is already the definitive admissibility
     // test. Running exact admission first would duplicate reduction simulation
     // for every terminal branch explored by the dynamic traversal.
-    let advanced = if let Some(advanced) =
+    let advanced = if constraint.has_template_parser() {
+        super::commit::advance_parser_stacks_if_possible(constraint, &parser_gss, terminal)
+            .unwrap_or_else(ParserGSS::empty)
+    } else if let Some(advanced) =
         constraint.advance_compact_segmented_parser(&parser_gss, terminal)
     {
         advanced
@@ -8972,8 +8975,8 @@ fn dynamic_mask_lookup_query_for_vocab(
                 .constraint
                 .direct_regular_admissible_terminals(gss)
                 .unwrap_or_else(|| {
-                    let candidates = BitSet::all(state.constraint.table.num_terminals as usize);
-                    stack_admissible_terminals(&state.constraint.table, gss, &candidates)
+                    let candidates = BitSet::all(state.constraint.parser_terminal_count() as usize);
+                    super::commit::exact_admitted_terminals_for_candidates(state.constraint, gss, &candidates)
                 });
             let mut terminals = admitted.iter_ones();
             terminals
@@ -9924,7 +9927,7 @@ fn fill_mask_dynamic_impl(
                         .direct_regular_admissible_terminals(&parser_gss)
                         .unwrap_or_else(|| {
                             let candidates =
-                                BitSet::all(state.constraint.table.num_terminals as usize);
+                                BitSet::all(state.constraint.parser_terminal_count() as usize);
                             super::commit::exact_admitted_terminals_for_candidates(
                                 state.constraint,
                                 &parser_gss,
@@ -9989,7 +9992,7 @@ fn fill_mask_dynamic_impl(
                 .map(|top| {
                     let mut hasher = rustc_hash::FxHasher::default();
                     top.hash(&mut hasher);
-                    for terminal in 0..state.constraint.table.num_terminals {
+                    for terminal in 0..state.constraint.parser_terminal_count() {
                         terminal.hash(&mut hasher);
                         state
                             .constraint

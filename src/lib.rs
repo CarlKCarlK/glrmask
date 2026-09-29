@@ -298,6 +298,66 @@ pub mod __private {
         crate::compiler::o21137_subgrammar_bench::run(mode);
     }
 
+    /// Experimental mandatory template backend. The LR table is dropped and
+    /// any accidental runtime table access fails loudly. Composition is not
+    /// supported by this experimental internal bridge.
+    pub fn into_template_parser(mut constraint: Constraint) -> Result<Constraint> {
+        constraint.install_template_parser()?;
+        Ok(constraint)
+    }
+
+    pub fn into_dynamic_template_parser(mut constraint: DynamicConstraint) -> Result<DynamicConstraint> {
+        for alternative in constraint.constraints_mut() { alternative.install_template_parser()?; }
+        Ok(constraint)
+    }
+
+    pub fn parser_backend_report(constraint: &Constraint) -> serde_json::Value {
+        constraint.parser_backend_report()
+    }
+
+    pub fn dynamic_parser_backend_report(constraint: &DynamicConstraint) -> serde_json::Value {
+        serde_json::Value::Array(constraint.clone_constraints().iter()
+            .map(Constraint::parser_backend_report).collect())
+    }
+
+    /// Bounded diagnostic only. This compares canonical stack languages and
+    /// accumulators, not pointer identity or incidental GSS sharing shape.
+    /// The reference is a separate oracle constraint, never retained inside
+    /// the table-free candidate. Do not call this inside performance intervals.
+    pub fn compare_parser_states_debug(
+        reference: &ConstraintState<'_>, candidate: &ConstraintState<'_>,
+    ) -> Option<serde_json::Value> {
+        use crate::compiler::glr::parser::ParserGSS;
+        use std::collections::BTreeMap;
+        fn canonical(state: &ConstraintState<'_>) -> BTreeMap<u32, ParserGSS> {
+            let mut map = BTreeMap::<u32, ParserGSS>::new();
+            for (&key, gss) in state.state.iter() {
+                map.entry(key).and_modify(|prior| *prior = prior.merge(gss)).or_insert_with(|| gss.clone());
+            }
+            map
+        }
+        let left = canonical(reference); let right = canonical(candidate);
+        let keys: std::collections::BTreeSet<_> = left.keys().chain(right.keys()).copied().collect();
+        for key in keys {
+            let a = left.get(&key).cloned().unwrap_or_else(ParserGSS::empty);
+            let b = right.get(&key).cloned().unwrap_or_else(ParserGSS::empty);
+            if a.semantically_eq(&b, 65_536) != Some(true) {
+                return Some(serde_json::json!({
+                    "tokenizer_state":key, "reference_keys":left.keys().collect::<Vec<_>>(),
+                    "candidate_keys":right.keys().collect::<Vec<_>>(),
+                    "reference_stacks":format!("{:?}",a.to_stacks(32)),
+                    "candidate_stacks":format!("{:?}",b.to_stacks(32)),
+                    "reference_stack_vectors":a.to_stacks(4096).map(|stacks|stacks.into_iter().map(|(stack,_)|stack).collect::<Vec<_>>()),
+                    "candidate_stack_vectors":b.to_stacks(4096).map(|stacks|stacks.into_iter().map(|(stack,_)|stack).collect::<Vec<_>>()),
+                    "reference_table":serde_json::to_value(&*reference.constraint.table).ok(),
+                    "candidate_templates":serde_json::to_value(&candidate.constraint.template_dfas_by_terminal).ok(),
+                    "ignore_terminal":reference.constraint.ignore_terminal,
+                }));
+            }
+        }
+        None
+    }
+
     pub trait ConstraintExt: Sized {
         fn compile_grammar_def_json(grammar_def_json: &str, vocab: &Vocab) -> Result<Self>;
         fn dump_json_schema_grammar_glrm(schema_json: &str) -> Result<String>;

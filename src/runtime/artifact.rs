@@ -9998,7 +9998,7 @@ impl ParserComponentTableSource for SegmentedParserComponentTables<'_> {
     fn component_table(&self, component: u32) -> Option<&GLRTable> {
         self.components
             .get(component as usize)
-            .map(|component| &component.constraint.table)
+            .map(|component| &*component.constraint.table)
     }
 
     #[inline]
@@ -10304,7 +10304,7 @@ pub struct Constraint {
     /// Sparse terminal-level automaton retained for exact direct-regular
     /// runtime indexes. Static artifact format versioning covers this field.
     pub(crate) direct_regular_automaton: Option<DirectRegularAutomaton>,
-    pub(crate) table: GLRTable,
+    pub(crate) table: crate::runtime::parser_backend::ParserTableStorage,
     pub(crate) terminal_display_names: Vec<String>,
     pub(crate) tokenizer: Arc<Tokenizer>,
     pub(crate) boundary_completion_index: Option<Arc<crate::compiler::boundary_precomputed_completion::PreparedCompletion>>,
@@ -10406,6 +10406,7 @@ pub struct Constraint {
     pub(crate) template_dfas_by_terminal: TemplateDfasByTerminal,
     /// Runtime-only compact transition view for commit template products.
     pub(crate) fast_template_dfas_by_terminal: FastTemplateDfasByTerminal,
+    pub(crate) template_parser: Option<Arc<crate::runtime::parser_backend::TemplateParser>>,
     /// Original token -> final shared constraint-internal token id.
     ///
     /// This is not necessarily equal to the parser-DWA compaction vocab map
@@ -10685,8 +10686,8 @@ pub(crate) struct ConstraintSerde {
     /// runtime indexes. Static artifact format versioning covers this field.
     #[serde(default)]
     pub(crate) direct_regular_automaton: Option<DirectRegularAutomaton>,
-    #[serde(with = "crate::compiler::glr::table::artifact_serde")]
-    pub(crate) table: GLRTable,
+    #[serde(with = "crate::runtime::parser_backend::table_serde")]
+    pub(crate) table: crate::runtime::parser_backend::ParserTableStorage,
     #[serde(default)]
     pub(crate) terminal_display_names: Vec<String>,
     #[serde(with = "crate::runtime::artifact::immutable_tokenizer_serde")]
@@ -10811,6 +10812,8 @@ pub(crate) struct ConstraintSerde {
     /// Runtime-only compact transition view for commit template products.
     #[serde(skip, default)]
     pub(crate) fast_template_dfas_by_terminal: FastTemplateDfasByTerminal,
+    #[serde(skip, default)]
+    pub(crate) template_parser: Option<Arc<crate::runtime::parser_backend::TemplateParser>>,
     /// Original token -> final shared constraint-internal token id.
     ///
     /// This is not necessarily equal to the parser-DWA compaction vocab map

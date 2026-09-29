@@ -3473,6 +3473,99 @@ impl<T: Clone + Eq + Hash, A: Merge + Clone + Eq + Hash> LeveledGSS<T, A> {
         dfs_upper(&self.inner, 0, limit, &mut emitted, &mut f)
     }
 
+    /// Test an input-prefix recognizer directly against the shared GSS DAG.
+    ///
+    /// `step(cursor, symbol)` reads one top-first symbol. Break(true) accepts
+    /// the prefix independently of all lower symbols; Break(false) rejects
+    /// that branch; Continue(next) requests another symbol. The caller must
+    /// handle an accepting initial recognizer state before invoking this method.
+    /// Reaching an empty stack while another symbol is needed rejects.
+    ///
+    /// The predicate intentionally cannot inspect path accumulators. Parser
+    /// input-domain queries use it only after normal delayed-exclusion pruning.
+    /// No output GSS, concrete stack, or alternate stack representation is
+    /// constructed. Shared (node,cursor) products are visited once. Small
+    /// products and traversal queues stay inline; deep inputs use an explicit
+    /// worklist rather than the native call stack.
+    pub fn any_prefix_matching(
+        &self,
+        initial: u32,
+        mut step: impl FnMut(u32, &T) -> std::ops::ControlFlow<bool, u32>,
+    ) -> bool {
+        use std::ops::ControlFlow;
+        enum Node<'a, T: Clone + Eq + Hash, A: Merge + Clone + Eq + Hash> {
+            Upper(&'a Upper<T, A>),
+            Lower(&'a Lower<T>),
+        }
+        let mut pending = SmallVec::<[(Node<'_, T, A>, u32); 16]>::new();
+        pending.push((Node::Upper(&self.inner), initial));
+        let mut small_seen = SmallVec::<[(usize, bool, u32); 16]>::new();
+        let mut large_seen = None::<FxHashSet<(usize, bool, u32)>>;
+        while let Some((node, mut cursor)) = pending.pop() {
+            let key = match &node {
+                Node::Upper(node) => (*node as *const Upper<T, A> as usize, true, cursor),
+                Node::Lower(node) => (*node as *const Lower<T> as usize, false, cursor),
+            };
+            if let Some(seen) = &mut large_seen {
+                if !seen.insert(key) { continue; }
+            } else {
+                if small_seen.contains(&key) { continue; }
+                if small_seen.len() < small_seen.inline_size() {
+                    small_seen.push(key);
+                } else {
+                    let mut seen: FxHashSet<_> = small_seen.iter().copied().collect();
+                    seen.insert(key);
+                    large_seen = Some(seen);
+                }
+            }
+            match node {
+                Node::Upper(Upper::Interface(interface)) => {
+                    pending.push((Node::Lower(&interface.inner), cursor));
+                }
+                Node::Upper(Upper::Branch(branch)) => {
+                    for (value, children) in branch.children.iter() {
+                        match step(cursor, value) {
+                            ControlFlow::Break(true) => return true,
+                            ControlFlow::Break(false) => {},
+                            ControlFlow::Continue(next) => {
+                                for child in children.values() {
+                                    pending.push((Node::Upper(child), next));
+                                }
+                            }
+                        }
+                    }
+                }
+                Node::Lower(Lower::General { children, .. }) => {
+                    for (value, children) in children.iter() {
+                        match step(cursor, value) {
+                            ControlFlow::Break(true) => return true,
+                            ControlFlow::Break(false) => {},
+                            ControlFlow::Continue(next) => {
+                                for child in children.values() {
+                                    pending.push((Node::Lower(child), next));
+                                }
+                            }
+                        }
+                    }
+                }
+                Node::Lower(Lower::Segment(segment)) => {
+                    let mut rejected = false;
+                    for value in segment.values.iter().rev() {
+                        match step(cursor, value) {
+                            ControlFlow::Break(true) => return true,
+                            ControlFlow::Break(false) => { rejected = true; break; },
+                            ControlFlow::Continue(next) => cursor = next,
+                        }
+                    }
+                    if !rejected {
+                        pending.push((Node::Lower(&segment.next), cursor));
+                    }
+                }
+            }
+        }
+        false
+    }
+
     /// Visit concrete stacks in top-first order without materializing the full
     /// stack set. Returns `false` as soon as more than `limit` paths are found.
     ///
@@ -7959,5 +8052,44 @@ mod tests {
     }
 
 
+
+    #[test]
+    fn shared_dag_prefix_recognizer_matches_literal_stacks() {
+        use std::ops::ControlFlow;
+        let cases = vec![
+            (vec![1u32, 2, 3], ()), (vec![1, 4, 3], ()),
+            (vec![9, 2], ()), (vec![9, 4, 3, 7], ()), (vec![], ()),
+        ];
+        let gss = super::LeveledGSS::from_stacks(&cases);
+        for prefix in [vec![3], vec![3, 2], vec![3, 4, 9], vec![2, 9], vec![7, 3, 4, 9], vec![3, 2, 1, 0], vec![99]] {
+            let expected = cases.iter().any(|(stack, _)| {
+                stack.iter().rev().copied().collect::<Vec<_>>().starts_with(&prefix)
+            });
+            let actual = gss.any_prefix_matching(0, |cursor, top| {
+                if prefix[cursor as usize] != *top { return ControlFlow::Break(false); }
+                if cursor as usize + 1 == prefix.len() { ControlFlow::Break(true) }
+                else { ControlFlow::Continue(cursor + 1) }
+            });
+            assert_eq!(actual, expected, "prefix {prefix:?}");
+        }
+    }
+
+    #[test]
+    fn shared_dag_prefix_recognizer_does_not_enumerate_exponential_paths() {
+        use std::ops::ControlFlow;
+        let mut gss = super::LeveledGSS::from_single_stack(vec![99u32], ());
+        for _ in 0..24 {
+            gss = gss.push(0).merge(&gss.push(1));
+        }
+        assert_eq!(gss.path_count_at_most(1_000_000), 1_000_000);
+        let mut calls = 0usize;
+        let admitted = gss.any_prefix_matching(0, |cursor, _| {
+            calls += 1;
+            if cursor == 25 { ControlFlow::Break(true) }
+            else { ControlFlow::Continue(cursor + 1) }
+        });
+        assert!(!admitted, "all concrete paths are shorter than 26 symbols");
+        assert!(calls < 200, "visited {calls} symbols despite compact shared DAG");
+    }
 
 }

@@ -537,7 +537,7 @@ impl<'a> SignedLinkContext<'a> {
         for (index, component) in components.iter().enumerate() {
             // Establish provenance structurally: sources cannot be paired with
             // an unrelated/rebuilt table that happens to have equal dimensions.
-            if !std::ptr::eq(&component.table, self.component_table(index as u32)?) {
+            if !std::ptr::eq(&*component.table, self.component_table(index as u32)?) {
                 return Err(format!("prepared template source {index} is not the context's table"));
             }
         }
@@ -715,9 +715,9 @@ pub(crate) fn build_signed_link_context<'a>(
     unbound_slots: BTreeSet<TerminalID>,
 ) -> Result<SignedLinkContext<'a>, String> {
     let mut tables = Vec::with_capacity(children.len() + 1);
-    tables.push(&parent.table);
+    tables.push(&*parent.table);
     for child in children {
-        tables.push(&child.constraint.table);
+        tables.push(&*child.constraint.table);
     }
     let mut ignore_terminals = Vec::with_capacity(children.len() + 1);
     ignore_terminals.push(parent.ignore_terminal);

@@ -5880,6 +5880,7 @@ impl Constraint {
     /// Current artifacts use a compact sectioned representation and retain
     /// runtime-native sections where doing so materially reduces load latency.
     pub fn save(&self) -> Vec<u8> {
+        assert!(!self.has_template_parser(), "template-only persistence is not implemented yet; refusing an LR artifact");
         let exact_only_token_ids = self
             .late_bind_vocab
             .get()
@@ -8087,7 +8088,7 @@ impl Constraint {
             }
             let attach_dwa_ms = attach_dwa_started
                 .map_or(0.0, |started| started.elapsed().as_secs_f64() * 1000.0);
-            constraint.table = table;
+            constraint.table = table.into();
             constraint.deferred_table_rules_blob = deferred_table_rules_blob;
             constraint.deferred_table_rules = Default::default();
             let invert_started = profile.then(std::time::Instant::now);

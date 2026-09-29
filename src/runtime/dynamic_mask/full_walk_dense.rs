@@ -3569,11 +3569,11 @@ impl FullWalkParserCache {
         if Some(terminal) != constraint.ignore_terminal
             && !constraint.uses_sparse_direct_regular_runtime()
             && !constraint.uses_compact_segmented_parser_runtime()
-            && constraint.table.control_terminals.is_empty()
+            && !constraint.parser_has_controls()
             && self.nodes[node_index]
                 .gss
                 .single_top_value()
-                .is_some_and(|top| constraint.table.action(top, terminal).is_none())
+                .is_some_and(|top| !constraint.parser_advance_row_allows(top, terminal))
         {
             self.nodes[node_index].children.push((terminal, Self::DEAD));
             self.nodes[node_index].last_child_terminal = terminal;
@@ -3638,13 +3638,13 @@ impl FullWalkParserCache {
             || self.nodes[parser_node as usize].admitted.is_some()
             || constraint.uses_sparse_direct_regular_runtime()
             || constraint.uses_compact_segmented_parser_runtime()
-            || !constraint.table.control_terminals.is_empty()
+            || constraint.parser_has_controls()
         {
             return None;
         }
         let top = self.nodes[parser_node as usize].gss.single_top_value()?;
-        let necessary = constraint.table.advance_row(top)?;
-        let guaranteed = constraint.table.unconditional_advance_row(top)?;
+        let necessary = constraint.parser_advance_row(top)?;
+        let guaranteed = constraint.parser_unconditional_row(top)?;
         full_walk_row_liveness_bound(
             transitions.future_intersects(tokenizer, lexer_state, guaranteed),
             || transitions.future_intersects(tokenizer, lexer_state, necessary),
@@ -8791,7 +8791,7 @@ mod full_walk_acceleration_tests {
                         cache.row_liveness_enabled = false;
                         assert!(cache.row_future_allowed(constraint, &constraint.tokenizer,
                             &transitions, node, 0).is_none());
-                        for terminal in 0..constraint.table.num_terminals {
+                        for terminal in 0..constraint.parser_terminal_count() {
                             if let Some(child) = parser_child(constraint, &stacks, terminal) {
                                 next.push(child);
                             }

@@ -10,7 +10,6 @@ use crate::compiler::glr::labels::{DEFAULT_LABEL, encode_positive_label};
 use crate::compiler::glr::parser::{
     lookahead_reduction_factor,
     lookahead_reduction_factor_row_subset,
-    stack_may_advance_on,
     ParserGSS,
 };
 use crate::ds::bitset::BitSet;
@@ -2263,7 +2262,7 @@ mod tests {
         poisoned.table.rules.clear();
         poisoned.table.forwarded_shifts.clear();
         poisoned.table.control_terminals.clear();
-        poisoned.table.skip_terminals.clear();
+        poisoned.parser_skip_terminals().clear();
         poisoned.table.guarded_shift_index.clear();
         poisoned.table.direct_regular_wide_frontiers.clear();
         poisoned.table.num_states = 0;
@@ -4229,7 +4228,7 @@ impl<'a> ConstraintState<'a> {
         source: &TerminalsDisallowed,
     ) -> TerminalsDisallowed {
         let terminal_start = component.terminal_offset;
-        let terminal_end = terminal_start.saturating_add(component.constraint.table.num_terminals);
+        let terminal_end = terminal_start.saturating_add(component.constraint.parser_terminal_count());
         let mut result = TerminalsDisallowed::new();
         for (global_tokenizer_state, terminals) in source.iter() {
             let local_tokenizer_states = self.segmented_local_tokenizer_states(
@@ -6493,7 +6492,7 @@ impl<'a> ConstraintState<'a> {
     /// a linker control chain. Ordinary parser-DWA weights remain the fast path;
     /// constraints without explicit controls pay nothing here.
     fn update_control_special_token_mask(&self, buf: &mut [u32]) {
-        if self.constraint.table.control_terminals.is_empty()
+        if !self.constraint.parser_has_controls()
             && !self.constraint.uses_compact_segmented_parser_runtime()
         {
             return;
@@ -8603,8 +8602,8 @@ impl<'a> ConstraintState<'a> {
                 && tokenizer_state != reset_state
                 && gss.all_accs_satisfy(|blocked: &TerminalsDisallowed| blocked.is_empty())
             {
-                for &terminal in &self.constraint.table.skip_terminals {
-                    if !stack_may_advance_on(&self.constraint.table, gss, terminal) {
+                for &terminal in self.constraint.parser_skip_terminals() {
+                    if !super::commit::parser_may_advance_on(self.constraint, gss, terminal) {
                         continue;
                     }
                     self.constraint.visit_possible_match_original_tokens(
@@ -8620,7 +8619,7 @@ impl<'a> ConstraintState<'a> {
                 continue;
             }
             for (terminal, tokens) in &self.constraint.scoped_ignore_only_tokens {
-                if !stack_may_advance_on(&self.constraint.table, gss, *terminal) {
+                if !super::commit::parser_may_advance_on(self.constraint, gss, *terminal) {
                     continue;
                 }
                 for &token in tokens.iter() {
@@ -8667,6 +8666,7 @@ impl<'a> ConstraintState<'a> {
     }
 
     fn lookahead_factored_mask_shadow(&self) -> Option<Box<Self>> {
+        if self.constraint.has_template_parser() { return None; }
         if self.constraint.static_dynamic_overlay.is_none()
             || std::env::var_os("GLRMASK_EXPERIMENT_MASK_LOOKAHEAD_FACTOR").is_none()
         {
@@ -8755,7 +8755,7 @@ impl<'a> ConstraintState<'a> {
                     continue;
                 };
                 for bit in final_after.difference(chain_forced).iter_ones() {
-                    if bit >= self.constraint.table.num_terminals as usize {
+                    if bit >= self.constraint.parser_terminal_count() as usize {
                         fast_guard_representable = false;
                         break;
                     }
@@ -9029,7 +9029,7 @@ impl<'a> ConstraintState<'a> {
                 }
             }
             self.update_control_special_token_mask(mask);
-            if !self.constraint.table.control_terminals.is_empty()
+            if self.constraint.parser_has_controls()
                 || self.constraint.uses_compact_segmented_parser_runtime()
             {
                 self.store_mask_cache_reuse_dense(mask);
@@ -9107,7 +9107,7 @@ impl<'a> ConstraintState<'a> {
             });
         self.update_control_special_token_mask(buf);
         self.clear_late_grammar_placeholder_mask(buf);
-        if !self.constraint.table.control_terminals.is_empty()
+        if self.constraint.parser_has_controls()
             || self.constraint.uses_compact_segmented_parser_runtime()
         {
             self.store_mask_cache_reuse_dense(buf);

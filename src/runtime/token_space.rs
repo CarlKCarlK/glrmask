@@ -461,7 +461,7 @@ impl Constraint {
 		let parser_gss = ParserGSS::from_stacks(&[(vec![0u32], TerminalsDisallowed::new())]);
 		let parser_gss = if let Some(closed) = self.close_compact_segmented_parser(&parser_gss) {
 			closed
-		} else if self.table.control_terminals.is_empty() {
+		} else if !self.parser_has_controls() {
 			parser_gss
 		} else {
 			close_control_stacks(&self.table, &parser_gss)

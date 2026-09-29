@@ -563,6 +563,11 @@ fn template_advance_enabled() -> bool {
         .get_or_init(|| std::env::var_os("GLRMASK_ENABLE_TEMPLATE_DFA_ADVANCE").is_some())
 }
 
+#[inline]
+fn template_advance_selected(constraint: &Constraint) -> bool {
+    constraint.has_template_parser() || template_advance_enabled()
+}
+
 fn validate_template_advance_enabled() -> bool {
     *VALIDATE_TEMPLATE_ADVANCE_ENABLED
         .get_or_init(|| std::env::var_os("GLRMASK_VALIDATE_TEMPLATE_DFA_ADVANCE").is_some())
@@ -573,13 +578,19 @@ fn advance_parser_stacks(
     stack: &ParserGSS,
     terminal: u32,
 ) -> ParserGSS {
+    if let Some(parser) = &constraint.template_parser {
+        parser.record_advance();
+        return advance_stacks_template_dfa(constraint, stack, terminal)
+            .expect("complete template program must contain this terminal");
+    }
+
     if let Some(advanced) = constraint.advance_compact_segmented_parser(stack, terminal) {
         return advanced;
     }
     if let Some(cached) = constraint.direct_regular_cached_advance(stack, terminal) {
         return cached;
     }
-    if template_advance_enabled()
+    if template_advance_selected(constraint)
         && let Some(template_advanced) = advance_stacks_template_dfa(constraint, stack, terminal)
     {
         if validate_template_advance_enabled() {
@@ -594,7 +605,7 @@ fn advance_parser_stacks(
         return template_advanced;
     }
 
-    if constraint.table.control_terminals.is_empty() {
+    if !constraint.parser_has_controls() {
         advance_stacks(&constraint.table, stack, terminal)
     } else {
         advance_control_closed_stacks(&constraint.table, stack, terminal)
@@ -606,13 +617,19 @@ fn advance_parser_stacks_owned(
     stack: ParserGSS,
     terminal: u32,
 ) -> ParserGSS {
+    if let Some(parser) = &constraint.template_parser {
+        parser.record_advance();
+        return advance_stacks_template_dfa_owned(constraint, stack, terminal)
+            .expect("complete template program must contain this terminal");
+    }
+
     if let Some(advanced) = constraint.advance_compact_segmented_parser(&stack, terminal) {
         return advanced;
     }
     if let Some(cached) = constraint.direct_regular_cached_advance(&stack, terminal) {
         return cached;
     }
-    if template_advance_enabled()
+    if template_advance_selected(constraint)
         && let Some(template_advanced) =
             advance_stacks_template_dfa_owned(constraint, stack.clone(), terminal)
     {
@@ -628,7 +645,7 @@ fn advance_parser_stacks_owned(
         return template_advanced;
     }
 
-    if constraint.table.control_terminals.is_empty() {
+    if !constraint.parser_has_controls() {
         advance_stacks_owned(&constraint.table, stack, terminal)
     } else {
         advance_control_closed_stacks_owned(&constraint.table, stack, terminal)
@@ -640,6 +657,13 @@ fn advance_parser_stacks_profiled(
     stack: &ParserGSS,
     terminal: u32,
 ) -> (ParserGSS, AdvanceProfile) {
+    if let Some(parser) = &constraint.template_parser {
+        parser.record_advance();
+        let advanced = advance_stacks_template_dfa(constraint, stack, terminal)
+            .expect("complete template program must contain this terminal");
+        return (advanced, AdvanceProfile::default());
+    }
+
     let template_start = std::time::Instant::now();
     if let Some(advanced) = constraint.advance_compact_segmented_parser(stack, terminal) {
         let elapsed = template_start.elapsed().as_nanos() as u64;
@@ -667,7 +691,7 @@ fn advance_parser_stacks_profiled(
             },
         );
     }
-    if template_advance_enabled()
+    if template_advance_selected(constraint)
         && let Some(template_advanced) = advance_stacks_template_dfa(constraint, stack, terminal)
     {
         let template_elapsed = template_start.elapsed().as_nanos() as u64;
@@ -704,7 +728,11 @@ fn advance_parser_stacks_profiled(
 /// retain their cheap precheck; exact-simulation tables must not execute the
 /// same reduction closure once for admission and again for the actual advance.
 #[inline]
-fn parser_may_advance_on(constraint: &Constraint, stack: &ParserGSS, terminal: u32) -> bool {
+pub(crate) fn parser_may_advance_on(constraint: &Constraint, stack: &ParserGSS, terminal: u32) -> bool {
+    if let Some(parser) = &constraint.template_parser {
+        return parser.admits(stack, terminal);
+    }
+
     if let Some(result) = constraint.compact_segmented_parser_may_advance_on(stack, terminal) {
         return result;
     }
@@ -712,7 +740,7 @@ fn parser_may_advance_on(constraint: &Constraint, stack: &ParserGSS, terminal: u
         .direct_regular_admissible_terminals(stack)
         .map_or_else(
             || {
-                if constraint.table.control_terminals.is_empty() {
+                if !constraint.parser_has_controls() {
                     stack_may_advance_on(&constraint.table, stack, terminal)
                 } else {
                     stack_may_advance_on_control_closed(&constraint.table, stack, terminal)
@@ -781,9 +809,11 @@ fn exact_simulation_prefilter_may_advance_on_any(
     stack: &ParserGSS,
     terminals: &crate::ds::bitset::BitSet,
 ) -> Option<bool> {
-    if constraint.table.admission_policy != AdmissionPolicy::ExactSimulation
-        || !constraint.table.control_terminals.is_empty()
-        || constraint.table.unconditional_advance.len() != constraint.table.num_states as usize
+    if constraint.has_template_parser() { return None; }
+
+    if constraint.parser_admission_policy() != AdmissionPolicy::ExactSimulation
+        || constraint.parser_has_controls()
+        || constraint.table.unconditional_advance.len() != constraint.parser_symbol_count() as usize
     {
         return None;
     }
@@ -792,7 +822,7 @@ fn exact_simulation_prefilter_may_advance_on_any(
     let mut any_relevant = false;
     for &state in &tops {
         let advance = constraint.table.advance.get(state as usize)?;
-        let unconditional = constraint.table.unconditional_advance_row(state)?;
+        let unconditional = constraint.parser_unconditional_row(state)?;
         if bitset_prefix_intersects(unconditional, terminals) {
             return Some(true);
         }
@@ -809,7 +839,7 @@ fn exact_simulation_prefilter_may_advance_on_any(
     let mut bounded_applicable = true;
     'tops: for &top in &tops {
         let actions = constraint.table.action.get(top as usize)?;
-        let unconditional = constraint.table.unconditional_advance_row(top)?;
+        let unconditional = constraint.parser_unconditional_row(top)?;
         let selected = match single_conditional_candidate(actions, unconditional, terminals) {
             Ok(selected) => selected,
             Err(()) => {
@@ -840,6 +870,10 @@ fn parser_may_advance_on_any(
     stack: &ParserGSS,
     terminals: &crate::ds::bitset::BitSet,
 ) -> bool {
+    if let Some(parser) = &constraint.template_parser {
+        return parser.admits_any(stack, terminals);
+    }
+
     if let Some(result) = constraint.compact_segmented_parser_may_advance_on_any(stack, terminals) {
         return result;
     }
@@ -854,7 +888,7 @@ fn parser_may_advance_on_any(
         .direct_regular_admissible_terminals(stack)
         .map_or_else(
             || {
-                if constraint.table.control_terminals.is_empty() {
+                if !constraint.parser_has_controls() {
                     stack_may_advance_on_any(&constraint.table, stack, terminals)
                 } else {
                     stack_may_advance_on_any_control_closed(&constraint.table, stack, terminals)
@@ -875,7 +909,7 @@ pub(crate) fn advance_parser_stacks_if_possible(
     stack: &ParserGSS,
     terminal: u32,
 ) -> Option<ParserGSS> {
-    if constraint.table.admission_policy == AdmissionPolicy::RowPresenceExact
+    if constraint.parser_admission_policy() == AdmissionPolicy::RowPresenceExact
         && !parser_may_advance_on(constraint, stack, terminal)
     {
         return None;
@@ -896,10 +930,14 @@ pub(crate) fn advance_parser_stacks_table_exact(
     stack: &ParserGSS,
     terminal: u32,
 ) -> Option<ParserGSS> {
+    if constraint.has_template_parser() {
+        return advance_parser_stacks_if_possible(constraint, stack, terminal);
+    }
+
     if let Some(advanced) = constraint.advance_compact_segmented_parser(stack, terminal) {
         return (!advanced.is_empty()).then_some(advanced);
     }
-    let advanced = if constraint.table.control_terminals.is_empty() {
+    let advanced = if !constraint.parser_has_controls() {
         advance_stacks(&constraint.table, stack, terminal)
     } else {
         advance_control_closed_stacks(&constraint.table, stack, terminal)
@@ -922,7 +960,7 @@ fn advance_parser_stacks_profiled_if_possible(
     use std::time::Instant;
 
     let mut may_ns = 0;
-    if constraint.table.admission_policy == AdmissionPolicy::RowPresenceExact {
+    if constraint.parser_admission_policy() == AdmissionPolicy::RowPresenceExact {
         let may_started_at = Instant::now();
         let admitted = parser_may_advance_on(constraint, stack, terminal);
         may_ns = may_started_at.elapsed().as_nanos() as u64;
@@ -1755,7 +1793,7 @@ fn runtime_terminal_count(constraint: &Constraint) -> usize {
         .uses_compact_segmented_parser_runtime()
         .then(|| constraint.recursive_runtime_terminal_count())
         .flatten()
-        .unwrap_or(constraint.table.num_terminals as usize)
+        .unwrap_or(constraint.parser_terminal_count() as usize)
 }
 
 /// An unfinished ignore lexeme is a valid byte prefix even though completing
@@ -1842,9 +1880,13 @@ fn exact_simulation_prefiltered_admitted_terminals(
     gss: &ParserGSS,
     candidates: &crate::ds::bitset::BitSet,
 ) -> crate::ds::bitset::BitSet {
-    if constraint.table.admission_policy != AdmissionPolicy::ExactSimulation
-        || !constraint.table.control_terminals.is_empty()
-        || constraint.table.unconditional_advance.len() != constraint.table.num_states as usize
+    if let Some(parser) = &constraint.template_parser {
+        return parser.admitted(gss, candidates);
+    }
+
+    if constraint.parser_admission_policy() != AdmissionPolicy::ExactSimulation
+        || constraint.parser_has_controls()
+        || constraint.table.unconditional_advance.len() != constraint.parser_symbol_count() as usize
     {
         return stack_admissible_terminals(&constraint.table, gss, candidates);
     }
@@ -1855,7 +1897,7 @@ fn exact_simulation_prefiltered_admitted_terminals(
         let Some(advance) = constraint.table.advance.get(state as usize) else {
             return stack_admissible_terminals(&constraint.table, gss, candidates);
         };
-        let Some(unconditional) = constraint.table.unconditional_advance_row(state) else {
+        let Some(unconditional) = constraint.parser_unconditional_row(state) else {
             return stack_admissible_terminals(&constraint.table, gss, candidates);
         };
         bitset_union_intersection_prefix(&mut guaranteed, unconditional, candidates);
@@ -1882,6 +1924,10 @@ pub(crate) fn exact_admitted_terminals_for_candidates(
     gss: &ParserGSS,
     candidates: &crate::ds::bitset::BitSet,
 ) -> crate::ds::bitset::BitSet {
+    if let Some(parser) = &constraint.template_parser {
+        return parser.admitted(gss, candidates);
+    }
+
     if let Some(admitted) = constraint.compact_segmented_parser_admitted_terminals(gss, candidates) {
         return admitted;
     }
@@ -1922,13 +1968,15 @@ fn try_local_row_presence_admission_words(
     gss: &ParserGSS,
     end_states: &[u32],
 ) -> Option<[u64; 32]> {
+    if constraint.has_template_parser() { return None; }
+
     const WORDS: usize = 32;
     if constraint.uses_compact_segmented_parser_runtime()
-        || constraint.table.admission_policy != AdmissionPolicy::ExactSimulation
-        || !constraint.table.control_terminals.is_empty()
+        || constraint.parser_admission_policy() != AdmissionPolicy::ExactSimulation
+        || constraint.parser_has_controls()
         || constraint.tokenizer.num_terminals() as usize > WORDS * 64
-        || constraint.table.advance.len() != constraint.table.num_states as usize
-        || constraint.table.unconditional_advance.len() != constraint.table.num_states as usize
+        || constraint.table.advance.len() != constraint.parser_symbol_count() as usize
+        || constraint.table.unconditional_advance.len() != constraint.parser_symbol_count() as usize
     {
         return None;
     }
@@ -1963,7 +2011,7 @@ fn try_local_row_presence_admission_words(
     let mut admitted = [0u64; WORDS];
     for state in tops {
         let advance = constraint.table.advance.get(state as usize)?;
-        let unconditional = constraint.table.unconditional_advance_row(state)?;
+        let unconditional = constraint.parser_unconditional_row(state)?;
         for index in 0..advance.words().len().min(WORDS) {
             let candidate_word = candidates[index];
             if candidate_word == 0 {
@@ -2163,7 +2211,7 @@ impl ActionableTerminals {
     fn bitset<'a>(&'a self, constraint: &'a Constraint) -> Option<&'a crate::ds::bitset::BitSet> {
         match self {
             Self::DirectDynamic(terminals) => Some(terminals),
-            Self::SingleState(state_id) => constraint.table.advance_row(*state_id),
+            Self::SingleState(state_id) => constraint.parser_advance_row(*state_id),
             Self::WideFrontier(index) => constraint
                 .direct_regular_wide_frontier_acceptance
                 .get(*index)
@@ -2175,14 +2223,14 @@ impl ActionableTerminals {
     fn contains(&self, constraint: &Constraint, terminal: u32) -> bool {
         match self {
             Self::DirectDynamic(terminals) => terminals.contains(terminal as usize),
-            Self::SingleState(state_id) => constraint.table.advance_row_allows(*state_id, terminal),
+            Self::SingleState(state_id) => constraint.parser_advance_row_allows(*state_id, terminal),
             Self::WideFrontier(index) => constraint
                 .direct_regular_wide_frontier_acceptance
                 .get(*index)
                 .is_some_and(|summary| summary.actionable_terminals.contains(terminal as usize)),
             Self::ManyStates(states) => states
                 .iter()
-                .any(|state_id| constraint.table.advance_row_allows(*state_id, terminal)),
+                .any(|state_id| constraint.parser_advance_row_allows(*state_id, terminal)),
         }
     }
 }
@@ -3194,7 +3242,7 @@ fn commit_bytes_fast_path(
 ) -> Option<Result<(), String>> {
     let gss = state.values().next().unwrap();
     let ignore_terminal = constraint.ignore_terminal;
-    let has_linker_controls = !constraint.table.control_terminals.is_empty()
+    let has_linker_controls = constraint.parser_has_controls()
         || constraint.uses_compact_segmented_parser_runtime();
 
     // Find exactly 1 non-ignored, actionable terminal match consuming all bytes
@@ -3230,7 +3278,7 @@ fn commit_bytes_fast_path(
 
     // Ultra-fast path: single Interface, empty accs, no end_state, pure shift.
     // Inlines the entire advance + prune + fuse to avoid all function call overhead.
-    if !has_linker_controls && all_accs_empty && !template_advance_enabled() {
+    if !has_linker_controls && all_accs_empty && !template_advance_selected(constraint) {
         let top_state = gss.single_exclusive_top_value();
         if let Some(top_state) = top_state {
             if let Some(action) = constraint.table.action(top_state, terminal) {
@@ -3285,7 +3333,7 @@ fn commit_bytes_fast_path(
     // The terminal and tokenizer end-state continuations are independent.
     // Preserve either branch if it produces viable parser state.
     let advanced = if !has_linker_controls
-        && !template_advance_enabled()
+        && !template_advance_selected(constraint)
         && let Some(top_state) = pruned_gss.single_exclusive_top_value()
         && let Some(action) = constraint.table.action(top_state, terminal)
         && let Some(advanced) = apply_single_top_action_fast(
@@ -3336,7 +3384,7 @@ fn commit_bytes_full_width_fast_path(
     state: &mut ParserStateMap,
     bytes: &[u8],
 ) -> Option<Result<(), String>> {
-    let has_linker_controls = !constraint.table.control_terminals.is_empty()
+    let has_linker_controls = constraint.parser_has_controls()
         || constraint.uses_compact_segmented_parser_runtime();
     if constraint.tokenizer_has_epsilon_transitions
         && state_has_nonempty_accumulators(state)
@@ -3391,7 +3439,7 @@ fn commit_bytes_full_width_fast_path(
 
         if let Some(terminal) = terminal {
             let advanced = if !has_linker_controls
-                && !template_advance_enabled()
+                && !template_advance_selected(constraint)
                 && let Some(top_state) = pruned_gss.single_exclusive_top_value()
                 && let Some(action) = constraint.table.action(top_state, terminal)
                 && let Some(advanced) =
@@ -4106,7 +4154,7 @@ fn try_advance_unique_actionable_top_fast(
     gss: &ParserGSS,
     terminal: u32,
 ) -> Option<ParserGSS> {
-    if !constraint.table.control_terminals.is_empty() || template_advance_enabled() {
+    if constraint.parser_has_controls() || template_advance_selected(constraint) {
         return None;
     }
     // If every nonempty path has this top, isolate(Some(top)) is precisely
@@ -4141,7 +4189,7 @@ fn try_batch_same_width_disjoint_alias_actions(
     width: usize,
     continuation_states: &[u32],
 ) -> Option<ParserGSS> {
-    if !constraint.table.control_terminals.is_empty() || template_advance_enabled() {
+    if constraint.parser_has_controls() || template_advance_selected(constraint) {
         return None;
     }
     let group = matches
@@ -4195,7 +4243,9 @@ fn try_batch_same_width_pure_matches(
     width: usize,
     continuation_states: &[u32],
 ) -> Option<ParserGSS> {
-    if !constraint.table.control_terminals.is_empty() {
+    if constraint.has_template_parser() { return None; }
+
+    if constraint.parser_has_controls() {
         return None;
     }
     let group = matches
@@ -4298,7 +4348,7 @@ fn commit_bytes_small_queue_fast_path(
     admission_cache: &mut SmallVec<[ParserAdmissionCacheEntry; 8]>,
     prune_tokenizer_scratch: &mut tokenizer_scan::ReusableTokenizerExecScratch,
 ) -> Option<Result<(), String>> {
-    let has_linker_controls = !constraint.table.control_terminals.is_empty()
+    let has_linker_controls = constraint.parser_has_controls()
         || constraint.uses_compact_segmented_parser_runtime();
     if bytes.len() > 16 || state.len() > 8 {
         return None;
@@ -4489,7 +4539,7 @@ fn commit_bytes_small_queue_fast_path(
                 }
 
                 let advanced = if !has_linker_controls
-                    && !template_advance_enabled()
+                    && !template_advance_selected(constraint)
                     && let Some(advanced) = try_advance_unique_actionable_top_fast(
                         constraint,
                         &gss_at_offset,
@@ -4753,6 +4803,8 @@ fn commit_bytes_direct_linear_fast_path(
     start_tokenizer_state: u32,
     mut profile: Option<&mut CommitProfile>,
 ) -> Option<LinearFastPathResult> {
+    if constraint.has_template_parser() { return None; }
+
     let mut gss = start_gss;
     let mut carried_stack = gss.try_virtual_stack();
     let mut offset = 0usize;
@@ -4791,7 +4843,7 @@ fn commit_bytes_direct_linear_fast_path(
             let carried_gate_start = profile.as_ref().map(|_| std::time::Instant::now());
             let keep_carried = stack.top().copied().is_some_and(|top_state| {
                 end_state != constraint.runtime_commit_initial_state()
-                    && !constraint.table.advance_row_intersects(
+                    && !constraint.parser_advance_row_intersects(
                         top_state,
                         constraint.tokenizer.possible_future_terminals(end_state),
                     )
@@ -4864,7 +4916,7 @@ fn commit_bytes_direct_linear_fast_path(
                 && let Some(top_state) = stack.top().copied()
                 && step.end_state.is_none_or(|end_state| {
                     end_state != constraint.runtime_commit_initial_state()
-                        && !constraint.table.advance_row_intersects(
+                        && !constraint.parser_advance_row_intersects(
                             top_state,
                             constraint.tokenizer.possible_future_terminals(end_state),
                         )
@@ -4883,7 +4935,7 @@ fn commit_bytes_direct_linear_fast_path(
             }
             if let Some(action) = carried_action {
                 let apply_action_start = profile.as_ref().map(|_| std::time::Instant::now());
-                if !template_advance_enabled()
+                if !template_advance_selected(constraint)
                     && let Some(stack) = carried_stack.as_mut()
                 {
                     shifted_carried_stack =
@@ -4924,7 +4976,7 @@ fn commit_bytes_direct_linear_fast_path(
                 }
             }
             let advance_start = profile.as_ref().map(|_| std::time::Instant::now());
-            let advanced = if !template_advance_enabled()
+            let advanced = if !template_advance_selected(constraint)
                 && let Some(top_state) = gss.single_exclusive_top_value()
                 && let Some(action) = constraint.table.action(top_state, step.terminal)
                 && let Some(advanced) =
@@ -5113,7 +5165,7 @@ fn commit_bytes_fast_path_profiled(
     let all_accs_empty = no_end_state
         && gss.all_accs_satisfy(|td: &TerminalsDisallowed| td.is_empty());
 
-    if all_accs_empty && !template_advance_enabled() {
+    if all_accs_empty && !template_advance_selected(constraint) {
         if let Some(top_state) = gss.single_exclusive_top_value() {
             if let Some(Action::Shift(target, is_replace)) = constraint.table.action(top_state, terminal) {
                 let advance_start = Instant::now();
@@ -5160,7 +5212,7 @@ fn commit_bytes_fast_path_profiled(
                 profile.fast_path_tokenizer_exec_ns = profile.exec_ns;
                 return Some(Ok(()));
             }
-            if !template_advance_enabled()
+            if !template_advance_selected(constraint)
                 && let Some(Action::StackShifts(shifts)) = constraint.table.action(top_state, terminal)
             {
                 let advance_start = Instant::now();
@@ -5987,7 +6039,7 @@ fn commit_bytes_linear_fast_path(
         {
             let keep_carried = stack.top().copied().is_some_and(|top_state| {
                 end_state != constraint.runtime_commit_initial_state()
-                    && !constraint.table.advance_row_intersects(
+                    && !constraint.parser_advance_row_intersects(
                         top_state,
                         constraint.tokenizer.possible_future_terminals(end_state),
                     )
@@ -6013,13 +6065,13 @@ fn commit_bytes_linear_fast_path(
 
         if !ignored {
             let mut shifted_carried_stack = false;
-            if !template_advance_enabled()
+            if !template_advance_selected(constraint)
                 && let Some(stack) = carried_stack.as_mut()
                 && let Some(top_state) = stack.top().copied()
                 && let Some(Action::Shift(target, is_replace)) = constraint.table.action(top_state, terminal)
                 && exec_result.end_state.iter().copied().all(|end_state| {
                     end_state != constraint.runtime_commit_initial_state()
-                        && !constraint.table.advance_row_intersects(
+                        && !constraint.parser_advance_row_intersects(
                             top_state,
                             constraint.tokenizer.possible_future_terminals(end_state),
                         )
@@ -6068,7 +6120,7 @@ fn commit_bytes_linear_fast_path(
                 gss = stack.into_gss();
             }
 
-            let fast_advanced = if !template_advance_enabled()
+            let fast_advanced = if !template_advance_selected(constraint)
                 && let Some(top_state) = gss.single_exclusive_top_value()
                 && let Some(action) = constraint.table.action(top_state, terminal)
             {
@@ -6226,7 +6278,7 @@ fn commit_bytes_linear_fast_path_profiled(
 
         if !ignored {
             let fast_start = Instant::now();
-            let fast_advanced = if !template_advance_enabled()
+            let fast_advanced = if !template_advance_selected(constraint)
                 && let Some(top_state) = gss.single_exclusive_top_value()
                 && let Some(action) = constraint.table.action(top_state, terminal)
                 && let Some(advanced) =
@@ -6415,6 +6467,8 @@ fn apply_terminal_to_flat_stacks(
     source: &[u32],
     scratch: &mut FlatActionScratch,
 ) -> Option<bool> {
+    if constraint.has_template_parser() { return None; }
+
     if source.is_empty() || source.len() > LINEAR_STACK_RESERVE {
         return None;
     }
@@ -6526,8 +6580,8 @@ fn flat_stack_may_advance_on_any(
     if runtime_future_contains_ignore(constraint, terminals) {
         return Some(true);
     }
-    if constraint.table.admission_policy == AdmissionPolicy::RowPresenceExact {
-        return Some(constraint.table.advance_row_intersects(top, terminals));
+    if constraint.parser_admission_policy() == AdmissionPolicy::RowPresenceExact {
+        return Some(constraint.parser_advance_row_intersects(top, terminals));
     }
 
     let mut unknown = false;
@@ -7202,6 +7256,8 @@ fn try_commit_direct_linear_in_place(
     tokenizer_scratch: &mut tokenizer_scan::ReusableTokenizerExecScratch,
     frontier: &mut FlatFrontierScratch,
 ) -> Option<Result<(), String>> {
+    if constraint.has_template_parser() { return None; }
+
     let debug_path = std::env::var_os("GLRMASK_DEBUG_COMMIT_PATH").is_some();
     let (&start_tokenizer_state, gss) = state.iter().next()?;
     let acc = gss.single_path_acc()?;
@@ -7369,6 +7425,8 @@ fn maybe_normalize_lookahead_invariant_reductions(
     constraint: &Constraint,
     state: &mut ParserStateMap,
 ) {
+    if constraint.has_template_parser() { return; }
+
     if constraint.static_dynamic_overlay.is_none()
         || constraint.uses_compact_segmented_parser_runtime()
         || std::env::var_os("GLRMASK_EXPERIMENT_EAGER_INVARIANT_REDUCTIONS").is_none()
@@ -7530,7 +7588,7 @@ fn commit_bytes_impl_inner(
     // control closure between lexemes.  Keep explicit-control tables on the
     // authoritative queue path until each fast path has its own equivalence
     // proof/implementation.
-    let has_linker_controls = !constraint.table.control_terminals.is_empty()
+    let has_linker_controls = constraint.parser_has_controls()
         || constraint.uses_compact_segmented_parser_runtime();
     let direct_dynamic = constraint.uses_dynamic_runtime()
         && constraint.direct_regular_automaton.is_some();
@@ -7618,7 +7676,7 @@ fn commit_bytes_impl_inner(
     // duplicate the work) when its ordinary profitability bounds already hold.
     if !has_linker_controls
         && !direct_dynamic
-        && constraint.table.admission_policy == AdmissionPolicy::ExactSimulation
+        && constraint.parser_admission_policy() == AdmissionPolicy::ExactSimulation
         && bytes.len() <= 16
         && state.len() <= 8
     {
@@ -7740,6 +7798,7 @@ fn commit_bytes_impl_inner(
                     && !future.contains(step.terminal as usize)
             });
             if continuation_is_inert
+                && !constraint.has_template_parser()
                 && let Some(Action::Shift(target, replace)) =
                     constraint.table.action(top_state, step.terminal)
                 && let Some(gss) = state.values_mut().next()
@@ -8410,7 +8469,7 @@ impl<'a> ConstraintState<'a> {
             (*right_source, *left_source)
         };
         let candidates = crate::ds::bitset::BitSet::all(
-            self.constraint.table.num_terminals as usize,
+            self.constraint.parser_terminal_count() as usize,
         );
         let mut admitted = exact_admitted_terminals_for_candidates(
             self.constraint,
@@ -9015,7 +9074,7 @@ mod tests {
     #[test]
     fn unique_actionable_top_matches_isolation_reference_including_empty_paths() {
         fn reference(constraint: &Constraint, gss: &ParserGSS, terminal: u32) -> Option<ParserGSS> {
-            if !constraint.table.control_terminals.is_empty() || template_advance_enabled() {
+            if constraint.parser_has_controls() || template_advance_selected(constraint) {
                 return None;
             }
             let mut selected = None;
@@ -9061,7 +9120,7 @@ mod tests {
                                 } else {
                                     with_empty += 1;
                                 }
-                                for terminal in 0..constraint.table.num_terminals {
+                                for terminal in 0..constraint.parser_terminal_count() {
                                     let expected = reference(constraint, &input, terminal);
                                     let actual = try_advance_unique_actionable_top_fast(constraint, &input, terminal);
                                     assert_eq!(actual.as_ref().map(canonical_gss), expected.as_ref().map(canonical_gss),
@@ -9447,8 +9506,8 @@ mod tests {
             assert_eq!(layout.leaves.len(), 2);
             let scoped_x = constraint.recursive_terminal_scoped_id(0, local_x).unwrap();
             let scoped_a = constraint.recursive_terminal_scoped_id(1, local_a).unwrap();
-            assert!(scoped_x >= constraint.table.num_terminals);
-            assert!(scoped_a >= constraint.table.num_terminals);
+            assert!(scoped_x >= constraint.parser_terminal_count());
+            assert!(scoped_a >= constraint.parser_terminal_count());
 
             let root_reset = constraint.recursive_tokenizer_reset_state(0).unwrap();
             let root_x = tokenizer_scan::execute_recursive_tokenizer_from_state_small(
@@ -9660,7 +9719,7 @@ mod tests {
         state.commit_bytes(b"const x = tools.tool_0({})").unwrap();
         eprintln!("STACKS {:?}", state.debug_parser_stacks());
         for (_, gss) in state.state.iter() {
-            let all = BitSet::all(constraint.table.num_terminals as usize + 1);
+            let all = BitSet::all(constraint.parser_terminal_count() as usize + 1);
             let admitted = stack_admissible_terminals(&constraint.table, gss, &all);
             let mut factor = gss.clone();
             let mut blockers = Vec::<u32>::new();
@@ -9692,7 +9751,7 @@ mod tests {
             for top in gss.peek_values() {
                 let mut kinds = BTreeMap::<String, Vec<u32>>::new();
                 for bit in admitted.iter_ones() {
-                    let terminal = if bit == constraint.table.num_terminals as usize {
+                    let terminal = if bit == constraint.parser_terminal_count() as usize {
                         EOF
                     } else {
                         bit as u32
@@ -10204,7 +10263,7 @@ mod tests {
         )
         .unwrap();
         assert_eq!(
-            constraint.table.admission_policy,
+            constraint.parser_admission_policy(),
             AdmissionPolicy::ExactSimulation,
         );
 
@@ -10215,7 +10274,7 @@ mod tests {
 
         for state in states {
             for gss in state.state.values() {
-                for terminal in 0..constraint.table.num_terminals {
+                for terminal in 0..constraint.parser_terminal_count() {
                     let legacy = if stack_may_advance_on(&constraint.table, gss, terminal) {
                         let advanced = advance_parser_stacks(&constraint, gss, terminal);
                         (!advanced.is_empty()).then_some(advanced)

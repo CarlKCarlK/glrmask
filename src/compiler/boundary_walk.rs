@@ -2233,10 +2233,10 @@ fn link_provider_boundary_table(
 ) -> Result<GLRTable, String> {
     let mut tables = Vec::with_capacity(children.len() + 1);
     let mut ignores = Vec::with_capacity(children.len() + 1);
-    tables.push(&parent.table);
+    tables.push(&*parent.table);
     ignores.push((!global_ignores).then_some(parent.ignore_terminal).flatten());
     for child in children {
-        tables.push(&child.constraint.table);
+        tables.push(&*child.constraint.table);
         ignores.push(
             (!global_ignores)
                 .then_some(child.constraint.ignore_terminal)
@@ -3292,7 +3292,7 @@ fn build_walk_static_boundary_link_nested(
     let pre_context_setup_ms = link_total_started.elapsed().as_secs_f64() * 1000.0;
     let link_context_started = Instant::now();
     let signed_context = crate::compiler::boundary_transfer::build_signed_link_context_from_parts(
-        leaves.iter().map(|leaf| &leaf.table).collect(),
+        leaves.iter().map(|leaf| &*leaf.table).collect(),
         leaves.iter().map(|leaf| leaf.ignore_terminal).collect(),
         expansion.links.clone(),
         &expansion.leaf_terminal_offsets,

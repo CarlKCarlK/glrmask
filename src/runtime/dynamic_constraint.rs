@@ -818,7 +818,7 @@ impl DynamicConstraint {
             ));
         }
         Ok(DynamicConstraintPayloadV1 {
-            table: payload.table,
+            table: payload.table.into(),
             terminal_display_names: payload.terminal_display_names,
             tokenizer: payload.tokenizer.into(),
             ignore_terminal: payload.ignore_terminal,
@@ -906,7 +906,7 @@ impl DynamicConstraint {
             direct_regular_dynamic_hot_frontiers: Vec::new(),
             direct_regular_parser_state_acceptance: Vec::new(),
             direct_regular_automaton: payload.direct_regular_automaton,
-            table: payload.table,
+            table: payload.table.into(),
             terminal_display_names: payload.terminal_display_names,
             tokenizer: payload.tokenizer.into(),
             boundary_completion_index: None,
@@ -938,6 +938,7 @@ impl DynamicConstraint {
             runtime_product_state_by_source_subset: Default::default(),
             template_dfas_by_terminal: Vec::new(),
             fast_template_dfas_by_terminal: Vec::new(),
+            template_parser: None,
             original_token_to_internal: Vec::new(),
             packed_original_token_to_internal: None,
             deferred_original_token_to_internal: std::sync::OnceLock::new(),
@@ -1197,7 +1198,7 @@ impl DynamicConstraint {
             .flatten();
         DynamicConstraintPayloadV2 {
             v1: DynamicConstraintPayloadV1 {
-                table: constraint.table.clone(),
+                table: constraint.table.clone_lr(),
                 terminal_display_names: constraint.terminal_display_names.clone(),
                 tokenizer: constraint.tokenizer.as_ref().clone(),
                 ignore_terminal: constraint.ignore_terminal,
@@ -1331,7 +1332,7 @@ impl DynamicConstraint {
             .then(|| constraint.save());
         DynamicConstraintTransferAlternativeV5 {
             table: CompactTransferTable {
-                table: constraint.table,
+                table: constraint.table.into_lr(),
                 deferred_rules: constraint.deferred_table_rules_blob,
             },
             terminal_display_names: constraint.terminal_display_names,

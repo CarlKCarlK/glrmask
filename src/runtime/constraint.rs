@@ -89,7 +89,7 @@ impl ParserComponentTableSource for RecursiveSegmentedParserTables<'_> {
 
     #[inline]
     fn component_table(&self, component: u32) -> Option<&GLRTable> {
-        self.leaf_constraint(component).map(|constraint| &constraint.table)
+        self.leaf_constraint(component).map(|constraint| &*constraint.table)
     }
 
     #[inline]
@@ -98,7 +98,7 @@ impl ParserComponentTableSource for RecursiveSegmentedParserTables<'_> {
         // Same idempotence contract: composed leaf tables own their scoped
         // ignores in-row; only raw leaves need provider-level Identity.
         let ignore = constraint.ignore_terminal?;
-        (!constraint.table.skip_terminals.contains(&ignore)).then_some(ignore)
+        (!constraint.parser_skip_terminals().contains(&ignore)).then_some(ignore)
     }
 }
 
@@ -1042,7 +1042,7 @@ impl Constraint {
     pub(crate) fn build_boundary_token_trigger(&mut self) -> Result<(), String> {
         self.materialize_composition_link_metadata_for_compilation()?;
 
-        let mut relevant = BitSet::new(self.table.num_terminals as usize);
+        let mut relevant = BitSet::new(self.parser_terminal_count() as usize);
         if let Some(summary) = self.composition_grammar_summary.as_ref() {
             relevant.union_with(&summary.root_last);
             let placeholders = self
@@ -1070,7 +1070,7 @@ impl Constraint {
             // Older/stripped artifacts may lack the grammar summary. The
             // Tokens trigger is only a pruning accelerator, so falling back to
             // every terminal preserves exactness.
-            relevant = BitSet::all(self.table.num_terminals as usize);
+            relevant = BitSet::all(self.parser_terminal_count() as usize);
         }
 
         if relevant.is_empty() {
@@ -1710,10 +1710,10 @@ impl Constraint {
             &child_rules,
         )?;
         let mut table = composed.table;
-        if table.num_terminals != self.table.num_terminals {
+        if table.num_terminals != self.parser_terminal_count() {
             return Err(format!(
                 "rebuilt recursive compiler table has {} terminals, grammar shell has {}",
-                table.num_terminals, self.table.num_terminals,
+                table.num_terminals, self.parser_terminal_count(),
             ));
         }
         table.set_embedded_end_token_ids(&self.table.embedded_end_token_ids());
@@ -1732,7 +1732,7 @@ impl Constraint {
         if !self.uses_compact_segmented_parser_runtime() {
             return Ok(false);
         }
-        if self.table.num_states != 0 && !self.table.action.is_empty() {
+        if self.parser_symbol_count() != 0 && !self.table.action.is_empty() {
             return Ok(false);
         }
         let blob = self
@@ -1749,10 +1749,10 @@ impl Constraint {
         } else {
             crate::compiler::glr::table::artifact_serde::from_compact_bytes(blob.as_ref())?
         };
-        if table.num_terminals != self.table.num_terminals {
+        if table.num_terminals != self.parser_terminal_count() {
             return Err(format!(
                 "recursive compiler table has {} terminals, grammar shell has {}",
-                table.num_terminals, self.table.num_terminals,
+                table.num_terminals, self.parser_terminal_count(),
             ));
         }
         if !provider_native && table.num_rules != self.table.num_rules {
@@ -1761,7 +1761,7 @@ impl Constraint {
                 table.num_rules, self.table.num_rules,
             ));
         }
-        self.table = table;
+        self.table = table.into();
         self.deferred_table_rules_blob = None;
         self.deferred_table_rules = OnceLock::new();
         Ok(true)
@@ -1781,7 +1781,7 @@ impl Constraint {
             .as_ref()
             .ok_or_else(|| "recursive runtime is missing overlay metadata".to_owned())?;
         if overlay.recursive_compiler_table.get().is_none() {
-            if self.table.num_states == 0 || self.table.action.is_empty() {
+            if self.parser_symbol_count() == 0 || self.table.action.is_empty() {
                 return Err(
                     "recursive grammar shell has no packed compiler table".to_owned(),
                 );
@@ -1794,7 +1794,7 @@ impl Constraint {
                 .set(packed)
                 .map_err(|_| "recursive compiler table initialized twice".to_owned())?;
         }
-        if self.table.num_states == 0 && self.table.action.is_empty() && self.table.goto.is_empty() {
+        if self.parser_symbol_count() == 0 && self.table.action.is_empty() && self.table.goto.is_empty() {
             return Ok(false);
         }
         self.table.action.clear();
@@ -2233,7 +2233,7 @@ impl Constraint {
     /// materialized composed table.
     pub(crate) fn recursive_parser_state_span(&self) -> Result<u32, String> {
         if !self.uses_compact_segmented_parser_runtime() {
-            return Ok(self.table.num_states);
+            return Ok(self.parser_symbol_count());
         }
         let overlay = self
             .static_dynamic_overlay
@@ -2270,7 +2270,7 @@ impl Constraint {
         out: &mut SmallVec<[(u32, TerminalID); 4]>,
     ) -> Result<(), String> {
         if !expand_this {
-            if terminal >= self.table.num_terminals {
+            if terminal >= self.parser_terminal_count() {
                 return Ok(());
             }
             let leaf_index = leaves
@@ -2290,7 +2290,7 @@ impl Constraint {
             .expect("recursive segmented parser tree requires overlay");
         for (component_index, component) in overlay.segmented_parser_components.iter().enumerate() {
             let offset = component.terminal_offset;
-            let end = offset.saturating_add(component.constraint.table.num_terminals);
+            let end = offset.saturating_add(component.constraint.parser_terminal_count());
             if terminal >= offset && terminal < end {
                 component_path.push(component_index as u32);
                 component.constraint.append_recursive_terminal_targets(
@@ -2333,12 +2333,12 @@ impl Constraint {
                 .map_err(|_| "recursive parser leaf index overflow".to_owned())?;
             leaves.push(RecursiveParserLeafLayout {
                 state_offset: base,
-                state_count: self.table.num_states,
+                state_count: self.parser_symbol_count(),
                 top_component,
                 component_path: component_path.clone(),
             });
             let next = base
-                .checked_add(self.table.num_states)
+                .checked_add(self.parser_symbol_count())
                 .ok_or_else(|| "recursive parser-state coordinate overflow".to_owned())?;
             return Ok((next, leaf_index));
         }
@@ -2490,11 +2490,11 @@ impl Constraint {
                 .ok_or_else(|| "recursive tokenizer-state coordinate overflow".to_owned())?;
             leaf_terminal_offsets.push(next_leaf_terminal);
             next_leaf_terminal = next_leaf_terminal
-                .checked_add(constraint.table.num_terminals)
+                .checked_add(constraint.parser_terminal_count())
                 .ok_or_else(|| "recursive terminal coordinate overflow".to_owned())?;
         }
-        let mut terminal_targets = Vec::with_capacity(self.table.num_terminals as usize);
-        for terminal in 0..self.table.num_terminals {
+        let mut terminal_targets = Vec::with_capacity(self.parser_terminal_count() as usize);
+        for terminal in 0..self.parser_terminal_count() {
             let mut targets = SmallVec::<[(u32, TerminalID); 4]>::new();
             self.append_recursive_terminal_targets(
                 terminal,
@@ -2513,7 +2513,7 @@ impl Constraint {
             total_tokenizer_states: next_tokenizer_state,
             leaf_terminal_offsets,
             total_leaf_terminals: next_leaf_terminal,
-            outer_terminal_count: self.table.num_terminals,
+            outer_terminal_count: self.parser_terminal_count(),
             tokenizer_future_scoped: (0..next_tokenizer_state)
                 .map(|_| OnceLock::new())
                 .collect(),
@@ -2830,7 +2830,7 @@ impl Constraint {
         let layout = self.recursive_parser_layout_ref()?;
         let leaf = layout.leaves.get(leaf_index)?;
         let leaf_constraint = self.constraint_at_recursive_component_path(&leaf.component_path)?;
-        if local_terminal >= leaf_constraint.table.num_terminals {
+        if local_terminal >= leaf_constraint.parser_terminal_count() {
             return None;
         }
         layout
@@ -2856,7 +2856,7 @@ impl Constraint {
         let local_terminal = scoped.checked_sub(layout.leaf_terminal_offsets[leaf_index])?;
         let leaf = layout.leaves.get(leaf_index)?;
         let leaf_constraint = self.constraint_at_recursive_component_path(&leaf.component_path)?;
-        (local_terminal < leaf_constraint.table.num_terminals)
+        (local_terminal < leaf_constraint.parser_terminal_count())
             .then_some((leaf_index, local_terminal))
     }
 
@@ -2880,7 +2880,7 @@ impl Constraint {
         let component_constraint = component.constraint.as_ref();
         if !component_constraint.uses_compact_segmented_parser_runtime() {
             if !descendant_path.is_empty()
-                || local_terminal >= component_constraint.table.num_terminals
+                || local_terminal >= component_constraint.parser_terminal_count()
             {
                 return None;
             }
@@ -3499,6 +3499,7 @@ impl Constraint {
 
     #[inline]
     pub(crate) fn uses_sparse_direct_regular_runtime(&self) -> bool {
+        if self.has_template_parser() { return false; }
         self.direct_regular_automaton.is_some()
             && self.table.num_rules == 0
             && self.table.action.is_empty()
@@ -4108,7 +4109,7 @@ impl Constraint {
         }
         if let Some(bounded64) = bounded64 {
             let quotient_multiplicity = vocab.mask_projection_state_multiplicities();
-            let mut parser_rows_by_terminal = vec![0usize; self.table.num_terminals as usize];
+            let mut parser_rows_by_terminal = vec![0usize; self.parser_terminal_count() as usize];
             for row in &self.table.advance {
                 for terminal in row.iter() {
                     if let Some(count) = parser_rows_by_terminal.get_mut(terminal) {
@@ -4424,7 +4425,7 @@ impl Constraint {
         .unwrap_or(8_192);
         if std::env::var_os("GLRMASK_PROFILE_DYNAMIC_PROJECTION_CANDIDATES").is_some() {
             let started = std::time::Instant::now();
-            let mut parser_rows_by_terminal = vec![0usize; self.table.num_terminals as usize];
+            let mut parser_rows_by_terminal = vec![0usize; self.parser_terminal_count() as usize];
             for row in &self.table.advance {
                 for terminal in row.iter() {
                     if let Some(count) = parser_rows_by_terminal.get_mut(terminal) {
@@ -6611,7 +6612,7 @@ impl Constraint {
                     first_byte_tokens[byte as usize] += 1;
                 }
             }
-            let mut parser_rows_by_terminal = vec![0usize; self.table.num_terminals as usize];
+            let mut parser_rows_by_terminal = vec![0usize; self.parser_terminal_count() as usize];
             for row in &self.table.advance {
                 for terminal in row.iter() {
                     if let Some(count) = parser_rows_by_terminal.get_mut(terminal) {
@@ -7095,7 +7096,7 @@ impl Constraint {
         // more precisely and more cheaply than a whole-tokenizer H64
         // refinement. Reserve H64 for genuinely large single-terminal
         // residual families where exhaustive vocab probing would be expensive.
-        let mut single_future_counts = vec![0usize; self.table.num_terminals as usize];
+        let mut single_future_counts = vec![0usize; self.parser_terminal_count() as usize];
         for state in 0..tokenizer.num_states() {
             let mut futures = tokenizer.possible_future_terminals_iter(state);
             let Some(terminal) = futures.next() else {
@@ -7198,7 +7199,7 @@ impl Constraint {
         // broad literal-self-loop residuals whose futures contain a terminal
         // admitted by at least one singleton LR row. This sidecar was already
         // paid for by production before parser-relative commit reuse consumed it.
-        let mut singleton_rows = vec![0usize; self.table.num_terminals as usize];
+        let mut singleton_rows = vec![0usize; self.parser_terminal_count() as usize];
         for row in &self.table.advance {
             let mut terminals = row.iter();
             let Some(terminal) = terminals.next() else {
@@ -7286,7 +7287,7 @@ impl Constraint {
         if candidates.is_empty() {
             const SMALL_PARSER_ROW_LIMIT: usize = 8;
             const REPEATED_MIXED_FAMILY_MIN_STATES: usize = 8;
-            let mut small_rows = vec![0usize; self.table.num_terminals as usize];
+            let mut small_rows = vec![0usize; self.parser_terminal_count() as usize];
             for row in &self.table.advance {
                 let row_len = row.iter().count();
                 if (1..=SMALL_PARSER_ROW_LIMIT).contains(&row_len) {
@@ -7503,12 +7504,12 @@ impl Constraint {
 
     pub(crate) fn rebuild_dynamic_runtime_caches(&mut self) {
         self.tokenizer_has_epsilon_transitions = self.tokenizer.has_epsilon_transitions();
-        if self.table.unconditional_advance.len() != self.table.num_states as usize
+        if self.table.unconditional_advance.len() != self.parser_symbol_count() as usize
             || self
                 .table
                 .unconditional_advance
                 .iter()
-                .any(|row| row.len() != self.table.num_terminals as usize)
+                .any(|row| row.len() != self.parser_terminal_count() as usize)
         {
             self.table.rebuild_unconditional_advance_rows();
         }
@@ -7520,7 +7521,7 @@ impl Constraint {
         // dynamic compile/load latency and allocations.
         self.terminal_live_states.clear();
         let started_at = profile.then(std::time::Instant::now);
-        if self.table.guarded_shift_index.len() != self.table.num_states as usize {
+        if self.table.guarded_shift_index.len() != self.parser_symbol_count() as usize {
             if self.table.has_guarded_stack_shifts() {
                 self.table.rebuild_guarded_shift_index();
             } else {
@@ -7532,7 +7533,7 @@ impl Constraint {
         let mut dynamic_mask_vocab = std::mem::take(&mut self.dynamic_mask_vocab);
         let small_ready_runtime = dynamic_mask_vocab.is_initialized()
             && self.tokenizer.num_states() <= 64
-            && self.table.num_states <= 32
+            && self.parser_symbol_count() <= 32
             && !self.uses_sparse_direct_regular_runtime();
         let build_vocab = || {
             let started_at = profile.then(std::time::Instant::now);
@@ -7563,7 +7564,7 @@ impl Constraint {
                     .map_or_else(DirectRegularTerminalSupport::default, |automaton| {
                         DirectRegularTerminalSupport::build(
                             automaton,
-                            self.table.num_terminals as usize,
+                            self.parser_terminal_count() as usize,
                         )
                     })
             } else {
@@ -7952,6 +7953,7 @@ impl Constraint {
     }
 
     pub(crate) fn table_has_ambiguity(&self) -> bool {
+        if self.has_template_parser() { return true; }
         self.table.has_ambiguity()
     }
 
@@ -8282,7 +8284,7 @@ impl Constraint {
         advance_by_terminal: Arc<[(TerminalID, Arc<[u32]>)]>,
     ) -> DirectRegularDynamicHotFrontier {
         let mut actionable_terminals =
-            crate::ds::bitset::BitSet::new(self.table.num_terminals as usize);
+            crate::ds::bitset::BitSet::new(self.parser_terminal_count() as usize);
         for &(terminal, _) in advance_by_terminal.iter() {
             actionable_terminals.set(terminal as usize);
         }
@@ -8412,6 +8414,8 @@ impl Constraint {
         &self,
         gss: &ParserGSS,
     ) -> Option<&DirectRegularDynamicHotFrontier> {
+        if self.has_template_parser() { return None; }
+
         if self.direct_regular_dynamic_hot_frontiers.is_empty() || gss.max_depth() != 1 {
             return None;
         }
@@ -8536,7 +8540,7 @@ impl Constraint {
                 }
             }
             let mut actionable_terminals =
-                crate::ds::bitset::BitSet::new(self.table.num_terminals as usize + 1);
+                crate::ds::bitset::BitSet::new(self.parser_terminal_count() as usize + 1);
             for &state in &states {
                 if let Some(row) = self.table.advance.get(state as usize) {
                     actionable_terminals.union_with(row);
@@ -8596,7 +8600,7 @@ impl Constraint {
         }
 
         let mut l1_terminals =
-            crate::ds::bitset::BitSet::new(self.table.num_terminals as usize + 1);
+            crate::ds::bitset::BitSet::new(self.parser_terminal_count() as usize + 1);
         for &terminal in self.direct_regular_l1_complete_by_terminal.keys() {
             l1_terminals.set(terminal as usize);
         }
@@ -9217,7 +9221,7 @@ impl Constraint {
         Vec<(TerminalID, Box<[u32]>)>,
         Vec<(TerminalID, Box<[(u32, u32)]>)>,
     ) {
-        if self.static_dynamic_overlay.is_none() || self.table.skip_terminals.is_empty() {
+        if self.static_dynamic_overlay.is_none() || self.parser_skip_terminals().is_empty() {
             return (Vec::new(), Vec::new());
         }
 
@@ -9535,7 +9539,7 @@ impl Constraint {
                 .map_or_else(DirectRegularTerminalSupport::default, |automaton| {
                     DirectRegularTerminalSupport::build(
                         automaton,
-                        self.table.num_terminals as usize,
+                        self.parser_terminal_count() as usize,
                     )
                 });
             self.dynamic_mask_vocab
@@ -9590,10 +9594,10 @@ impl Constraint {
         // anywhere a dynamic full walk is explicitly requested. DynamicConstraint
         // prepares its own execution coordinate in rebuild_dynamic_runtime_caches().
         let guarded_shift_started_at = profile.then(std::time::Instant::now);
-        if self.table.guarded_shift_index.len() != self.table.num_states as usize {
+        if self.table.guarded_shift_index.len() != self.parser_symbol_count() as usize {
             if self.table.num_rules == 0 {
                 self.table.guarded_shift_index =
-                    vec![FxHashMap::default(); self.table.num_states as usize];
+                    vec![FxHashMap::default(); self.parser_symbol_count() as usize];
             } else {
                 self.table.rebuild_guarded_shift_index();
             }
@@ -11412,7 +11416,7 @@ impl Constraint {
         dense
     }
 
-    fn compute_fast_template_dfas(&self) -> FastTemplateDfasByTerminal {
+    pub(crate) fn compute_fast_template_dfas(&self) -> FastTemplateDfasByTerminal {
         self.template_dfas_by_terminal
             .iter()
             .map(|template| {
@@ -12150,6 +12154,8 @@ impl Constraint {
         &self,
         gss: &ParserGSS,
     ) -> Option<usize> {
+        if self.has_template_parser() { return None; }
+
         // The cache below can only contain indices into this table. Ordinary
         // parser runtimes may have no direct-regular wide-frontier summaries;
         // avoid materializing deferred dynamic-vocab state merely to query a
@@ -12210,6 +12216,8 @@ impl Constraint {
         &self,
         gss: &ParserGSS,
     ) -> Option<&DirectRegularWideFrontierAcceptance> {
+        if self.has_template_parser() { return None; }
+
         let index = self.direct_regular_wide_frontier_index_for_gss(gss)?;
         self.direct_regular_wide_frontier_acceptance.get(index)
     }
@@ -12247,7 +12255,7 @@ impl Constraint {
             stack.push(raw);
         }
         let mut seen = vec![false; automaton.states.len()];
-        let mut terminals = crate::ds::bitset::BitSet::new(self.table.num_terminals as usize);
+        let mut terminals = crate::ds::bitset::BitSet::new(self.parser_terminal_count() as usize);
         while let Some(raw) = stack.pop() {
             let Some(state) = automaton.states.get(raw as usize) else {
                 return false;
@@ -12334,7 +12342,7 @@ impl Constraint {
             }
             stack.extend(state.epsilons.iter().copied());
             for (&terminal, targets) in &state.transitions {
-                if (terminal as usize) >= self.table.num_terminals as usize {
+                if (terminal as usize) >= self.parser_terminal_count() as usize {
                     continue;
                 }
                 targets_by_terminal
@@ -12345,7 +12353,7 @@ impl Constraint {
         }
 
         let mut actionable_terminals =
-            crate::ds::bitset::BitSet::new(self.table.num_terminals as usize);
+            crate::ds::bitset::BitSet::new(self.parser_terminal_count() as usize);
         let advance_by_terminal = targets_by_terminal
             .into_iter()
             .filter_map(|(terminal, mut targets)| {
@@ -12522,7 +12530,7 @@ impl Constraint {
         let support = self.dynamic_mask_vocab.direct_regular_terminal_support();
         if support.is_initialized() {
             let mut terminals =
-                crate::ds::bitset::BitSet::new(self.table.num_terminals as usize);
+                crate::ds::bitset::BitSet::new(self.parser_terminal_count() as usize);
             gss.for_each_top_value(|state| {
                 let mut add_state = |raw| {
                     if !support.for_each_small_state_terminal(raw, |terminal| {
@@ -12550,6 +12558,8 @@ impl Constraint {
         gss: &ParserGSS,
         terminal: TerminalID,
     ) -> Option<ParserGSS> {
+        if self.has_template_parser() { return None; }
+
         if let Some(summary) = self.direct_regular_dynamic_hot_frontier_for_gss(gss) {
             let acc = gss.uniform_accumulator()?;
             let Ok(index) = summary
@@ -12725,7 +12735,7 @@ impl Constraint {
     }
 
     pub(crate) fn num_parser_states(&self) -> u32 {
-        self.table.num_states
+        self.parser_symbol_count()
     }
 
     pub(crate) fn num_tokenizer_states(&self) -> usize {
@@ -14178,7 +14188,7 @@ mod dense_internal_token_mask_tests {
                 action_origins: Vec::new(),
                 state_count: frontier_states.len(),
                 actionable_terminals: crate::ds::bitset::BitSet::new(
-                    loaded.table.num_terminals as usize,
+                    loaded.parser_terminal_count() as usize,
                 ),
                 frontier_states: Arc::<[u32]>::from(frontier_states.as_slice()),
                 // Keep this deliberately unrelated to `gss` so the cheap

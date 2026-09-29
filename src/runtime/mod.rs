@@ -3,6 +3,7 @@ pub(crate) mod boundary_cpu_profile;
 mod artifact;
 mod commit;
 mod constraint;
+pub(crate) mod parser_backend;
 mod dynamic_mask;
 pub(crate) use dynamic_mask::dynamic_mask_profile_enabled;
 mod finalize;

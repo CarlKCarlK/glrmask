@@ -608,6 +608,9 @@ impl<'a> ConstraintState<'a> {
                     .flatten(),
             )
             .any(|stack| {
+                if let Some(parser) = &self.constraint.template_parser {
+                    return parser.finished(stack);
+                }
                 !stack.is_empty()
                     && self
                         .constraint
@@ -617,7 +620,7 @@ impl<'a> ConstraintState<'a> {
                                 self.constraint.compact_segmented_parser_is_finished(stack)
                             {
                                 finished
-                            } else if self.constraint.table.control_terminals.is_empty() {
+                            } else if !self.constraint.parser_has_controls() {
                                 stacks_finished(&self.constraint.table, stack)
                             } else {
                                 stacks_finished_control_closed(&self.constraint.table, stack)
