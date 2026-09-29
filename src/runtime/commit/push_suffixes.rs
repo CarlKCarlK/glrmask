@@ -1,8 +1,10 @@
 //! Bounded exact output-language materialization for acyclic PUSH programs.
 //!
 //! This is a derived acceleration index, never a replacement for the complete
-//! template. Large languages stay as DAGs; no exponential path enumeration is
-//! performed. The usual shared GSS branch constructor owns all stack storage.
+//! template. Preparation never enumerates languages beyond the stated budget.
+//! Large uniform-annotation languages use the graph-native `push_dag` index;
+//! correlated annotations retain the ordered exact template evaluator. The
+//! usual shared GSS branch constructor owns all stack storage.
 use crate::compiler::glr::labels::{is_negative_label, negative_to_positive_label};
 use crate::compiler::glr::parser::ParserGSS;
 use crate::runtime::CommitTemplateDfas;

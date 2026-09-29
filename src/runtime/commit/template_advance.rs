@@ -801,6 +801,13 @@ fn advance_with_prepared_template(template: &CommitTemplateDfas, stack: ParserGS
                     output = output.merge(&outputs);
                     continue;
                 }
+                if sparse_input
+                    && let Some(plan) = prepared.and_then(|p| p.push_dag.as_ref())
+                    && let Some(outputs) = plan.apply(state_id, &gss)
+                {
+                    output = output.merge(&outputs);
+                    continue;
+                }
                 let Some(dfa_state) = template.push.states.get(state_id as usize) else {
                     continue;
                 };

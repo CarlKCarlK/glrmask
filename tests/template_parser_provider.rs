@@ -208,3 +208,36 @@ fn ordinary_lr_parents_reject_table_free_children_without_panicking() {
     let linked = module.bind("child", &lr_child).unwrap().link().unwrap();
     let mut state = linked.start(); state.commit_bytes(b"xa").unwrap(); assert!(state.is_accepting());
 }
+
+#[test]
+fn exponentially_many_custom_push_outputs_remain_runnable_after_roundtrip() {
+    use glrmask::template_parser::StackDfa;
+    // 25 states encode 16,777,216 distinct output stacks. This must be a graph
+    // computation, not an enumeration of those words during commit or masking.
+    let depth = 24;
+    let mut push = StackDfa { start: 0, states: vec![StackState::default(); depth + 1] };
+    for i in 0..depth {
+        for symbol in [1, 2] {
+            push.states[i].transitions.push(StackTransition {
+                label: StackLabel::Symbol(symbol), target: i as u32 + 1,
+            });
+        }
+    }
+    push.states[depth].accepting = true;
+    let program = ParserProgram::new(ParserDefinition {
+        stack_symbol_count: 3,
+        terminals: vec![StackTemplate { push, pop_to_push: vec![Some(0)], ..StackTemplate::reject() }],
+        completion: StackTemplate::identity(),
+    }).unwrap();
+    let lexer = LexerDefinition::new(vec![TerminalPattern::literal(b"a".to_vec())]);
+    let v = Vocab::new(vec![(0, b"a".to_vec()), (1, b"aa".to_vec()), (2, b"b".to_vec())]);
+    let c = program.compile(&lexer, &v).unwrap();
+    for parser in [&c, &Constraint::load(c.save()).unwrap()] {
+        assert_eq!(parser.parser_backend(), ParserBackend::TemplateDfa);
+        let mut state = parser.start(); let mut mask = vec![0; parser.mask_len()];
+        for _ in 0..3 {
+            state.fill_mask(&mut mask); assert_eq!(mask[0] & 7, 3);
+            state.commit_token(0).unwrap(); assert!(state.is_accepting());
+        }
+    }
+}

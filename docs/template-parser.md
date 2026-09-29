@@ -165,3 +165,39 @@ through save/load.
 Template artifacts are versioned and validated separately from legacy LR
 artifacts; existing LR artifacts remain readable. Component composition is
 explicitly deferred and must not be implemented by retaining a hidden table.
+
+
+## Large finite output languages
+
+Acyclicity bounds the length of a single parser step, but it does **not** bound
+its number of possible output stacks. A layered PUSH graph with two labels per
+layer and a shared successor represents `2^d` outputs using only `d + 1` states.
+The executor must not turn that compact representation into a list of words.
+
+Small output languages retain the bounded prepared-suffix fast path. Larger
+ones use a **PUSH-only acceleration index**, not a different commit or
+mask engine: an incoming stack language is accumulated once per reachable PUSH
+state in topological order. For input language `B`, the invariant is
+
+```text
+L[q] = union { append(B, w) : entry --w--> q }
+L[entry] = B
+L[target] |= push(L[source], label)
+result = union { L[q] : q is accepting }
+```
+
+Appending distributes over language union. Processing every predecessor before
+its target therefore preserves every output exactly while merging convergent
+paths before traversing their common continuation. The existing GSS push/merge
+operations preserve shared lower prefixes; neither a new stack representation
+nor an LR table is introduced. Scratch is proportional to reachable pending
+states, not the full declared stack alphabet or the represented word count.
+The layered binary example retains a linear number of GSS nodes. This is **not**
+a universal linear-time guarantee for every finite relation: union of unrelated
+input languages can still require a larger GSS, and other parser phases have
+their own product costs.
+
+This reordering currently requires a uniform path annotation. Correlated
+annotations use the established exact traversal order. The optimization is a
+derived runtime index rebuilt after loading, so it adds no serialized program
+section and does not relax acyclicity or input validation.
