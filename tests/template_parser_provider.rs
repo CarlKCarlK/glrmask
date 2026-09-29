@@ -3,7 +3,46 @@
 use std::cell::Cell;
 use glrmask::{BuildOptions, Constraint, Grammar, ParserBackend, Vocab};
 use glrmask::template_parser::{LexerDefinition, ParserDefinition, ParserProgram, ParserProvider,
-    StackLabel, StackState, StackTemplate, StackTransition, TemplateBuildOptions, TerminalPattern};
+    StackDfa, StackLabel, StackState, StackTemplate, StackTransition, TemplateBuildOptions, TerminalPattern};
+
+#[test]
+fn reconverging_push_and_pop_languages_remain_shared_across_reload() {
+    for depth in [12usize,24,128] {
+        let mut push=StackDfa{start:0,states:vec![StackState::default();depth+1]};
+        let mut pop=StackDfa{start:0,states:vec![StackState::default();depth+2]};
+        for i in 0..depth {
+            for symbol in [1,2] {
+                push.states[i].transitions.push(StackTransition{label:StackLabel::Symbol(symbol),target:i as u32+1});
+            }
+            pop.states[i].transitions.push(StackTransition{label:StackLabel::Symbol(0),target:depth as u32+1});
+            pop.states[i].transitions.push(StackTransition{label:StackLabel::Default,target:i as u32+1});
+        }
+        push.states[depth].accepting=true;pop.states[depth].accepting=true;
+        let parser=ParserProgram::new(ParserDefinition{stack_symbol_count:3,terminals:vec![
+            StackTemplate{push,pop_to_push:vec![Some(0)],..StackTemplate::reject()},
+            StackTemplate{pop,..StackTemplate::reject()},
+        ],completion:StackTemplate::read_top_and_push([0],[])}).unwrap();
+        let vocabulary=Vocab::new(["a","b","ab","ba","aa","bb"].iter().enumerate()
+            .map(|(id,piece)|(id as u32,piece.as_bytes().to_vec())).collect());
+        let lex=LexerDefinition::new(vec![TerminalPattern::literal(b"a".to_vec()),TerminalPattern::literal(b"b".to_vec())]);
+        let fresh=parser.compile(&lex,&vocabulary).unwrap();
+        let bytes=fresh.save();
+        assert!(bytes.len()<64_000+depth*64,"a linear graph must not serialize its exponentially many paths");
+        let restored=Constraint::load(&bytes).unwrap();
+        for constraint in [&fresh,&restored] {
+            assert_eq!(constraint.parser_backend(),ParserBackend::TemplateDfa);
+            let mut state=constraint.start();let mut mask=vec![0;constraint.mask_len()];
+            state.fill_mask(&mut mask);assert_eq!(mask[0]&63,21);assert!(state.is_accepting());
+            for (token,expected,complete) in [(0,31,false),(0,63,false),(1,31,false),(1,21,true)] {
+                state.commit_token(token).unwrap();state.fill_mask(&mut mask);
+                assert_eq!(mask[0]&63,expected,"depth={depth} token={token}");
+                assert_eq!(state.is_accepting(),complete);
+            }
+            state.commit_token(2).unwrap();state.fill_mask(&mut mask);
+            assert!(state.is_accepting());assert_eq!(mask[0]&63,21);
+        }
+    }
+}
 
 fn definition() -> ParserDefinition {
     ParserDefinition { stack_symbol_count: 2,

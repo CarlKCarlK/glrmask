@@ -454,7 +454,7 @@ struct TemplateMemoEntry {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-enum Phase {
+pub(super) enum Phase {
     Pop,
     Read,
     Push,
@@ -670,6 +670,18 @@ fn advance_with_prepared_template(template: &CommitTemplateDfas, stack: ParserGS
     while let Some((phase, state_id, gss)) = worklist.pop() {
         if gss.is_empty() {
             continue;
+        }
+        // A LIFO path walker is cheapest for ordinary sparse actions, but
+        // repeated POPs through a shared ambiguous stack must not expand its
+        // concrete paths. Switch the exact *remaining work*, not the original
+        // input, to state-level dataflow once the inline frontier grows. This
+        // adds no retained input clone or second GSS representation to the
+        // normal path. Uniform annotations permit union reassociation.
+        if sparse_input && worklist.len() >= 8
+            && let Some(plan) = prepared.and_then(|p| p.phase_dag.as_ref())
+        {
+            worklist.push((phase, state_id, gss));
+            return plan.apply(template, worklist.drain(..), output);
         }
         let visit_key = (phase, state_id, gss.ptr_key());
         if let Some(source) = visited.get(&visit_key) {
