@@ -5782,10 +5782,9 @@ impl<'a> ConstraintState<'a> {
     }
 
 
-    /// Union one final token set, replaying a cached output mask only when
-    /// the active internal mask contains the complete set. Uncached sets stay
-    /// in internal coordinates until all paths have been unioned: expanding
-    /// each small set independently repeats writes to the same output words.
+    /// Union a final token set. Budgeted artifact-backed ranges may replay
+    /// their intersection; cached complete masks require full containment.
+    /// Fresh owned sets stay internal until the path union is expanded once.
     fn merge_final_token_set(
         &self,
         token_set: RuntimeTokenSetRef<'_>,
@@ -5796,7 +5795,9 @@ impl<'a> ConstraintState<'a> {
         direct_buf_dirty: &mut bool,
     ) -> bool {
         if let (Some(buf), RuntimeTokenSetRef::Materialized(tokens)) = (direct_buf, token_set) {
-            if self.constraint.try_replay_cached_final_mask(dense, tokens, buf) {
+            if self.constraint.try_replay_range_final_mask(dense, tokens, buf)
+                || self.constraint.try_replay_cached_final_mask(dense, tokens, buf)
+            {
                 *direct_buf_dirty = true;
                 return true;
             }

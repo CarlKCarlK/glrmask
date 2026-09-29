@@ -16,7 +16,7 @@ fn aliased_constraint() -> Constraint {
 }
 
 #[test]
-fn range_final_sets_leave_output_expansion_to_the_combined_mask() {
+fn uncached_final_masks_leave_output_untouched() {
     let mut constraint = aliased_constraint();
     // Supply an explicit range-cache entry: the simple grammar can compile
     // entirely to full weights, so cache existence is not a grammar invariant.
@@ -88,4 +88,97 @@ fn range_final_replay_preserves_aliases_and_loaded_masks() {
         state.fill_mask(&mut actual);
         assert!(actual.iter().all(|&word| word == 0));
     }
+}
+
+// Tiny unshared DWAs use the decoded DWF2 fallback. Build the same parser
+// with its supported shared-row representation so saving emits a backed view.
+fn artifact_backed_aliased_constraint() -> Constraint {
+    use crate::automata::weighted::dwa::PackedRuntimeDwa;
+
+    let mut fresh = aliased_constraint();
+    let parser = fresh.parser_dwa.clone().share_exact_transition_rows_owned();
+    assert!(parser.has_shared_transition_rows());
+    let packed = PackedRuntimeDwa::from_dwa(&parser).unwrap();
+    assert!(packed.backed_fast_wire_bytes().is_none());
+    fresh.packed_parser_dwa = Some(Arc::new(packed));
+    let expected = fresh.start().mask();
+    let loaded = Constraint::load(fresh.save()).unwrap();
+    assert!(loaded.packed_parser_dwa.as_ref()
+        .unwrap().backed_fast_wire_bytes().is_some());
+    assert_eq!(loaded.start().mask(), expected);
+    loaded
+}
+
+#[test]
+fn bounded_final_range_replay_intersects_before_expanding_aliases() {
+    let mut fresh = aliased_constraint();
+    let loaded = artifact_backed_aliased_constraint();
+    let tokens = Arc::new(RangeSetBlaze::from_iter([0u32]));
+    fresh.range_final_token_sets.insert(Arc::as_ptr(&tokens) as usize);
+    assert!(fresh.packed_parser_dwa.is_none());
+    let mut output = vec![0x1234_5678; fresh.mask_len()];
+    let before = output.clone();
+    assert!(!fresh.try_replay_range_final_mask(&[u64::MAX], &tokens, &mut output));
+    assert_eq!(output, before);
+    // Large fresh constraints also pack their DWA, but still own its storage.
+    let packed = crate::automata::weighted::dwa::PackedRuntimeDwa::from_dwa(
+        &fresh.parser_dwa,
+    ).unwrap();
+    assert!(packed.backed_fast_wire_bytes().is_none());
+    fresh.packed_parser_dwa = Some(Arc::new(packed));
+    assert!(!fresh.try_replay_range_final_mask(&[u64::MAX], &tokens, &mut output));
+    assert_eq!(output, before, "owned packed storage must retain combined replay");
+    for mut constraint in [loaded] {
+        assert!(constraint.packed_parser_dwa.as_ref()
+            .unwrap().backed_fast_wire_bytes().is_some());
+        let count = constraint.internal_token_count();
+        assert!(count > 0);
+        assert_eq!(constraint.final_mask_mapping.internal_len(), 0);
+        let last = (count - 1).min(63) as u32;
+        let tokens = Arc::new(RangeSetBlaze::from_iter([0..=last]));
+        let key = Arc::as_ptr(&tokens) as usize;
+        let words = constraint.body_mask_len();
+        let mut untouched = vec![0x1234_5678; words + 3];
+        let before = untouched.clone();
+        assert!(!constraint.try_replay_range_final_mask(&[u64::MAX], &tokens, &mut untouched));
+        assert_eq!(untouched, before, "unplanned ranges must decline without writes");
+        constraint.range_final_token_sets.insert(key);
+        for selected in [0, 1, 0xaaaa_aaaa_aaaa_aaaa, u64::MAX] {
+            let mut storage = vec![0x1234_5678; words + 7];
+            let output = &mut storage[2..words + 5];
+            let mut expected = output.to_vec();
+            let mut ignored_stats = 0;
+            for token in 0..=last as usize {
+                if selected & (1u64 << token) != 0 {
+                    constraint.or_internal_token_to_buf_fast::<false>(
+                        token, &mut expected, &mut ignored_stats,
+                    );
+                }
+            }
+            assert!(constraint.try_replay_range_final_mask(&[selected], &tokens, output));
+            assert_eq!(output, expected);
+            assert_eq!(&storage[..2], &[0x1234_5678; 2]);
+            assert_eq!(&storage[words + 5..], &[0x1234_5678; 2]);
+        }
+        assert!(constraint.try_replay_range_final_mask(&[], &tokens, &mut untouched));
+        assert_eq!(untouched, before, "an empty intersection must not write output");
+    }
+}
+
+#[test]
+fn bounded_final_range_replay_declines_over_budget_or_short_output() {
+    let mut constraint = artifact_backed_aliased_constraint();
+    assert!(constraint.packed_parser_dwa.as_ref()
+        .unwrap().backed_fast_wire_bytes().is_some());
+    let tokens = Arc::new(RangeSetBlaze::from_iter([0u32..=2048]));
+    constraint.range_final_token_sets.insert(Arc::as_ptr(&tokens) as usize);
+    let mut output = vec![0x1234_5678; constraint.body_mask_len()];
+    let before = output.clone();
+    assert!(!constraint.try_replay_range_final_mask(&[u64::MAX], &tokens, &mut output));
+    assert_eq!(output, before);
+    let tiny = Arc::new(RangeSetBlaze::from_iter([0u32]));
+    constraint.range_final_token_sets.insert(Arc::as_ptr(&tiny) as usize);
+    let end = output.len() - 1;
+    assert!(!constraint.try_replay_range_final_mask(&[u64::MAX], &tiny, &mut output[..end]));
+    assert_eq!(output, before);
 }

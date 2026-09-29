@@ -1068,11 +1068,11 @@ impl Constraint {
         self.weight_token_set_inventory_with_packed(None)
     }
 
-    /// Plan which final token sets can be intersected as ranges, avoiding
-    /// prebuilt dense and output masks. Runtime unions those sets in internal
-    /// coordinates and expands the union once, never once per final weight.
-    /// Retain the conservative scan/expansion budget used during finalization
-    /// so this runtime simplification does not add compile-time cache work.
+    /// Plan bounded final token sets without prebuilding dense/output masks.
+    /// Fresh owned runtime weights union these sets before output expansion;
+    /// artifact-backed weights may replay their intersection directly instead.
+    /// The same conservative scan/expansion budget bounds both representations
+    /// without adding compile-time cache work for the replay policy.
     pub(super) fn plan_final_token_sets(
         &self,
         final_token_sets: &[(usize, Arc<RangeSetBlaze<u32>>) ],

@@ -583,6 +583,45 @@ impl Constraint {
         }
     }
 
+    /// Replay a budgeted final set from artifact-backed runtime storage.
+    /// Fresh owned DWAs keep the cheaper combined internal-mask union. Backed
+    /// sets intersect before expansion; declining always leaves output untouched.
+    #[inline]
+    pub(crate) fn try_replay_range_final_mask(
+        &self,
+        dense: &[u64],
+        tokens: &Arc<RangeSetBlaze<u32>>,
+        output: &mut [u32],
+    ) -> bool {
+        if self.packed_parser_dwa.as_ref()
+            .and_then(|dwa| dwa.backed_fast_wire_bytes()).is_none()
+        {
+            return false;
+        }
+        let key = Arc::as_ptr(tokens) as usize;
+        if !self.range_final_token_sets.contains(&key)
+            || tokens.len() > 2048
+            || self.final_mask_mapping.internal_len() != 0
+            || output.len() < self.body_mask_len()
+        {
+            return false;
+        }
+        let count = self.internal_token_count();
+        if count == 0 || dense.is_empty() {
+            return true;
+        }
+        let mut ignored_stats = 0;
+        for range in tokens.ranges() {
+            let end = (*range.end() as usize).min(count - 1);
+            for token in *range.start() as usize..=end {
+                if dense.get(token / 64).is_some_and(|word| word & (1u64 << (token % 64)) != 0) {
+                    self.or_internal_token_to_buf_fast::<false>(token, output, &mut ignored_stats);
+                }
+            }
+        }
+        true
+    }
+
     /// Replay an already cached output mask only when its complete internal
     /// token set is admissible. A cache miss must leave the output untouched.
     #[inline(always)]
