@@ -291,6 +291,90 @@ impl TemplateDomain {
         }
     }
 
+    /// Encode the already-compiled domain in a versioned internal cache wire.
+    /// This representation contains only input-prefix transitions, never LR
+    /// actions/gotos or a PUSH/output program. It is not a stable public format.
+    pub fn to_bytes(&self) -> Result<Vec<u8>, String> {
+        let n = u32::try_from(self.states.len()).map_err(|_| "too many domain states")?;
+        let m = u32::try_from(self.edges.len()).map_err(|_| "too many domain edges")?;
+        let size = 16usize.checked_add(self.states.len().checked_mul(16).ok_or("domain size overflow")?)
+            .and_then(|n| self.edges.len().checked_mul(8).and_then(|m| n.checked_add(m)))
+            .ok_or("domain size overflow")?;
+        let mut wire = Vec::with_capacity(size);
+        wire.extend_from_slice(b"GTD1");
+        for value in [self.start, n, m] { wire.extend_from_slice(&value.to_le_bytes()); }
+        for state in &self.states {
+            for value in [u32::from(state.accepts_prefix), state.default_target,
+                u32::try_from(state.first_edge).map_err(|_| "domain edge offset overflow")?,
+                u32::try_from(state.edge_count).map_err(|_| "domain edge count overflow")?]
+            { wire.extend_from_slice(&value.to_le_bytes()); }
+        }
+        for &(label, target) in &self.edges {
+            wire.extend_from_slice(&label.to_le_bytes()); wire.extend_from_slice(&target.to_le_bytes());
+        }
+        debug_assert_eq!(wire.len(), size);
+        Ok(wire)
+    }
+
+    /// Decode and validate a compiled domain, without reconstructing templates
+    /// or consulting a parser table. The backward-edge invariant proves the
+    /// entire input graph acyclic in one pass; bad data cannot introduce a
+    /// nonterminating query. Counts are checked against input before allocation.
+    pub fn from_bytes(wire: &[u8]) -> Result<Self, String> {
+        if wire.len() < 16 || !wire.starts_with(b"GTD1") {
+            return Err("invalid template-domain header".to_owned());
+        }
+        let read = |offset: usize| u32::from_le_bytes(wire[offset..offset + 4].try_into().unwrap());
+        let start = read(4); let n = read(8) as usize; let m = read(12) as usize;
+        let edge_base = n.checked_mul(16).and_then(|n| n.checked_add(16)).ok_or("domain size overflow")?;
+        let required = m.checked_mul(8).and_then(|m| m.checked_add(edge_base)).ok_or("domain size overflow")?;
+        if required != wire.len() || n >= REJECT as usize {
+            return Err("template-domain size/count mismatch".to_owned());
+        }
+        if (n == 0 && (start != REJECT || m != 0)) || (n != 0 && start as usize >= n) {
+            return Err("invalid template-domain start".to_owned());
+        }
+        let mut states = Vec::with_capacity(n);
+        let mut edges = Vec::with_capacity(m);
+        let mut consumed = 0usize;
+        for id in 0..n {
+            let offset = 16 + id * 16;
+            let flags = read(offset); let default = read(offset + 4);
+            let first = read(offset + 8) as usize; let count = read(offset + 12) as usize;
+            let end = first.checked_add(count).ok_or("domain edge interval overflow")?;
+            if flags > 1 || first != consumed || end > m {
+                return Err("invalid template-domain row".to_owned());
+            }
+            if default != REJECT && default as usize >= id {
+                return Err("template-domain DEFAULT is not acyclic".to_owned());
+            }
+            if flags == 1 && (default != REJECT || count != 0) {
+                return Err("accepting template-domain row has outgoing edges".to_owned());
+            }
+            let mut last = None;
+            let mut productive = flags == 1 || default != REJECT;
+            for edge in first..end {
+                let label = read(edge_base + edge * 8); let target = read(edge_base + edge * 8 + 4);
+                if label > i32::MAX as u32 || label == DEFAULT_LABEL as u32
+                    || last.is_some_and(|last| last >= label)
+                {
+                    return Err("invalid or unordered template-domain symbol".to_owned());
+                }
+                if target != REJECT && target as usize >= id {
+                    return Err("template-domain edge is not acyclic".to_owned());
+                }
+                productive |= target != REJECT;
+                last = Some(label); edges.push((label, target));
+            }
+            if !productive { return Err("unproductive template-domain row".to_owned()); }
+            states.push(DomainState { accepts_prefix: flags == 1, default_target: default,
+                first_edge: first, edge_count: count });
+            consumed = end;
+        }
+        if consumed != m { return Err("unreferenced template-domain edges".to_owned()); }
+        Ok(Self { start, states: states.into_boxed_slice(), edges: edges.into_boxed_slice() })
+    }
+
     pub fn state_count(&self) -> usize { self.states.len() }
     pub fn edge_count(&self) -> usize { self.edges.len() }
     /// Native heap payload, not serialized wire size or peak allocation.
@@ -462,7 +546,10 @@ mod tests {
             for links in [&mut t.pop_to_read, &mut t.pop_to_push, &mut t.read_to_push] {
                 *links = (0..5).map(|_| if next() >> 62 == 0 { None } else { Some((next() % 5) as u32) }).collect();
             }
-            let domain = TemplateDomain::compile(&t).unwrap();
+            let compiled = TemplateDomain::compile(&t).unwrap();
+            let wire = compiled.to_bytes().unwrap();
+            let domain = TemplateDomain::from_bytes(&wire).unwrap();
+            assert_eq!(domain.to_bytes().unwrap(), wire, "wire roundtrip seed={seed}");
             for stack in &stacks {
                 assert_eq!(domain.matches_top_first(stack.iter().copied()), output_exists(&t, stack),
                     "seed={seed} top_first={stack:?}");
@@ -480,4 +567,29 @@ mod tests {
         assert!(domain.matches_top_first(std::iter::repeat_n(0, 15_000)));
         assert_eq!(TemplateDomain::compile(&CommitTemplateDfas::default()).unwrap().start(), DomainProbe::Reject);
     }
+    #[test]
+    fn domain_wire_rejects_truncation_invalid_indices_and_cycles() {
+        let mut t = template(); let accepted = t.pop.add_state();
+        t.pop.set_accepting(accepted, true); t.pop.add_transition(0, 7, accepted);
+        let domain = TemplateDomain::compile(&t).unwrap(); let wire = domain.to_bytes().unwrap();
+        assert_eq!(wire.len(), 16 + 2 * 16 + 8);
+        for length in 0..wire.len() { assert!(TemplateDomain::from_bytes(&wire[..length]).is_err()); }
+        let mut bad = wire.clone(); bad[0] ^= 1;
+        assert!(TemplateDomain::from_bytes(&bad).is_err());
+        let mut bad = wire.clone(); bad[8..12].copy_from_slice(&u32::MAX.to_le_bytes());
+        assert!(TemplateDomain::from_bytes(&bad).is_err());
+        let mut bad = wire.clone(); let root = domain.start;
+        // The final explicit edge would cycle to its own root.
+        let offset = bad.len() - 4; bad[offset..].copy_from_slice(&root.to_le_bytes());
+        assert!(TemplateDomain::from_bytes(&bad).unwrap_err().contains("acyclic"));
+        let mut bad = wire.clone(); bad[4..8].copy_from_slice(&999u32.to_le_bytes());
+        assert!(TemplateDomain::from_bytes(&bad).is_err());
+        let mut bad = wire.clone(); bad[16..20].copy_from_slice(&2u32.to_le_bytes());
+        assert!(TemplateDomain::from_bytes(&bad).is_err());
+        let empty = TemplateDomain::compile(&CommitTemplateDfas::default()).unwrap();
+        let wire = empty.to_bytes().unwrap();
+        assert_eq!(wire.len(), 16);
+        assert_eq!(TemplateDomain::from_bytes(&wire).unwrap().start(), DomainProbe::Reject);
+    }
+
 }
