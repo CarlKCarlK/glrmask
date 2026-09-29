@@ -3732,9 +3732,11 @@ impl<T: Clone + Eq + Hash, A: Merge + Clone + Eq + Hash> LeveledGSS<T, A> {
         }
         let left = self.to_stacks(max_stacks)?;
         let right = other.to_stacks(max_stacks)?;
+        // Shared DAG children can overlap across maximum-depth groups, so
+        // enumeration may emit an identical (stack, accumulator) more than
+        // once. This API compares a language/set, not its path multiplicity.
         Some(
-            left.len() == right.len()
-                && left.iter().all(|entry| right.contains(entry))
+            left.iter().all(|entry| right.contains(entry))
                 && right.iter().all(|entry| left.contains(entry)),
         )
     }
@@ -8090,6 +8092,32 @@ mod tests {
         });
         assert!(!admitted, "all concrete paths are shorter than 26 symbols");
         assert!(calls < 200, "visited {calls} symbols despite compact shared DAG");
+    }
+
+    #[test]
+    fn semantic_equality_ignores_duplicate_shared_dag_paths() {
+        use super::{CompactMap, CompactOrdMap, LeveledGSS, Upper, new_interface, new_lower};
+        let short = LeveledGSS::from_single_stack(vec![0u32], ());
+        let long = LeveledGSS::from_stacks(&[(vec![0u32], ()), (vec![1, 0], ())]);
+        let lower = |gss: &LeveledGSS<u32, ()>| match &*gss.inner {
+            Upper::Interface(i) => i.inner.clone(),
+            _ => panic!("uniform unit accumulator should be an interface"),
+        };
+        let short = lower(&short); let long = lower(&long);
+        let mut children = CompactOrdMap::new();
+        children.insert(short.max_depth(), short);
+        children.insert(long.max_depth(), long);
+        let overlapping = LeveledGSS {
+            inner: new_interface(new_lower(CompactMap::unit(5, children), false), ()),
+        };
+        let unique = LeveledGSS::from_stacks(&[(vec![0u32, 5], ()), (vec![1, 0, 5], ())]);
+        assert_eq!(overlapping.to_stacks(10).unwrap().len(), 3);
+        assert_eq!(unique.to_stacks(10).unwrap().len(), 2);
+        assert_eq!(overlapping.semantically_eq(&unique, 10), Some(true));
+        assert_eq!(unique.semantically_eq(&overlapping, 10), Some(true));
+        assert_eq!(overlapping.semantically_eq(&unique, 1), None,
+            "a real enumeration budget must still decline, never truncate");
+        assert_eq!(overlapping.semantically_eq(&unique.push(6), 10), Some(false));
     }
 
 }
