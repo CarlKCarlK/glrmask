@@ -2262,7 +2262,7 @@ mod tests {
         poisoned.table.rules.clear();
         poisoned.table.forwarded_shifts.clear();
         poisoned.table.control_terminals.clear();
-        poisoned.parser_skip_terminals().clear();
+        poisoned.table.skip_terminals.clear();
         poisoned.table.guarded_shift_index.clear();
         poisoned.table.direct_regular_wide_frontiers.clear();
         poisoned.table.num_states = 0;

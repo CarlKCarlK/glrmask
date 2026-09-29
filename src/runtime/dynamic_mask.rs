@@ -11880,7 +11880,7 @@ nt start ::= A | B | A A | A B | B A | B B;
             crate::automata::lexer::tokenizer::arbitrary_epsilon_l1_test_tokenizer();
         assert!(tokenizer.has_epsilon_transitions());
         let mut dynamic = DynamicConstraint::from_parts(
-            parser_source.table.clone(),
+            parser_source.table.clone_lr(),
             parser_source.terminal_display_names.clone(),
             tokenizer,
             None,

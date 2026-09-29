@@ -5121,7 +5121,7 @@ mod tests {
 
         let legacy_transfer = DynamicConstraintTransferPayloadV1 {
             alternatives: vec![DynamicConstraintTransferAlternativeV1 {
-                table: constraint.inner.table.clone(),
+                table: constraint.inner.table.clone_lr(),
                 terminal_display_names: constraint.inner.terminal_display_names.clone(),
                 tokenizer: constraint.inner.tokenizer.as_ref().clone(),
                 ignore_terminal: constraint.inner.ignore_terminal,
@@ -7193,7 +7193,7 @@ mod tests {
         let legacy = LegacyDynamicConstraintPayloadV11V3 {
             alternatives: vec![LegacyDynamicConstraintPayloadV11V2 {
                 v1: LegacyDynamicConstraintPayloadV11V1 {
-                    table: constraint.inner.table.clone(),
+                    table: constraint.inner.table.clone_lr(),
                     terminal_display_names: constraint.inner.terminal_display_names.clone(),
                     tokenizer: constraint.inner.tokenizer.as_ref().clone(),
                     ignore_terminal: constraint.inner.ignore_terminal,
@@ -7229,7 +7229,7 @@ mod tests {
         let legacy = LegacyDynamicConstraintPayloadV12V3 {
             alternatives: vec![LegacyDynamicConstraintPayloadV12V2 {
                 v1: LegacyDynamicConstraintPayloadV12V1 {
-                    table: constraint.inner.table.clone(),
+                    table: constraint.inner.table.clone_lr(),
                     terminal_display_names: constraint.inner.terminal_display_names.clone(),
                     tokenizer: constraint.inner.tokenizer.as_ref().clone(),
                     ignore_terminal: constraint.inner.ignore_terminal,
@@ -7716,7 +7716,7 @@ nt start ::= A;
         let original_mask = original.start().mask();
         let legacy = LegacyDynamicConstraintTransferPayloadV1 {
             alternatives: vec![LegacyDynamicConstraintTransferAlternativeV1 {
-                table: original.inner.table.clone(),
+                table: original.inner.table.clone_lr(),
                 terminal_display_names: original.inner.terminal_display_names.clone(),
                 tokenizer: original.inner.tokenizer.as_ref().clone(),
                 ignore_terminal: original.inner.ignore_terminal,
@@ -7745,7 +7745,7 @@ nt start ::= A;
         let original_mask = original.start().mask();
         let legacy = LegacyDynamicConstraintTransferPayloadV2 {
             alternatives: vec![LegacyDynamicConstraintTransferAlternativeV2 {
-                table: original.inner.table.clone(),
+                table: original.inner.table.clone_lr(),
                 terminal_display_names: original.inner.terminal_display_names.clone(),
                 tokenizer: original.inner.tokenizer.as_ref().clone(),
                 ignore_terminal: original.inner.ignore_terminal,
@@ -7779,7 +7779,7 @@ nt start ::= A;
             .mask_tokenizer_quotient_for_transfer();
         let legacy = LegacyDynamicConstraintTransferPayloadV3 {
             alternatives: vec![LegacyDynamicConstraintTransferAlternativeV3 {
-                table: original.inner.table.clone(),
+                table: original.inner.table.clone_lr(),
                 terminal_display_names: original.inner.terminal_display_names.clone(),
                 tokenizer: original.inner.tokenizer.as_ref().clone(),
                 ignore_terminal: original.inner.ignore_terminal,

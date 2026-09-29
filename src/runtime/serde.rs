@@ -9262,8 +9262,9 @@ mod tests {
         let mut constraint = ignored_constraint();
         constraint.parser_state_domain_labels =
             vec![i32::MAX; constraint.parser_symbol_count() as usize];
+        let symbol_count = constraint.parser_symbol_count();
         if let Some(first) = constraint.parser_state_domain_labels.first_mut() {
-            *first = constraint.parser_symbol_count() as i32;
+            *first = symbol_count as i32;
         }
         let loaded = Constraint::load(&constraint.save()).unwrap();
         assert_eq!(
