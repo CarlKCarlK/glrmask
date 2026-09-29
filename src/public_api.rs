@@ -1392,6 +1392,18 @@ impl GrammarBinding<'_> {
     }
 }
 
+/// Composition has not yet been lowered to parser-independent relations.
+/// Reject before querying LR-only nullable/link metadata, including when the
+/// parent chose the ordinary LR backend but a child is table-free.
+fn require_composable_parser(constraint: &RuntimeConstraint) -> Result<()> {
+    if constraint.has_template_parser() {
+        return Err(Error::Compilation(
+            "template-parser component composition is not implemented; no LR fallback is permitted".into(),
+        ));
+    }
+    Ok(())
+}
+
 fn prepare_compiled_children(
     children: Vec<(String, CompiledChild<'_>)>,
     vocab: &Vocab,
@@ -1400,10 +1412,10 @@ fn prepare_compiled_children(
     children
         .into_iter()
         .map(|(name, child)| {
+            let alternatives = child.into_constraints();
+            for alternative in &alternatives { require_composable_parser(alternative)?; }
             let mut constraint = collapse_dynamic_alternatives(
-                child.into_constraints(),
-                vocab,
-                boundary_backend,
+                alternatives, vocab, boundary_backend,
             )?;
             // Root termination is policy, not an embedded grammar terminal.
             // The native artifact cache already contains body-only bytes.
@@ -1499,6 +1511,8 @@ fn compose_named_children(
     if present.is_empty() {
         return Ok(parent);
     }
+    require_composable_parser(&parent)?;
+    for &child_index in &present { require_composable_parser(&children[child_index].1)?; }
 
     let remaining_parent_slots = parent
         .late_grammar_slots
@@ -1760,6 +1774,8 @@ fn select_supported_boundary(
                         .any(|component| requires_dynamic_boundary(&component.constraint))
             })
     }
+    require_composable_parser(parent)?;
+    for (_, child) in children { require_composable_parser(child)?; }
     if requires_dynamic_boundary(parent) {
         return Ok(SegmentedBoundaryBackend::Dynamic);
     }

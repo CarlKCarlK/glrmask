@@ -182,3 +182,29 @@ fn unsupported_template_composition_fails_explicitly_without_changing_default_lr
     assert!(module.link_with(BuildOptions::default().parser_backend(ParserBackend::TemplateDfa)).is_err());
     assert_eq!(module.link().unwrap().parser_backend(),ParserBackend::LrTable);
 }
+
+#[test]
+fn ordinary_lr_parents_reject_table_free_children_without_panicking() {
+    let v = Vocab::new(vec![(0, b"a".to_vec()), (1, b"xa".to_vec()), (2, b"x".to_vec())]);
+    let child = Grammar::from_glrm(r#"start root; nt root ::= "a";"#)
+        .compile_with(&v, BuildOptions::default().parser_backend(ParserBackend::TemplateDfa))
+        .unwrap();
+    let module = Grammar::from_glrm(
+        r#"glrm 1; start root; extern grammar child; nt root = "x" child;"#,
+    ).compile_unlinked(&v).unwrap();
+    for child in [&child, &Constraint::load(child.save()).unwrap()] {
+        for optimization in [glrmask::Optimization::Auto, glrmask::Optimization::FastRuntime, glrmask::Optimization::FastBuild] {
+            let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                module.bind("child", child).and_then(|bound| bound.link_with(
+                    BuildOptions::default().optimization(optimization)))
+            }));
+            assert!(outcome.is_ok(), "unsupported composition must return an error, not touch an absent LR table");
+            let error = outcome.unwrap().unwrap_err();
+            assert!(error.to_string().contains("template") && error.to_string().contains("composition"), "{error}");
+            assert_eq!(child.parser_backend(), ParserBackend::TemplateDfa);
+        }
+    }
+    let lr_child = Grammar::from_glrm(r#"start root; nt root ::= "a";"#).compile(&v).unwrap();
+    let linked = module.bind("child", &lr_child).unwrap().link().unwrap();
+    let mut state = linked.start(); state.commit_bytes(b"xa").unwrap(); assert!(state.is_accepting());
+}
