@@ -392,32 +392,58 @@ fn find_default_specialization_mismatch(
 }
 
 fn specialize_template_dfa_defaults_for_commit_determinized(dfa: &UnweightedDfa) -> UnweightedDfa {
-    let mut nfa = NFA::new_empty();
-    nfa.states = vec![Default::default(); dfa.states.len()];
-    nfa.start_states = vec![dfa.start_state];
+    // DEFAULT in the source is a wildcard *union*, whereas the runtime's
+    // deterministic lookup uses DEFAULT only if an explicit edge is absent.
+    // This must be resolved on whole reachable subsets, not on each original
+    // state's local explicit alphabet: another member of a subset can supply
+    // an explicit edge and thereby hide this member's wildcard contribution.
+    let mut specialized = UnweightedDfa::new();
+    let start_subset = BTreeSet::from([dfa.start_state]);
+    let mut ids = BTreeMap::from([(start_subset.clone(), specialized.start_state)]);
+    let mut pending = VecDeque::from([start_subset]);
 
-    for (state_id, state) in dfa.states.iter().enumerate() {
-        let from = state_id as u32;
-        if state.is_accepting {
-            nfa.set_accepting(from);
-        }
-        for (&label, &target) in &state.transitions {
-            nfa.add_transition(from, label, target);
-        }
-        if let Some(&default_target) = state.transitions.get(&DEFAULT_LABEL) {
-            let positive_pop_labels: Vec<_> = state
-                .transitions
-                .keys()
-                .copied()
-                .filter(|&label| label != DEFAULT_LABEL && label >= 0)
-                .collect();
-            for label in positive_pop_labels {
-                nfa.add_transition(from, label, default_target);
+    while let Some(subset) = pending.pop_front() {
+        let from = ids[&subset];
+        let mut explicit: BTreeMap<i32, BTreeSet<u32>> = BTreeMap::new();
+        let mut defaults = BTreeSet::new();
+        for &state_id in &subset {
+            let Some(state) = dfa.states.get(state_id as usize) else {
+                continue;
+            };
+            specialized.states[from as usize].is_accepting |= state.is_accepting;
+            for (&label, &target) in &state.transitions {
+                if label == DEFAULT_LABEL {
+                    defaults.insert(target);
+                } else {
+                    explicit.entry(label).or_default().insert(target);
+                }
             }
+        }
+
+        // Every concrete nonnegative symbol not explicitly mentioned below
+        // has the same successor subset: exactly `defaults`. Negative labels
+        // encode PUSH, so they must never inherit wildcard POP transitions.
+        for (&label, targets) in &mut explicit {
+            if label >= 0 {
+                targets.extend(defaults.iter().copied());
+            }
+        }
+        if !defaults.is_empty() {
+            explicit.insert(DEFAULT_LABEL, defaults);
+        }
+        for (label, targets) in explicit {
+            let to = if let Some(&id) = ids.get(&targets) {
+                id
+            } else {
+                let id = specialized.add_state();
+                ids.insert(targets.clone(), id);
+                pending.push_back(targets);
+                id
+            };
+            specialized.add_transition(from, label, to);
         }
     }
 
-    let specialized = determinize(&nfa);
     if template_quotient_validation_enabled()
         && let Some(witness) = find_default_specialization_mismatch(dfa, &specialized)
     {
@@ -1548,6 +1574,100 @@ mod tests {
             .transitions
             .remove(&DEFAULT_LABEL);
         assert!(find_default_specialization_mismatch(&original, &corrupted).is_some());
+    }
+
+    #[test]
+    fn default_specialization_preserves_cross_subset_wildcards() {
+        // After consuming 1, both a and b are live. Symbol 2 is explicit only
+        // at a, but b's DEFAULT must contribute on 2 as well. Specializing
+        // each original state before ordinary determinization loses -20.
+        let mut original = UnweightedDfa::new();
+        let a = original.add_state();
+        let b = original.add_state();
+        let a_push = original.add_state();
+        let b_push = original.add_state();
+        let accepted = original.add_state();
+        original.add_transition(0, 1, a);
+        original.add_transition(0, DEFAULT_LABEL, b);
+        original.add_transition(a, 2, a_push);
+        original.add_transition(b, DEFAULT_LABEL, b_push);
+        original.add_transition(a_push, encode_negative_label(10), accepted);
+        original.add_transition(b_push, encode_negative_label(20), accepted);
+        original.set_accepting(accepted, true);
+
+        // Demonstrate the exact pre-fix failure using the old local expansion.
+        let mut locally_expanded = NFA::new_empty();
+        locally_expanded.states = vec![Default::default(); original.states.len()];
+        locally_expanded.start_states = vec![original.start_state];
+        for (source, state) in original.states.iter().enumerate() {
+            if state.is_accepting { locally_expanded.set_accepting(source as u32); }
+            for (&label, &target) in &state.transitions {
+                locally_expanded.add_transition(source as u32, label, target);
+                if label >= 0 && label != DEFAULT_LABEL
+                    && let Some(&wildcard) = state.transitions.get(&DEFAULT_LABEL)
+                {
+                    locally_expanded.add_transition(source as u32, label, wildcard);
+                }
+            }
+        }
+        assert_eq!(find_default_specialization_mismatch(&original, &determinize(&locally_expanded)),
+            Some(vec![1, 2, encode_negative_label(20)]));
+
+        let specialized = specialize_template_dfa_defaults_for_commit_determinized(&original);
+        assert_eq!(find_default_specialization_mismatch(&original, &specialized), None);
+        assert!(specialized.compute_is_acyclic());
+        for last in [10, 20] {
+            let mut cursor = Some(specialized.start_state);
+            for label in [1, 2, encode_negative_label(last)] {
+                cursor = super::specialized_default_semantic_advance(&specialized, cursor, label);
+            }
+            assert!(super::dfa_accepts_at(&specialized, cursor));
+        }
+        let split = try_split_commit_template_dfas(&specialized)
+            .expect("correct specialization retains the pop-then-push phase discipline");
+        assert_eq!(find_split_commit_language_mismatch(&specialized, &split), None);
+    }
+
+    #[test]
+    fn default_specialization_does_not_treat_push_as_wildcard_pop() {
+        let mut original = UnweightedDfa::new();
+        let accepted = original.add_state();
+        original.add_transition(0, DEFAULT_LABEL, accepted);
+        original.set_accepting(accepted, true);
+        let specialized = specialize_template_dfa_defaults_for_commit_determinized(&original);
+        assert_eq!(find_default_specialization_mismatch(&original, &specialized), None);
+        assert_eq!(super::specialized_default_semantic_advance(
+            &specialized, Some(specialized.start_state), encode_negative_label(0)), None);
+    }
+
+    #[test]
+    fn default_specialization_preserves_generated_acyclic_relations() {
+        // Deterministic generation; no new dependency and no test-order/env
+        // dependence. The independent product checker covers all words, not
+        // just sampled accepting paths, for each finite graph.
+        let alphabet = [0, 1, 2, DEFAULT_LABEL, encode_negative_label(0), encode_negative_label(2)];
+        for seed in 1..=128u64 {
+            let mut random = seed;
+            let mut next = || {
+                random = random.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+                random
+            };
+            let mut original = UnweightedDfa::new();
+            for _ in 1..9 { original.add_state(); }
+            for state in 0..9u32 {
+                original.set_accepting(state, next() >> 61 == 0 || state == 8);
+                if state == 8 { continue; }
+                for &label in &alphabet {
+                    if next() >> 62 == 0 { continue; }
+                    let target = state + 1 + (next() % (8 - state) as u64) as u32;
+                    original.add_transition(state, label, target);
+                }
+            }
+            let specialized = specialize_template_dfa_defaults_for_commit_determinized(&original);
+            assert_eq!(find_default_specialization_mismatch(&original, &specialized), None,
+                "seed={seed}");
+            assert!(specialized.compute_is_acyclic(), "seed={seed}");
+        }
     }
 
 }
