@@ -659,6 +659,11 @@ pub fn try_split_commit_template_dfas(
     let mut push_map = BTreeMap::new();
     let mut read_source_map = BTreeMap::new();
     let mut read_target_map = BTreeMap::new();
+    // READ compression removes an explicit POP edge from its row. When the
+    // row also has DEFAULT, a rejecting explicit edge must continue to shadow
+    // that fallback. Otherwise x / push(x) becomes READ(x) *plus* DEFAULT(x),
+    // admitting an unrelated stack effect. One shared dead POP state suffices.
+    let mut dead_pop_state = None;
 
     let start = ensure_pop_state(
         dfa.start_state,
@@ -718,6 +723,15 @@ pub fn try_split_commit_template_dfas(
                             &mut read_target_map,
                         );
                         read.add_transition(read_source, label, read_target);
+                        if old.transitions.contains_key(&DEFAULT_LABEL) {
+                            let dead = *dead_pop_state.get_or_insert_with(|| {
+                                let dead = pop.add_state();
+                                pop_to_read.resize(pop.states.len(), None);
+                                pop_to_push.resize(pop.states.len(), None);
+                                dead
+                            });
+                            pop.add_transition(pop_state, label, dead);
+                        }
                         let push_target =
                             ensure_push_state(post_read_target, dfa, &mut push, &mut push_map);
                         read_to_push[read_target as usize] = Some(push_target);
@@ -1495,6 +1509,27 @@ mod tests {
         let dfa = mixed_phase_commit_dfa();
         let split = try_split_commit_template_dfas(&dfa)
             .expect("mixed-phase commit DFA should be splittable");
+        assert_eq!(find_split_commit_language_mismatch(&dfa, &split), None);
+    }
+
+    #[test]
+    fn read_compression_keeps_explicit_default_shadow() {
+        // For top 7: preserve 7 and push 20. For OTHER tops: replace by 30.
+        // There is also an unconditional push 40. Literal action-word
+        // equivalence alone cannot detect losing the exclusion of 7 from
+        // DEFAULT when the explicit pop(7),push(7) pair becomes READ(7).
+        let dfa = mixed_phase_commit_dfa();
+        let split = try_split_commit_template_dfas(&dfa).unwrap();
+        let root = &split.pop.states[split.pop.start_state as usize];
+        let &shadow = root.transitions.get(&7)
+            .expect("READ-compressed label must still shadow DEFAULT");
+        let dead = &split.pop.states[shadow as usize];
+        assert!(!dead.is_accepting && dead.transitions.is_empty());
+        assert!(split.pop_to_read[shadow as usize].is_none());
+        assert!(split.pop_to_push[shadow as usize].is_none());
+        assert!(root.transitions.contains_key(&DEFAULT_LABEL));
+        let read = split.pop_to_read[split.pop.start_state as usize].unwrap();
+        assert!(split.read.states[read as usize].transitions.contains_key(&7));
         assert_eq!(find_split_commit_language_mismatch(&dfa, &split), None);
     }
 

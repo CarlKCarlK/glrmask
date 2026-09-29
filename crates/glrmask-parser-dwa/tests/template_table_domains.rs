@@ -142,3 +142,27 @@ fn default_specialization_retains_feasible_guarded_alternatives_after_reduction(
             "stack={stack:?}");
     }
 }
+
+#[test]
+fn read_compression_does_not_enable_shadowed_default_stack_effects() {
+    use glrmask_finite_automata::unweighted_u32::dfa::DFA;
+    use glrmask_glr::__private::glr::labels::encode_negative_label;
+    let mut dfa = DFA::new();
+    let a = dfa.add_state(); let b = dfa.add_state(); let accept = dfa.add_state();
+    let fallback = dfa.add_state();
+    dfa.add_transition(dfa.start_state, 7, a);
+    dfa.add_transition(a, encode_negative_label(7), b);
+    dfa.add_transition(b, encode_negative_label(20), accept);
+    dfa.add_transition(dfa.start_state, DEFAULT_LABEL, fallback);
+    dfa.add_transition(fallback, encode_negative_label(30), accept);
+    dfa.add_transition(dfa.start_state, encode_negative_label(40), accept);
+    dfa.set_accepting(accept, true);
+    let split = try_split_commit_template_dfas(&dfa).unwrap();
+    for bottom in [0, 7, 9] {
+        assert_eq!(literal_outputs(&split, &[bottom,7]),
+            BTreeSet::from([vec![bottom,7,20], vec![bottom,7,40]]));
+        assert_eq!(literal_outputs(&split, &[bottom,9]),
+            BTreeSet::from([vec![bottom,30], vec![bottom,9,40]]));
+    }
+    assert_eq!(literal_outputs(&split, &[]), BTreeSet::from([vec![40]]));
+}
