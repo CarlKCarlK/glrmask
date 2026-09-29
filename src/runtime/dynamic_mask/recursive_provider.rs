@@ -22,6 +22,9 @@ struct RecursiveConfigTransitions<'scan, 'constraint> {
     rows: Vec<Option<Box<[u64; 256]>>>,
     candidate_futures: Vec<Option<BitSet>>,
     boundary: FxHashMap<(u32, u32), bool>,
+    support_enabled: bool,
+    support_cache: FxHashMap<(u32, usize), Option<super::super::constraint::ScopedAdmissionSupport<'constraint>>>,
+    support_profile: Option<ScopedSupportProfile>,
     projected_resets: FxHashMap<(usize, u32), u32>,
     project_resets: bool,
     // Bound total optional proof work, not just each individual search.
@@ -29,6 +32,12 @@ struct RecursiveConfigTransitions<'scan, 'constraint> {
     #[cfg(test)]
     epsilon_proofs_proved: usize,
     error: Option<String>,
+}
+
+#[derive(Default, Debug)]
+struct ScopedSupportProfile {
+    builds: usize, hits: usize, declined: usize, queries: usize,
+    input_candidates: usize, retained_candidates: usize,
 }
 
 impl<'scan, 'constraint> RecursiveConfigTransitions<'scan, 'constraint> {
@@ -416,6 +425,42 @@ impl FullWalkTransitionTable for RecursiveConfigTransitions<'_, '_> {
         let ignored = self.routing.leaves[leaf].constraint.ignore_terminal
             .map(|terminal| self.routing.leaves[leaf].terminal_offset + terminal);
         let allowed = ignored.is_some_and(|terminal| self.future_contains(lexer_state, terminal)) || {
+            if self.support_enabled {
+                const MAX_SUPPORTS: usize = 32;
+                let key = (parser_node, leaf);
+                if !self.support_cache.contains_key(&key) && self.support_cache.len() < MAX_SUPPORTS {
+                    let gss = self.routing.parser_gss(parser_node, parser_cache);
+                    let summary = self.routing.constraint.prepare_scoped_admission_support(&gss, leaf);
+                    if let Some(profile) = &mut self.support_profile {
+                        profile.builds += 1;
+                        profile.declined += usize::from(summary.is_none());
+                    }
+                    self.support_cache.insert(key, summary);
+                } else if let Some(profile) = &mut self.support_profile {
+                    profile.hits += usize::from(self.support_cache.contains_key(&key));
+                }
+                if self.support_cache.get(&key).is_some_and(Option::is_some) {
+                    self.candidate_scoped_future(lexer_state);
+                    let summary = self.support_cache.get(&key).and_then(Option::as_ref)
+                        .expect("prepared support");
+                    let candidates = self.candidate_futures[lexer_state as usize].as_ref()
+                        .expect("initialized native candidates");
+                    if let Some(profile) = &mut self.support_profile {
+                        profile.queries += 1;
+                        profile.input_candidates += candidates.count_ones();
+                        profile.retained_candidates += summary.retained_count(candidates);
+                    }
+                    let descriptor = self.routing.leaves[leaf];
+                    let table = &mut self.tables[leaf];
+                    let result = summary.matches(candidates, |terminal| {
+                        terminal.checked_sub(descriptor.terminal_offset).is_some_and(|terminal| {
+                            terminal < descriptor.terminal_count && table.future_contains(local, terminal)
+                        })
+                    });
+                    self.boundary.insert((lexer_state, parser_node), result);
+                    return result;
+                }
+            }
             let candidates = self.candidate_scoped_future(lexer_state).clone();
             let gss = self.routing.parser_gss(parser_node, parser_cache);
             constraint.compact_segmented_parser_may_advance_on_any_matching(
@@ -498,6 +543,17 @@ fn with_provider_and_baseline(
         routing, tables, states: Vec::new(), ids: FxHashMap::default(),
         roots: FxHashMap::default(), resets: vec![None; reset_count], rows: Vec::new(),
         candidate_futures: Vec::new(), boundary: FxHashMap::default(),
+        support_enabled: {
+            static ENABLED: OnceLock<bool> = OnceLock::new();
+            *ENABLED.get_or_init(|| env_flag("GLRMASK_CLOSED_ADMISSION_SUPPORT", false))
+        },
+        support_cache: FxHashMap::default(),
+        support_profile: {
+            static GENERATIONS: OnceLock<Vec<u64>> = OnceLock::new();
+            let generations = GENERATIONS.get_or_init(|| std::env::var("GLRMASK_PROFILE_CLOSED_SUPPORT")
+                .unwrap_or_default().split(',').filter_map(|n|n.parse().ok()).collect());
+            generations.contains(&(state.generation as u64)).then(ScopedSupportProfile::default)
+        },
         projected_resets: FxHashMap::default(),
         project_resets: std::env::var_os("GLRMASK_PROFILE_SCOPED_RESET_PROJECTION").is_some(),
         epsilon_proofs_remaining: {
@@ -515,6 +571,9 @@ fn with_provider_and_baseline(
     let result = evaluate(&mut provider);
     if let Some(start) = walk_start {
         eprintln!("[glrmask/profile][recursive_phases] walk_ns={}", start.elapsed().as_nanos());
+    }
+    if let Some(counts) = &provider.support_profile {
+        eprintln!("[closed-support] generation={} enabled={} {:?}", state.generation, provider.support_enabled, counts);
     }
     let finish_start = profile.then(std::time::Instant::now);
     provider.finish()?;
@@ -610,5 +669,110 @@ mod epsilon_reset_boundary_tests {
             }
         }
         assert!(total_proved > 0, "fixture must execute a proved epsilon-only reset");
+    }
+}
+
+#[cfg(test)]
+mod closed_admission_support_tests {
+    use super::*;
+    use crate::{Constraint, Grammar, Vocab};
+    use std::collections::BTreeSet;
+
+    fn mask_with_policy(state: &ConstraintState<'_>, direct: bool) -> (Vec<u32>, usize) {
+        let vocab = state.constraint.dynamic_mask_vocab_for_runtime();
+        let mut mask = vec![u32::MAX; state.constraint.mask_len() + 2];
+        let mut queries = 0;
+        assert!(with_provider(state, vocab.max_token_byte_len(), |provider| {
+            // Select the exact NFA carrier even for deterministic small fixtures.
+            for table in &mut provider.tables { table.cache.deterministic = false; }
+            provider.support_enabled = direct;
+            provider.support_profile = Some(ScopedSupportProfile::default());
+            provider.epsilon_proofs_remaining = 0;
+            let filled = fill_recursive_mask_using_vocab(state, &mut mask, provider, vocab)?;
+            queries = provider.support_profile.as_ref().unwrap().queries;
+            assert!(provider.support_cache.len() <= 32);
+            provider.validate_mask_result()?;
+            Ok(filled)
+        }).unwrap());
+        assert!(mask[state.constraint.mask_len()..].iter().all(|&word| word == 0));
+        (mask, queries)
+    }
+
+    #[test]
+    fn closed_support_preserves_complete_word_masks_predicate_order_and_reentry() {
+        let mut total_queries = 0;
+        for nullable in [false, true] {
+            let leaves = if nullable { vec!["", "a", "ab"] } else { vec!["a", "ab"] };
+            let words: BTreeSet<Vec<u8>> = leaves.iter().flat_map(|a| leaves.iter()
+                .map(move |b| format!("P[{a}]{b}!").into_bytes())).collect();
+            let mut prefixes = BTreeSet::new();
+            let mut tokens = BTreeSet::new();
+            for word in &words {
+                for end in 0..=word.len() { prefixes.insert(word[..end].to_vec()); }
+                for start in 0..word.len() {
+                    for end in start+1..=word.len() { tokens.insert(word[start..end].to_vec()); }
+                }
+            }
+            tokens.extend([vec![], vec![0, 255], b"z".to_vec(), b"ab!!".to_vec()]);
+            let mut entries: Vec<_> = tokens.into_iter().enumerate()
+                .map(|(i, t)| (i as u32 * 3, t)).collect();
+            entries.push((7001, b"a]!".to_vec()));
+            entries.push((7003, b"a]!".to_vec()));
+            let vocab = Vocab::new(entries.clone());
+            let child_source = if nullable {
+                r#"glrm 1; start leaf; t W = "a" | "ab"; nt leaf = W?;"#
+            } else {
+                r#"glrm 1; start leaf; t W = "a" | "ab"; nt leaf = W;"#
+            };
+            let outer = Constraint::compile(Grammar::glrm(
+                r#"glrm 1; start root; extern grammar leaf; nt root = "P[" leaf "]" leaf "!";"#,
+            ), &vocab).unwrap();
+            let child = Constraint::compile(Grammar::glrm(child_source), &vocab).unwrap();
+            let bound = outer.bind_grammar_dynamic_boundary("leaf", child).unwrap();
+            let loaded = Constraint::load(bound.save()).unwrap();
+            for constraint in [&bound, &loaded] {
+                for prefix in &prefixes {
+                    let mut state = constraint.start();
+                    state.commit_bytes(prefix).unwrap();
+                    let (reference, _) = mask_with_policy(&state, false);
+                    let (actual, queries) = mask_with_policy(&state, true);
+                    total_queries += queries;
+                    assert_eq!(actual, reference, "prefix={prefix:?} nullable={nullable}");
+                    for (id, token) in &entries {
+                        let expected = !token.is_empty() && words.iter().any(|word| {
+                            word.len() >= prefix.len() + token.len() && word.starts_with(prefix)
+                                && word[prefix.len()..].starts_with(token)
+                        });
+                        assert_eq!(actual[*id as usize/32] & (1 << (id%32)) != 0, expected);
+                    }
+                    let layout = constraint.recursive_parser_layout().unwrap().unwrap();
+                    for leaf in 0..layout.leaves.len() {
+                        let child = constraint.recursive_leaf_constraint(leaf).unwrap();
+                        let base = layout.outer_terminal_count + layout.leaf_terminal_offsets[leaf];
+                        for gss in state.state.values() {
+                            // Compare all predicate outcomes and invocation order.
+                            for modulus in [1, 2, 3] {
+                                let mut old_seen = Vec::new();
+                                let old = constraint.compact_segmented_parser_may_advance_on_any_matching(
+                                    gss, base..base+child.table.num_terminals,
+                                    |t| { old_seen.push(t); t%modulus==0 },
+                                );
+                                let mut new_seen = Vec::new();
+                                let prepared = constraint.prepare_scoped_admission_support(gss, leaf)
+                                    .expect("bounded fixture support");
+                                let mut candidates = BitSet::new((base + child.table.num_terminals) as usize);
+                                for t in base..base+child.table.num_terminals { candidates.set(t as usize); }
+                                let new = Some(prepared.matches(&candidates,
+                                    |t| { new_seen.push(t); t%modulus==0 }));
+                                assert_eq!(old,new);
+                                assert_eq!(old_seen,new_seen,"predicate order must not change");
+                            }
+                            assert!(constraint.prepare_scoped_admission_support(gss, usize::MAX).is_none());
+                        }
+                    }
+                }
+            }
+        }
+        assert!(total_queries > 0, "fixture must actually execute closed support");
     }
 }
