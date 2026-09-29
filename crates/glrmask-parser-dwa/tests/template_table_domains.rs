@@ -208,3 +208,36 @@ fn mixed_guarded_shift_and_nonreplacing_reduce_keeps_both_paths() {
         }
     }
 }
+
+
+#[test]
+fn fallible_selected_characterization_rejects_cycles_without_panicking_or_fallback() {
+    use glrmask_parser_dwa::__private::templates::characterize::
+        try_characterize_selected_terminals_for_terminal_count;
+
+    // This reduction crosses its pushed goto prefix, consumes another input
+    // predecessor, and may repeat until it finds state 2 and reaches a shift.
+    // Unlike a pure no-output epsilon loop, it has unbounded productive stack
+    // inspection, so the characterizer must decline acyclic certification.
+    let actions = [vec![], vec![(0, Action::Reduce(0, 2))], vec![],
+        vec![(0, Action::Shift(4, false))], vec![]];
+    let gotos = [vec![(0, (1, false))], vec![], vec![(0, (3, false))], vec![], vec![]];
+    let cyclic = build_test_table(5, 1,
+        &actions.iter().map(Vec::as_slice).collect::<Vec<_>>(),
+        &gotos.iter().map(Vec::as_slice).collect::<Vec<_>>());
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(||
+        try_characterize_selected_terminals_for_terminal_count(&cyclic, 1, &[true])));
+    let error = result.expect("unsupported reduction cycles must return an error")
+        .expect_err("a cyclic relation must not be truncated or accepted");
+    assert!(error.contains("terminal 0") && error.contains("reduction cycle"), "{error}");
+    assert!(try_characterize_selected_terminals_for_terminal_count(&cyclic, 1, &[false])
+        .unwrap().is_empty(), "an unselected relation requires no characterization");
+    assert!(try_characterize_selected_terminals_for_terminal_count(&cyclic, 1, &[]).is_err());
+
+    let actions = [vec![(0, Action::Shift(1, false))], vec![(0, Action::Skip)]];
+    let acyclic = build_test_table(2, 1,
+        &actions.iter().map(Vec::as_slice).collect::<Vec<_>>(), &[&[], &[]]);
+    assert_eq!(try_characterize_selected_terminals_for_terminal_count(&acyclic, 1, &[true]).unwrap(),
+        characterize_selected_terminals_for_terminal_count(&acyclic, 1, &[true]),
+        "the fallible API must preserve the ordinary bounded relation exactly");
+}

@@ -14,7 +14,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use glrmask_parser_dwa::__private::templates::admissibility::{DomainProbe, TemplateDomain, TopAdmission};
-use glrmask_parser_dwa::__private::templates::characterize::characterize_selected_terminals_for_terminal_count;
+use glrmask_parser_dwa::__private::templates::characterize::try_characterize_selected_terminals_for_terminal_count;
 use glrmask_parser_dwa::__private::templates::compile_dfa::{
     Templates, specialize_template_dfa_defaults_for_commit_split_input, try_split_commit_template_dfas,
 };
@@ -429,7 +429,8 @@ impl Constraint {
             sparse_regular_templates(self.direct_regular_automaton.as_ref().unwrap(), terminal_count)?
         } else {
             let selected = vec![true; terminal_count as usize];
-            let characterizations = characterize_selected_terminals_for_terminal_count(&self.table, terminal_count, &selected);
+            let characterizations = try_characterize_selected_terminals_for_terminal_count(&self.table, terminal_count, &selected)
+                .map_err(crate::Error::Compilation)?;
             let raw = Templates::from_characterizations(&characterizations);
             let mut templates = vec![None; terminal_count as usize];
             for (terminal, dfa) in raw.by_terminal {

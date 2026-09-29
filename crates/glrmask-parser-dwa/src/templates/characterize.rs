@@ -1297,11 +1297,11 @@ fn characterize_nt_continuations_for_top_states(
     }
 }
 
-fn characterize_terminal(
+fn try_characterize_terminal(
     table: &GLRTable,
     index: &CharacterizationIndex,
     terminal: TerminalID,
-) -> TerminalCharacterization {
+) -> Result<TerminalCharacterization, String> {
     let mut output = CharacterizationOutput::default();
     characterize_initial_actions_for_terminal(table, index, terminal, &mut output);
     characterize_nt_continuations_for_terminal(table, index, terminal, &mut output);
@@ -1327,16 +1327,23 @@ fn characterize_terminal(
     };
 
     if let Some(cycle) = characterization.find_cycle() {
-        panic!(
-            "terminal characterization for terminal {} contains a reduction cycle: {:?}",
-            terminal,
-            cycle
-        );
+        return Err(format!(
+            "terminal characterization for terminal {terminal} contains a reduction cycle: {cycle:?}",
+        ));
     }
 
-    characterization
+    Ok(characterization)
 }
 
+fn characterize_terminal(
+    table: &GLRTable,
+    index: &CharacterizationIndex,
+    terminal: TerminalID,
+) -> TerminalCharacterization {
+    // Keep the established compiler API while callers that accept arbitrary
+    // frontends can explicitly reject an unsupported finite relation.
+    try_characterize_terminal(table, index, terminal).unwrap_or_else(|error| panic!("{error}"))
+}
 
 pub fn characterize_terminals(
     table: &GLRTable,
@@ -1366,11 +1373,23 @@ pub fn characterize_selected_terminals_for_terminal_count(
     num_terminals: u32,
     selected: &[bool],
 ) -> BTreeMap<TerminalID, TerminalCharacterization> {
-    assert_eq!(
-        selected.len(),
-        num_terminals as usize,
-        "selected template mask must cover the terminal domain",
-    );
+    try_characterize_selected_terminals_for_terminal_count(table, num_terminals, selected)
+        .unwrap_or_else(|error| panic!("{error}"))
+}
+
+/// Fallible count-only characterization for a caller that requires acyclic
+/// per-terminal programs. A cyclic reduction relation is unsupported, not a
+/// reason to truncate the language, retain an LR fallback, or panic in a
+/// fallible public grammar build. Unselected terminals are not characterized.
+/// Existing compiler entry points retain their established infallible contract.
+pub fn try_characterize_selected_terminals_for_terminal_count(
+    table: &GLRTable,
+    num_terminals: u32,
+    selected: &[bool],
+) -> Result<BTreeMap<TerminalID, TerminalCharacterization>, String> {
+    if selected.len() != num_terminals as usize {
+        return Err("selected template mask must cover the terminal domain".to_owned());
+    }
     let profile = std::env::var_os("GLRMASK_PROFILE_COMPOSE").is_some();
     let total_started = profile.then(Instant::now);
     let index_started = profile.then(Instant::now);
@@ -1394,8 +1413,8 @@ pub fn characterize_selected_terminals_for_terminal_count(
     let signature_ms = signature_started.map_or(0.0, elapsed_ms);
     let characterize_started = profile.then(Instant::now);
     let characterize_group = |terminals: &Vec<TerminalID>| {
-        let characterization = characterize_terminal(table, &index, terminals[0]);
-        (terminals.clone(), characterization)
+        try_characterize_terminal(table, &index, terminals[0])
+            .map(|characterization| (terminals.clone(), characterization))
     };
     let characterized = if super::macro_parallelism_disabled() {
         let mut timings = Vec::with_capacity(groups.len());
@@ -1407,11 +1426,11 @@ pub fn characterize_selected_terminals_for_terminal_count(
                 timings.push(elapsed_ms(started));
                 result
             })
-            .collect::<Vec<_>>();
+            .collect::<Result<Vec<_>, String>>()?;
         super::report_macro_item_timings("selected_terminal_characterization", &timings);
         characterized
     } else {
-        groups.par_iter().map(characterize_group).collect::<Vec<_>>()
+        groups.par_iter().map(characterize_group).collect::<Result<Vec<_>, String>>()?
     };
     let characterize_ms = characterize_started.map_or(0.0, elapsed_ms);
 
@@ -1431,7 +1450,7 @@ pub fn characterize_selected_terminals_for_terminal_count(
             elapsed_ms(total_started),
         );
     }
-    result
+    Ok(result)
 }
 
 
