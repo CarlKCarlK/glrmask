@@ -53,6 +53,7 @@ pub fn commit_template_dfas_enabled() -> bool {
     env_flag("GLRMASK_ENABLE_COMMIT_TEMPLATE_DFAS").unwrap_or(false)
 }
 
+pub(crate) mod admissibility;
 pub(crate) mod characterize;
 pub(crate) mod compile_bundle;
 pub(crate) mod compile_dfa;

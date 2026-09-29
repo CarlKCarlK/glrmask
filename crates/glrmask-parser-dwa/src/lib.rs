@@ -88,6 +88,9 @@ pub mod __private {
     }
     pub mod templates {
         pub use crate::templates::*;
+        pub mod admissibility {
+            pub use crate::templates::admissibility::*;
+        }
         pub mod characterize {
             pub use crate::templates::characterize::*;
         }
