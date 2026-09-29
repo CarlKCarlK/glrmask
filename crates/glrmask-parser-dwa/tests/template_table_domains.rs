@@ -8,7 +8,7 @@ use std::collections::BTreeSet;
 use glrmask_glr::__private::glr::labels::{DEFAULT_LABEL, negative_to_positive_label};
 use glrmask_glr::__private::glr::{
     accumulator::TerminalsDisallowed,
-    parser::{ParserGSS, advance_stacks, stack_may_advance_on},
+    parser::{ParserGSS, advance_stacks, advance_stacks_owned, advance_stacks_profiled, stack_may_advance_on},
     table::{Action, AdmissionPolicy, GLRTable, GuardedStackShift, StackShift, StackShiftGuard, testing::build_test_table},
 };
 use glrmask_parser_dwa::__private::templates::{
@@ -165,4 +165,46 @@ fn read_compression_does_not_enable_shadowed_default_stack_effects() {
             BTreeSet::from([vec![bottom,30], vec![bottom,9,40]]));
     }
     assert_eq!(literal_outputs(&split, &[]), BTreeSet::from([vec![40]]));
+}
+
+#[test]
+fn mixed_guarded_shift_and_nonreplacing_reduce_keeps_both_paths() {
+    // Minimized from Codecov: the fast combined predecessor-remap handles
+    // replacing gotos only. A non-replacing goto is unsupported, NOT dead.
+    // The relation is distributive: [0,1,2] -> [0,7], [0,3] -> [0,5].
+    for chained in [false, true] {
+        let actions = [
+            vec![], vec![],
+            vec![(0, Action::GuardedStackShifts(vec![GuardedStackShift {
+                guards: vec![StackShiftGuard { pop: 1, states: vec![1] }],
+                pop: 2, pushes: vec![7],
+            }]))],
+            vec![(0, Action::Reduce(0,1))],
+            vec![(0, if chained { Action::Reduce(1,1) } else { Action::Shift(5,true) })],
+            vec![], vec![(0,Action::Shift(5,true))], vec![],
+        ];
+        let gotos = [vec![(0,(4,false)),(1,(6,false))],vec![],vec![],vec![],vec![],vec![],vec![],vec![]];
+        let table=build_test_table(8,1,&actions.iter().map(Vec::as_slice).collect::<Vec<_>>(),
+            &gotos.iter().map(Vec::as_slice).collect::<Vec<_>>());
+        let expected=BTreeSet::from([vec![0,5],vec![0,7]]);
+        let split=split_template(&table);
+        let mut literal=literal_outputs(&split,&[0,1,2]);
+        literal.extend(literal_outputs(&split,&[0,3]));
+        assert_eq!(literal,expected,"literal relation chained={chained}");
+        for reverse in [false,true] {
+            let mut inputs=vec![(vec![0,1,2],TerminalsDisallowed::new()),(vec![0,3],TerminalsDisallowed::new())];
+            if reverse { inputs.reverse(); }
+            let gss=ParserGSS::from_stacks(&inputs);
+            for (kind, result) in [
+                ("borrowed", advance_stacks(&table, &gss, 0)),
+                ("owned", advance_stacks_owned(&table, gss.clone(), 0)),
+                ("profiled", advance_stacks_profiled(&table, &gss, 0).0),
+            ] {
+                let actual: BTreeSet<_> = result.to_stacks(100).unwrap()
+                    .into_iter().map(|(stack, _)| stack).collect();
+                assert_eq!(actual, expected,
+                    "combined LR kernel {kind} chained={chained} reverse={reverse}");
+            }
+        }
+    }
 }

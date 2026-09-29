@@ -2598,9 +2598,16 @@ fn try_advance_pop1_reduce_guarded_stackshift_wave(
                     _ => None,
                 };
                 if let Some(nt) = reduction_nt {
-                    let Some((goto_target, true)) = table.goto_target(*predecessor, nt) else {
+                    let Some((goto_target, goto_replace)) = table.goto_target(*predecessor, nt) else {
                         return Ok(None);
                     };
+                    // This structural remap replaces both the old top and its
+                    // predecessor. A non-replacing goto needs to keep that
+                    // predecessor, so decline the optimization rather than
+                    // incorrectly treating the live reduction branch as dead.
+                    if !goto_replace {
+                        return Err(());
+                    }
                     let Some(next_action) = table.action(goto_target, token) else {
                         return Ok(None);
                     };
