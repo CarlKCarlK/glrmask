@@ -4837,12 +4837,52 @@ fn provider_reduction_input_is_uniform_empty(stack: &ParserGSS) -> bool {
         && stack.all_accs_satisfy(TerminalsDisallowed::is_empty)
 }
 
+// Keep the eager initializer available as an explicit diagnostic fallback.
+// The default avoids work only when the exact first action is absent, or when
+// this traversal never needs a Completion semantic key.
+fn provider_light_start_policy(value: Option<&str>) -> bool {
+    value.is_none_or(|value| matches!(value, "1" | "true"))
+}
+
 fn advance_provider_traversal_with_policy<P: ParserActionProvider, const REDUCTION_PREFIX: bool, const RESUME: bool>(
     provider: &P,
-    mut closure: ParserGSS,
+    closure: ParserGSS,
     symbol: P::Symbol,
     mode: ProviderAdvanceMode,
 ) -> ProviderAdvanceResult {
+    static LIGHT_START: OnceLock<bool> = OnceLock::new();
+    if *LIGHT_START.get_or_init(|| {
+        provider_light_start_policy(std::env::var("GLRMASK_PROVIDER_LIGHT_START").ok().as_deref())
+    })
+    {
+        advance_provider_traversal_with_initialization::<P, REDUCTION_PREFIX, RESUME, true>(
+            provider, closure, symbol, mode,
+        )
+    } else {
+        advance_provider_traversal_with_initialization::<P, REDUCTION_PREFIX, RESUME, false>(
+            provider, closure, symbol, mode,
+        )
+    }
+}
+
+// Reuse the first queried action so live frontiers do not pay for a second
+// probe. A missing action for the sole visible top is exactly the reference
+// first wave with no shifted/reduced/accepted output. An epsilon alternative
+// has no visible top and cannot add a transition for this symbol either.
+fn advance_provider_traversal_with_initialization<
+    P: ParserActionProvider, const REDUCTION_PREFIX: bool, const RESUME: bool,
+    const LIGHT_START: bool,
+>(
+    provider: &P, mut closure: ParserGSS, symbol: P::Symbol, mode: ProviderAdvanceMode,
+) -> ProviderAdvanceResult {
+    let mut first_action = if LIGHT_START {
+        if let Some(state) = closure.single_top_value() {
+            match provider.action(state, symbol) {
+                Some(provided) => Some((state, provided)),
+                None => return ProviderAdvanceResult { shifted: ParserGSS::empty(), accepted: false },
+            }
+        } else { None }
+    } else { None };
     let reduction_prefix_eligible = REDUCTION_PREFIX
         && mode == ProviderAdvanceMode::Advance
         && provider_reduction_input_is_uniform_empty(&closure);
@@ -4850,15 +4890,21 @@ fn advance_provider_traversal_with_policy<P: ParserActionProvider, const REDUCTI
     let mut shifted = ParserGSS::empty();
     let mut accepted = false;
     let mut visited = FxHashSet::<u32>::default();
-    let mut key_interner = GssSemanticKeyInterner::<u32, TerminalsDisallowed>::new();
+    // Only Completion reduction cycles use semantic keys. Advance and
+    // immediately resolved Completion queries must not initialize that table.
+    let mut key_interner = (!LIGHT_START)
+        .then(GssSemanticKeyInterner::<u32, TerminalsDisallowed>::new);
 
     loop {
         let mut next = ParserGSS::empty();
 
         for state in closure.peek_values() {
-            let Some(provided) = provider.action(state, symbol) else {
-                continue;
+            let provided = if first_action.as_ref().is_some_and(|(top, _)| *top == state) {
+                first_action.take().map(|(_, provided)| provided)
+            } else {
+                provider.action(state, symbol)
             };
+            let Some(provided) = provided else { continue; };
             let isolated = closure.isolate(Some(state));
             if reduction_prefix_eligible
                 && reduction_steps_remaining != 0 && provided.extra_stack_shifts.is_empty()
@@ -4938,7 +4984,7 @@ fn advance_provider_traversal_with_policy<P: ParserActionProvider, const REDUCTI
                             };
                             if mode == ProviderAdvanceMode::Completion {
                                 if !branch.is_empty() {
-                                    let key = key_interner.key(&branch);
+                                    let key = key_interner.get_or_insert_with(GssSemanticKeyInterner::new).key(&branch);
                                     if visited.insert(key) {
                                         merge_into(&mut next, branch);
                                     }

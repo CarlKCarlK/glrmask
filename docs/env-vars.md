@@ -157,3 +157,41 @@ certified depth. This does not cache parser results between mask calls.
 
 These changes reduce measured boundary costs; they do not guarantee that every
 boundary invocation is as cheap as its ordinary non-boundary contribution.
+
+## Provider traversal initialization
+
+`GLRMASK_PROVIDER_LIGHT_START` defaults to enabled. A single-top provider query
+reuses its exact first action lookup and skips traversal setup when that action
+is absent. Semantic-key storage is initialized only when a Completion reduction
+actually needs it. Parser actions, guards, scopes, zero-width controls, and
+completion-cycle detection are unchanged. This is shared parser machinery, not
+a composition-specific token walker or a cross-mask parser-result cache.
+
+Set `GLRMASK_PROVIDER_LIGHT_START=0` to use the previous eager initialization for
+differential diagnosis. Explicit `1` and `true` enable the new initialization;
+other explicit values disable it. The policy is read once per process.
+
+## Control-closed admission support
+
+`GLRMASK_CLOSED_ADMISSION_SUPPORT` defaults to enabled. During one recursive mask
+invocation, a bounded summary retains the exact input control closure and the
+current first-action terminal support for a parser frontier and lexer leaf.
+Only candidates lacking any first action are removed. Surviving candidates
+still use the existing parser evaluator and exact lexical predicate, in their
+original order. The summary is never reused across masks or constraints.
+
+At most 32 summaries are retained per invocation. Summary eligibility is capped
+at 4,096 terminals, 16 visible tops, 4,096 inspected row keys, and stack depth
+256. Unsupported metadata or exceeded limits use the original query; limits
+never truncate the parser language. Summary construction and destruction are
+part of the measured boundary cost, not hidden preparation work.
+
+These are summary eligibility and retention limits, not a strict bound on
+control-closure CPU time or temporary memory. The full reference control
+closure is computed before some eligibility checks. A declined summary can
+therefore repeat that closure in the original fallback.
+
+Set `GLRMASK_CLOSED_ADMISSION_SUPPORT=0` to retain the previous unfiltered
+admission path for diagnosis. `GLRMASK_PROFILE_CLOSED_SUPPORT` accepts a
+comma-separated list of generation numbers for diagnostic summary counters;
+it is off unless explicitly set, and profiling timings are not benchmark data.

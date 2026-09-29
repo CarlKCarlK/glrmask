@@ -1,5 +1,9 @@
 # Final-mask replay cleanup
 
+> Historical checkpoint: this document retains its original scope and measurements.
+> See [structural-overhaul architecture and validation](structural-overhaul.md)
+> for the current navigation and the final-candidate readiness record.
+
 ## Scope
 
 This change sits on a frozen copy of the integrated overhaul, commit

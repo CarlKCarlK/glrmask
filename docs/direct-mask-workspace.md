@@ -1,5 +1,9 @@
 # Direct static-mask workspace
 
+> Historical checkpoint: this document retains its original scope and measurements.
+> See [structural-overhaul architecture and validation](structural-overhaul.md)
+> for the current navigation and the final-candidate readiness record.
+
 `runtime/mask/single_path.rs` owns admission, explicit-path evaluation, and
 optional repeated-stack plans for static masking. It is an internal refactor;
 the public API, vocabulary partitioning, and artifact representation are unchanged.

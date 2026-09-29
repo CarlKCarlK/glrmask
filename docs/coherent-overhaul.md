@@ -1,5 +1,9 @@
 # Coherent runtime and artifact overhaul
 
+> Historical checkpoint: this document retains its original scope and measurements.
+> See [structural-overhaul architecture and validation](structural-overhaul.md)
+> for the current navigation and the final-candidate readiness record.
+
 This checkpoint combines the reviewed runtime work in one source tree. The
 public Rust/Python facade and the private vocabulary-partition implementation
 are unchanged from the full-width coordinate checkpoint. Correctness and

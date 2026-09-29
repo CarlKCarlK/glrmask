@@ -11,11 +11,13 @@ mod observations;
 mod parser;
 mod parser_cache;
 mod recursive_parser;
+mod scoped_admission_support;
 mod regular;
 mod vocabulary;
 mod weights;
 
 pub use super::artifact::Constraint;
+pub(crate) use scoped_admission_support::ScopedAdmissionSupport;
 pub(crate) use super::mask_mapping::{DeltaReplayProfileStats, DenseToBufProfileStats};
 pub(crate) use weights::{RuntimeTokenSetRef, RuntimeWeightRef};
 pub(crate) use mask_cache::{InternalTokenMaskPrebuild, TokenMaskCachePrebuild};
