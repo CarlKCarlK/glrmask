@@ -325,3 +325,42 @@ fn single_path_monotone_cache_generated_replays_match_original_id_unions() {
     assert!(admitted >= 96, "generated trials must actually exercise reuse");
     assert!(declined >= 96, "all deliberate removals must decline");
 }
+
+#[test]
+fn bounded_monotone_growth_preserves_the_budget_and_late_removals() {
+    let previous = [0u64, 0, 1];
+    assert!(bounded_monotone_growth(&previous, &[u64::MAX, 0, 1]));
+    assert!(!bounded_monotone_growth(&previous, &[u64::MAX, 1, 1]));
+    assert!(!bounded_monotone_growth(&previous, &[1, 0, 0]));
+    assert!(!bounded_monotone_growth(&previous, &[0, 0]));
+    assert!(bounded_monotone_growth(&previous, &previous));
+    for word in 0..3 {
+        for added in 0..=64 {
+            let mut current = previous;
+            let bits = if added == 64 { u64::MAX } else { (1u64 << added) - 1 };
+            current[word] |= bits;
+            let reference = previous.iter().zip(current).all(|(&p, c)| p & !c == 0)
+                && previous.iter().zip(current)
+                    .map(|(&p, c)| (c & !p).count_ones()).sum::<u32>() <= 64;
+            assert_eq!(bounded_monotone_growth(&previous, &current), reference);
+        }
+    }
+}
+
+#[test]
+fn single_path_monotone_broad_growth_declines_without_writes() {
+    for backing in [None, Some(0), Some(1)] {
+        let constraint = monotone_projection_fixture(backing);
+        let state = constraint.start();
+        let previous = vec![1u64, 0, 0, 0];
+        let current = vec![u64::MAX, u64::MAX, u64::MAX, 1];
+        state.store_mask_cache(&projection_oracle(&constraint, &previous), &previous);
+        let mut output = vec![0x7654_3210; constraint.body_mask_len()];
+        let unchanged = output.clone();
+        assert!(!state.try_replay_monotone_dense_cache(&current, &mut output));
+        assert_eq!(output, unchanged);
+        output.fill(0);
+        constraint.or_internal_dense_to_buf_fast(&current, &mut output, true);
+        assert_eq!(output, projection_oracle(&constraint, &current));
+    }
+}

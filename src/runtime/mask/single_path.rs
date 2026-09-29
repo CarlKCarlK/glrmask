@@ -23,6 +23,27 @@ use super::{
     mask_single_path_to_stacks_fallback_disabled, walk_single_stack,
 };
 
+// Speculative delta pricing must stay cheaper than simply rebuilding a mask.
+// This budget limits the optimization, never the set of admitted tokens.
+const MAX_MONOTONE_MASK_ADDITIONS: u32 = 64;
+
+fn bounded_monotone_growth(previous: &[u64], current: &[u64]) -> bool {
+    if previous.len() != current.len() {
+        return false;
+    }
+    let mut additions = 0u32;
+    for (&old, &new) in previous.iter().zip(current) {
+        if old & !new != 0 {
+            return false;
+        }
+        additions += (new & !old).count_ones();
+        if additions > MAX_MONOTONE_MASK_ADDITIONS {
+            return false;
+        }
+    }
+    true
+}
+
 type SinglePathMaskPath = (
     u32,
     TerminalsDisallowed,
@@ -464,11 +485,13 @@ impl ConstraintState<'_> {
             return true;
         }
 
+        // Prove the complete subset relation and bound new work before
+        // pricing any aliases. Broad growth uses the ordinary exact rebuild.
+        if !bounded_monotone_growth(&previous.merged_dense, merged) {
+            return false;
+        }
         let mut added_cost = 0u64;
         for (wi, (&current, &old)) in merged.iter().zip(&previous.merged_dense).enumerate() {
-            if old & !current != 0 {
-                return false;
-            }
             let added = current & !old;
             if added == 0 {
                 continue;
