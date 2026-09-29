@@ -32,7 +32,9 @@ pub(crate) fn advance_stacks_template_dfa(
         .template_dfas_by_terminal
         .get(terminal as usize)?
         .as_ref()?;
-    Some(advance_with_template(dfa, stack.clone()))
+    let output = advance_with_template(dfa, stack.clone());
+    debug_validate_template_output(dfa, stack, &output, terminal);
+    Some(output)
 }
 
 pub(super) fn advance_stacks_template_dfa_owned(
@@ -44,7 +46,101 @@ pub(super) fn advance_stacks_template_dfa_owned(
         .template_dfas_by_terminal
         .get(terminal as usize)?
         .as_ref()?;
-    Some(advance_with_template(dfa, stack))
+    let input = debug_template_literal_enabled().then(|| stack.clone());
+    let output = advance_with_template(dfa, stack);
+    if let Some(input) = input { debug_validate_template_output(dfa, &input, &output, terminal); }
+    Some(output)
+}
+
+// Opt-in independent interpreter used only to diagnose relation/GSS errors.
+// It never references an LR table and is excluded from timed runs.
+fn debug_template_literal_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| std::env::var_os("GLRMASK_DIAG_TEMPLATE_LITERAL").is_some())
+}
+
+fn debug_validate_template_output(
+    template: &CommitTemplateDfas, input: &ParserGSS, output: &ParserGSS, terminal: u32,
+) {
+    if !debug_template_literal_enabled() { return; }
+    let Some(inputs) = input.to_stacks(4_096) else { return; };
+    let mut outputs = Vec::new();
+    let mut operations = 0usize;
+    for (stack, accumulator) in &inputs {
+        let mut work = vec![(Phase::Pop, template.pop.start_state, stack.clone())];
+        let mut visited = rustc_hash::FxHashSet::default();
+        while let Some((phase, id, stack)) = work.pop() {
+            operations += 1;
+            if operations > 1_000_000 { return; }
+            if !visited.insert((phase, id, stack.clone())) { continue; }
+            let state = match phase {
+                Phase::Pop => &template.pop.states[id as usize],
+                Phase::Read => &template.read.states[id as usize],
+                Phase::Push => &template.push.states[id as usize],
+            };
+            if state.is_accepting { outputs.push((stack.clone(), accumulator.clone())); }
+            match phase {
+                Phase::Pop => {
+                    if let Some(&top) = stack.last() {
+                        if let Some(&next) = state.transitions.get(&(top as i32))
+                            .or_else(|| state.transitions.get(&DEFAULT_LABEL)) {
+                            let mut popped = stack.clone(); popped.pop();
+                            work.push((Phase::Pop, next, popped));
+                        }
+                    }
+                    if let Some(next) = template.pop_to_read[id as usize] {
+                        work.push((Phase::Read, next, stack.clone()));
+                    }
+                    if let Some(next) = template.pop_to_push[id as usize] {
+                        work.push((Phase::Push, next, stack));
+                    }
+                }
+                Phase::Read => {
+                    if let Some(top) = stack.last() {
+                        if let Some(&next) = state.transitions.get(&(*top as i32)) {
+                            work.push((Phase::Read, next, stack.clone()));
+                        }
+                    }
+                    if let Some(next) = template.read_to_push[id as usize] {
+                        work.push((Phase::Push, next, stack));
+                    }
+                }
+                Phase::Push => {
+                    for (&label, &next) in &state.transitions {
+                        let mut pushed = stack.clone();
+                        pushed.push(negative_to_positive_label(label) as u32);
+                        work.push((Phase::Push, next, pushed));
+                    }
+                }
+            }
+        }
+    }
+    if terminal == 1 && std::env::var_os("GLRMASK_DIAG_TEMPLATE_TRACE").is_some() {
+        use std::io::Write;
+        let path = std::env::var("GLRMASK_DIAG_TEMPLATE_TRACE").unwrap();
+        let mut file = std::fs::OpenOptions::new().create(true).append(true).open(path).unwrap();
+        let record = serde_json::json!({
+            "terminal":terminal,
+            "input":inputs.iter().map(|(stack,_)|stack).collect::<Vec<_>>(),
+            "output":outputs.iter().map(|(stack,_)|stack).collect::<Vec<_>>(),
+            "accumulators":format!("{inputs:?}"),
+        });
+        writeln!(file, "{record}").unwrap();
+    }
+    let expected = ParserGSS::from_stacks(&outputs);
+    if output.semantically_eq(&expected, 65_536) != Some(true) {
+        let fixture = serde_json::json!({
+            "terminal":terminal,"template":template,
+            "input_stacks":inputs.iter().map(|(stack,_)|stack).collect::<Vec<_>>(),
+            "literal_stacks":outputs.iter().map(|(stack,_)|stack).collect::<Vec<_>>(),
+            "actual_stacks":output.to_stacks(4096).map(|stacks|stacks.into_iter().map(|(stack,_)|stack).collect::<Vec<_>>()),
+            "input_debug":format!("{input:?}"),
+        });
+        let path = std::env::var("GLRMASK_DIAG_TEMPLATE_LITERAL_PATH")
+            .unwrap_or_else(|_| "template-literal-difference.json".into());
+        std::fs::write(path, serde_json::to_vec(&fixture).unwrap()).unwrap();
+        panic!("template GSS output differs from independent literal interpretation for terminal {terminal}");
+    }
 }
 
 pub(crate) struct TemplateAdvanceRuntime {
@@ -552,6 +648,169 @@ fn evaluate_template_language(
 fn advance_with_template(template: &CommitTemplateDfas, stack: ParserGSS) -> ParserGSS {
 
     let mut output = ParserGSS::empty();
+    // Uniform annotations make branch-order changes immaterial. Keep the
+    // established merge order for an input with correlated annotations; this
+    // optimization does not redefine weighted-path normalization.
+    let sparse_input = stack.single_interface_lower_id().is_some();
+    let mut worklist = SmallVec::<[(Phase, u32, ParserGSS); 8]>::new();
+    worklist.push((Phase::Pop, template.pop.start_state, stack));
+    // Retain every visited source GSS. Raw pointer keys alone are not safe:
+    // temporary isolate/push results can be dropped and their addresses reused
+    // later in the same evaluation.
+    let mut visited = FxHashMap::<(Phase, u32, usize), ParserGSS>::default();
+
+    while let Some((phase, state_id, gss)) = worklist.pop() {
+        if gss.is_empty() {
+            continue;
+        }
+        let visit_key = (phase, state_id, gss.ptr_key());
+        if let Some(source) = visited.get(&visit_key) {
+            debug_assert!(source.ptr_eq(&gss));
+            continue;
+        }
+        visited.insert(visit_key, gss.clone());
+
+        match phase {
+            Phase::Pop => {
+                let Some(dfa_state) = template.pop.states.get(state_id as usize) else {
+                    continue;
+                };
+                if dfa_state.is_accepting {
+                    output = output.merge(&gss);
+                }
+
+                if sparse_input {
+                    // Intersect the automaton row with the actual GSS frontier,
+                    // not with every stack symbol in the grammar. A JSON/JS
+                    // template row can contain hundreds of labels while the live
+                    // GSS typically exposes only one or two. DEFAULT still has
+                    // lower priority than *every* explicit edge, including a
+                    // rejecting edge retained as a wildcard exception.
+                    if let Some(top) = gss.single_exclusive_top_value() {
+                        if let Some(&target) = dfa_state.transitions.get(&(top as i32))
+                            .or_else(|| dfa_state.transitions.get(&DEFAULT_LABEL))
+                        {
+                            worklist.push((Phase::Pop, target, gss.popn(1)));
+                        }
+                    } else {
+                        for top in gss.peek_values() {
+                            if let Some(&target) = dfa_state.transitions.get(&(top as i32))
+                                .or_else(|| dfa_state.transitions.get(&DEFAULT_LABEL))
+                            {
+                                let branch = gss.pop_top_value(&top);
+                                if !branch.is_empty() {
+                                    worklist.push((Phase::Pop, target, branch));
+                                }
+                            }
+                        }
+                    }
+                } else {
+                    for (&label, &target) in &dfa_state.transitions {
+                        if is_negative_label(label) {
+                            panic!(
+                                "commit template pop DFA contains push label {label} at state {state_id}"
+                            );
+                        }
+                        if label != DEFAULT_LABEL && label >= 0 {
+                            let state = label as u32;
+                            let branch = gss.isolate(Some(state)).popn(1);
+                            if !branch.is_empty() {
+                                worklist.push((Phase::Pop, target, branch));
+                            }
+                        }
+                    }
+                    if let Some(&target) = dfa_state.transitions.get(&DEFAULT_LABEL) {
+                        for top in gss.peek_values() {
+                            if dfa_state.transitions.contains_key(&(top as i32)) {
+                                continue;
+                            }
+                            let branch = gss.isolate(Some(top)).popn(1);
+                            if !branch.is_empty() {
+                                worklist.push((Phase::Pop, target, branch));
+                            }
+                        }
+                    }
+                }
+
+                if let Some(Some(read_state)) = template.pop_to_read.get(state_id as usize) {
+                    worklist.push((Phase::Read, *read_state, gss.clone()));
+                }
+                if let Some(Some(push_state)) = template.pop_to_push.get(state_id as usize) {
+                    worklist.push((Phase::Push, *push_state, gss));
+                }
+            }
+            Phase::Read => {
+                let Some(dfa_state) = template.read.states.get(state_id as usize) else {
+                    continue;
+                };
+                if dfa_state.is_accepting {
+                    output = output.merge(&gss);
+                }
+
+                if sparse_input {
+                    if let Some(top) = gss.single_exclusive_top_value() {
+                        if let Some(&target) = dfa_state.transitions.get(&(top as i32)) {
+                            worklist.push((Phase::Read, target, gss.clone()));
+                        }
+                    } else {
+                        for top in gss.peek_values() {
+                            if let Some(&target) = dfa_state.transitions.get(&(top as i32)) {
+                                let branch = gss.isolate(Some(top));
+                                if !branch.is_empty() {
+                                    worklist.push((Phase::Read, target, branch));
+                                }
+                            }
+                        }
+                    }
+                } else {
+                    for (&label, &target) in &dfa_state.transitions {
+                        if label == DEFAULT_LABEL || is_negative_label(label) {
+                            panic!(
+                                "commit template read DFA contains non-read label {label} at state {state_id}"
+                            );
+                        }
+                        let branch = gss.isolate(Some(label as u32));
+                        if !branch.is_empty() {
+                            worklist.push((Phase::Read, target, branch));
+                        }
+                    }
+                }
+
+                if let Some(Some(push_state)) = template.read_to_push.get(state_id as usize) {
+                    worklist.push((Phase::Push, *push_state, gss));
+                }
+            }
+            Phase::Push => {
+                let Some(dfa_state) = template.push.states.get(state_id as usize) else {
+                    continue;
+                };
+                if dfa_state.is_accepting {
+                    output = output.merge(&gss);
+                }
+
+                for (&label, &target) in &dfa_state.transitions {
+                    if !is_negative_label(label) {
+                        panic!(
+                            "commit template push DFA contains non-push label {label} at state {state_id}"
+                        );
+                    }
+                    worklist.push((
+                        Phase::Push,
+                        target,
+                        gss.push(negative_to_positive_label(label) as u32),
+                    ));
+                }
+            }
+        }
+    }
+
+    output
+}
+
+#[cfg(test)]
+fn advance_with_template_reference(template: &CommitTemplateDfas, stack: ParserGSS) -> ParserGSS {
+
+    let mut output = ParserGSS::empty();
     let mut worklist = vec![(Phase::Pop, template.pop.start_state, stack)];
     // Retain every visited source GSS. Raw pointer keys alone are not safe:
     // temporary isolate/push results can be dropped and their addresses reused
@@ -661,7 +920,6 @@ fn advance_with_template(template: &CommitTemplateDfas, stack: ParserGSS) -> Par
 
     output
 }
-
 
 /// Apply a deterministic single-stack commit template to preallocated flat
 /// stack scratch. `Some(true)` is an accepting result, `Some(false)` is an
@@ -951,6 +1209,50 @@ mod tests {
     use crate::compiler::glr::accumulator::TerminalsDisallowed;
     use crate::compiler::glr::parser::ParserGSS;
     use crate::runtime::{CommitTemplateDfas, FastCommitTemplateDfas};
+
+    #[test]
+    fn sparse_frontier_walk_matches_row_scanning_on_generated_dag_programs() {
+        use crate::compiler::glr::labels::{DEFAULT_LABEL, encode_negative_label};
+        let mut seed = 608894u64;
+        let mut next = || {
+            seed ^= seed << 13; seed ^= seed >> 7; seed ^= seed << 17; seed
+        };
+        for case in 0..128 {
+            let mut pop = UnweightedDfa::new();
+            let mut read = UnweightedDfa::new();
+            let mut push = UnweightedDfa::new();
+            for _ in 1..5 { pop.add_state(); read.add_state(); push.add_state(); }
+            for from in 0..5u32 {
+                pop.set_accepting(from, next() % 5 == 0);
+                read.set_accepting(from, next() % 5 == 0);
+                push.set_accepting(from, next() % 3 == 0);
+                if from == 4 { continue; }
+                for label in 0..7u32 {
+                    if next() % 3 == 0 { pop.add_transition(from, label as i32, from + 1 + (next() % (4-from) as u64) as u32); }
+                    if next() % 3 == 0 { read.add_transition(from, label as i32, from + 1 + (next() % (4-from) as u64) as u32); }
+                    if next() % 5 == 0 { push.add_transition(from, encode_negative_label(label), from + 1 + (next() % (4-from) as u64) as u32); }
+                }
+                if next() % 2 == 0 { pop.add_transition(from, DEFAULT_LABEL, from + 1); }
+            }
+            let mut link = || (0..5).map(|_| if next()%3==0 { Some((next()%5) as u32) } else { None }).collect();
+            let template = CommitTemplateDfas { pop, read, push,
+                pop_to_read:link(), pop_to_push:link(), read_to_push:link() };
+            let clean = TerminalsDisallowed::new();
+            let guarded = clean.with_insert(0, 5);
+            let paths = vec![
+                (vec![], clean.clone()), (vec![0], clean.clone()),
+                (vec![0,1,4], clean.clone()), (vec![0,2,4], guarded.clone()),
+                (vec![0,6,5], guarded.clone()), (vec![3,1], clean.clone()),
+            ];
+            for group in [&paths[..1], &paths[1..2], &paths[2..4], &paths[1..], &paths[..]] {
+                let source = ParserGSS::from_stacks(group);
+                let expected = super::advance_with_template_reference(&template, source.clone());
+                let actual = advance_with_template(&template, source);
+                assert_eq!(actual.semantically_eq(&expected, 16_384), Some(true),
+                    "sparse frontier relation differs, case={case}, paths={group:?}");
+            }
+        }
+    }
 
     #[test]
     fn template_advance_distributes_over_merged_branched_floor() {
