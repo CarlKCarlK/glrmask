@@ -57,6 +57,28 @@ pub(crate) fn encode(parser: &TemplateParser) -> Vec<u8> {
     bytes
 }
 
+/// The vocabulary digest authenticates the binding coordinate, not the
+/// authorship of this artifact. The parser program still comes only from the
+/// saved acyclic templates, never from an LR reconstruction.
+pub(crate) fn encode_external(parser: &TemplateParser, digest: [u8; 32]) -> Vec<u8> {
+    let body = encode(parser);
+    let mut bytes = Vec::with_capacity(36 + body.len());
+    bytes.extend_from_slice(b"TPX1");
+    bytes.extend_from_slice(&digest);
+    bytes.extend_from_slice(&body);
+    bytes
+}
+
+pub(crate) fn decode_external(bytes: &[u8], vocab: &crate::Vocab) -> Result<ParserSeed, String> {
+    if bytes.len() < 36 || !bytes.starts_with(b"TPX1") {
+        return Err("invalid external-vocabulary template parser section".into());
+    }
+    if bytes[4..36] != crate::compiler::compile::vocab_content_digest(vocab) {
+        return Err("template parser artifact does not match the supplied vocabulary".into());
+    }
+    decode(&bytes[36..])
+}
+
 struct Input<'a> { bytes: &'a [u8], offset: usize }
 impl Input<'_> {
     fn take<const N: usize>(&mut self) -> Result<[u8; N], String> {

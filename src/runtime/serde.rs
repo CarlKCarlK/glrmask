@@ -57,6 +57,9 @@ const CONSTRAINT_VERSION: u16 = 30;
 // V31 retains S30 framing but replaces the LR section with a TPR1 acyclic
 // parser program. Ordinary LR artifacts deliberately continue writing V30.
 const TEMPLATE_CONSTRAINT_VERSION: u16 = 31;
+// V32 is the exact same template-only body bound to an external vocabulary.
+// Token bytes are omitted; TPX1 stores their content identity before TPR1 data.
+const EXTERNAL_TEMPLATE_CONSTRAINT_VERSION: u16 = 32;
 const CONSTRAINT_HEADER_LEN: usize = CONSTRAINT_MAGIC.len() + 2 + 8;
 const COMPRESSED_PAYLOAD_HEADER_LEN: usize = 8;
 const CONSTRAINT_COMPRESSION_LEVEL: i32 = 1;
@@ -112,6 +115,7 @@ fn uses_external_runtime_sections(version: u16) -> bool {
         version,
         CONSTRAINT_VERSION
             | TEMPLATE_CONSTRAINT_VERSION
+            | EXTERNAL_TEMPLATE_CONSTRAINT_VERSION
             | PREVIOUS_BOUNDARY_SUMMARYLESS_CONSTRAINT_VERSION
             | PREVIOUS_STATIC_PROJECTION_CONSTRAINT_VERSION
             | PREVIOUS_STATIC_RESIDUAL_CONSTRAINT_VERSION
@@ -5899,15 +5903,39 @@ impl Constraint {
     /// Current artifacts use a compact sectioned representation and retain
     /// runtime-native sections where doing so materially reduces load latency.
     pub fn save(&self) -> Vec<u8> {
+        self.save_with_vocab_policy(false)
+    }
+
+    fn template_artifact_vocab_digest(&self) -> [u8; 32] {
+        if let Some(vocab) = self.late_bind_vocab.get() {
+            return crate::compiler::compile::vocab_content_digest(vocab);
+        }
+        let mut digest = blake3::Hasher::new();
+        digest.update(b"glrmask-vocab-content-v1\0");
+        digest.update(&(self.token_bytes_count() as u64).to_le_bytes());
+        for (id, bytes) in self.token_bytes_iter() {
+            digest.update(&id.to_le_bytes());
+            digest.update(&(bytes.len() as u64).to_le_bytes());
+            digest.update(bytes);
+        }
+        *digest.finalize().as_bytes()
+    }
+
+    pub(crate) fn save_template_with_external_vocab(&self) -> Vec<u8> {
+        assert!(self.has_template_parser(), "external template save requires a table-free parser");
+        self.save_with_vocab_policy(true)
+    }
+
+    fn save_with_vocab_policy(&self, external_vocab: bool) -> Vec<u8> {
         let exact_only_token_ids = self
             .late_bind_vocab
             .get()
             .map(|vocab| vocab.exact_only_token_ids().collect::<Vec<_>>())
             .unwrap_or_default();
         if self.end_tokens.is_empty() && exact_only_token_ids.is_empty() {
-            return self.save_body();
+            return self.save_body_with_vocab_policy(external_vocab);
         }
-        let body = self.save_body();
+        let body = self.save_body_with_vocab_policy(external_vocab);
         let mut bytes = Vec::with_capacity(
             16 + (self.end_tokens.len() + exact_only_token_ids.len()) * 4 + body.len(),
         );
@@ -5921,9 +5949,19 @@ impl Constraint {
     }
 
     pub(crate) fn save_body(&self) -> Vec<u8> {
-        let artifact_version = if self.has_template_parser() { TEMPLATE_CONSTRAINT_VERSION } else { CONSTRAINT_VERSION };
+        self.save_body_with_vocab_policy(false)
+    }
+
+    fn save_body_with_vocab_policy(&self, external_vocab: bool) -> Vec<u8> {
+        let artifact_version = if external_vocab { EXTERNAL_TEMPLATE_CONSTRAINT_VERSION }
+            else if self.has_template_parser() { TEMPLATE_CONSTRAINT_VERSION } else { CONSTRAINT_VERSION };
         if let Some(bytes) = &self.serialized_artifact_cache {
-            return clone_serialized_artifact(bytes.as_slice());
+            // A loaded external body cannot be returned as a self-contained
+            // save, or vice versa. All other unchanged same-mode saves retain
+            // the existing bulk-copy fast path.
+            if bytes.get(8..10) == Some(artifact_version.to_le_bytes().as_slice()) {
+                return clone_serialized_artifact(bytes.as_slice());
+            }
         }
         let profile = std::env::var_os("GLRMASK_PROFILE_SERIALIZATION").is_some();
         if std::env::var_os("GLRMASK_PROFILE_CACHE_ARTIFACT").is_some() {
@@ -6039,7 +6077,8 @@ impl Constraint {
                     // is not a serialization cache. Loaded artifact-backed
                     // vocabularies may need a section copy if they no longer
                     // own a standalone token wire.
-                    let bytes = self.packed_token_bytes.as_ref().map_or_else(
+                    let bytes = if external_vocab { std::sync::Arc::new(Vec::new()) } else {
+                        self.packed_token_bytes.as_ref().map_or_else(
                         || {
                             std::sync::Arc::new(
                                 crate::runtime::artifact::token_bytes_artifact_serde::pack_external(
@@ -6052,7 +6091,8 @@ impl Constraint {
                                 std::sync::Arc::new(packed.wire().to_vec())
                             })
                         },
-                    );
+                        )
+                    };
                     if let Some(started) = started {
                         eprintln!(
                             "[glrmask/profile][constraint_save_section] name=token_bytes ms={:.3} bytes={}",
@@ -6300,7 +6340,11 @@ impl Constraint {
                     || {
                         let started = profile.then(std::time::Instant::now);
                         let bytes = if let Some(parser) = &self.template_parser {
-                            crate::runtime::parser_backend::wire::encode(parser)
+                            if external_vocab {
+                                crate::runtime::parser_backend::wire::encode_external(parser, self.template_artifact_vocab_digest())
+                            } else {
+                                crate::runtime::parser_backend::wire::encode(parser)
+                            }
                         } else {
                             let rules = self.retained_table_rules()
                                 .expect("validated retained grammar rules must remain readable");
@@ -6336,7 +6380,8 @@ impl Constraint {
                                 dynamic_mask_vocab: self.uses_dynamic_runtime().then(|| {
                                     // The template-only artifact is also the self-contained
                                     // O2 persistence body; preserve its proven mask quotient.
-                                    if self.has_template_parser() { self.dynamic_mask_vocab.to_artifact() }
+                                    if external_vocab { self.dynamic_mask_vocab.to_template_external_vocab_artifact() }
+                                    else if self.has_template_parser() { self.dynamic_mask_vocab.to_artifact() }
                                     else { self.dynamic_mask_vocab.to_vocab_artifact() }
                                 }).flatten(),
                                 virtual_runtimes: self
@@ -6795,12 +6840,15 @@ impl Constraint {
     /// accepted; current-format artifacts copy borrowed input once because
     /// runtime structures retain zero-copy views into persistent backing bytes.
     pub fn load<'a>(bytes: impl Into<Cow<'a, [u8]>>) -> crate::Result<Self> {
-        let bytes = bytes.into();
+        Self::load_with_vocab_policy(bytes.into(), None)
+    }
+
+    fn load_with_vocab_policy(bytes: Cow<'_, [u8]>, supplied_vocab: Option<&crate::Vocab>) -> crate::Result<Self> {
         if bytes.starts_with(PREVIOUS_ROOT_POLICY_MAGIC) {
-            return Self::load_previous_root_policy(bytes);
+            return Self::load_previous_root_policy(bytes, supplied_vocab);
         }
         if !bytes.starts_with(ROOT_POLICY_MAGIC) {
-            let body = Self::load_body(bytes)?;
+            let body = Self::load_body_with_vocab_policy(bytes, supplied_vocab)?;
             if !body.late_grammar_slots.is_empty() {
                 return Err(crate::Error::Serialization(
                     "constraint artifact has unresolved slots; load it as an UnlinkedConstraint instead"
@@ -6833,8 +6881,8 @@ impl Constraint {
             return Err(crate::Error::Serialization("noncanonical root vocabulary policy".to_owned()));
         }
         let mut body = match bytes {
-            Cow::Owned(mut bytes) => Self::load_body(Cow::Owned(bytes.split_off(start)))?,
-            Cow::Borrowed(bytes) => Self::load_body(Cow::Borrowed(&bytes[start..]))?,
+            Cow::Owned(mut bytes) => Self::load_body_with_vocab_policy(Cow::Owned(bytes.split_off(start)), supplied_vocab)?,
+            Cow::Borrowed(bytes) => Self::load_body_with_vocab_policy(Cow::Borrowed(&bytes[start..]), supplied_vocab)?,
         };
         if !body.late_grammar_slots.is_empty() {
             return Err(crate::Error::Serialization("root artifact has unresolved slots".to_owned()));
@@ -6858,7 +6906,7 @@ impl Constraint {
             .map_err(|error| crate::Error::Serialization(error.to_string()))
     }
 
-    fn load_previous_root_policy(bytes: Cow<'_, [u8]>) -> crate::Result<Self> {
+    fn load_previous_root_policy(bytes: Cow<'_, [u8]>, supplied_vocab: Option<&crate::Vocab>) -> crate::Result<Self> {
         if bytes.len() < 12 {
             return Err(crate::Error::Serialization("truncated root policy header".to_owned()));
         }
@@ -6872,8 +6920,8 @@ impl Constraint {
             return Err(crate::Error::Serialization("noncanonical end-token policy".to_owned()));
         }
         let body = match bytes {
-            Cow::Owned(mut bytes) => Self::load_body(Cow::Owned(bytes.split_off(start)))?,
-            Cow::Borrowed(bytes) => Self::load_body(Cow::Borrowed(&bytes[start..]))?,
+            Cow::Owned(mut bytes) => Self::load_body_with_vocab_policy(Cow::Owned(bytes.split_off(start)), supplied_vocab)?,
+            Cow::Borrowed(bytes) => Self::load_body_with_vocab_policy(Cow::Borrowed(&bytes[start..]), supplied_vocab)?,
         };
         if !body.late_grammar_slots.is_empty() {
             return Err(crate::Error::Serialization("root artifact has unresolved slots".to_owned()));
@@ -6882,12 +6930,16 @@ impl Constraint {
     }
 
     fn load_body(bytes: Cow<'_, [u8]>) -> crate::Result<Self> {
+        Self::load_body_with_vocab_policy(bytes, None)
+    }
+
+    fn load_body_with_vocab_policy(bytes: Cow<'_, [u8]>, supplied_vocab: Option<&crate::Vocab>) -> crate::Result<Self> {
         match bytes {
             Cow::Owned(bytes) => {
                 let backing = std::sync::Arc::new(bytes);
-                Self::load_impl(backing.as_slice(), Some(std::sync::Arc::clone(&backing)))
+                Self::load_impl(backing.as_slice(), Some(std::sync::Arc::clone(&backing)), supplied_vocab)
             }
-            Cow::Borrowed(bytes) => Self::load_impl(bytes, None),
+            Cow::Borrowed(bytes) => Self::load_impl(bytes, None, supplied_vocab),
         }
     }
 
@@ -6914,7 +6966,7 @@ impl Constraint {
         bytes: impl Into<Cow<'a, [u8]>>,
         vocab: &crate::Vocab,
     ) -> crate::Result<Self> {
-        let mut constraint = Self::load(bytes)?;
+        let mut constraint = Self::load_with_vocab_policy(bytes.into(), Some(vocab))?;
         constraint
             .bind_vocab_exact(vocab)
             .map_err(crate::GlrMaskError::Serialization)?;
@@ -6924,6 +6976,7 @@ impl Constraint {
     fn load_impl(
         bytes: &[u8],
         owned_artifact: Option<std::sync::Arc<Vec<u8>>>,
+        supplied_vocab: Option<&crate::Vocab>,
     ) -> crate::Result<Self> {
         let profile = std::env::var_os("GLRMASK_PROFILE_SERIALIZATION").is_some();
         let total_started = profile.then(std::time::Instant::now);
@@ -6934,6 +6987,10 @@ impl Constraint {
             ));
         }
         let version = u16::from_le_bytes([bytes[8], bytes[9]]);
+        let external_vocab = if version == EXTERNAL_TEMPLATE_CONSTRAINT_VERSION {
+            Some(supplied_vocab.ok_or_else(|| crate::Error::Serialization(
+                "this table-free artifact requires the exact external vocabulary".into()))?)
+        } else { None };
         if !matches!(
             version,
             LEGACY_CONSTRAINT_VERSION
@@ -6958,6 +7015,7 @@ impl Constraint {
                 | PREVIOUS_BOUNDARY_SUMMARYLESS_CONSTRAINT_VERSION
                 | CONSTRAINT_VERSION
                 | TEMPLATE_CONSTRAINT_VERSION
+            | EXTERNAL_TEMPLATE_CONSTRAINT_VERSION
         ) {
             let decompress_started = profile.then(std::time::Instant::now);
             return Err(crate::GlrMaskError::Serialization(format!(
@@ -7081,7 +7139,7 @@ impl Constraint {
                 token_mask_cache_section,
                 composition_metadata_section,
             ) =
-                if matches!(version, CONSTRAINT_VERSION | TEMPLATE_CONSTRAINT_VERSION) {
+                if matches!(version, CONSTRAINT_VERSION | TEMPLATE_CONSTRAINT_VERSION | EXTERNAL_TEMPLATE_CONSTRAINT_VERSION) {
                     let (weight, dwa, table, core, runtime, token_bytes, original_map, tokenizer, internal_masks, token_mask_cache, composition_metadata) = v30_sections(serialized)
                         .map_err(crate::GlrMaskError::Serialization)?;
                     (
@@ -7345,9 +7403,11 @@ impl Constraint {
                             rayon::join(
                                 || {
                                     let started = profile.then(std::time::Instant::now);
-                                    if version == TEMPLATE_CONSTRAINT_VERSION {
-                                        return crate::runtime::parser_backend::wire::decode(table_section)
-                                            .map(|seed| (crate::runtime::parser_backend::ParserTableStorage::absent(), None, Some(seed)));
+                                    if matches!(version, TEMPLATE_CONSTRAINT_VERSION | EXTERNAL_TEMPLATE_CONSTRAINT_VERSION) {
+                                        let seed = if let Some(vocab) = external_vocab {
+                                            crate::runtime::parser_backend::wire::decode_external(table_section, vocab)
+                                        } else { crate::runtime::parser_backend::wire::decode(table_section) };
+                                        return seed.map(|seed| (crate::runtime::parser_backend::ParserTableStorage::absent(), None, Some(seed)));
                                     }
                                     let result = if uses_external_runtime_sections(version) {
                                         let backing = current_backing.as_ref().ok_or_else(|| {
@@ -7386,7 +7446,7 @@ impl Constraint {
                                         return Ok(None);
                                     };
                                     let started = profile.then(std::time::Instant::now);
-                                    let result = if matches!(version, CONSTRAINT_VERSION | TEMPLATE_CONSTRAINT_VERSION)
+                                    let result = if matches!(version, CONSTRAINT_VERSION | TEMPLATE_CONSTRAINT_VERSION | EXTERNAL_TEMPLATE_CONSTRAINT_VERSION)
                                         || version == PREVIOUS_BOUNDARY_SUMMARYLESS_CONSTRAINT_VERSION
                                     {
                                         current_backing
@@ -8054,7 +8114,12 @@ impl Constraint {
             let (artifact, deferred_token_bytes, packed_weights) =
                 core_result.map_err(crate::GlrMaskError::Serialization)?;
             let token_bytes_started = profile.then(std::time::Instant::now);
-            let external_token_bytes = if let Some(token_bytes_section) = token_bytes_section {
+            let external_token_bytes = if external_vocab.is_some() {
+                if !token_bytes_section.is_some_and(<[u8]>::is_empty) {
+                    return Err(crate::Error::Serialization("external template artifact unexpectedly contains token bytes".into()));
+                }
+                None
+            } else if let Some(token_bytes_section) = token_bytes_section {
                 let backing = current_backing
                     .as_ref()
                     .expect("current-format token section has artifact backing");
@@ -8189,6 +8254,12 @@ impl Constraint {
                 constraint.backed_internal_token_buf_flat = None;
             }
             constraint.packed_token_bytes = external_token_bytes.or(deferred_token_bytes);
+            if let Some(vocab) = external_vocab {
+                if constraint.packed_token_bytes.is_some() || !constraint.token_bytes.is_empty() {
+                    return Err(crate::Error::Serialization("external template core contains a duplicate vocabulary".into()));
+                }
+                constraint.token_bytes = vocab.entries_arc();
+            }
             if let Some(cache) = token_mask_cache {
                 install_token_mask_cache(&mut constraint, cache)
                     .map_err(crate::GlrMaskError::Serialization)?;
@@ -8216,9 +8287,13 @@ impl Constraint {
                     loaded_packed_dwa_dense_masks = true;
                 }
                 if let Some(dynamic_mask_vocab) = runtime.dynamic_mask_vocab {
-                    constraint.dynamic_mask_vocab =
+                    constraint.dynamic_mask_vocab = if let Some(vocab) = external_vocab {
+                        crate::dynamic_constraint::DynamicConstraint::dynamic_vocab_from_transfer_artifact(
+                            Some(dynamic_mask_vocab), vocab)?
+                    } else {
                         crate::runtime::artifact::DynamicMaskVocab::from_artifact(dynamic_mask_vocab)
-                            .map_err(crate::GlrMaskError::Serialization)?;
+                            .map_err(crate::GlrMaskError::Serialization)?
+                    };
                 }
                 if let Some(segmented_runtime) = runtime.segmented_runtime_v20 {
                     restore_segmented_runtime_v20(&mut constraint, segmented_runtime)?;
@@ -8409,7 +8484,7 @@ impl Constraint {
                 Some(owned_artifact.unwrap_or_else(|| std::sync::Arc::new(bytes.to_vec())))
             });
         }
-        if !matches!(version, CONSTRAINT_VERSION | TEMPLATE_CONSTRAINT_VERSION) && constraint.boundary_candidate_summary.get().is_none() {
+        if !matches!(version, CONSTRAINT_VERSION | TEMPLATE_CONSTRAINT_VERSION | EXTERNAL_TEMPLATE_CONSTRAINT_VERSION) && constraint.boundary_candidate_summary.get().is_none() {
             let _ = constraint.boundary_candidate_summary.set(
                 crate::runtime::BoundaryCandidateSummary::Unknown {
                     reason: crate::runtime::SummaryUnavailable::LegacyArtifact,

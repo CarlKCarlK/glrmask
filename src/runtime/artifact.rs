@@ -8221,6 +8221,16 @@ impl DynamicMaskVocab {
         self.to_artifact_impl(true)
     }
 
+    /// Preserve the exact O2 execution coordinate while omitting accelerators
+    /// determined solely by the caller's separately supplied model vocabulary.
+    pub(crate) fn to_template_external_vocab_artifact(&self) -> Option<DynamicMaskVocabArtifact> {
+        let mut artifact = self.to_artifact_impl(true)?;
+        if artifact.grammar_quotiented {
+            artifact.llg_slice_leftovers.clear();
+        }
+        Some(artifact)
+    }
+
     /// Serialize only vocabulary-derived runtime data. Constraint-specific
     /// mask-tokenizer quotients and projections are reconstructed after load.
     pub(crate) fn to_vocab_artifact(&self) -> Option<DynamicMaskVocabArtifact> {

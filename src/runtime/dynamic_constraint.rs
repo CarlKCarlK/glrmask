@@ -85,6 +85,7 @@ const LEGACY_DYNAMIC_TRANSFER_VERSION_V12: u16 = 12;
 // compact master-slice proof/coverage/radius rows. This replaces giant
 // projected-terminal quotient payloads for the dynamic master proof fast path.
 const DYNAMIC_TRANSFER_VERSION: u16 = 13;
+const TEMPLATE_DYNAMIC_TRANSFER_VERSION: u16 = 14;
 const DYNAMIC_TRANSFER_V12_PAYLOAD_HEADER_LEN: usize = 8;
 const DYNAMIC_TRANSFER_V12_ALT_DESCRIPTOR_LEN: usize = 6 * 8;
 
@@ -1665,10 +1666,8 @@ impl DynamicConstraint {
     }
 
     fn build_external_vocab_artifact_bytes(&self) -> Vec<u8> {
-        // Until the new parser section supports an external vocabulary slot,
-        // retain a self-contained artifact rather than silently writing LR data.
         if self.inner.has_template_parser() || self.alternatives.iter().any(Constraint::has_template_parser) {
-            return self.save();
+            return self.save_template_alternatives(true);
         }
         let profile_transfer = std::env::var_os("GLRMASK_PROFILE_SERIALIZATION").is_some();
         let total_started = profile_transfer.then(std::time::Instant::now);
@@ -1758,8 +1757,6 @@ impl DynamicConstraint {
     }
 
     /// Compact transfer artifact that deliberately omits vocabulary bytes.
-    /// Experimental template-only backends currently keep their self-contained
-    /// vocabulary in this representation; `load_with_vocab` still validates it.
     /// Pair with `load_with_vocab`. This is the natural persisted format for
     /// APIs (such as Python) whose load operation already requires a Vocab.
     pub fn save_with_external_vocab(&self) -> Vec<u8> {
@@ -2885,26 +2882,26 @@ impl DynamicConstraint {
         Ok(Self::from_alternatives(std::mem::take(&mut alternatives)))
     }
 
-    fn save_template_alternatives(&self) -> Vec<u8> {
+    fn save_template_alternatives(&self, external_vocab: bool) -> Vec<u8> {
         let constraints = std::iter::once(&self.inner).chain(&self.alternatives);
         let count = self.alternatives.len().checked_add(1).expect("dynamic alternative count");
         let mut payload = Vec::new();
         payload.extend_from_slice(&u32::try_from(count).expect("dynamic alternative count fits u32").to_le_bytes());
         for constraint in constraints {
             assert!(constraint.has_template_parser(), "mixed LR/template dynamic artifacts are unsupported");
-            let bytes = constraint.save();
+            let bytes = if external_vocab { constraint.save_template_with_external_vocab() } else { constraint.save() };
             payload.extend_from_slice(&(bytes.len() as u64).to_le_bytes());
             payload.extend_from_slice(&bytes);
         }
         let mut bytes = Vec::with_capacity(DYNAMIC_CONSTRAINT_HEADER_LEN + payload.len());
-        bytes.extend_from_slice(&DYNAMIC_CONSTRAINT_MAGIC);
-        bytes.extend_from_slice(&TEMPLATE_DYNAMIC_CONSTRAINT_VERSION.to_le_bytes());
+        bytes.extend_from_slice(if external_vocab { &DYNAMIC_TRANSFER_MAGIC } else { &DYNAMIC_CONSTRAINT_MAGIC });
+        bytes.extend_from_slice(&(if external_vocab { TEMPLATE_DYNAMIC_TRANSFER_VERSION } else { TEMPLATE_DYNAMIC_CONSTRAINT_VERSION }).to_le_bytes());
         bytes.extend_from_slice(&(payload.len() as u64).to_le_bytes());
         bytes.extend_from_slice(&payload);
         bytes
     }
 
-    fn load_template_alternatives(payload: &[u8]) -> crate::Result<Self> {
+    fn load_template_alternatives(payload: &[u8], vocab: Option<&Vocab>) -> crate::Result<Self> {
         let error = |message: &str| crate::GlrMaskError::Serialization(message.into());
         let count = payload.get(..4).ok_or_else(|| error("truncated template dynamic count"))?;
         let count = u32::from_le_bytes(count.try_into().unwrap()) as usize;
@@ -2920,7 +2917,7 @@ impl DynamicConstraint {
                 .map_err(|_| error("template dynamic length does not fit this platform"))?;
             let end = header_end.checked_add(length).ok_or_else(|| error("template dynamic length overflow"))?;
             let body = payload.get(header_end..end).ok_or_else(|| error("truncated template dynamic alternative"))?;
-            let constraint = Constraint::load(body)?;
+            let constraint = match vocab { Some(vocab) => Constraint::load_with_vocab(body, vocab)?, None => Constraint::load(body)? };
             if !constraint.has_template_parser() || !constraint.uses_dynamic_runtime() {
                 return Err(error("template dynamic alternative is not a table-free dynamic constraint"));
             }
@@ -2934,7 +2931,7 @@ impl DynamicConstraint {
     /// Serialize this dynamic constraint to a versioned binary artifact.
     pub fn save(&self) -> Vec<u8> {
         if self.inner.has_template_parser() || self.alternatives.iter().any(Constraint::has_template_parser) {
-            return self.save_template_alternatives();
+            return self.save_template_alternatives(false);
         }
         if std::env::var_os("GLRMASK_PROFILE_DYNAMIC_ARTIFACT").is_some() {
             for (index, constraint) in std::iter::once(&self.inner)
@@ -3003,7 +3000,7 @@ impl DynamicConstraint {
         bytes
     }
 
-    fn dynamic_vocab_from_transfer_artifact(
+    pub(crate) fn dynamic_vocab_from_transfer_artifact(
         artifact: Option<crate::runtime::DynamicMaskVocabArtifact>,
         vocab: &Vocab,
     ) -> crate::Result<DynamicMaskVocab> {
@@ -3074,6 +3071,7 @@ impl DynamicConstraint {
                 | LEGACY_DYNAMIC_TRANSFER_VERSION_V11
                 | LEGACY_DYNAMIC_TRANSFER_VERSION_V12
                 | DYNAMIC_TRANSFER_VERSION
+                | TEMPLATE_DYNAMIC_TRANSFER_VERSION
         ) {
             return Err(crate::GlrMaskError::Serialization(format!(
                 "unsupported dynamic transfer artifact version {version}",
@@ -3093,6 +3091,11 @@ impl DynamicConstraint {
             return Err(crate::GlrMaskError::Serialization(
                 "invalid dynamic transfer artifact payload length".to_owned(),
             ));
+        }
+        if version == TEMPLATE_DYNAMIC_TRANSFER_VERSION {
+            let mut loaded = Self::load_template_alternatives(&bytes[DYNAMIC_CONSTRAINT_HEADER_LEN..], Some(vocab))?;
+            loaded.external_vocab_artifact_cache = Some(Arc::new(bytes.to_vec()));
+            return Ok(loaded);
         }
         if matches!(
             version,
@@ -3525,7 +3528,7 @@ impl DynamicConstraint {
             ));
         }
         match version {
-            TEMPLATE_DYNAMIC_CONSTRAINT_VERSION => Self::load_template_alternatives(&bytes[DYNAMIC_CONSTRAINT_HEADER_LEN..]),
+            TEMPLATE_DYNAMIC_CONSTRAINT_VERSION => Self::load_template_alternatives(&bytes[DYNAMIC_CONSTRAINT_HEADER_LEN..], None),
             1 => {
                 let payload: LegacyDynamicConstraintPayloadV1 =
                     bincode::deserialize(&bytes[DYNAMIC_CONSTRAINT_HEADER_LEN..])
