@@ -1,6 +1,7 @@
 //! Public constraint lifecycle and the private runtime implementation boundary.
 
 use crate::automata::lexer::Lexer;
+mod boundary_reset_support;
 mod cache;
 mod compiler_views;
 mod dynamic_vocab;

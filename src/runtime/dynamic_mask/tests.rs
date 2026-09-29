@@ -2554,3 +2554,87 @@ fn recursive_zero_byte_domain_preserves_only_live_exact_special_ids() {
         assert!(state.is_accepting());
     }
 }
+
+
+#[test]
+    fn packed_boundary_vocab_preserves_aliases_bytes_and_complete_masks() {
+        let entries = vec![(0,vec![]),(1,b"P".to_vec()),(2,b"a".to_vec()),
+            (3,b"b".to_vec()),(4,b"c".to_vec()),(5,b"Q".to_vec()),
+            (8,b"abQ".to_vec()),(17,b"acQ".to_vec()),(31,b"bQ".to_vec()),
+            (65,b"cQ".to_vec()),(99,b"abQ".to_vec()),(4001,vec![0,255]),
+            (9001,b"bad".to_vec())];
+        let vocab = Vocab::new(entries.clone());
+        for nullable in [false,true] {
+            let parent = Constraint::compile(Grammar::glrm(
+                r#"glrm 1; start root; extern grammar leaf; nt root = "P" leaf "Q";"#), &vocab).unwrap();
+            let source = if nullable { r#"glrm 1; start leaf; nt leaf = ("ab" | "ac")?;"# }
+                else { r#"glrm 1; start leaf; nt leaf = "ab" | "ac";"# };
+            let child = crate::ConstraintSpec::builder(Grammar::glrm(source), &vocab).unwrap()
+                .build().unwrap().compile_dynamic().unwrap();
+            let bound = parent.bind_grammar_dynamic_boundary("leaf", child).unwrap();
+            let loaded = Constraint::load(bound.save()).unwrap();
+            for c in [&bound, &loaded] {
+                for ids in [Vec::new(),vec![8],vec![8,99],vec![99,8,99,8],entries.iter().rev().map(|(id,_)|*id).collect()] {
+                    let a = PreparedMaskVocabulary::make_vocab_owned_reference(c,&ids).unwrap();
+                    let b = PreparedMaskVocabulary::make_vocab_packed(c,&ids).unwrap();
+                    assert_eq!(bincode::serialize(a.trie.as_ref()).unwrap(),bincode::serialize(b.trie.as_ref()).unwrap());
+                    assert_eq!(a.all_original_token_words(),b.all_original_token_words());
+                    for id in 0..=a.canonical_token_count() as u32 {
+                        assert_eq!(a.token_ids(id),b.token_ids(id));
+                        // token_ids permits unknown IDs; word-mask access requires a valid canonical ID.
+                        if id < a.canonical_token_count() as u32 {
+                            assert_eq!(a.token_word_masks(id),b.token_word_masks(id));
+                        }
+                    }
+                    assert_eq!(a.full_walk_token_markers(),b.full_walk_token_markers());
+                    for prefix in [b"".as_slice(),b"P",b"Pa",b"Pab",b"Pac",b"PabQ"] {
+                        let mut state=c.start();state.commit_bytes(prefix).unwrap();
+                        let mut x=vec![0;c.mask_len()];let mut y=x.clone();
+                        assert!(try_fill_recursive_mask_with_vocab(&state,&mut x,&a).unwrap());
+                        assert!(try_fill_recursive_mask_with_vocab(&state,&mut y,&b).unwrap());
+                        assert_eq!(x,y,"nullable={nullable}, ids={ids:?}, prefix={prefix:?}");
+                    }
+                }
+                assert!(PreparedMaskVocabulary::make_vocab_packed(c,&[999999]).is_err());
+            }
+        }
+    }
+
+#[test]
+    fn packed_boundary_vocab_preserves_special_byte_union_and_sparse_aliases() {
+        let entries=vec![(0,vec![]),(1,b"X".to_vec()),(2,b"a".to_vec()),
+            (3,b"!".to_vec()),(7,vec![]),(19,b"a".to_vec()),(40,b"a!".to_vec()),
+            (50,vec![0,255]),(71,b"Xa!".to_vec()),(83,b"aaa".to_vec())];
+        let ids=entries.iter().map(|(id,_)|*id).chain([9001]).collect::<Vec<_>>();
+        let vocab=Vocab::new(entries);
+        let child=crate::ConstraintSpec::builder(Grammar::glrm(
+            r#"glrm 1; start child; extern token MARK; nt child = MARK "a" | "a";"#),&vocab)
+            .unwrap().bind_token("MARK",[7,9001]).unwrap().build().unwrap().compile().unwrap();
+        let parent=Constraint::compile(Grammar::glrm(
+            r#"glrm 1; start root; extern grammar child; nt root = "X" child "!";"#),&vocab).unwrap();
+        let bound=parent.bind_grammar_dynamic_boundary("child",child).unwrap();
+        let loaded=Constraint::load(bound.save()).unwrap();
+        for constraint in [&bound,&loaded] {
+            for domain in [ids.clone(),vec![],vec![19,2,2,40],vec![0,7,50],vec![9001]] {
+                let owned=PreparedMaskVocabulary::make_vocab_owned_reference(constraint,&domain).unwrap();
+                let borrowed=PreparedMaskVocabulary::make_vocab_packed(constraint,&domain).unwrap();
+                assert_eq!(bincode::serialize(owned.trie.as_ref()).unwrap(),
+                    bincode::serialize(borrowed.trie.as_ref()).unwrap(),"domain={domain:?}");
+                for &canonical in owned.trie.all_subtree_tokens() {
+                    assert_eq!(owned.token_ids(canonical),borrowed.token_ids(canonical));
+                }
+                if let Some(canonical)=owned.trie.node(0).token_id {
+                    assert_eq!(owned.token_ids(canonical),borrowed.token_ids(canonical));
+                }
+                for prefix in ["","X","Xa","Xa!"] {
+                    let mut state=constraint.start();state.commit_bytes(prefix.as_bytes()).unwrap();
+                    let mut a=vec![0;constraint.mask_len()];let mut b=a.clone();
+                    assert_eq!(try_fill_recursive_mask_with_vocab(&state,&mut a,&owned).unwrap(),
+                        try_fill_recursive_mask_with_vocab(&state,&mut b,&borrowed).unwrap());
+                    assert_eq!(a,b,"domain={domain:?} prefix={prefix:?}");
+                }
+            }
+            assert!(PreparedMaskVocabulary::make_vocab_packed(constraint,&[8]).is_err());
+            assert!(PreparedMaskVocabulary::make_vocab_owned_reference(constraint,&[8]).is_err());
+        }
+    }

@@ -138,3 +138,22 @@ disabled. The same pieces can be configured manually with
 - For minimize strategy vars, invalid set values panic with a validation error.
 - For compact mode vars, unknown set values silently fall back to the per-callsite default.
 - `GLRMASK_AP_KEY_ANY_STRING` is effectively enabled if either itself or `GLRMASK_ADDPROP_NO_EXCLUSIONS` is enabled.
+
+## Bounded dynamic-boundary runtime paths
+
+These runtime paths use the existing shared token-trie walker and preserve its
+parser, lexer, and token-mask semantics. Their defaults were promoted together;
+setting an individual flag to `0` retains its comparison/fallback implementation.
+
+| Variable | Type | Default and behavior |
+|---|---|---|
+| `GLRMASK_EPSILON_ONLY_RESETS` | truthy bool | on; at most four bounded proofs per mask may represent a completed leaf as an epsilon-only fresh reset. Token-end acceptance is retained. Any uncertainty keeps ordinary reset processing. |
+| `GLRMASK_BOUNDARY_PACKED_VOCAB` | truthy bool | on; prepares boundary vocabularies using borrowed token bytes and flat alias storage. Preparation remains charged to the first use; no hidden prewarming. |
+| `GLRMASK_BOUNDED_HIGH_RAW_MEMO` | truthy bool | on; raw state IDs of at least 1,024 use query-local full-key tagged caches instead of directories sized by the highest raw ID. Small IDs retain dense lookups. Cache collisions recompute exactly. |
+
+The shared walker also initializes owned traversal storage only at depths it
+actually saves, starting with eight inline slots and growing within the trie's
+certified depth. This does not cache parser results between mask calls.
+
+These changes reduce measured boundary costs; they do not guarantee that every
+boundary invocation is as cheap as its ordinary non-boundary contribution.

@@ -402,6 +402,37 @@ impl DynamicMaskVocab {
         };
         let (canonical_original_token_offsets, canonical_original_tokens) =
             preflattened.unwrap_or_else(|| Self::flatten_canonical_original_tokens(&token_aliases));
+        Self::from_ordered_alias_parts(
+            trie, token_aliases, canonical_original_token_offsets,
+            canonical_original_tokens, prepared_all_original_token_words,
+        )
+    }
+
+    /// Build the same owned runtime vocabulary from preflattened, sorted aliases.
+    /// Each offsets interval corresponds to one canonical trie token.
+    pub(crate) fn from_materialized_flat_ordered(
+        trie: Arc<DynamicMaskTrie>,
+        offsets: Arc<Vec<u32>>,
+        originals: Arc<Vec<u32>>,
+    ) -> Self {
+        assert_eq!(offsets.first(), Some(&0));
+        assert_eq!(offsets.last().copied().map(|n| n as usize), Some(originals.len()));
+        assert!(offsets.windows(2).all(|p| p[0] <= p[1]));
+        debug_assert!(offsets.windows(2).all(|p| originals[p[0] as usize..p[1] as usize]
+            .windows(2).all(|q| q[0] <= q[1])));
+        let token_aliases = DynamicMaskAliasStore::Flat {
+            offsets: Arc::clone(&offsets), originals: Arc::clone(&originals),
+        };
+        Self::from_ordered_alias_parts(trie, token_aliases, offsets, originals, None)
+    }
+
+    fn from_ordered_alias_parts(
+        trie: Arc<DynamicMaskTrie>,
+        token_aliases: DynamicMaskAliasStore,
+        canonical_original_token_offsets: Arc<Vec<u32>>,
+        canonical_original_tokens: Arc<Vec<u32>>,
+        prepared_all_original_token_words: Option<Arc<Vec<u32>>>,
+    ) -> Self {
         let build_words = || {
             Self::build_canonical_original_word_masks_sorted(
                 &canonical_original_token_offsets,

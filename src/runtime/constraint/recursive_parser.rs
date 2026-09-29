@@ -24,9 +24,9 @@ use std::borrow::Cow;
 use std::sync::Arc;
 use std::sync::OnceLock;
 
-struct RecursiveSegmentedParserTables<'a> {
-    root: &'a Constraint,
-    layout: &'a RecursiveParserLayout,
+pub(super) struct RecursiveSegmentedParserTables<'a> {
+    pub(super) root: &'a Constraint,
+    pub(super) layout: &'a RecursiveParserLayout,
 }
 
 

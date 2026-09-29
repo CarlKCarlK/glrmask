@@ -1101,6 +1101,12 @@ impl FullWalkHotScalarCache {
     }
 }
 
+mod raw_high_memo;
+
+// Dense lookups remain unchanged for small IDs. High IDs must not allocate
+// arrays proportional to a sparse coordinate merely to cache a few cells.
+const RAW_DENSE_MEMO_LIMIT: u32 = 1024;
+
 /// Strict-walk transition backend for the lexer representation selected by the
 /// ordinary runtime. In a deterministic tokenizer the config id is simply the
 /// raw state id. In an epsilon-NFA tokenizer it is a `DynamicNfaScanCache`
@@ -1110,6 +1116,9 @@ struct FullWalkConfigTransitions<'a, 'b> {
     cache: &'a mut DynamicNfaScanCache<'b>,
     error: Option<String>,
     raw_cell_rows: Vec<Option<Box<[u64; 256]>>>,
+    bounded_high_raw: bool,
+    high_raw_cells: raw_high_memo::TaggedMemo<256>,
+    high_raw_targets: raw_high_memo::TaggedMemo<64>,
     hot_scalar: FullWalkHotScalarCache,
     hot_enabled: bool,
     hot_persist_key: Option<(usize, u64)>,
@@ -1215,6 +1224,12 @@ impl<'a, 'b> FullWalkConfigTransitions<'a, 'b> {
         cache: cache,
         error: None,
         raw_cell_rows: Vec::new(),
+        bounded_high_raw: {
+            static ENABLED: OnceLock<bool> = OnceLock::new();
+            *ENABLED.get_or_init(||env_flag("GLRMASK_BOUNDED_HIGH_RAW_MEMO", true))
+        },
+        high_raw_cells: raw_high_memo::TaggedMemo::new(),
+        high_raw_targets: raw_high_memo::TaggedMemo::new(),
         hot_scalar,
         hot_enabled,
         hot_persist_key,
@@ -1531,6 +1546,13 @@ impl FullWalkTransitionTable for FullWalkConfigTransitions<'_, '_> {
             if self.profile {
                 self.max_raw_state_seen = self.max_raw_state_seen.max(raw_state);
             }
+            if self.bounded_high_raw && raw_state >= RAW_DENSE_MEMO_LIMIT {
+                let key=(u64::from(raw_state)<<8)|u64::from(byte);
+                if let Some(packed)=self.high_raw_cells.get(key) {
+                    if self.profile { self.raw_cell_hits += 1; }
+                    return FullWalkConfigCell { target:packed as u32, has_finalizer:(packed>>32)&1 != 0 };
+                }
+            }
             let raw_index = raw_state as usize;
             if raw_index < self.raw_cell_rows.len()
                 && let Some(row) = unsafe { self.raw_cell_rows.get_unchecked(raw_index) }
@@ -1613,7 +1635,9 @@ impl FullWalkTransitionTable for FullWalkConfigTransitions<'_, '_> {
                 }
             } else {
                 let raw_target_index = raw_target as usize;
-                let cached_target = if raw_target_index < self.raw_target_cells.len() {
+                let cached_target = if self.bounded_high_raw && raw_target >= RAW_DENSE_MEMO_LIMIT {
+                    self.high_raw_targets.get(u64::from(raw_target))
+                } else if raw_target_index < self.raw_target_cells.len() {
                     let packed = self.raw_target_cells[raw_target_index];
                     (packed != UNKNOWN).then_some(packed)
                 } else {
@@ -1640,11 +1664,15 @@ impl FullWalkTransitionTable for FullWalkConfigTransitions<'_, '_> {
                                     .raw_has_finalizer_ns
                                     .saturating_add(started.elapsed().as_nanos() as u64);
                             }
-                            if self.raw_target_cells.len() <= raw_target_index {
-                                self.raw_target_cells.resize(raw_target_index + 1, UNKNOWN);
+                            let packed=u64::from(target) | ((has_finalizer as u64) << 32);
+                            if self.bounded_high_raw && raw_target >= RAW_DENSE_MEMO_LIMIT {
+                                self.high_raw_targets.insert(u64::from(raw_target), packed);
+                            } else {
+                                if self.raw_target_cells.len() <= raw_target_index {
+                                    self.raw_target_cells.resize(raw_target_index + 1, UNKNOWN);
+                                }
+                                self.raw_target_cells[raw_target_index] = packed;
                             }
-                            self.raw_target_cells[raw_target_index] =
-                                u64::from(target) | ((has_finalizer as u64) << 32);
                             FullWalkConfigCell {
                                 target,
                                 has_finalizer,
@@ -1697,16 +1725,18 @@ impl FullWalkTransitionTable for FullWalkConfigTransitions<'_, '_> {
         if self.error.is_none()
             && let Some(raw_state) = raw_state
         {
-            let raw_state = raw_state as usize;
-            if self.raw_cell_rows.len() <= raw_state {
-                self.raw_cell_rows.resize_with(raw_state + 1, || None);
-            }
-            let row = self.raw_cell_rows[raw_state]
-                .get_or_insert_with(|| Box::new([UNKNOWN; 256]));
-            let slot = unsafe { row.get_unchecked_mut(byte as usize) };
-            if *slot == UNKNOWN {
-                *slot = u64::from(returned_cell.target)
-                    | ((returned_cell.has_finalizer as u64) << 32);
+            let packed=u64::from(returned_cell.target) | ((returned_cell.has_finalizer as u64)<<32);
+            if self.bounded_high_raw && raw_state >= RAW_DENSE_MEMO_LIMIT {
+                self.high_raw_cells.insert((u64::from(raw_state)<<8)|u64::from(byte),packed);
+            } else {
+                let raw_state = raw_state as usize;
+                if self.raw_cell_rows.len() <= raw_state {
+                    self.raw_cell_rows.resize_with(raw_state + 1, || None);
+                }
+                let row = self.raw_cell_rows[raw_state]
+                    .get_or_insert_with(|| Box::new([UNKNOWN; 256]));
+                let slot = unsafe { row.get_unchecked_mut(byte as usize) };
+                if *slot == UNKNOWN { *slot = packed; }
             }
         }
         if self.error.is_none()
@@ -2212,6 +2242,27 @@ struct FullWalkManyTransitionCache {
     misses: usize,
     exhausted: usize,
     max_branches: usize,
+}
+
+/// Materialize only owned DFS depths actually saved by the shared walker.
+/// Cached products retain their small IDs separately and never need a slot.
+#[inline]
+fn full_walk_owned_many_slot<T>(
+    storage: &mut SmallVec<[Option<T>; 8]>,
+    depth: usize,
+    stack_len: usize,
+) -> &mut Option<T> {
+    assert!(depth < stack_len, "owned DFS depth exceeds the trie bound");
+    let needed = depth + 1;
+    if storage.len() < needed {
+        if storage.capacity() < needed {
+            // Grow geometrically without exceeding the certified heap bound.
+            let target = storage.capacity().saturating_mul(2).max(needed).min(stack_len);
+            storage.reserve_exact(target - storage.len());
+        }
+        storage.resize_with(needed, || None);
+    }
+    &mut storage[depth]
 }
 
 impl FullWalkManyTransitionCache {
@@ -5369,18 +5420,9 @@ fn try_full_walk_mask_with_table<
         heap_two.resize(stack_len, ((0, 0), (0, 0)));
         heap_two.as_mut_slice()
     };
-    // Multi-branch stack states are uncommon, and `FullWalkManyState` embeds a
-    // SmallVec. Do not eagerly construct/drop 256 empty SmallVec values on
-    // every complete vocabulary walk; materialize only the depths that
-    // actually carry a multi state.
-    let mut inline_many: [Option<FullWalkManyState>; 256] = std::array::from_fn(|_| None);
-    let mut heap_many = Vec::<Option<FullWalkManyState>>::new();
-    let stack_many: &mut [Option<FullWalkManyState>] = if stack_len <= inline_many.len() {
-        &mut inline_many[..stack_len]
-    } else {
-        heap_many.resize_with(stack_len, || None);
-        heap_many.as_mut_slice()
-    };
+    // Most products use compact cache IDs. Reserve only a few owned slots
+    // inline, growing lazily to depths actually saved (not the whole trie).
+    let mut stack_many = SmallVec::<[Option<FullWalkManyState>; 8]>::new();
    let mut pair_union_cache = FxHashMap::<(u32, u32), Option<u32>>::default();
     let mut triple_union_cache = FxHashMap::<(u32, u32, u32), Option<u32>>::default();
     let product_transition_cache_capacity = transitions.product_transition_cache_capacity();
@@ -5453,7 +5495,8 @@ fn try_full_walk_mask_with_table<
             stack_lexer[0] = lexer_state;
             stack_parser[0] = parser_node;
         } else {
-            stack_many[0] = Some(full_walk_many_state_from_branches(roots));
+            *full_walk_owned_many_slot(&mut stack_many, 0, stack_len) =
+                Some(full_walk_many_state_from_branches(roots));
         }
     }
 
@@ -5680,6 +5723,9 @@ fn try_full_walk_mask_with_table<
                 if product_transition_cache_capacity == 0
                     || current_many_id == FullWalkManyTransitionCache::UNKNOWN
                 {
+                    // An uncached MULTI parent is saved either at the root
+                    // or after its incoming edge, before any descendant read.
+                    debug_assert!(parent_depth < stack_many.len());
                     current_many.clone_from(unsafe {
                         stack_many
                             .get_unchecked(parent_depth)
@@ -6695,7 +6741,9 @@ fn try_full_walk_mask_with_table<
                     if product_transition_cache_capacity == 0
                         || current_many_id == FullWalkManyTransitionCache::UNKNOWN
                     {
-                        let slot = stack_many.get_unchecked_mut(parent_depth + 1);
+                        let slot = full_walk_owned_many_slot(
+                            &mut stack_many, parent_depth + 1, stack_len,
+                        );
                         if let Some(existing) = slot.as_mut() {
                             existing.clone_from(&current_many);
                         } else {
@@ -7461,6 +7509,17 @@ impl<'a> DynamicNfaScanCache<'a> {
         self.config_futures.push(futures);
         self.fresh_reset_ids.insert(config, reset);
         Ok(reset)
+    }
+
+    /// Exact lexer coordinate for a parser reset that accepts the current token
+    /// boundary but has no positive-byte continuation. This uses the ordinary
+    /// config/fresh-reset representation; it is not a second lexer engine.
+    fn fresh_empty_reset_config(&mut self) -> Result<u32, String> {
+        if self.deterministic {
+            return Err("empty fresh reset is only valid in the NFA-config coordinate".to_owned());
+        }
+        let empty=self.intern_config(Vec::new())?;
+        self.fresh_reset_config(empty)
     }
 
     fn step_config(&mut self, config: u32, byte: u8) -> Result<Option<u32>, String> {
@@ -9327,6 +9386,10 @@ pub(crate) struct PreparedMaskVocabulary {
 
 impl PreparedMaskVocabulary {
     fn make_vocab(constraint: &Constraint, ids: &[u32]) -> Result<Arc<DynamicMaskVocab>, String> {
+        static PACKED: OnceLock<bool> = OnceLock::new();
+        if *PACKED.get_or_init(|| env_flag("GLRMASK_BOUNDARY_PACKED_VOCAB", true)) {
+            return Self::make_vocab_packed(constraint, ids);
+        }
         static BORROW_BYTES: OnceLock<bool> = OnceLock::new();
         if *BORROW_BYTES.get_or_init(|| std::env::var("GLRMASK_PREPARED_VOCAB_BORROW_BYTES")
             .is_ok_and(|value| matches!(value.as_str(), "1" | "true")))
@@ -9335,6 +9398,32 @@ impl PreparedMaskVocabulary {
         } else {
             Self::make_vocab_owned_reference(constraint, ids)
         }
+    }
+
+    fn make_vocab_packed(constraint: &Constraint, ids: &[u32]) -> Result<Arc<DynamicMaskVocab>, String> {
+        let mut entries = Vec::<(u32, &[u8])>::with_capacity(ids.len());
+        for &id in ids {
+            if let Some(bytes) = constraint.token_bytes_for_id(id) { entries.push((id, bytes)); }
+            else if !constraint.has_special_token_id(id) {
+                return Err(format!("candidate token {id} has no byte or special-token semantics"));
+            }
+        }
+        entries.sort_unstable_by(|a,b| a.1.cmp(b.1).then_with(|| a.0.cmp(&b.0)));
+        let mut refs = Vec::<(u16, usize, &[u8])>::with_capacity(entries.len());
+        let mut offsets = Vec::<u32>::with_capacity(entries.len() + 1);
+        let mut originals = Vec::<u32>::with_capacity(entries.len());
+        for (id, bytes) in entries {
+            if refs.last().is_none_or(|last| last.2 != bytes) {
+                offsets.push(u32::try_from(originals.len()).map_err(|_| "too many vocabulary aliases")?);
+                refs.push((0, refs.len(), bytes));
+            }
+            originals.push(id);
+        }
+        offsets.push(u32::try_from(originals.len()).map_err(|_| "too many vocabulary aliases")?);
+        let trie = Arc::new(DynamicMaskTrie::from_partitioned_token_refs(&refs));
+        Ok(Arc::new(DynamicMaskVocab::from_materialized_flat_ordered(
+            trie, Arc::new(offsets), Arc::new(originals),
+        ).with_mask_cache_entry_cap(64)))
     }
 
     /// Canonicalize immutable byte references. The resulting trie owns its
@@ -10231,4 +10320,109 @@ fn fill_mask_dynamic_impl(
 }
 
 #[cfg(test)]
-mod tests ;
+mod tests;
+
+
+#[cfg(test)]
+mod epsilon_only_reset_config_tests {
+    use super::*;
+    use crate::{Constraint,Grammar,Vocab};
+
+    fn fixture()->Constraint {
+        let vocab=Vocab::new(vec![(0,b"a".to_vec()),(1,b"b".to_vec()),(2,b"ab".to_vec())]);
+        Constraint::compile(Grammar::glrm(
+            r#"glrm 1; start s; t A = "a"; t B = "b"; nt s = A B | A;"#,
+        ),&vocab).unwrap()
+    }
+
+    #[test]
+    fn fresh_empty_reset_preserves_only_boundary_acceptance() {
+        let c=fixture();
+        let mut scan=DynamicNfaScanCache::new(&c,None);
+        // Exercise the config representation even if this tiny fixture's
+        // physical tokenizer is deterministic.
+        scan.deterministic=false;
+        let ordinary_empty=scan.intern_config(Vec::new()).unwrap();
+        let fresh=scan.fresh_empty_reset_config().unwrap();
+        assert_ne!(fresh,ordinary_empty);
+        let fi=scan.config_index(fresh).unwrap();
+        let oi=scan.config_index(ordinary_empty).unwrap();
+        assert!(scan.config_is_fresh_reset[fi]);
+        assert!(!scan.config_is_fresh_reset[oi]);
+        assert_eq!(scan.config_len(fresh),0);
+        assert!(!scan.config_has_finalizer(fresh));
+        assert!(scan.config_matched[fi].is_empty());
+        assert!(scan.config_futures[fi].is_empty());
+        assert_eq!(scan.residual_config(fresh).unwrap(),None);
+        for byte in 0u8..=u8::MAX {
+            assert_eq!(scan.step_config(fresh,byte).unwrap(),None,"byte={byte}");
+        }
+    }
+
+    #[test]
+    fn fresh_empty_reset_is_memoized_and_ordinary_empty_stays_nonfresh() {
+        let c=fixture();
+        let mut scan=DynamicNfaScanCache::new(&c,None);
+        scan.deterministic=false;
+        let a=scan.fresh_empty_reset_config().unwrap();
+        let b=scan.fresh_empty_reset_config().unwrap();
+        assert_eq!(a,b);
+        let empty=scan.intern_config(Vec::new()).unwrap();
+        assert_ne!(a,empty);
+        assert!(!scan.config_is_fresh_reset[scan.config_index(empty).unwrap()]);
+        assert!(scan.config_is_fresh_reset[scan.config_index(a).unwrap()]);
+    }
+}
+
+
+#[cfg(test)]
+mod saved_depth_storage_tests {
+    use super::{full_walk_owned_many_slot, SmallVec};
+
+    #[test]
+    fn untouched_cached_walk_needs_no_slots_and_descending_visits_keep_high_slots() {
+        let mut slots=SmallVec::<[Option<u32>;8]>::new();
+        assert!(slots.is_empty());assert!(!slots.spilled());
+        *full_walk_owned_many_slot(&mut slots,0,11)=Some(7);
+        assert_eq!(slots.len(),1);assert!(!slots.spilled());
+        *full_walk_owned_many_slot(&mut slots,9,11)=Some(31);
+        assert_eq!(slots.len(),10);assert!(slots.capacity()<=11);
+        *full_walk_owned_many_slot(&mut slots,2,11)=Some(9);
+        assert_eq!(slots.len(),10);assert_eq!(slots[0],Some(7));assert_eq!(slots[9],Some(31));
+        *full_walk_owned_many_slot(&mut slots,9,11)=Some(42);
+        assert_eq!(slots[9],Some(42));assert!(slots[1].is_none());
+    }
+
+    #[test]
+    fn deep_saved_path_preserves_every_slot_and_checks_certified_bound() {
+        let mut slots=SmallVec::<[Option<usize>;8]>::new();
+        for depth in 0..513 {
+            *full_walk_owned_many_slot(&mut slots,depth,513)=Some(depth*3);
+            assert_eq!(slots.len(),depth+1);
+            if slots.spilled(){assert!(slots.capacity()<=513);}
+        }
+        for depth in (0..513).rev(){assert_eq!(slots[depth],Some(depth*3));}
+        let mut invalid=SmallVec::<[Option<u32>;8]>::new();
+        let result=std::panic::catch_unwind(std::panic::AssertUnwindSafe(||{
+            let _=full_walk_owned_many_slot(&mut invalid,3,3);
+        }));
+        assert!(result.is_err());assert!(invalid.is_empty());
+    }
+
+    #[test]
+    fn overwritten_and_saved_owned_values_are_dropped_exactly_once() {
+        use std::sync::{Arc,atomic::{AtomicUsize,Ordering}};
+        struct Tracked(Arc<AtomicUsize>);
+        impl Drop for Tracked {fn drop(&mut self){self.0.fetch_add(1,Ordering::SeqCst);}}
+        let drops=Arc::new(AtomicUsize::new(0));
+        {
+            let mut slots=SmallVec::<[Option<Tracked>;8]>::new();
+            *full_walk_owned_many_slot(&mut slots,0,17)=Some(Tracked(drops.clone()));
+            *full_walk_owned_many_slot(&mut slots,16,17)=Some(Tracked(drops.clone()));
+            assert_eq!(drops.load(Ordering::SeqCst),0);
+            *full_walk_owned_many_slot(&mut slots,16,17)=Some(Tracked(drops.clone()));
+            assert_eq!(drops.load(Ordering::SeqCst),1);
+        }
+        assert_eq!(drops.load(Ordering::SeqCst),3);
+    }
+}

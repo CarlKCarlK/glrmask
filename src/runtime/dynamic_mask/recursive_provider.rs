@@ -24,6 +24,10 @@ struct RecursiveConfigTransitions<'scan, 'constraint> {
     boundary: FxHashMap<(u32, u32), bool>,
     projected_resets: FxHashMap<(usize, u32), u32>,
     project_resets: bool,
+    // Bound total optional proof work, not just each individual search.
+    epsilon_proofs_remaining: u8,
+    #[cfg(test)]
+    epsilon_proofs_proved: usize,
     error: Option<String>,
 }
 
@@ -72,6 +76,38 @@ impl<'scan, 'constraint> RecursiveConfigTransitions<'scan, 'constraint> {
         };
         self.projected_resets.insert((leaf, parser), result);
         result
+    }
+
+    /// Return a token-end-only child reset only when the existing bounded
+    /// provider-control proof completely establishes that this leaf has no
+    /// ordinary terminal continuation. The parser node is immutable and is
+    /// retained exactly; only this leaf's lexer continuation is narrowed.
+    fn epsilon_only_reset(
+        &mut self, raw_reset:u32, parser:u32, cache:&FullWalkParserCache,
+    )->Option<u32> {
+        if self.epsilon_proofs_remaining == 0 { return None; }
+        let (leaf,_)=self.routing.constraint.recursive_tokenizer_leaf_state(raw_reset)?;
+        if self.routing.leaves.get(leaf)?.reset!=raw_reset
+            || !self.tables.get(leaf)?.parser_projection_enabled()
+        {
+            return None;
+        }
+        self.epsilon_proofs_remaining -= 1;
+        let proved=(|| {
+            let stacks = &cache.nodes.get(parser as usize)?.gss;
+            if stacks.max_depth() > 256 { return None; }
+            let cursor = stacks.try_virtual_stack()?;
+            self.routing.constraint
+                .bounded_mask_same_leaf_support_empty_cursor(&cursor,leaf)
+        })();
+        if proved!=Some(true){
+            return None;
+        }
+        let local=self.tables.get_mut(leaf)?.cache.fresh_empty_reset_config().ok()?;
+        let scoped=self.intern(leaf,local).ok()?;
+        #[cfg(test)]
+        { self.epsilon_proofs_proved += 1; }
+        Some(scoped)
     }
 
     fn finish(self) -> Result<(), String> {
@@ -352,6 +388,12 @@ impl FullWalkTransitionTable for RecursiveConfigTransitions<'_, '_> {
         let raw_resets = self.routing.scoped_reset_branches(parser_cache, constraint, parser_node, terminal);
         let mut result = SmallVec::new();
         for (raw_reset, parser) in raw_resets {
+            if self.epsilon_proofs_remaining != 0
+                && let Some(lexer) = self.epsilon_only_reset(raw_reset, parser, parser_cache)
+            {
+                result.push((lexer, parser));
+                continue;
+            }
             match self.root_state(raw_reset) {
                 Ok(lexer) => result.push((self.projected_reset(lexer, parser, parser_cache), parser)),
                 Err(error) => self.fail(error),
@@ -458,6 +500,12 @@ fn with_provider_and_baseline(
         candidate_futures: Vec::new(), boundary: FxHashMap::default(),
         projected_resets: FxHashMap::default(),
         project_resets: std::env::var_os("GLRMASK_PROFILE_SCOPED_RESET_PROJECTION").is_some(),
+        epsilon_proofs_remaining: {
+            static ENABLED: OnceLock<bool> = OnceLock::new();
+            if *ENABLED.get_or_init(|| env_flag("GLRMASK_EPSILON_ONLY_RESETS", true)) { 4 } else { 0 }
+        },
+        #[cfg(test)]
+        epsilon_proofs_proved: 0,
         error: None,
     };
     if let Some(start) = setup_start {
@@ -475,4 +523,92 @@ fn with_provider_and_baseline(
         eprintln!("[glrmask/profile][recursive_phases] finish_ns={}", start.elapsed().as_nanos());
     }
     result
+}
+
+
+#[cfg(test)]
+mod epsilon_reset_boundary_tests {
+    use super::*;
+    use crate::{Constraint, Grammar, Vocab};
+    use std::collections::BTreeSet;
+
+    fn mask_with_budget(state: &ConstraintState<'_>, budget: u8) -> (Vec<u32>, usize) {
+        let vocab = state.constraint.dynamic_mask_vocab_for_runtime();
+        let mut mask = vec![u32::MAX; state.constraint.mask_len() + 2];
+        let mut proved = 0;
+        assert!(with_provider(state, vocab.max_token_byte_len(), |provider| {
+            // The NFA configuration executor is exact for deterministic lexers
+            // too. Select it explicitly so this small test exercises the reset
+            // representation rather than depending on compiler heuristics.
+            for table in &mut provider.tables {
+                table.cache.deterministic = false;
+            }
+            provider.epsilon_proofs_remaining = budget;
+            let filled = fill_recursive_mask_using_vocab(state, &mut mask, provider, vocab)?;
+            proved = provider.epsilon_proofs_proved;
+            assert!(proved <= budget as usize);
+            assert!(provider.epsilon_proofs_remaining <= budget);
+            provider.validate_mask_result()?;
+            Ok(filled)
+        }).unwrap());
+        assert!(mask[state.constraint.mask_len()..].iter().all(|&word| word == 0));
+        (mask, proved)
+    }
+
+    #[test]
+    fn epsilon_only_resets_preserve_endpoints_reentry_aliases_and_budget_fallback() {
+        let mut total_proved = 0;
+        for nullable in [false, true] {
+            let leaves = if nullable { vec!["", "a", "ab"] } else { vec!["a", "ab"] };
+            let words: BTreeSet<Vec<u8>> = leaves.iter().flat_map(|a| leaves.iter()
+                .map(move |b| format!("P[{a}]{b}!").into_bytes())).collect();
+            let mut prefixes = BTreeSet::new();
+            let mut tokens = BTreeSet::new();
+            for word in &words {
+                for end in 0..=word.len() { prefixes.insert(word[..end].to_vec()); }
+                for start in 0..word.len() {
+                    for end in start+1..=word.len() { tokens.insert(word[start..end].to_vec()); }
+                }
+            }
+            tokens.extend([vec![], vec![0, 255], b"z".to_vec(), b"ab!!".to_vec()]);
+            let mut entries: Vec<_> = tokens.into_iter().enumerate()
+                .map(|(i, t)| (i as u32 * 3, t)).collect();
+            entries.push((7001, b"a]!".to_vec()));
+            entries.push((7003, b"a]!".to_vec()));
+            let vocab = Vocab::new(entries.clone());
+            let child_source = if nullable {
+                r#"glrm 1; start leaf; t W = "a" | "ab"; nt leaf = W?;"#
+            } else {
+                r#"glrm 1; start leaf; t W = "a" | "ab"; nt leaf = W;"#
+            };
+            let outer = Constraint::compile(Grammar::glrm(
+                r#"glrm 1; start root; extern grammar leaf; nt root = "P[" leaf "]" leaf "!";"#,
+            ), &vocab).unwrap();
+            let child = Constraint::compile(Grammar::glrm(child_source), &vocab).unwrap();
+            let bound = outer.bind_grammar_dynamic_boundary("leaf", child).unwrap();
+            let loaded = Constraint::load(bound.save()).unwrap();
+            for constraint in [&bound, &loaded] {
+                for prefix in &prefixes {
+                    let mut state = constraint.start();
+                    state.commit_bytes(prefix).unwrap();
+                    let (reference, _) = mask_with_budget(&state, 0);
+                    for budget in [1, 4] {
+                        let (actual, proved) = mask_with_budget(&state, budget);
+                        total_proved += proved;
+                        assert_eq!(actual, reference, "prefix={prefix:?} nullable={nullable} budget={budget}");
+                        for (id, token) in &entries {
+                            let expected = !token.is_empty() && words.iter().any(|word| {
+                                word.len() >= prefix.len() + token.len()
+                                    && word.starts_with(prefix)
+                                    && word[prefix.len()..].starts_with(token)
+                            });
+                            let got = actual[*id as usize/32] & (1 << (id%32)) != 0;
+                            assert_eq!(got, expected, "prefix={prefix:?} token={token:?} budget={budget}");
+                        }
+                    }
+                }
+            }
+        }
+        assert!(total_proved > 0, "fixture must execute a proved epsilon-only reset");
+    }
 }
