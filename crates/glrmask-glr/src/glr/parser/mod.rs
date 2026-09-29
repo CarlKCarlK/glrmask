@@ -4836,6 +4836,13 @@ fn provider_reduction_input_is_uniform_empty(stack: &ParserGSS) -> bool {
         && stack.all_accs_satisfy(TerminalsDisallowed::is_empty)
 }
 
+// Keep the eager initializer available as an explicit diagnostic fallback.
+// The default avoids work only when the exact first action is absent, or when
+// this traversal never needs a Completion semantic key.
+fn provider_light_start_policy(value: Option<&str>) -> bool {
+    value.is_none_or(|value| matches!(value, "1" | "true"))
+}
+
 fn advance_provider_traversal_with_policy<P: ParserActionProvider, const REDUCTION_PREFIX: bool, const RESUME: bool>(
     provider: &P,
     closure: ParserGSS,
@@ -4843,8 +4850,9 @@ fn advance_provider_traversal_with_policy<P: ParserActionProvider, const REDUCTI
     mode: ProviderAdvanceMode,
 ) -> ProviderAdvanceResult {
     static LIGHT_START: OnceLock<bool> = OnceLock::new();
-    if *LIGHT_START.get_or_init(|| std::env::var("GLRMASK_PROVIDER_LIGHT_START")
-        .is_ok_and(|value| matches!(value.as_str(), "1" | "true")))
+    if *LIGHT_START.get_or_init(|| {
+        provider_light_start_policy(std::env::var("GLRMASK_PROVIDER_LIGHT_START").ok().as_deref())
+    })
     {
         advance_provider_traversal_with_initialization::<P, REDUCTION_PREFIX, RESUME, true>(
             provider, closure, symbol, mode,
@@ -6163,6 +6171,17 @@ mod tests {
     use crate::grammar::flat::TerminalID;
     use rustc_hash::FxHashSet;
     use smallvec::SmallVec;
+
+    #[test]
+    fn provider_light_start_defaults_enabled_and_keeps_explicit_eager_fallback() {
+        assert!(super::provider_light_start_policy(None));
+        for value in ["1", "true"] {
+            assert!(super::provider_light_start_policy(Some(value)));
+        }
+        for value in ["0", "false", "", "invalid"] {
+            assert!(!super::provider_light_start_policy(Some(value)));
+        }
+    }
 
     #[test]
     fn provider_light_start_matches_eager_on_scopes_branches_guards_and_labels() {

@@ -545,7 +545,7 @@ fn with_provider_and_baseline(
         candidate_futures: Vec::new(), boundary: FxHashMap::default(),
         support_enabled: {
             static ENABLED: OnceLock<bool> = OnceLock::new();
-            *ENABLED.get_or_init(|| env_flag("GLRMASK_CLOSED_ADMISSION_SUPPORT", false))
+            *ENABLED.get_or_init(|| env_flag("GLRMASK_CLOSED_ADMISSION_SUPPORT", true))
         },
         support_cache: FxHashMap::default(),
         support_profile: {
