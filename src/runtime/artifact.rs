@@ -10818,6 +10818,7 @@ pub(crate) struct ConstraintSerde {
     /// Runtime-only inverse used to re-coalesce a uniform source frontier.
     #[serde(skip, default)]
     pub(crate) runtime_product_state_by_source_subset: FxHashMap<Box<[u32]>, u32>,
+    #[serde(with = "crate::runtime::parser_backend::wire::core_programs")]
     pub(crate) template_dfas_by_terminal: TemplateDfasByTerminal,
     /// Runtime-only compact transition view for commit template products.
     #[serde(skip, default)]

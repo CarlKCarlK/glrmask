@@ -1,7 +1,10 @@
 //! A standalone parser section. The ordinary terminal templates live once in
 //! the shared constraint core; this section adds only their coordinate metadata
 //! and the exact EOF relation. Neither save nor load constructs an LR table.
+mod compact;
+
 use std::collections::BTreeSet;
+use crate::runtime::artifact::TemplateDfasByTerminal;
 use std::sync::Arc;
 
 use super::{CommitTemplateDfas, Constraint, ParserTableStorage, TemplateParser};
@@ -20,39 +23,21 @@ pub(crate) struct ParserSeed {
     terminal_count: u32,
     skip_terminals: BTreeSet<u32>,
     completion: CommitTemplateDfas,
+    programs: Option<TemplateDfasByTerminal>,
 }
 
-fn put_u32(out: &mut Vec<u8>, value: usize) {
-    out.extend_from_slice(&u32::try_from(value).expect("validated template wire count fits u32").to_le_bytes());
-}
-fn encode_dfa(out: &mut Vec<u8>, dfa: &DFA) {
-    out.extend_from_slice(&dfa.start_state.to_le_bytes());
-    put_u32(out, dfa.states.len());
-    for state in &dfa.states {
-        out.push(u8::from(state.is_accepting));
-        put_u32(out, state.transitions.len());
-        for (&label, &target) in &state.transitions {
-            out.extend_from_slice(&label.to_le_bytes());
-            out.extend_from_slice(&target.to_le_bytes());
-        }
-    }
-}
-fn encode_links(out: &mut Vec<u8>, links: &[Option<u32>]) {
-    put_u32(out, links.len());
-    for link in links { out.extend_from_slice(&link.unwrap_or(NONE).to_le_bytes()); }
-}
-
-pub(crate) fn encode(parser: &TemplateParser) -> Vec<u8> {
-    let mut bytes = Vec::new();
-    bytes.extend_from_slice(MAGIC);
-    bytes.extend_from_slice(&parser.state_count.to_le_bytes());
-    bytes.extend_from_slice(&parser.terminal_count.to_le_bytes());
-    put_u32(&mut bytes, parser.skip_terminals.len());
-    for terminal in &parser.skip_terminals { bytes.extend_from_slice(&terminal.to_le_bytes()); }
-    let completion = &parser.completion_template;
-    for dfa in [&completion.pop, &completion.read, &completion.push] { encode_dfa(&mut bytes, dfa); }
-    for links in [&completion.pop_to_read, &completion.pop_to_push, &completion.read_to_push] {
-        encode_links(&mut bytes, links);
+pub(crate) fn encode(parser: &TemplateParser, templates: &TemplateDfasByTerminal) -> Vec<u8> {
+    let bytes = compact::encode(parser, templates);
+    if std::env::var_os("GLRMASK_VALIDATE_TEMPLATE_WIRE").is_some() {
+        let decoded = compact::decode(&bytes).expect("newly encoded template programs must decode");
+        assert_eq!(decoded.state_count, parser.state_count);
+        assert_eq!(decoded.terminal_count, parser.terminal_count);
+        assert_eq!(decoded.skip_terminals, parser.skip_terminals);
+        assert!(bincode::serialize(decoded.programs.as_ref().unwrap()).unwrap() == bincode::serialize(templates).unwrap(),
+            "compact template wire changed raw graph numbering, edges, or links");
+        assert!(bincode::serialize(&decoded.completion).unwrap() == bincode::serialize(&*parser.completion_template).unwrap(),
+            "compact template wire changed raw EOF completion program");
+        eprintln!("[glrmask/validate][template_parser_wire] exact_graphs=true templates={} bytes={}", templates.len(), bytes.len());
     }
     bytes
 }
@@ -60,8 +45,8 @@ pub(crate) fn encode(parser: &TemplateParser) -> Vec<u8> {
 /// The vocabulary digest authenticates the binding coordinate, not the
 /// authorship of this artifact. The parser program still comes only from the
 /// saved acyclic templates, never from an LR reconstruction.
-pub(crate) fn encode_external(parser: &TemplateParser, digest: [u8; 32]) -> Vec<u8> {
-    let body = encode(parser);
+pub(crate) fn encode_external(parser: &TemplateParser, templates: &TemplateDfasByTerminal, digest: [u8; 32]) -> Vec<u8> {
+    let body = encode(parser, templates);
     let mut bytes = Vec::with_capacity(36 + body.len());
     bytes.extend_from_slice(b"TPX1");
     bytes.extend_from_slice(&digest);
@@ -139,6 +124,7 @@ fn validate_dimensions(state_count: u32, terminal_count: u32) -> Result<(), Stri
 }
 
 pub(crate) fn decode(bytes: &[u8]) -> Result<ParserSeed, String> {
+    if bytes.starts_with(b"TPR2") { return compact::decode(bytes); }
     let mut input = Input { bytes, offset: 0 };
     if &input.take::<4>()? != MAGIC { return Err("invalid template parser section tag".into()); }
     let state_count = input.u32()?;
@@ -165,7 +151,7 @@ pub(crate) fn decode(bytes: &[u8]) -> Result<ParserSeed, String> {
     if input.offset != bytes.len() { return Err("trailing bytes in template parser section".into()); }
     validate_alphabet(&completion, state_count)?;
     super::compile_domain(&completion).map_err(|error| error.to_string())?;
-    Ok(ParserSeed { state_count, terminal_count, skip_terminals, completion })
+    Ok(ParserSeed { state_count, terminal_count, skip_terminals, completion, programs: None })
 }
 
 fn validate_alphabet(template: &CommitTemplateDfas, state_count: u32) -> Result<(), String> {
@@ -182,7 +168,18 @@ fn validate_alphabet(template: &CommitTemplateDfas, state_count: u32) -> Result<
 }
 
 impl ParserSeed {
-    pub(crate) fn install(self, constraint: &mut Constraint) -> Result<(), String> {
+    pub(crate) fn install(mut self, constraint: &mut Constraint) -> Result<(), String> {
+        if let Some(programs) = self.programs.take() {
+            if !constraint.template_dfas_by_terminal.is_empty() {
+                return Err("compact template artifact has duplicate core parser programs".into());
+            }
+            constraint.template_dfas_by_terminal = programs;
+        }
+        if !constraint.terminal_display_names.is_empty()
+            && constraint.terminal_display_names.len() != self.terminal_count as usize
+        {
+            return Err("template parser terminal coordinate disagrees with lexical metadata".into());
+        }
         if constraint.template_dfas_by_terminal.len() != self.terminal_count as usize {
             return Err("template parser terminal count does not match its relation inventory".into());
         }
@@ -203,5 +200,29 @@ impl ParserSeed {
         constraint.deferred_table_rules = Default::default();
         constraint.fast_template_dfas_by_terminal = constraint.compute_fast_template_dfas();
         Ok(())
+    }
+}
+
+/// The shared core keeps its established field shape. New parser sections own
+/// the programs once; legacy/ordinary encoders continue writing the old vector.
+/// A scoped guard restores the thread-local policy even if serialization fails.
+pub(crate) mod core_programs {
+    use std::cell::Cell;
+    use serde::{Serialize, Deserialize, Serializer, Deserializer};
+    use super::TemplateDfasByTerminal;
+    thread_local! { static EXTERNAL: Cell<bool> = const { Cell::new(false) }; }
+    pub(crate) struct Guard(bool);
+    pub(crate) fn externalize(enabled: bool) -> Guard {
+        Guard(EXTERNAL.with(|value| value.replace(enabled)))
+    }
+    impl Drop for Guard {
+        fn drop(&mut self) { EXTERNAL.with(|value| value.set(self.0)); }
+    }
+    pub(crate) fn serialize<S: Serializer>(templates: &TemplateDfasByTerminal, serializer: S) -> Result<S::Ok, S::Error> {
+        if EXTERNAL.with(Cell::get) { TemplateDfasByTerminal::new().serialize(serializer) }
+        else { templates.serialize(serializer) }
+    }
+    pub(crate) fn deserialize<'de, D: Deserializer<'de>>(deserializer: D) -> Result<TemplateDfasByTerminal, D::Error> {
+        TemplateDfasByTerminal::deserialize(deserializer)
     }
 }

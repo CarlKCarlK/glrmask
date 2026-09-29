@@ -6218,6 +6218,7 @@ impl Constraint {
                             crate::runtime::artifact::token_bytes_artifact_serde::set_packed(true);
                         let previous_external_token_bytes =
                             crate::runtime::artifact::token_bytes_artifact_serde::set_external(true);
+                        let _external_template_programs = crate::runtime::parser_backend::wire::core_programs::externalize(self.has_template_parser());
                         let started = profile.then(std::time::Instant::now);
                         // `bincode::serialize` first runs `serialized_size` and
                         // then serializes again. Custom compact serializers
@@ -6341,9 +6342,9 @@ impl Constraint {
                         let started = profile.then(std::time::Instant::now);
                         let bytes = if let Some(parser) = &self.template_parser {
                             if external_vocab {
-                                crate::runtime::parser_backend::wire::encode_external(parser, self.template_artifact_vocab_digest())
+                                crate::runtime::parser_backend::wire::encode_external(parser, &self.template_dfas_by_terminal, self.template_artifact_vocab_digest())
                             } else {
-                                crate::runtime::parser_backend::wire::encode(parser)
+                                crate::runtime::parser_backend::wire::encode(parser, &self.template_dfas_by_terminal)
                             }
                         } else {
                             let rules = self.retained_table_rules()

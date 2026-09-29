@@ -106,8 +106,7 @@ fn replace_parser(bytes:&[u8], parser:&[u8])->Vec<u8> {
     let size=(out.len()-18) as u64; out[10..18].copy_from_slice(&size.to_le_bytes()); out
 }
 fn fixture()->Vec<u8> {
-    let c=Constraint::compile(Grammar::glrm(GRAMMARS[1]),&vocab()).unwrap();
-    into_template_parser(c).unwrap().save()
+    include_bytes!("fixtures/template_parser_v1/static-v31-tpr1.bin").to_vec()
 }
 
 #[test]
@@ -169,7 +168,7 @@ fn external_template_artifacts_omit_vocab_require_exact_binding_and_roundtrip() 
     assert_eq!(token_section_len,0,"model-token bytes must really be absent");
     let parser = &body[parser_range(body)];
     assert_eq!(&parser[..4],b"TPX1");
-    assert_eq!(&parser[36..40],b"TPR1");
+    assert_eq!(&parser[36..40],b"TPR2");
     let loaded = <DynamicConstraint as DynamicConstraintExt>::load_with_vocab(&external, &v).unwrap();
     compare_dynamic(&reference, &loaded);
     assert_eq!(loaded.save_with_external_vocab(), external,"external re-save must use same-mode backing bytes");
@@ -208,4 +207,130 @@ fn malformed_external_template_binding_is_rejected() {
     assert!(<DynamicConstraint as DynamicConstraintExt>::load_with_vocab(&bad,&v).is_err(),"accepted forged vocabulary digest");
     let mut bad=external.clone(); bad[38..40].copy_from_slice(&31u16.to_le_bytes());
     assert!(<DynamicConstraint as DynamicConstraintExt>::load_with_vocab(&bad,&v).is_err(),"accepted external parser as self-contained");
+}
+
+#[test]
+fn legacy_lr_and_template_artifacts_remain_readable() {
+    let v=vocab();
+    let lr=Constraint::compile(Grammar::glrm(GRAMMARS[1]),&v).unwrap();
+    for bytes in [
+        include_bytes!("fixtures/template_parser_v1/static-v30-lr.bin").as_slice(),
+        include_bytes!("fixtures/template_parser_v1/static-v31-tpr1.bin").as_slice(),
+    ] {
+        let restored=Constraint::load(bytes).unwrap();
+        compare_static(&lr,&restored);
+        assert_eq!(restored.save(),bytes,"old unchanged backing must re-save verbatim");
+    }
+    let o2=DynamicConstraint::compile_with_vocab_partition(Grammar::glrm(GRAMMARS[1]),&v).unwrap();
+    let old=include_bytes!("fixtures/template_parser_v1/o2-v21-tpr1.bin");
+    let restored=DynamicConstraint::load(old).unwrap();
+    compare_dynamic(&o2,&restored);
+    assert_eq!(restored.save(),old);
+    let old=include_bytes!("fixtures/template_parser_v1/o2-transfer-v14-tpx1.bin");
+    let restored=<DynamicConstraint as DynamicConstraintExt>::load_with_vocab(old,&v).unwrap();
+    compare_dynamic(&o2,&restored);
+    assert_eq!(restored.save_with_external_vocab(),old);
+    for report in dynamic_parser_backend_report(&restored).as_array().unwrap() {
+        assert_eq!(report["lr_table_present"],false);
+    }
+}
+
+fn compact_fixture()->Vec<u8> {
+    into_template_parser(Constraint::compile(Grammar::glrm(GRAMMARS[1]),&vocab()).unwrap()).unwrap().save()
+}
+fn read_var(bytes:&[u8],offset:&mut usize)->u32 {
+    let mut value=0;
+    for shift in (0..=28).step_by(7) {
+        let byte=bytes[*offset];*offset+=1;value|=u32::from(byte&127)<<shift;
+        if byte&128==0{return value;}
+    }
+    panic!("test fixture has malformed varint")
+}
+fn var_bytes(mut value:u32)->Vec<u8> {
+    let mut bytes=Vec::new();
+    while value>=128 {bytes.push((value as u8&127)|128);value>>=7;}
+    bytes.push(value as u8);bytes
+}
+fn mutate_range(bytes:&[u8],range:std::ops::Range<usize>,value:&[u8])->Vec<u8> {
+    let mut result=bytes[..range.start].to_vec();result.extend_from_slice(value);result.extend_from_slice(&bytes[range.end..]);result
+}
+
+#[test]
+fn compact_template_programs_reject_noncanonical_counts_truncation_and_duplicate_core() {
+    let original=compact_fixture();let parser=&original[parser_range(&original)];
+    assert_eq!(&parser[..4],b"TPR2");
+    let mut cursor=4;let alphabet=read_var(parser,&mut cursor);let first_end=cursor;
+    for bad in [vec![128,0],vec![255,255,255,255,31],vec![128;6]] {
+        let bad=mutate_range(parser,4..first_end,&bad);
+        let error=Constraint::load(replace_parser(&original,&bad)).unwrap_err();
+        assert!(error.to_string().contains("varint"),"wrong rejection for malformed varint: {error}");
+    }
+    assert!(alphabet>0);
+    for length in 0..parser.len() {
+        assert!(Constraint::load(replace_parser(&original,&parser[..length])).is_err(),"accepted compact truncation{length}");
+    }
+    let mut trailing=parser.to_vec();trailing.push(0);
+    assert!(Constraint::load(replace_parser(&original,&trailing)).is_err());
+    // Programs cannot exist in both the old core vector and the new section.
+    let old=include_bytes!("fixtures/template_parser_v1/static-v31-tpr1.bin");
+    let error=Constraint::load(replace_parser(old,parser)).unwrap_err();
+    assert!(error.to_string().contains("duplicate core parser programs"),"wrong duplicate-program rejection: {error}");
+}
+
+#[test]
+fn compact_template_edges_reject_cycles_missing_targets_and_bad_labels() {
+    let original=compact_fixture();let parser=&original[parser_range(&original)];
+    let mut cursor=4;
+    let alphabet=read_var(parser,&mut cursor);let terminals=read_var(parser,&mut cursor);
+    let skips=read_var(parser,&mut cursor);for _ in 0..skips{read_var(parser,&mut cursor);}
+    let mut exercised=false;
+    'programs: for _ in 0..=terminals {
+        for _phase in 0..3 {
+            let states=read_var(parser,&mut cursor);
+            if states==0{continue;}
+            read_var(parser,&mut cursor); // start state
+            for source in 0..states {
+                let flags=read_var(parser,&mut cursor);
+                for _ in 0..flags>>1 {
+                    let label_start=cursor;read_var(parser,&mut cursor);let label_end=cursor;
+                    let target_start=cursor;read_var(parser,&mut cursor);let target_end=cursor;
+                    let bad=mutate_range(parser,target_start..target_end,&var_bytes(source));
+                    let error=Constraint::load(replace_parser(&original,&bad)).unwrap_err();
+                    assert!(error.to_string().contains("cyclic"),"wrong self-cycle rejection: {error}");
+                    let bad=mutate_range(parser,target_start..target_end,&var_bytes(states));
+                    let error=Constraint::load(replace_parser(&original,&bad)).unwrap_err();
+                    assert!(error.to_string().contains("missing state"),"wrong missing-target rejection: {error}");
+                    let bad=mutate_range(parser,label_start..label_end,&var_bytes(alphabet+1));
+                    let error=Constraint::load(replace_parser(&original,&bad)).unwrap_err();
+                    assert!(error.to_string().contains("alphabet"),"wrong label rejection: {error}");
+                    exercised=true;break 'programs;
+                }
+            }
+        }
+        for _ in 0..3 {let links=read_var(parser,&mut cursor);for _ in 0..links{read_var(parser,&mut cursor);}}
+    }
+    assert!(exercised,"fixture needs a nonempty transition graph");
+}
+
+#[test]
+fn table_free_root_end_and_exact_only_token_policies_survive_roundtrip() {
+    use glrmask::BuildOptions;
+    let v=Vocab::new_with_exact_token_ids(vec![(0,b"a".to_vec()),(1,b"b".to_vec())],[31,77]);
+    let source=Grammar::from_glrm(r#"start start; t A ::= "a"; nt start ::= A;"#);
+    let lr=source.compile_with(&v,BuildOptions::default().end_tokens([77])).unwrap();
+    let template=into_template_parser(lr.clone()).unwrap();
+    let saved=template.save();
+    assert_eq!(&saved[..8],b"GLRROOT2");
+    let restored=Constraint::load_with_vocab(saved.clone(),&v).unwrap();
+    assert_eq!(parser_backend_report(&restored)["lr_table_present"],false);
+    let mut a=lr.start();let mut b=restored.start();
+    for token in [0,77] {
+        assert_eq!(a.mask(),b.mask());
+        a.commit_token(token).unwrap();b.commit_token(token).unwrap();
+        assert_eq!(a.is_accepting(),b.is_accepting());
+        assert_eq!(a.is_terminated(),b.is_terminated());
+    }
+    assert!(b.is_terminated());
+    let missing=Vocab::new(vec![(0,b"a".to_vec()),(1,b"b".to_vec())]);
+    assert!(Constraint::load_with_vocab(saved,&missing).is_err());
 }
