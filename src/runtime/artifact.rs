@@ -1468,6 +1468,7 @@ impl FastTemplateDfa {
 
 #[derive(Debug, Clone, Default)]
 pub(crate) struct FastCommitTemplateDfas {
+    pub(crate) push_suffixes: Vec<Option<super::commit::push_suffixes::PreparedPushSuffixes>>,
     pub(crate) pop: FastTemplateDfa,
     pub(crate) read: FastTemplateDfa,
     pub(crate) push: FastTemplateDfa,
@@ -1479,6 +1480,7 @@ pub(crate) struct FastCommitTemplateDfas {
 impl FastCommitTemplateDfas {
     pub(crate) fn from_template(template: &CommitTemplateDfas) -> Self {
         Self {
+            push_suffixes: super::commit::push_suffixes::prepare(template),
             pop: FastTemplateDfa::from_dfa(&template.pop),
             read: FastTemplateDfa::from_dfa(&template.read),
             push: FastTemplateDfa::from_dfa(&template.push),

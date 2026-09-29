@@ -1,6 +1,7 @@
 use crate::automata::lexer::Lexer;
 pub(crate) mod profile;
 mod template_advance;
+pub(crate) mod push_suffixes;
 pub(crate) use template_advance::advance_stacks_template_dfa;
 pub(crate) mod tokenizer_scan;
 

@@ -32,7 +32,8 @@ pub(crate) fn advance_stacks_template_dfa(
         .template_dfas_by_terminal
         .get(terminal as usize)?
         .as_ref()?;
-    let output = advance_with_template(dfa, stack.clone());
+    let output = advance_with_prepared_template(dfa, stack.clone(),
+        constraint.fast_template_dfas_by_terminal.get(terminal as usize).and_then(|t| t.as_deref()));
     debug_validate_template_output(dfa, stack, &output, terminal);
     Some(output)
 }
@@ -47,7 +48,8 @@ pub(super) fn advance_stacks_template_dfa_owned(
         .get(terminal as usize)?
         .as_ref()?;
     let input = debug_template_literal_enabled().then(|| stack.clone());
-    let output = advance_with_template(dfa, stack);
+    let output = advance_with_prepared_template(dfa, stack,
+        constraint.fast_template_dfas_by_terminal.get(terminal as usize).and_then(|t| t.as_deref()));
     if let Some(input) = input { debug_validate_template_output(dfa, &input, &output, terminal); }
     Some(output)
 }
@@ -646,6 +648,11 @@ fn evaluate_template_language(
 }
 
 fn advance_with_template(template: &CommitTemplateDfas, stack: ParserGSS) -> ParserGSS {
+    advance_with_prepared_template(template, stack, None)
+}
+
+fn advance_with_prepared_template(template: &CommitTemplateDfas, stack: ParserGSS,
+    prepared: Option<&FastCommitTemplateDfas>) -> ParserGSS {
 
     let mut output = ParserGSS::empty();
     // Uniform annotations make branch-order changes immaterial. Keep the
@@ -785,6 +792,14 @@ fn advance_with_template(template: &CommitTemplateDfas, stack: ParserGSS) -> Par
                 }
             }
             Phase::Push => {
+                if sparse_input
+                    && let Some(plan) = prepared.and_then(|p| p.push_suffixes.get(state_id as usize))
+                    .and_then(Option::as_ref)
+                    && let Some(outputs) = plan.apply(&gss)
+                {
+                    output = output.merge(&outputs);
+                    continue;
+                }
                 let Some(dfa_state) = template.push.states.get(state_id as usize) else {
                     continue;
                 };
@@ -1251,7 +1266,11 @@ mod tests {
             for group in [&paths[..1], &paths[1..2], &paths[2..4], &paths[1..], &paths[..]] {
                 let source = ParserGSS::from_stacks(group);
                 let expected = super::advance_with_template_reference(&template, source.clone());
+                let fast = crate::runtime::FastCommitTemplateDfas::from_template(&template);
+                let accelerated = super::advance_with_prepared_template(&template, source.clone(), Some(&fast));
                 let actual = advance_with_template(&template, source);
+                assert_eq!(accelerated.semantically_eq(&expected, 16_384), Some(true),
+                    "prepared PUSH differs, case={case}, paths={group:?}");
                 assert_eq!(actual.semantically_eq(&expected, 16_384), Some(true),
                     "sparse frontier relation differs, case={case}, paths={group:?}");
             }
