@@ -705,25 +705,28 @@ fn advance_with_template(template: &CommitTemplateDfas, stack: ParserGSS) -> Par
                         }
                     }
                 } else {
-                    for (&label, &target) in &dfa_state.transitions {
-                        if is_negative_label(label) {
-                            panic!(
-                                "commit template pop DFA contains push label {label} at state {state_id}"
-                            );
-                        }
-                        if label != DEFAULT_LABEL && label >= 0 {
-                            let state = label as u32;
-                            let branch = gss.isolate(Some(state)).popn(1);
-                            if !branch.is_empty() {
-                                worklist.push((Phase::Pop, target, branch));
+                    // Preserve the original BTreeMap row order for correlated
+                    // annotations. Only live top labels can produce a branch;
+                    // sorting them preserves the exact old merge order while
+                    // avoiding scans of all absent grammar-state labels.
+                    let tops = gss.peek_values();
+                    let mut explicit_tops = tops.clone();
+                    explicit_tops.sort_unstable();
+                    for &top in &explicit_tops {
+                        let label = top as i32;
+                        if label == DEFAULT_LABEL || is_negative_label(label) { continue; }
+                        if let Some(&target) = dfa_state.transitions.get(&label) {
+                            let isolated = gss.isolate(Some(top));
+                            if !isolated.is_empty() {
+                                worklist.push((Phase::Pop, target, isolated.popn(1)));
                             }
                         }
                     }
                     if let Some(&target) = dfa_state.transitions.get(&DEFAULT_LABEL) {
-                        for top in gss.peek_values() {
-                            if dfa_state.transitions.contains_key(&(top as i32)) {
-                                continue;
-                            }
+                        // The old fallback visits remaining GSS top values in
+                        // their native order, separately from explicit edges.
+                        for top in tops {
+                            if dfa_state.transitions.contains_key(&(top as i32)) { continue; }
                             let branch = gss.isolate(Some(top)).popn(1);
                             if !branch.is_empty() {
                                 worklist.push((Phase::Pop, target, branch));
@@ -763,15 +766,16 @@ fn advance_with_template(template: &CommitTemplateDfas, stack: ParserGSS) -> Par
                         }
                     }
                 } else {
-                    for (&label, &target) in &dfa_state.transitions {
-                        if label == DEFAULT_LABEL || is_negative_label(label) {
-                            panic!(
-                                "commit template read DFA contains non-read label {label} at state {state_id}"
-                            );
-                        }
-                        let branch = gss.isolate(Some(label as u32));
-                        if !branch.is_empty() {
-                            worklist.push((Phase::Read, target, branch));
+                    let mut tops = gss.peek_values();
+                    tops.sort_unstable();
+                    for top in tops {
+                        let label = top as i32;
+                        if is_negative_label(label) { continue; }
+                        if let Some(&target) = dfa_state.transitions.get(&label) {
+                            let isolated = gss.isolate(Some(top));
+                            if !isolated.is_empty() {
+                                worklist.push((Phase::Read, target, isolated));
+                            }
                         }
                     }
                 }
