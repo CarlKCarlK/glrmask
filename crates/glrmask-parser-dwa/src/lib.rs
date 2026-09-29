@@ -94,6 +94,9 @@ pub mod __private {
         pub mod characterize {
             pub use crate::templates::characterize::*;
         }
+        pub mod completion {
+            pub use crate::templates::completion::*;
+        }
         pub mod compile_bundle {
             pub use crate::templates::compile_bundle::*;
         }

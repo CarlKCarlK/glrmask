@@ -106,6 +106,73 @@ pub fn characterize_finish_probe(table: &GLRTable) -> TerminalCharacterization {
     }
 }
 
+/// Derive an exact standalone completion-domain relation from the built-in
+/// frontend's EOF semantics. The returned relation is a build artifact, not
+/// an EOF stack-advance operation: its output stack is existentially ignored.
+///
+/// Only EOF Accept (including an accepting Split) terminates successfully.
+/// EOF shifts/skips/replacements are discarded, while reductions and gotos
+/// retain their concrete predecessor feasibility. An accepting Split can be
+/// replaced by identity outright because it already proves this configuration
+/// is in the domain, independently of its other reductions or shift branch.
+///
+/// Linker controls are deliberately unsupported in this standalone primitive;
+/// silently ignoring their closure would be incorrect. Re-reduction cycles
+/// are rejected rather than truncated to a bounded accepting approximation.
+pub fn characterize_completion_domain(table: &GLRTable) -> Result<TerminalCharacterization, String> {
+    use crate::compiler::glr::table::row::ActionRow;
+
+    if !table.control_terminals.is_empty() {
+        return Err("standalone completion templates do not support linker-control closure".to_owned());
+    }
+    let mut projected = table.clone();
+    projected.num_terminals = 1;
+    projected.action = (0..table.num_states).map(|source| {
+        let action = if table.advance_row_allows(source, EOF) {
+            match table.action(source, EOF) {
+                Some(Action::Accept | Action::Split { accept: true, .. }) => Some(Action::Skip),
+                Some(Action::Reduce(nt, len)) => Some(Action::Reduce(*nt, *len)),
+                Some(Action::Split { reduces, .. }) if !reduces.is_empty() => Some(Action::Split {
+                    shift: None, reduces: reduces.clone(), accept: false,
+                }),
+                _ => None,
+            }
+        } else { None };
+        ActionRow::from_iter(action.into_iter().map(|action| (0, action)))
+    }).collect();
+    // Terminal zero is synthetic: never inherit unrelated real-terminal
+    // forwarding/guard/ignore metadata into its characterization coordinate.
+    projected.forwarded_shifts.clear();
+    projected.skip_terminals.clear();
+    projected.guarded_shift_index.clear();
+    projected.direct_regular_wide_frontiers.clear();
+    projected.rebuild_advance_rows_from_actions();
+    projected.unconditional_advance.clear();
+
+    let index = build_characterization_index_for_terminal_count(&projected, 1);
+    let mut output = CharacterizationOutput::default();
+    characterize_initial_actions_for_terminal(&projected, &index, 0, &mut output);
+    characterize_nt_continuations_for_terminal(&projected, &index, 0, &mut output);
+    let mut all_nts = BTreeSet::new();
+    for reduce in &output.reduces { all_nts.insert(reduce.nonterminal); }
+    for escape in &output.nt_escapes { all_nts.insert(escape.source_nonterminal); }
+    for reduce in &output.nt_rereduces {
+        all_nts.insert(reduce.source_nonterminal);
+        all_nts.insert(reduce.target_nonterminal);
+    }
+    let characterization = TerminalCharacterization {
+        escapes: output.escapes.into_iter().collect(),
+        reduces: output.reduces.into_iter().collect(),
+        nt_escapes: output.nt_escapes.into_iter().collect(),
+        nt_rereduces: output.nt_rereduces.into_iter().collect(),
+        all_nts,
+    };
+    if let Some(cycle) = characterization.find_cycle() {
+        return Err(format!("completion template requires a cyclic reduction relation: {cycle:?}"));
+    }
+    Ok(characterization)
+}
+
 /// Endpoint policy for deriving a child Finish transfer from local EOF rows.
 ///
 /// The ordinary characterizer ignores `Accept`; a Finish transfer must turn a

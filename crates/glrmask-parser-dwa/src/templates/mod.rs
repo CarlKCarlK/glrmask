@@ -56,6 +56,7 @@ pub fn commit_template_dfas_enabled() -> bool {
 pub(crate) mod admissibility;
 pub(crate) mod characterize;
 pub(crate) mod compile_bundle;
+pub(crate) mod completion;
 pub(crate) mod compile_dfa;
 
 pub use compile_dfa::Templates;
