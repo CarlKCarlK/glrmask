@@ -8226,6 +8226,12 @@ impl DynamicMaskVocab {
     /// Preserve the exact O2 execution coordinate while omitting accelerators
     /// determined solely by the caller's separately supplied model vocabulary.
     pub(crate) fn to_template_external_vocab_artifact(&self) -> Option<DynamicMaskVocabArtifact> {
+        // A full-vocabulary walk has no grammar quotient to persist. Returning
+        // None lets the reader reconstruct its pure vocabulary-derived data
+        // from the already fingerprint-validated external Vocab. A serialized
+        // identity/full cache has no quotient source digest and must not be
+        // misidentified as a grammar quotient by the transfer reader.
+        if !self.grammar_quotiented { return None; }
         let mut artifact = self.to_artifact_impl(true)?;
         if artifact.grammar_quotiented {
             artifact.llg_slice_leftovers.clear();

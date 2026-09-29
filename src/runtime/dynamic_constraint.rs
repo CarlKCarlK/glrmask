@@ -233,8 +233,8 @@ impl<'de> serde::Deserialize<'de> for CompactTransferTable {
 }
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
-struct DynamicConstraintPayloadV1 {
-    table: GLRTable,
+struct DynamicConstraintPayloadV1<Table = GLRTable> {
+    table: Table,
     terminal_display_names: Vec<String>,
     #[serde(with = "crate::automata::lexer::tokenizer::compact_artifact_serde")]
     tokenizer: Tokenizer,
@@ -259,8 +259,8 @@ struct LegacyDynamicConstraintPayloadV1 {
 }
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
-struct DynamicConstraintPayloadV2 {
-    v1: DynamicConstraintPayloadV1,
+struct DynamicConstraintPayloadV2<Table = GLRTable> {
+    v1: DynamicConstraintPayloadV1<Table>,
     special_token_terminals: Vec<SpecialTokenTerminal>,
 }
 
@@ -872,6 +872,23 @@ impl DynamicConstraint {
         payload: DynamicConstraintPayloadV2,
         dynamic_mask_vocab: DynamicMaskVocab,
     ) -> Constraint {
+        let DynamicConstraintPayloadV2 { v1, special_token_terminals } = payload;
+        let DynamicConstraintPayloadV1 { table, terminal_display_names, tokenizer,
+            ignore_terminal, direct_regular_automaton, token_bytes, ignore_expr, terminal_exprs } = v1;
+        Self::constraint_from_runtime_parts(DynamicConstraintPayloadV2 {
+            v1: DynamicConstraintPayloadV1 { table: table.into(), terminal_display_names, tokenizer,
+                ignore_terminal, direct_regular_automaton, token_bytes, ignore_expr, terminal_exprs },
+            special_token_terminals,
+        }, dynamic_mask_vocab)
+    }
+
+    /// Shared assembly accepts an absent parser store. A data-only constructor
+    /// does not construct even a placeholder GLR table and installs its program
+    /// before any runtime-derived caches are initialized.
+    fn constraint_from_runtime_parts(
+        payload: DynamicConstraintPayloadV2<crate::runtime::parser_backend::ParserTableStorage>,
+        dynamic_mask_vocab: DynamicMaskVocab,
+    ) -> Constraint {
         let DynamicConstraintPayloadV2 {
             v1: mut payload,
             special_token_terminals,
@@ -910,7 +927,7 @@ impl DynamicConstraint {
             direct_regular_dynamic_hot_frontiers: Vec::new(),
             direct_regular_parser_state_acceptance: Vec::new(),
             direct_regular_automaton: payload.direct_regular_automaton,
-            table: payload.table.into(),
+            table: payload.table,
             terminal_display_names: payload.terminal_display_names,
             tokenizer: payload.tokenizer.into(),
             boundary_completion_index: None,
@@ -1004,6 +1021,36 @@ impl DynamicConstraint {
             deferred_table_rules_blob: None,
             deferred_table_rules: Default::default(),
         };
+        inner
+    }
+
+    pub(crate) fn from_template_runtime_parts(
+        tokenizer: Tokenizer,
+        terminal_display_names: Vec<String>,
+        ignore_terminal: Option<TerminalID>,
+        templates: Vec<Option<Arc<crate::runtime::CommitTemplateDfas>>>,
+        parser: Arc<crate::runtime::parser_backend::TemplateParser>,
+        vocab: &Vocab,
+    ) -> Constraint {
+        let ignore_expr = ignore_terminal.and_then(|t|tokenizer.terminal_expr(t).cloned());
+        let terminal_exprs = tokenizer.terminal_exprs().map(ToOwned::to_owned);
+        let payload = DynamicConstraintPayloadV2 {
+            v1: DynamicConstraintPayloadV1 {
+                table: crate::runtime::parser_backend::ParserTableStorage::absent(),
+                terminal_display_names, tokenizer, ignore_terminal,
+                direct_regular_automaton: None, token_bytes: vocab.entries_arc(),
+                ignore_expr, terminal_exprs,
+            },
+            special_token_terminals: Vec::new(),
+        };
+        let dynamic_vocab = crate::compiler::constraint_possible_matches::runtime_dynamic_vocab_for_vocab(vocab);
+        let mut inner = Self::constraint_from_runtime_parts(payload, dynamic_vocab);
+        inner.template_dfas_by_terminal = templates;
+        inner.template_parser = Some(parser);
+        inner.fast_template_dfas_by_terminal = inner.compute_fast_template_dfas();
+        let _ = inner.late_bind_vocab.set(vocab.clone());
+        inner.rebuild_dynamic_runtime_caches();
+        assert!(!inner.table.is_present(), "data-only constructor created an LR table");
         inner
     }
 
@@ -3715,6 +3762,20 @@ impl<'a> DynamicConstraintState<'a> {
             ));
         };
         state.commit_token_profiled(token_id)
+    }
+
+    /// Bounded diagnostic mirror of the common state profiler. No timing
+    /// benchmark should use this stack-enumerating inspection API.
+    #[cfg(any(test, feature = "internal-api"))]
+    #[doc(hidden)]
+    pub fn commit_token_per_advance(&mut self, token_id: u32) -> Result<
+        (Vec<crate::runtime::PerAdvanceEntry>, Vec<(u32, Vec<Vec<u32>>)>, CommitProfile),
+        String,
+    > {
+        let [state] = self.alternatives.as_mut_slice() else {
+            return Err("per-advance profiling requires one dynamic alternative".into());
+        };
+        state.commit_token_per_advance(token_id)
     }
 
     /// Fill `buf` with the allowed-token mask as a packed bitset.

@@ -466,6 +466,27 @@ fn dynamic_named_alternatives_from_named(
     Ok(alternatives)
 }
 
+fn compile_bounded_template_from_source(
+    source: &str, vocab: &crate::Vocab, table_construction: GlrTableConstruction,
+    parse: fn(&str) -> crate::Result<ast::NamedGrammar>,
+    transform: Option<NamedGrammarTransform>,
+) -> crate::Result<DynamicConstraint> {
+    with_large_import_stack(source.len(), || {
+        let alternatives = dynamic_named_alternatives(source, parse, transform, &[])?;
+        let mut compiled = Vec::with_capacity(alternatives.len());
+        for alternative in alternatives {
+            let grammar = ast::lower(&alternative)?;
+            let prepared = crate::compiler::grammar::transforms::prepare_grammar_transforms_only(grammar);
+            compiled.push(compile_dynamic_owned_with_vocab_partition_with_table_construction(
+                prepared, vocab, table_construction,
+            )?);
+        }
+        let mut constraint = DynamicConstraint::from_alternatives(compiled);
+        for component in constraint.constraints_mut() { component.install_template_parser()?; }
+        Ok(constraint)
+    })
+}
+
 fn compile_dynamic_from_named(
     named: ast::NamedGrammar,
     vocab: &crate::Vocab,
@@ -1725,6 +1746,27 @@ impl DynamicConstraint {
                 &[],
             )
         })
+    }
+
+    /// Compile the same O2 runtime with the bounded grammar normal form
+    /// required by an acyclic stack-action backend. This does not build the
+    /// static token-mask DWA, and it never approximates a recursive action
+    /// relation by a finite-depth unrolling.
+    pub(crate) fn from_glrm_with_bounded_template_parser(source: &str, vocab: &crate::Vocab) -> crate::Result<Self> {
+        compile_bounded_template_from_source(source, vocab, GlrTableConstruction::ExperimentalCoreMerged, parse_glrm_to_named, None)
+    }
+
+    pub(crate) fn from_ebnf_with_bounded_template_parser(source: &str, vocab: &crate::Vocab) -> crate::Result<Self> {
+        compile_bounded_template_from_source(source, vocab, GlrTableConstruction::ExperimentalCoreMerged, parse_ebnf_to_named, None)
+    }
+
+    pub(crate) fn from_lark_with_bounded_template_parser(source: &str, vocab: &crate::Vocab) -> crate::Result<Self> {
+        compile_bounded_template_from_source(source, vocab, GlrTableConstruction::ExperimentalCoreMerged, parse_lark_to_named, None)
+    }
+
+    pub(crate) fn from_json_schema_with_bounded_template_parser(source: &str, vocab: &crate::Vocab) -> crate::Result<Self> {
+        compile_bounded_template_from_source(source, vocab, GlrTableConstruction::Lalr,
+            parse_json_schema_to_named_dynamic_vocab_partition, Some(prepare_json_schema_named))
     }
 
     /// Compile a GLRM grammar with reduced latency and model end-token IDs.

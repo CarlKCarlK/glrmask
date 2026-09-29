@@ -232,3 +232,7 @@ path = "tests/regressions/json_schema/integer_multiple_exact.rs"
 name = "template_parser_artifact"
 path = "tests/template_parser_artifact.rs"
 required-features = ["internal-api"]
+
+[[test]]
+name = "template_parser_provider"
+path = "tests/template_parser_provider.rs"

@@ -83,6 +83,7 @@ pub(crate) mod compiler;
 pub(crate) mod ds;
 mod error;
 mod public_api;
+pub mod template_parser;
 pub(crate) use glrmask_grammar::__private::grammar;
 pub(crate) mod import;
 pub(crate) mod programmatic_js;
@@ -94,7 +95,7 @@ pub(crate) use glrmask_vocab::__private as vocab;
 pub use runtime::{Constraint, ConstraintState};
 pub use glrmask_vocab::{ExactToken, ExactTokens, Vocab};
 pub use error::{Error, Result};
-pub use public_api::{BuildOptions, Grammar, Optimization, UnlinkedConstraint};
+pub use public_api::{BuildOptions, Grammar, Optimization, ParserBackend, UnlinkedConstraint};
 
 /// Model token identifier.
 pub type TokenId = u32;
@@ -313,6 +314,12 @@ pub mod __private {
 
     pub fn parser_backend_report(constraint: &Constraint) -> serde_json::Value {
         constraint.parser_backend_report()
+    }
+
+    /// Native research gate for the bounded O2 frontend; compare against the
+    /// ordinary O2 parser independently before adopting as a public policy.
+    pub fn compile_bounded_template_o2_glrm(source: &str, vocab: &Vocab) -> Result<DynamicConstraint> {
+        DynamicConstraint::from_glrm_with_bounded_template_parser(source, vocab)
     }
 
     pub fn dynamic_parser_backend_report(constraint: &DynamicConstraint) -> serde_json::Value {

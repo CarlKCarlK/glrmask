@@ -5921,6 +5921,18 @@ impl Constraint {
         *digest.finalize().as_bytes()
     }
 
+    /// Save a table-free constraint without duplicating its model vocabulary.
+    /// Load with `Constraint::load_with_vocab` and the exact original vocabulary;
+    /// an absent or incompatible binding is rejected. This mode is currently
+    /// available only for `ParserBackend::TemplateDfa` constraints.
+    pub fn save_with_external_vocab(&self) -> crate::Result<Vec<u8>> {
+        if !self.has_template_parser() {
+            return Err(crate::Error::Serialization(
+                "external-vocabulary Constraint artifacts currently require the template parser backend".into()));
+        }
+        Ok(self.save_template_with_external_vocab())
+    }
+
     pub(crate) fn save_template_with_external_vocab(&self) -> Vec<u8> {
         assert!(self.has_template_parser(), "external template save requires a table-free parser");
         self.save_with_vocab_policy(true)

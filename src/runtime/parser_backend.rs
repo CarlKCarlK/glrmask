@@ -123,7 +123,7 @@ fn matches_gss(domain: &TemplateDomain, stack: &ParserGSS) -> bool {
 }
 
 impl TemplateParser {
-    fn compile(
+    pub(crate) fn compile(
         state_count: u32,
         terminal_count: u32,
         skip_terminals: BTreeSet<TerminalID>,

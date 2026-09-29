@@ -29,11 +29,23 @@ pub enum Optimization {
     FastRuntime,
 }
 
+/// Parser implementation used by a final runnable constraint. TemplateDfa
+/// physically omits LR action/goto storage; unsupported composition fails
+/// explicitly rather than retaining a hidden table fallback.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[non_exhaustive]
+pub enum ParserBackend {
+    #[default]
+    LrTable,
+    TemplateDfa,
+}
+
 /// Options that apply only when producing a final runnable constraint.
 #[derive(Debug, Clone, Default)]
 pub struct BuildOptions {
     end_tokens: Vec<u32>,
     optimization: Optimization,
+    parser_backend: ParserBackend,
 }
 
 impl BuildOptions {
@@ -48,6 +60,10 @@ impl BuildOptions {
     pub fn optimization(mut self, optimization: Optimization) -> Self {
         self.optimization = optimization;
         self
+    }
+
+    pub fn parser_backend(mut self, backend: ParserBackend) -> Self {
+        self.parser_backend = backend; self
     }
 
     pub(crate) fn end_token_ids(&self) -> &[u32] {
@@ -235,6 +251,29 @@ impl<'a> Grammar<'a> {
         vocab: &Vocab,
         options: BuildOptions,
     ) -> Result<RuntimeConstraint> {
+        if options.parser_backend == ParserBackend::TemplateDfa {
+            if !self.bindings.is_empty() {
+                return Err(Error::Compilation("template-parser component composition is not implemented; no LR fallback is permitted".into()));
+            }
+            if options.optimization == Optimization::FastBuild {
+                // Use the existing O2 runtime with the bounded grammar normal
+                // form required by finite templates. Ordinary dynamic grammar
+                // preparation intentionally allows recursive action closures.
+                let dynamic = match self.source {
+                    GrammarSource::Glrm(source) => DynamicConstraint::from_glrm_with_bounded_template_parser(source, vocab),
+                    GrammarSource::Ebnf(source) => DynamicConstraint::from_ebnf_with_bounded_template_parser(source, vocab),
+                    GrammarSource::Lark(source) => DynamicConstraint::from_lark_with_bounded_template_parser(source, vocab),
+                    GrammarSource::JsonSchema(source) => DynamicConstraint::from_json_schema_with_bounded_template_parser(source, vocab),
+                }?;
+                let mut components = dynamic.into_constraints();
+                if components.len() != 1 {
+                    return Err(Error::Compilation("a template-parser Constraint currently requires one compiled component; union composition is not implemented".into()));
+                }
+                let constraint = components.pop().unwrap();
+                ensure_runnable_constraint(&constraint)?;
+                return constraint.with_end_tokens(options.end_token_ids());
+            }
+        }
         let mut spec = ConstraintSpec::builder(self.clone(), vocab)?.build()?;
         spec.automatic_boundary_selection = true;
         if let Some(name) = spec.unbound_grammar_names.first() {
@@ -242,8 +281,11 @@ impl<'a> Grammar<'a> {
                 "external grammar {name:?} is unbound; compile_unlinked() if a reusable pre-link artifact is intended",
             )));
         }
-        let constraint = spec.compile_final(options.optimization_value())?;
+        let mut constraint = spec.compile_final(options.optimization_value())?;
         ensure_runnable_constraint(&constraint)?;
+        if options.parser_backend == ParserBackend::TemplateDfa {
+            constraint.install_template_parser()?;
+        }
         constraint.with_end_tokens(options.end_token_ids())
     }
 
@@ -2072,14 +2114,20 @@ impl UnlinkedConstraint {
 
     /// Link a fully bound artifact with final build options.
     pub fn link_with(&self, options: BuildOptions) -> Result<RuntimeConstraint> {
+        if options.parser_backend == ParserBackend::TemplateDfa && !self.bindings.is_empty() {
+            return Err(Error::Compilation("template-parser component composition is not implemented; no LR fallback is permitted".into()));
+        }
         if let Some((name, kind)) = self.first_open_slot()? {
             return Err(Error::Compilation(format!(
                 "external {} {name:?} is still unbound",
                 kind.name(),
             )));
         }
-        let constraint = self.materialize(options.optimization_value())?;
+        let mut constraint = self.materialize(options.optimization_value())?;
         ensure_runnable_constraint(&constraint)?;
+        if options.parser_backend == ParserBackend::TemplateDfa {
+            constraint.install_template_parser()?;
+        }
         constraint.with_end_tokens(options.end_token_ids())
     }
 
@@ -5550,5 +5598,15 @@ mod cached_parent_main_tests {
         let loaded = RuntimeConstraint::load(fast_build.save()).unwrap();
         assert!(loaded.uses_dynamic_runtime());
         assert_eq!(loaded.start().mask(), fast_runtime.start().mask());
+    }
+}
+
+impl RuntimeConstraint {
+    /// Inspect the actual stored parser backend, not a process-wide switch.
+    pub fn parser_backend(&self) -> ParserBackend {
+        if self.has_template_parser() {
+            assert!(!self.table.is_present(), "template parser retained LR storage");
+            ParserBackend::TemplateDfa
+        } else { ParserBackend::LrTable }
     }
 }

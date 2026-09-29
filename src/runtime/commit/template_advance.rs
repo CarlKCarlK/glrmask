@@ -647,6 +647,7 @@ fn evaluate_template_language(
     output
 }
 
+#[cfg(test)]
 fn advance_with_template(template: &CommitTemplateDfas, stack: ParserGSS) -> ParserGSS {
     advance_with_prepared_template(template, stack, None)
 }
