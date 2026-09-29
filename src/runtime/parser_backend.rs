@@ -122,6 +122,21 @@ fn matches_gss(domain: &TemplateDomain, stack: &ParserGSS) -> bool {
     })
 }
 
+/// Enumerate only possible members of an existential query. In particular,
+/// do not iterate an entire wide lexer-future set and rediscover the same
+/// exclusive GSS top for every impossible terminal.
+fn intersecting_bits<'a>(left: &'a BitSet, right: &'a BitSet) -> impl Iterator<Item = usize> + 'a {
+    left.words().iter().zip(right.words()).enumerate().flat_map(|(index, (&a, &b))| {
+        let mut word = a & b;
+        std::iter::from_fn(move || {
+            if word == 0 { return None; }
+            let bit = index * 64 + word.trailing_zeros() as usize;
+            word &= word - 1;
+            Some(bit)
+        })
+    })
+}
+
 impl TemplateParser {
     pub(crate) fn compile(
         state_count: u32,
@@ -192,6 +207,19 @@ impl TemplateParser {
     }
 
     pub(crate) fn admits_any(&self, stack: &ParserGSS, candidates: &BitSet) -> bool {
+        if let Some(top) = stack.single_exclusive_top_value()
+            && let Some(possible) = self.possible.get(top as usize)
+        {
+            if self.profile { self.admissions.fetch_add(1, Ordering::Relaxed); }
+            if self.unconditional.get(top as usize).is_some_and(|row|
+                row.words().iter().zip(candidates.words()).any(|(a,b)| a & b != 0))
+            { return true; }
+            return intersecting_bits(possible, candidates).any(|bit| {
+                let domain = if bit == self.terminal_count as usize { Some(&self.completion) }
+                    else { self.domains.get(bit) };
+                domain.is_some_and(|domain| matches_gss(domain, stack))
+            });
+        }
         // A top certificate was derived from the complete relation with its
         // lower suffix universally quantified. One live certified top is
         // therefore sufficient for an existential GSS query, even when the
@@ -257,6 +285,13 @@ impl TemplateParser {
         if top.and_then(|top| self.unconditional.get(top as usize)).is_some_and(|row|
             row.words().iter().zip(candidates.words()).any(|(a,b)| a & b != 0))
         { return true; }
+        if let Some(possible) = top.and_then(|top| self.possible.get(top as usize)) {
+            return intersecting_bits(possible, candidates).any(|bit| {
+                let domain = if bit == self.terminal_count as usize { Some(&self.completion) }
+                    else { self.domains.get(bit) };
+                domain.is_some_and(|domain| domain.matches_top_first(stack.iter().rev().copied()))
+            });
+        }
         for bit in candidates.iter() {
             if top.and_then(|top| self.possible.get(top as usize)).is_some_and(|row| !row.contains(bit)) { continue; }
             let domain = if bit == self.terminal_count as usize { Some(&self.completion) } else { self.domains.get(bit) };

@@ -1844,6 +1844,11 @@ fn batched_end_state_admitted_terminals(
     gss: &ParserGSS,
     end_states: &[u32],
 ) -> Option<crate::ds::bitset::BitSet> {
+    // Template admission is an existential domain query: its exact boolean
+    // path can stop at a suffix-independent witness. Computing the full set
+    // here would classify unrelated conditional terminals before intersecting
+    // each lexer future, defeating that shortcut.
+    if constraint.has_template_parser() { return None; }
     let mut candidates = crate::ds::bitset::BitSet::new(runtime_terminal_count(constraint));
     let mut non_initial = 0usize;
     for &end_state in end_states {
@@ -1970,15 +1975,15 @@ fn try_local_row_presence_admission_words(
     gss: &ParserGSS,
     end_states: &[u32],
 ) -> Option<[u64; 32]> {
-    if constraint.has_template_parser() { return None; }
-
     const WORDS: usize = 32;
     if constraint.uses_compact_segmented_parser_runtime()
         || constraint.parser_admission_policy() != AdmissionPolicy::ExactSimulation
         || constraint.parser_has_controls()
         || constraint.tokenizer.num_terminals() as usize > WORDS * 64
-        || constraint.table.advance.len() != constraint.parser_symbol_count() as usize
-        || constraint.table.unconditional_advance.len() != constraint.parser_symbol_count() as usize
+        || (!constraint.has_template_parser()
+            && (constraint.table.advance.len() != constraint.parser_symbol_count() as usize
+                || constraint.table.unconditional_advance.len()
+                    != constraint.parser_symbol_count() as usize))
     {
         return None;
     }
@@ -1987,9 +1992,11 @@ fn try_local_row_presence_admission_words(
         return None;
     }
 
-    // Only terminals reachable from the tokenizer continuation matter for this
-    // admission query. A table may contain stack-dependent actions elsewhere
-    // without invalidating row-presence admission for this exact future set.
+    // Only terminals reachable from the tokenizer continuation matter. Both
+    // backends provide a sound upper bound P and a suffix-independent lower
+    // bound U. If (P - U) intersects none of these candidates, U is exact for
+    // this query. Template rows are derived from the input-domain automata;
+    // this shortcut neither reads an LR action nor materializes output stacks.
     let initial = constraint.runtime_commit_initial_state();
     let mut candidates = [0u64; WORDS];
     for &end_state in end_states {
@@ -2012,7 +2019,7 @@ fn try_local_row_presence_admission_words(
 
     let mut admitted = [0u64; WORDS];
     for state in tops {
-        let advance = constraint.table.advance.get(state as usize)?;
+        let advance = constraint.parser_advance_row(state)?;
         let unconditional = constraint.parser_unconditional_row(state)?;
         for index in 0..advance.words().len().min(WORDS) {
             let candidate_word = candidates[index];
@@ -2059,6 +2066,7 @@ fn cached_batched_end_state_admission(
     end_states: &[u32],
     cache: &mut SmallVec<[ParserAdmissionCacheEntry; 8]>,
 ) -> Option<usize> {
+    if constraint.has_template_parser() { return None; }
     let mut candidates = crate::ds::bitset::BitSet::new(runtime_terminal_count(constraint));
     let mut non_initial = 0usize;
     for &end_state in end_states {
