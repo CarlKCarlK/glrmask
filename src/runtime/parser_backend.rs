@@ -179,11 +179,31 @@ impl TemplateParser {
         if let Some(top) = stack.single_exclusive_top_value() {
             if self.unconditional.get(top as usize).is_some_and(|row| row.contains(bit)) { return true; }
             if self.possible.get(top as usize).is_some_and(|row| !row.contains(bit)) { return false; }
+        } else {
+            let tops = stack.peek_values();
+            let mut possible = tops.is_empty();
+            for top in tops {
+                if self.unconditional.get(top as usize).is_some_and(|row| row.contains(bit)) { return true; }
+                possible |= self.possible.get(top as usize).is_none_or(|row| row.contains(bit));
+            }
+            if !possible { return false; }
         }
         matches_gss(domain, stack)
     }
 
     pub(crate) fn admits_any(&self, stack: &ParserGSS, candidates: &BitSet) -> bool {
+        // A top certificate was derived from the complete relation with its
+        // lower suffix universally quantified. One live certified top is
+        // therefore sufficient for an existential GSS query, even when the
+        // graph contains many branches and correlated annotations.
+        for top in stack.peek_values() {
+            if self.unconditional.get(top as usize).is_some_and(|row|
+                row.words().iter().zip(candidates.words()).any(|(a,b)| a & b != 0))
+            {
+                if self.profile { self.admissions.fetch_add(1, Ordering::Relaxed); }
+                return true;
+            }
+        }
         for bit in candidates.iter() {
             let terminal = if bit == self.terminal_count as usize { EOF } else { bit as u32 };
             if self.admits(stack, terminal) { return true; }
@@ -192,12 +212,57 @@ impl TemplateParser {
     }
 
     pub(crate) fn admitted(&self, stack: &ParserGSS, candidates: &BitSet) -> BitSet {
+        if self.profile { self.admissions.fetch_add(1, Ordering::Relaxed); }
         let mut result = BitSet::new(candidates.len());
-        for bit in candidates.iter() {
-            let terminal = if bit == self.terminal_count as usize { EOF } else { bit as u32 };
-            if self.admits(stack, terminal) { result.set(bit); }
+        let mut possible = BitSet::new(candidates.len());
+        let tops = stack.peek_values();
+        if tops.is_empty() {
+            // Prefix-accepting domains may accept an empty concrete stack.
+            // An empty language is still rejected by matches_gss below.
+            possible = candidates.clone();
+        }
+        for top in tops {
+            match self.possible.get(top as usize) {
+                Some(row) => for ((dst, a), b) in possible.words_mut().iter_mut()
+                    .zip(row.words()).zip(candidates.words()) { *dst |= a & b; },
+                None => possible = candidates.clone(),
+            }
+            if let Some(row) = self.unconditional.get(top as usize) {
+                for ((dst, a), b) in result.words_mut().iter_mut()
+                    .zip(row.words()).zip(candidates.words()) { *dst |= a & b; }
+            }
+        }
+        // U(tops) is a proven subset and P(tops) a proven superset of exact
+        // admission. Only P minus U needs a deeper input-domain traversal.
+        // Both sets come from template-domain automata, never LR rows.
+        for (word_index, &word) in possible.words().iter().enumerate() {
+            let mut remaining = word & !result.words()[word_index];
+            while remaining != 0 {
+                let bit = word_index * 64 + remaining.trailing_zeros() as usize;
+                remaining &= remaining - 1;
+                let domain = if bit == self.terminal_count as usize {
+                    Some(&self.completion)
+                } else { self.domains.get(bit) };
+                if domain.is_some_and(|domain| matches_gss(domain, stack)) { result.set(bit); }
+            }
         }
         result
+    }
+
+    /// Input-only query for the shared allocation-free flat commit frontier.
+    /// No output stack, GSS node, or LR action is materialized.
+    pub(crate) fn admits_flat_any(&self, stack: &[u32], candidates: &BitSet) -> bool {
+        if self.profile { self.admissions.fetch_add(1, Ordering::Relaxed); }
+        let top = stack.last().copied();
+        if top.and_then(|top| self.unconditional.get(top as usize)).is_some_and(|row|
+            row.words().iter().zip(candidates.words()).any(|(a,b)| a & b != 0))
+        { return true; }
+        for bit in candidates.iter() {
+            if top.and_then(|top| self.possible.get(top as usize)).is_some_and(|row| !row.contains(bit)) { continue; }
+            let domain = if bit == self.terminal_count as usize { Some(&self.completion) } else { self.domains.get(bit) };
+            if domain.is_some_and(|domain| domain.matches_top_first(stack.iter().rev().copied())) { return true; }
+        }
+        false
     }
 
     pub(crate) fn finished(&self, stack: &ParserGSS) -> bool {
@@ -360,6 +425,72 @@ impl Constraint {
                 parser.report()
             }
             None => serde_json::json!({"backend":"lr-table", "lr_table_present":self.table.is_present()}),
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::compiler::glr::accumulator::TerminalsDisallowed;
+
+    fn pop_word(labels: &[i32], accepting: bool) -> CommitTemplateDfas {
+        let mut pop = DFA::new();
+        let mut cursor = pop.start_state;
+        for &label in labels {
+            let target = pop.add_state(); pop.add_transition(cursor, label, target); cursor = target;
+        }
+        pop.set_accepting(cursor, accepting);
+        CommitTemplateDfas { pop, read: DFA::new(), push: DFA::new(),
+            pop_to_read: Vec::new(), pop_to_push: Vec::new(), read_to_push: Vec::new() }
+    }
+
+    #[test]
+    fn bulk_top_certificates_match_literal_domains_on_shared_and_empty_languages() {
+        let mut fallback = pop_word(&[crate::compiler::glr::labels::DEFAULT_LABEL, 2], true);
+        let dead = fallback.pop.add_state();
+        fallback.pop.add_transition(fallback.pop.start_state, 1, dead);
+        let raw = vec![pop_word(&[1], true), fallback, pop_word(&[], true),
+            pop_word(&[], false), pop_word(&[2, 3], true)];
+        let raw: Vec<_> = raw.into_iter().map(|p| Some(Arc::new(p))).collect();
+        let parser = TemplateParser::compile(4, 5, BTreeSet::new(), &raw, pop_word(&[0], true)).unwrap();
+        let mut concrete = vec![Vec::<u32>::new()];
+        for length in 1..=3u32 {
+            for encoded in 0..6u32.pow(length) {
+                let mut n=encoded; let mut stack=Vec::new();
+                for _ in 0..length { stack.push(n%6); n/=6; }
+                concrete.push(stack);
+            }
+        }
+        let clean=TerminalsDisallowed::new(); let guarded=clean.with_insert(0, 3);
+        let mut inputs=vec![ParserGSS::empty()];
+        for stack in &concrete { inputs.push(ParserGSS::from_single_stack(stack.clone(), clean.clone())); }
+        for group in concrete.chunks(7) {
+            let paths:Vec<_>=group.iter().enumerate().map(|(i,s)|(s.clone(), if i%2==0 { clean.clone() } else { guarded.clone() })).collect();
+            inputs.push(ParserGSS::from_stacks(&paths));
+        }
+        for input in inputs {
+            let literal = input.to_stacks(4096).unwrap();
+            for requested in 0..64u64 {
+                // Include an unknown bit, and out-of-certificate stack tops
+                // 4/5 above, to verify bounds fall back exactly, not reject.
+                let mut candidates=BitSet::new(73); candidates.set(72);
+                for bit in 0..6 { if requested & (1<<bit)!=0 { candidates.set(bit); } }
+                let expected:Vec<_>=candidates.iter().filter(|&bit| {
+                    let domain=if bit==5 { Some(&parser.completion) } else { parser.domains.get(bit) };
+                    domain.is_some_and(|d| literal.iter().any(|(s,_)|d.matches_top_first(s.iter().rev().copied())))
+                }).collect();
+                let actual=parser.admitted(&input,&candidates);
+                assert_eq!(actual.iter().collect::<Vec<_>>(),expected);
+                assert_eq!(parser.admits_any(&input,&candidates),!expected.is_empty());
+                for (stack,_) in &literal {
+                    let expected=candidates.iter().any(|bit| {
+                        let domain=if bit==5 { Some(&parser.completion) } else { parser.domains.get(bit) };
+                        domain.is_some_and(|d|d.matches_top_first(stack.iter().rev().copied()))
+                    });
+                    assert_eq!(parser.admits_flat_any(stack,&candidates),expected);
+                }
+            }
         }
     }
 }
