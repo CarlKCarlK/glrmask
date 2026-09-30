@@ -6291,6 +6291,25 @@ pub(crate) fn compile_dynamic_owned_with_vocab_partition_with_table_construction
         vocab,
         default_table_construction,
         true,
+        true,
+    )
+}
+
+/// Finalize the ordinary O2 runtime for immediate parser replacement. The
+/// caller will invalidate the LR transfer snapshot when it installs its new
+/// parser, so preparing that snapshot here would serialize data only to drop
+/// it. Keep all lexer, quotient, and runtime preparation identical.
+pub(crate) fn compile_dynamic_owned_with_vocab_partition_for_parser_replacement(
+    grammar: GrammarDef,
+    vocab: &Vocab,
+    default_table_construction: GlrTableConstruction,
+) -> crate::Result<DynamicConstraint> {
+    compile_dynamic_owned_with_vocab_partition_impl(
+        grammar,
+        vocab,
+        default_table_construction,
+        true,
+        false,
     )
 }
 
@@ -6304,6 +6323,7 @@ pub(crate) fn compile_dynamic_owned_with_vocab_partition_unfinalized_with_table_
         vocab,
         default_table_construction,
         false,
+        false,
     )
 }
 
@@ -6312,6 +6332,7 @@ fn compile_dynamic_owned_with_vocab_partition_impl(
     vocab: &Vocab,
     default_table_construction: GlrTableConstruction,
     finalize_runtime: bool,
+    cache_transfer_artifact: bool,
 ) -> crate::Result<DynamicConstraint> {
     let profile = compile_profile_enabled();
     let total_started = profile.then(Instant::now);
@@ -6380,7 +6401,7 @@ fn compile_dynamic_owned_with_vocab_partition_impl(
         let tiny_save_artifact = constraint.inner.dynamic_mask_vocab.canonical_token_count() <= 8
             && constraint.inner.tokenizer.num_states() <= 64
             && constraint.inner.table.num_states <= 32;
-        if !tiny_save_artifact {
+        if cache_transfer_artifact && !tiny_save_artifact {
             constraint.cache_external_vocab_artifact_for_save();
         }
     }

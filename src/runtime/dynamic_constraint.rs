@@ -3724,6 +3724,77 @@ pub struct DynamicConstraintState<'a> {
     mask_len: usize,
 }
 
+#[cfg(test)]
+mod parser_replacement_compile_tests {
+    use super::*;
+
+    #[test]
+    fn parser_replacement_omits_only_the_discarded_lr_snapshot() {
+        let words = (0..40).map(|i| format!("k{i:02};")).collect::<Vec<_>>();
+        let vocab = Vocab::new(words.iter().enumerate()
+            .map(|(i, word)| (i as u32, word.as_bytes().to_vec())).collect());
+        let mut source = String::from("start root;\n");
+        for (i, word) in words.iter().enumerate() {
+            source.push_str(&format!("t T{i} ::= \"{word}\";\n"));
+        }
+        source.push_str("nt root ::= ");
+        source.push_str(&(0..words.len()).map(|i| format!("T{i}"))
+            .collect::<Vec<_>>().join(" "));
+        source.push(';');
+        let named = crate::grammar::glrm::from_glrm(&source).unwrap();
+        let grammar = crate::grammar::ast::lower(&named).unwrap();
+        let grammar = crate::compiler::grammar::transforms::prepare_grammar_transforms_only(grammar);
+        let construction = crate::compiler::glr::table::GlrTableConstruction::ExperimentalCoreMerged;
+        let mut ordinary = crate::compiler::pipeline::
+            compile_dynamic_owned_with_vocab_partition_with_table_construction(
+                grammar.clone(), &vocab, construction,
+            ).unwrap();
+        let mut replacement = crate::compiler::pipeline::
+            compile_dynamic_owned_with_vocab_partition_for_parser_replacement(
+                grammar, &vocab, construction,
+            ).unwrap();
+
+        assert!(ordinary.external_vocab_artifact_cache.is_some(),
+            "the reference fixture must actually build a non-tiny transfer snapshot");
+        assert!(replacement.external_vocab_artifact_cache.is_none());
+        for dynamic in [&mut ordinary, &mut replacement] {
+            for constraint in dynamic.constraints_mut() {
+                constraint.install_template_parser().unwrap();
+                assert!(constraint.table.as_lr().is_none());
+            }
+            assert!(dynamic.external_vocab_artifact_cache.is_none(),
+                "parser replacement must invalidate the original LR snapshot");
+        }
+        let reference = ordinary.into_constraints().pop().unwrap();
+        let candidate = replacement.into_constraints().pop().unwrap();
+        let restored = Constraint::load(candidate.save()).unwrap();
+        let external = Constraint::load_with_vocab(
+            candidate.save_with_external_vocab().unwrap(), &vocab,
+        ).unwrap();
+        for constraint in [&candidate, &restored, &external] {
+            assert!(constraint.table.as_lr().is_none());
+            let mut left = reference.start();
+            let mut right = constraint.start();
+            let mut a = vec![0; reference.mask_len()];
+            let mut b = vec![0; constraint.mask_len()];
+            for token in 0..words.len() as u32 {
+                left.fill_mask(&mut a);
+                right.fill_mask(&mut b);
+                assert_eq!(a, b, "mask before token {token}");
+                assert_eq!(left.is_accepting(), right.is_accepting());
+                assert_ne!(a[token as usize / 32] & (1 << (token % 32)), 0);
+                left.commit_token(token).unwrap();
+                right.commit_token(token).unwrap();
+            }
+            assert!(left.is_accepting());
+            assert!(right.is_accepting());
+            left.fill_mask(&mut a);
+            right.fill_mask(&mut b);
+            assert_eq!(a, b);
+        }
+    }
+}
+
 impl<'a> DynamicConstraintState<'a> {
     fn retain_committing(
         &mut self,

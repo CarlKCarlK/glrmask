@@ -17,6 +17,7 @@ use crate::compiler::compile::{
 use crate::compiler::pipeline::{
     compile_dynamic_owned_unfinalized_with_table_construction,
     compile_dynamic_owned_with_table_construction,
+    compile_dynamic_owned_with_vocab_partition_for_parser_replacement,
     compile_dynamic_owned_with_vocab_partition_unfinalized_with_table_construction,
     compile_dynamic_owned_with_vocab_partition_with_table_construction,
 };
@@ -477,7 +478,7 @@ fn compile_bounded_template_from_source(
         for alternative in alternatives {
             let grammar = ast::lower(&alternative)?;
             let prepared = crate::compiler::grammar::transforms::prepare_grammar_transforms_only(grammar);
-            compiled.push(compile_dynamic_owned_with_vocab_partition_with_table_construction(
+            compiled.push(compile_dynamic_owned_with_vocab_partition_for_parser_replacement(
                 prepared, vocab, table_construction,
             )?);
         }
