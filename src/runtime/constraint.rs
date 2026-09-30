@@ -1,5 +1,7 @@
 mod boundary_reset_support;
 pub(crate) mod packed_final_masks;
+mod scoped_admission_support;
+pub(crate) use scoped_admission_support::ScopedAdmissionSupport;
 
 use crate::automata::lexer::{
     tokenizer::{Tokenizer, TokenizerStateSet},
