@@ -280,3 +280,40 @@ fn exponentially_many_custom_push_outputs_remain_runnable_after_roundtrip() {
         }
     }
 }
+
+
+#[test]
+fn epsilon_read_links_apply_after_popping_the_last_concrete_symbol() {
+    use glrmask::template_parser::StackDfa;
+    // "a" pops one zero, then accepts through READ even when no top remains.
+    let mut a=StackTemplate::rewrite([StackLabel::Symbol(0)],[]);
+    a.pop_to_push.clear();a.pop_to_read=vec![None,Some(0)];a.read=StackDfa::accept();
+    // "b" pushes zero through a READ epsilon link, without any READ label.
+    let mut b=StackTemplate::rewrite([], [0]);
+    b.pop_to_push.clear();b.pop_to_read=vec![Some(0)];b.read_to_push=vec![Some(0)];
+    let program=ParserProgram::new(ParserDefinition {stack_symbol_count:1,
+        terminals:vec![a,b],completion:StackTemplate::identity()}).unwrap();
+    let lexer=LexerDefinition::new(vec![TerminalPattern::literal(b"a".to_vec()),TerminalPattern::literal(b"b".to_vec())]);
+    let words=["a","b","ab","ba","aa","bb"];
+    let vocab=Vocab::new(words.iter().enumerate().map(|(i,s)|(i as u32,s.as_bytes().to_vec())).collect());
+    let built=program.compile(&lexer,&vocab).unwrap();
+    for constraint in [&built,&Constraint::load(built.save()).unwrap(),
+        &Constraint::load_with_vocab(built.save_with_external_vocab().unwrap(),&vocab).unwrap()]
+    {
+        for length in 0..=7 {
+            for bits in 0..(1usize<<length) {
+                let prefix=(0..length).map(|i|if bits&(1<<i)==0{b'a'}else{b'b'}).collect::<Vec<_>>();
+                let advance=|bytes:&[u8],mut count:usize|->Option<usize>{
+                    for byte in bytes {count=if *byte==b'a'{count.checked_sub(1)?}else{count+1};}Some(count)
+                };
+                let Some(count)=advance(&prefix,1)else{continue;};
+                let mut state=constraint.start();state.commit_bytes(&prefix).unwrap();
+                assert!(state.is_accepting());let mut mask=vec![0;constraint.mask_len()];state.fill_mask(&mut mask);
+                for (i,word) in words.iter().enumerate() {
+                    assert_eq!(mask[i/32]&(1<<(i%32))!=0,advance(word.as_bytes(),count).is_some(),
+                        "prefix={prefix:?} word={word}");
+                }
+            }
+        }
+    }
+}
