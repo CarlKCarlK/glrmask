@@ -2,6 +2,7 @@ use crate::automata::lexer::Lexer;
 pub(crate) mod profile;
 mod template_advance;
 pub(crate) mod push_suffixes;
+mod flat_template;
 pub(crate) mod push_dag;
 pub(crate) mod phase_dag;
 pub(crate) mod single_cursor;
@@ -6479,7 +6480,12 @@ fn apply_terminal_to_flat_stacks(
     source: &[u32],
     scratch: &mut FlatActionScratch,
 ) -> Option<bool> {
-    if constraint.has_template_parser() { return None; }
+    if let Some(parser) = constraint.template_parser.as_ref() {
+        let fast = constraint.fast_template_dfas_by_terminal.get(terminal as usize)?.as_ref()?;
+        let result = flat_template::apply(fast, source, scratch);
+        if result.is_some() { parser.record_advance(); }
+        return result;
+    }
 
     if source.is_empty() || source.len() > LINEAR_STACK_RESERVE {
         return None;
@@ -6588,6 +6594,12 @@ fn flat_stack_may_advance_on_any(
     terminals: &crate::ds::bitset::BitSet,
     scratch: &mut FlatActionScratch,
 ) -> Option<bool> {
+    if let Some(parser) = constraint.template_parser.as_ref() {
+        if runtime_future_contains_ignore(constraint, terminals) {
+            return Some(true);
+        }
+        return Some(parser.admits_flat_any(stack, terminals));
+    }
     let top = *stack.last()?;
     if runtime_future_contains_ignore(constraint, terminals) {
         return Some(true);

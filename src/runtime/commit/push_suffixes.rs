@@ -21,6 +21,13 @@ pub(crate) struct PreparedPushSuffixes {
 }
 
 impl PreparedPushSuffixes {
+    /// Exact cached words, including epsilon independently of nonempty words.
+    /// Used by the bounded flat-stack primitive without materializing a GSS.
+    pub(super) fn words(&self) -> impl Iterator<Item = &[u32]> {
+        self.accepts_empty.then_some(&[][..]).into_iter()
+            .chain(self.suffixes.iter().map(|word| word.as_ref()))
+    }
+
     pub(crate) fn apply(&self, base: &ParserGSS) -> Option<ParserGSS> {
         // Reordering output construction is valid only for one shared path
         // annotation. Correlated inputs retain the authoritative DAG walk.
