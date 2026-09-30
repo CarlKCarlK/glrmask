@@ -10,7 +10,9 @@
 //! prefix accepts every remaining stack suffix. An explicit rejection edge is
 //! retained when it overrides an otherwise productive DEFAULT transition.
 
-use std::collections::{BTreeMap, BTreeSet, VecDeque};
+use std::collections::{BTreeMap, VecDeque};
+#[cfg(test)]
+use std::collections::BTreeSet;
 use rustc_hash::FxHashMap;
 
 use crate::automata::unweighted_u32::dfa::DFA;
@@ -130,12 +132,12 @@ fn linked_productive(links: &[Option<u32>], source: usize, productive: &[bool]) 
 fn merged_domain_row(
     transitions: &BTreeMap<i32, u32>,
     canonical: &[u32],
-    read_labels: Option<&BTreeSet<u32>>,
+    read_labels: Option<&[u32]>,
     default: u32,
 ) -> Vec<(u32, u32)> {
     let mut pop = transitions.iter().filter(|(label, _)| **label != DEFAULT_LABEL)
         .map(|(&label, &target)| (label as u32, canonical[target as usize])).peekable();
-    let read_len = read_labels.map_or(0, BTreeSet::len);
+    let read_len = read_labels.map_or(0, <[u32]>::len);
     let mut row = Vec::with_capacity(transitions.len().saturating_add(read_len));
     for &label in read_labels.into_iter().flatten() {
         while pop.peek().is_some_and(|&(top, _)| top < label) {
@@ -165,16 +167,19 @@ impl TemplateDomain {
                 || state.transitions.values().any(|&target| push_good[target as usize]);
         }
         let mut read_without_input = vec![false; template.read.states.len()];
-        let mut read_labels = vec![BTreeSet::<u32>::new(); template.read.states.len()];
+        // Each input row already has strictly ordered, unique labels. Filtering
+        // it preserves those properties; no ordered-tree insertion is needed
+        // for the derived READ certificate set.
+        let mut read_labels = vec![Vec::<u32>::new(); template.read.states.len()];
         for &id in read_order.iter().rev() {
             let i = id as usize;
             let state = &template.read.states[i];
             read_without_input[i] = state.is_accepting
                 || linked_productive(&template.read_to_push, i, &push_good);
             if read_without_input[i] { continue; }
-            let labels: BTreeSet<u32> = state.transitions.iter().filter_map(|(&label, &target)| {
+            let labels: Vec<u32> = state.transitions.iter().filter_map(|(&label, &target)| {
                 let target = target as usize;
-                (read_without_input[target] || read_labels[target].contains(&(label as u32)))
+                (read_without_input[target] || read_labels[target].binary_search(&(label as u32)).is_ok())
                     .then_some(label as u32)
             }).collect();
             read_labels[i] = labels;
@@ -204,7 +209,7 @@ impl TemplateDomain {
             let default = state.transitions.get(&DEFAULT_LABEL)
                 .map_or(REJECT, |&target| canonical[target as usize]);
             let row = merged_domain_row(&state.transitions, &canonical,
-                read.map(|read| &read_labels[read]), default);
+                read.map(|read| read_labels[read].as_slice()), default);
             if default == REJECT && row.is_empty() { continue; }
             let signature = (default, row);
             let next_id = if let Some(&id) = row_ids.get(&signature) { id } else {
@@ -465,7 +470,8 @@ mod tests {
             }
             transitions.insert(DEFAULT_LABEL, (next() % 12) as u32);
             for default in [REJECT, 0, 1, 2, 3] {
-                for read in [None, Some(&reads)] {
+                let read_values = reads.iter().copied().collect::<Vec<_>>();
+                for read in [None, Some(read_values.as_slice())] {
                     let actual = merged_domain_row(&transitions, &canonical, read, default);
                     let mut reference: BTreeMap<u32, u32> = transitions.iter()
                         .filter(|(label, _)| **label != DEFAULT_LABEL)

@@ -1461,17 +1461,18 @@ impl FastTemplateDfa {
                 .map(|state| {
                     let default_target = state.transitions.get(&DEFAULT_LABEL).copied();
                     FastTemplateDfaState {
-                    is_accepting: state.is_accepting,
-                    default_target,
-                    transitions: FastTemplateTransitionRow::from_entries(
-                        state
-                            .transitions
-                            .iter()
-                            .filter(|(label, _)| **label != DEFAULT_LABEL)
-                            .map(|(&label, &target)| (label, target)),
-                        state.transitions.len() - usize::from(default_target.is_some()),
-                    ),
-                }})
+                        is_accepting: state.is_accepting,
+                        default_target,
+                        transitions: FastTemplateTransitionRow::from_entries(
+                            state
+                                .transitions
+                                .iter()
+                                .filter(|(label, _)| **label != DEFAULT_LABEL)
+                                .map(|(&label, &target)| (label, target)),
+                            state.transitions.len() - usize::from(default_target.is_some()),
+                        ),
+                    }
+                })
                 .collect(),
             start_state: dfa.start_state,
         }
