@@ -258,3 +258,12 @@ required-features = ["internal-api"]
 # Upstream tracking: https://github.com/rust-lang/rust/issues/157750
 [profile.release.package._glrmask]
 strip = "none"
+
+[[test]]
+name = "template_parser_randomized"
+path = "tests/template_parser_randomized.rs"
+
+[[test]]
+name = "template_parser_artifact_bounds"
+path = "tests/template_parser_artifact_bounds.rs"
+required-features = ["internal-api"]

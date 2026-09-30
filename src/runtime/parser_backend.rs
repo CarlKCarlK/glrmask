@@ -451,6 +451,12 @@ impl Constraint {
         self.template_parser = Some(Arc::new(parser));
         // Drop, do not merely clear rows or change an environment flag.
         self.table = ParserTableStorage::absent();
+        if !self.uses_dynamic_runtime() {
+            // Conversion occurs after ordinary compile finalization. Prime
+            // the requested parser only after the table has been removed;
+            // this cannot accidentally warm an LR fallback instead.
+            self.prime_initial_commit_hot_path();
+        }
         Ok(())
     }
 

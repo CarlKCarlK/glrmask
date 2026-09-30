@@ -34,6 +34,7 @@ use crate::ds::bitset::BitSet;
 use crate::ds::u8set::U8Set;
 
 use super::mask_mapping::FinalMaskMapping;
+use super::mask_cache_payload::DynamicMaskCachePayload;
 
 pub(crate) type PossibleMatchesByTerminal = BTreeMap<TerminalID, Weight>;
 
@@ -2429,18 +2430,6 @@ struct DynamicMaskCacheEntry {
     hash: u64,
     state: DynamicMaskStateKey,
     mask: DynamicMaskCachePayload,
-}
-
-#[derive(Debug)]
-enum DynamicMaskCachePayload {
-    /// Exact key observed once, but no mask payload stored yet. A second miss
-    /// for the same key upgrades this entry to a real payload. This avoids
-    /// paying mask-storage cost for cheap one-off states while preserving
-    /// reuse for cheap states that actually recur.
-    Probation,
-    Dense(Arc<[u32]>),
-    SparseZero(Box<[(u32, u32)]>),
-    SparseAllOriginal(Box<[(u32, u32)]>),
 }
 
 #[derive(Debug, Default)]
@@ -8064,41 +8053,7 @@ impl DynamicMaskVocab {
         }) {
             return DynamicMaskCachePayload::Dense(Arc::from(mask));
         }
-        let baseline = self.all_original_token_words();
-        let nonzero_count = mask.iter().filter(|&&word| word != 0).count();
-        let baseline_diff_count = mask
-            .iter()
-            .enumerate()
-            .filter(|&(index, &word)| word != baseline.get(index).copied().unwrap_or(0))
-            .count();
-        let dense_bytes = mask.len().saturating_mul(std::mem::size_of::<u32>());
-        let sparse_zero_bytes = nonzero_count.saturating_mul(std::mem::size_of::<(u32, u32)>());
-        let sparse_baseline_bytes =
-            baseline_diff_count.saturating_mul(std::mem::size_of::<(u32, u32)>());
-        if sparse_zero_bytes < dense_bytes && sparse_zero_bytes <= sparse_baseline_bytes {
-            DynamicMaskCachePayload::SparseZero(
-                mask.iter()
-                    .enumerate()
-                    .filter_map(|(index, &word)| {
-                        (word != 0).then_some((index as u32, word))
-                    })
-                    .collect::<Vec<_>>()
-                    .into_boxed_slice(),
-            )
-        } else if sparse_baseline_bytes < dense_bytes {
-            DynamicMaskCachePayload::SparseAllOriginal(
-                mask.iter()
-                    .enumerate()
-                    .filter_map(|(index, &word)| {
-                        (word != baseline.get(index).copied().unwrap_or(0))
-                            .then_some((index as u32, word))
-                    })
-                    .collect::<Vec<_>>()
-                    .into_boxed_slice(),
-            )
-        } else {
-            DynamicMaskCachePayload::Dense(Arc::from(mask))
-        }
+        super::mask_cache_payload::from_words(mask, self.all_original_token_words())
     }
 
     /// Limit one immutable vocabulary's result memo independently of the

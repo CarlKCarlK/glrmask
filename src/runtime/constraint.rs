@@ -505,6 +505,26 @@ fn initial_commit_prime_token_ids(mask: &[u32]) -> Option<Vec<u32>> {
     Some(token_ids)
 }
 
+/// Select at most the existing priming budget from the actual initial mask.
+/// A wide initial language does not prevent bounded template-kernel priming.
+/// This selects only allowed token IDs; it never changes the initial state or
+/// the tokens admitted by the compiled constraint.
+fn template_initial_prime_token_ids(mask: &[u32]) -> Vec<u32> {
+    let mut token_ids = Vec::new();
+    for (word_index, &word) in mask.iter().enumerate() {
+        let mut remaining = word;
+        while remaining != 0 {
+            if token_ids.len() == INITIAL_COMMIT_PRIME_MAX_TOKENS {
+                return token_ids;
+            }
+            let bit = remaining.trailing_zeros() as usize;
+            token_ids.push((word_index * 32 + bit) as u32);
+            remaining &= remaining - 1;
+        }
+    }
+    token_ids
+}
+
 pub(crate) struct InternalTokenMaskPrebuild {
     internal_token_buf_masks: Vec<InternalTokenBufMasks>,
 }
@@ -3521,7 +3541,7 @@ impl Constraint {
     }
 
     #[cold]
-    fn prime_initial_commit_hot_path(&self) {
+    pub(crate) fn prime_initial_commit_hot_path(&self) {
         let mut state = ConstraintState {
             terminated: false,
             constraint: self,
@@ -3539,10 +3559,14 @@ impl Constraint {
             let Some(mask) = cache.as_ref().map(|cache| cache.mask.as_slice()) else {
                 return;
             };
-            let Some(token_ids) = initial_commit_prime_token_ids(mask) else {
-                return;
-            };
-            token_ids
+            if self.has_template_parser() {
+                template_initial_prime_token_ids(mask)
+            } else {
+                let Some(token_ids) = initial_commit_prime_token_ids(mask) else {
+                    return;
+                };
+                token_ids
+            }
         };
 
         let initial_state = &state.state;
@@ -9488,6 +9512,7 @@ impl Constraint {
     pub(crate) fn rebuild_runtime_caches_impl(
         &mut self,
         preserve_packed_dwa_dense_masks: bool,
+        prepared_template_indices: Option<FastTemplateDfasByTerminal>,
     ) {
         let mut packed_weight_token_sets =
             crate::automata::weighted::dwa::take_packed_decode_token_set_inventory();
@@ -9649,7 +9674,12 @@ impl Constraint {
         let state_relation_ms = state_relation_started_at
             .map_or(0.0, |started| started.elapsed().as_secs_f64() * 1000.0);
         let fast_template_started_at = profile.then(std::time::Instant::now);
-        let fast_template_dfas_by_terminal = self.compute_fast_template_dfas();
+        // The template loader may hand back the exact indices it just built
+        // from this constraint's validated immutable program. Keep those
+        // objects instead of constructing and discarding a second copy.
+        // Ordinary compile/mutation rebuilds supply None and remain unchanged.
+        let fast_template_dfas_by_terminal = prepared_template_indices
+            .unwrap_or_else(|| self.compute_fast_template_dfas());
         let fast_template_ms = fast_template_started_at
             .map_or(0.0, |started| started.elapsed().as_secs_f64() * 1000.0);
         let guarded_shift_ms = guarded_shift_started_at
@@ -10058,10 +10088,14 @@ impl Constraint {
         // Freshly compiled constraints may still choose to pay this one-time
         // warm-up before decoding starts. A current-format disk load already
         // has an explicit latency target, and warming an otherwise lazy cache
-        // is not part of reconstructing its semantics. Do not charge it to
-        // load; the first commit remains exact and will initialize lazily if
-        // needed.
-        if self.packed_parser_dwa.is_none() {
+        // is not part of reconstructing its semantics. Ordinary LR packed
+        // loads retain their existing lazy policy. A table-free static parser
+        // uses at most 16 real initial tokens to prepare the same shared commit
+        // kernel; its measured load cost includes this work. Dynamic parsers
+        // retain their existing initialization policy.
+        if self.packed_parser_dwa.is_none()
+            || (self.has_template_parser() && !self.uses_dynamic_runtime())
+        {
             self.prime_initial_commit_hot_path();
         }
         let initial_commit_prime_ms = initial_commit_prime_started_at
@@ -14290,6 +14324,19 @@ mod dense_internal_token_mask_tests {
     fn initial_commit_prime_token_ids_rejects_above_limit() {
         let mask = [u32::MAX >> (32 - (INITIAL_COMMIT_PRIME_MAX_TOKENS + 1))];
         assert_eq!(initial_commit_prime_token_ids(&mask), None);
+    }
+
+    #[test]
+    fn template_initial_priming_is_bounded_and_selects_only_allowed_tokens() {
+        assert!(template_initial_prime_token_ids(&[]).is_empty());
+        assert!(template_initial_prime_token_ids(&[0, 0]).is_empty());
+        assert_eq!(template_initial_prime_token_ids(&[0, 0b1010, 0]), vec![33, 35]);
+        let wide = [0, u32::MAX, u32::MAX];
+        assert_eq!(
+            template_initial_prime_token_ids(&wide),
+            (32..32 + INITIAL_COMMIT_PRIME_MAX_TOKENS as u32).collect::<Vec<_>>()
+        );
+        assert!(initial_commit_prime_token_ids(&wide).is_none());
     }
 
     #[test]
