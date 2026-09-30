@@ -317,3 +317,43 @@ fn epsilon_read_links_apply_after_popping_the_last_concrete_symbol() {
         }
     }
 }
+
+// Proposed addition to tests/template_parser_provider.rs. Run in a child
+// process so OnceLock profiling configuration cannot leak to parallel tests.
+#[test]
+fn dynamic_mask_diagnostics_do_not_request_an_lr_table() {
+    const CHILD: &str = "GLRMASK_TEST_TEMPLATE_MASK_PROFILE_CHILD";
+    if std::env::var_os(CHILD).is_none() {
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", "dynamic_mask_diagnostics_do_not_request_an_lr_table", "--nocapture"])
+            .env(CHILD, "1")
+            .env("GLRMASK_PROFILE_DYNAMIC_MASK", "1")
+            .output().unwrap();
+        assert!(output.status.success(), "profiled template process failed:\n{}\n{}",
+            String::from_utf8_lossy(&output.stdout), String::from_utf8_lossy(&output.stderr));
+        assert!(String::from_utf8_lossy(&output.stderr).contains("dynamic_mask"),
+            "fixture must actually reach a dynamic profiling branch");
+        return;
+    }
+    let vocab = glrmask::Vocab::new((32u8..=126)
+        .enumerate().map(|(i,byte)|(i as u32,vec![byte])).collect());
+    let compiled = glrmask::Grammar::from_json_schema(
+        r#"{"type":"object","properties":{"key":{"type":"string"},"value":{"type":"string"}},"required":["key","value"]}"#)
+        .compile_with(&vocab, glrmask::BuildOptions::default()
+            .optimization(glrmask::Optimization::FastBuild)
+            .parser_backend(glrmask::ParserBackend::TemplateDfa)).unwrap();
+    let loaded = glrmask::Constraint::load(compiled.save()).unwrap();
+    for constraint in [&compiled,&loaded] {
+        assert_eq!(constraint.parser_backend(),glrmask::ParserBackend::TemplateDfa);
+        let mut state = constraint.start();
+        let mut mask = vec![0;constraint.mask_len()];
+        state.fill_mask(&mut mask);
+        for byte in br#"{"key": "a", "value": "b"}"# {
+            let token = u32::from(*byte-32);
+            assert!(mask[token as usize/32] & (1u32<<(token%32)) != 0);
+            state.commit_token(token).unwrap();
+            state.fill_mask(&mut mask);
+        }
+        assert!(state.is_accepting());
+    }
+}
