@@ -8,6 +8,9 @@
 
 pub(crate) mod wire;
 pub(crate) mod composition;
+pub(crate) mod embedding;
+pub(crate) mod link;
+pub(crate) mod link_program;
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::ops::{ControlFlow, Deref, DerefMut};
@@ -93,6 +96,7 @@ pub(crate) struct TemplateParser {
     pub(crate) skip_terminals: BTreeSet<TerminalID>,
     pub(crate) completion_template: Arc<CommitTemplateDfas>,
     pub(crate) composition: Option<Arc<composition::TemplateComposition>>,
+    pub(crate) embedding: Option<Arc<embedding::TemplateEmbedding>>,
     domains: Vec<TemplateDomain>,
     completion: TemplateDomain,
     /// Possible is an upper bound over every lower stack suffix; unconditional
@@ -173,7 +177,7 @@ impl TemplateParser {
         }
         let profile = std::env::var_os("GLRMASK_PROFILE_TEMPLATE_BACKEND").is_some();
         Ok(Self { state_count, terminal_count, skip_terminals,
-            completion_template: Arc::new(completion_template), composition: None, domains, completion,
+            completion_template: Arc::new(completion_template), composition: None, embedding: None, domains, completion,
             possible, unconditional, profile,
             advances: AtomicU64::new(0), admissions: AtomicU64::new(0), completions: AtomicU64::new(0),
         })
@@ -347,6 +351,7 @@ impl TemplateParser {
             "domain_heap_payload_bytes":self.domains.iter().map(TemplateDomain::heap_payload_bytes).sum::<usize>(),
             "completion_domain_states":self.completion.state_count(),
             "composition":self.composition.as_ref().map(|composition| composition.report()),
+            "finite_embedding":self.embedding.is_some(),
             "counters_enabled":self.profile,
             "template_advances":self.advances.load(Ordering::Relaxed),
             "template_admission_queries":self.admissions.load(Ordering::Relaxed),
@@ -496,7 +501,13 @@ impl Constraint {
                 .map_err(crate::Error::Compilation)?;
             (templates, completion, self.table.num_states)
         };
-        let parser = TemplateParser::compile(state_count, terminal_count, self.table.skip_terminals.clone(), &templates, completion)?;
+        let mut parser = TemplateParser::compile(state_count, terminal_count, self.table.skip_terminals.clone(), &templates, completion)?;
+        // Not every standalone provider/legacy table has the finite canonical
+        // embedding contract. Such a parser remains runnable, but linking it
+        // returns an explicit error instead of reconstructing a table.
+        if !self.uses_sparse_direct_regular_runtime() {
+            parser.embedding = embedding::TemplateEmbedding::from_constraint(self).ok().map(Arc::new);
+        }
         self.template_dfas_by_terminal = templates;
         self.fast_template_dfas_by_terminal = self.compute_fast_template_dfas();
         self.serialized_artifact_cache = None;

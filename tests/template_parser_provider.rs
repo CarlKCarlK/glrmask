@@ -209,16 +209,17 @@ fn bounded_fast_build_selection_supports_all_builtin_source_frontends() {
 }
 
 #[test]
-fn unsupported_template_composition_fails_explicitly_without_changing_default_lr() {
+fn supported_template_composition_does_not_change_the_default_lr_backend() {
     let v=Vocab::new(vec![(0,b"a".to_vec()),(1,b"xa".to_vec()),(2,b"x".to_vec())]);
     let child=Grammar::from_glrm(r#"start root; nt root ::= "a";"#);
     let parent=Grammar::from_glrm(r#"glrm 1; start root; extern grammar child; nt root = "x" child;"#);
     let bound=parent.clone().bind("child",&child).unwrap();
-    let error=bound.compile_with(&v,BuildOptions::default().parser_backend(ParserBackend::TemplateDfa)).unwrap_err();
-    assert!(error.to_string().contains("composition"));
+    let template=bound.compile_with(&v,BuildOptions::default().parser_backend(ParserBackend::TemplateDfa)).unwrap();
+    assert_eq!(template.parser_backend(),ParserBackend::TemplateDfa);
+    let mut state=template.start();state.commit_bytes(b"xa").unwrap();assert!(state.is_accepting());
     assert_eq!(bound.compile(&v).unwrap().parser_backend(),ParserBackend::LrTable);
     let module=parent.compile_unlinked(&v).unwrap().bind("child",&child.compile(&v).unwrap()).unwrap();
-    assert!(module.link_with(BuildOptions::default().parser_backend(ParserBackend::TemplateDfa)).is_err());
+    assert_eq!(module.link_with(BuildOptions::default().parser_backend(ParserBackend::TemplateDfa)).unwrap().parser_backend(),ParserBackend::TemplateDfa);
     assert_eq!(module.link().unwrap().parser_backend(),ParserBackend::LrTable);
 }
 

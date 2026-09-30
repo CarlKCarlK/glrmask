@@ -168,7 +168,7 @@ fn external_template_artifacts_omit_vocab_require_exact_binding_and_roundtrip() 
     assert_eq!(token_section_len,0,"model-token bytes must really be absent");
     let parser = &body[parser_range(body)];
     assert_eq!(&parser[..4],b"TPX1");
-    assert_eq!(&parser[36..40],b"TPR2");
+    assert_eq!(&parser[36..40],b"TPR4");
     let loaded = <DynamicConstraint as DynamicConstraintExt>::load_with_vocab(&external, &v).unwrap();
     compare_dynamic(&reference, &loaded);
     assert_eq!(loaded.save_with_external_vocab(), external,"external re-save must use same-mode backing bytes");
@@ -258,7 +258,7 @@ fn mutate_range(bytes:&[u8],range:std::ops::Range<usize>,value:&[u8])->Vec<u8> {
 #[test]
 fn compact_template_programs_reject_noncanonical_counts_truncation_and_duplicate_core() {
     let original=compact_fixture();let parser=&original[parser_range(&original)];
-    assert_eq!(&parser[..4],b"TPR2");
+    assert_eq!(&parser[..4],b"TPR4");
     let mut cursor=4;let alphabet=read_var(parser,&mut cursor);let first_end=cursor;
     for bad in [vec![128,0],vec![255,255,255,255,31],vec![128;6]] {
         let bad=mutate_range(parser,4..first_end,&bad);
@@ -333,4 +333,55 @@ fn table_free_root_end_and_exact_only_token_policies_survive_roundtrip() {
     assert!(b.is_terminated());
     let missing=Vocab::new(vec![(0,b"a".to_vec()),(1,b"b".to_vec())]);
     assert!(Constraint::load_with_vocab(saved,&missing).is_err());
+}
+
+#[test]
+fn malformed_embedding_flags_slots_and_finish_graphs_are_rejected() {
+    fn skip_program(bytes: &[u8], cursor: &mut usize) {
+        for _ in 0..3 {
+            let states = read_var(bytes, cursor);
+            if states == 0 { continue; }
+            read_var(bytes, cursor);
+            for _ in 0..states {
+                let edges = read_var(bytes, cursor) >> 1;
+                for _ in 0..edges { read_var(bytes, cursor); read_var(bytes, cursor); }
+            }
+        }
+        for _ in 0..3 { let count = read_var(bytes, cursor); for _ in 0..count { read_var(bytes, cursor); } }
+    }
+    let original = compact_fixture(); let parser = &original[parser_range(&original)];
+    assert_eq!(&parser[..4], b"TPR4");
+    let mut cursor = 4; let alphabet = read_var(parser, &mut cursor); let terminals = read_var(parser, &mut cursor);
+    let skips = read_var(parser, &mut cursor); for _ in 0..skips { read_var(parser, &mut cursor); }
+    for _ in 0..=terminals { skip_program(parser, &mut cursor); }
+    let composed = cursor; assert_eq!(read_var(parser, &mut cursor), 0);
+    let nullable = cursor; read_var(parser, &mut cursor);
+    let return_pop = cursor; read_var(parser, &mut cursor);
+    let count_start = cursor; assert_eq!(read_var(parser, &mut cursor), 0); let finish_start = cursor;
+    for (position, value) in [(composed, 2), (nullable, 2), (return_pop, 0), (return_pop, 3)] {
+        let mut end = position; read_var(parser, &mut end);
+        let bad = mutate_range(parser, position..end, &var_bytes(value));
+        assert!(Constraint::load(replace_parser(&original, &bad)).is_err(), "accepted malformed embedding field {position}");
+    }
+    let mut invalid_slot = var_bytes(1); invalid_slot.extend(var_bytes(terminals));
+    let bad = mutate_range(parser, count_start..finish_start, &invalid_slot);
+    assert!(Constraint::load(replace_parser(&original, &bad)).is_err());
+    let mut exercised = false;
+    'phases: for _ in 0..3 {
+        let states = read_var(parser, &mut cursor); if states == 0 { continue; }
+        read_var(parser, &mut cursor);
+        for source in 0..states {
+            let edges = read_var(parser, &mut cursor) >> 1;
+            for _ in 0..edges {
+                let label = cursor; read_var(parser, &mut cursor); let label_end = cursor;
+                let target = cursor; read_var(parser, &mut cursor); let target_end = cursor;
+                let cycle = mutate_range(parser, target..target_end, &var_bytes(source));
+                assert!(Constraint::load(replace_parser(&original, &cycle)).is_err());
+                let outside = mutate_range(parser, label..label_end, &var_bytes(alphabet + 1));
+                assert!(Constraint::load(replace_parser(&original, &outside)).is_err());
+                exercised = true; break 'phases;
+            }
+        }
+    }
+    assert!(exercised, "embedding fixture must contain a nontrivial Finish relation");
 }

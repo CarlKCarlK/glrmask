@@ -2125,6 +2125,38 @@ impl UnlinkedConstraint {
         self.link_with(BuildOptions::default())
     }
 
+    fn contains_template_component(&self) -> bool {
+        self.inner.has_template_parser() || self.bindings.values().any(|binding| match binding {
+            ModuleBinding::Module(module) => module.contains_template_component(),
+            ModuleBinding::Constraint(constraint) => constraint.has_template_parser(),
+            ModuleBinding::ExactTokens(_) => false,
+        })
+    }
+
+    fn materialize_template_components(&self, optimization: Optimization) -> Result<RuntimeConstraint> {
+        self.validate_slot_manifest()?;
+        if !self.bindings.is_empty() && optimization == Optimization::FastRuntime {
+            return Err(Error::Compilation("static boundary compilation from already table-free components is not implemented; choose FastBuild or Auto, not an implicit fallback".into()));
+        }
+        let mut parent = self.inner.as_ref().clone();
+        parent.install_template_parser()?;
+        if self.bindings.is_empty() { return Ok(parent); }
+        let vocab = constraint_vocab(self.inner.as_ref());
+        let children = self.bindings.iter().map(|(name, binding)| {
+            let mut child = match binding {
+                ModuleBinding::Module(module) => module.materialize_template_components(optimization)?,
+                ModuleBinding::Constraint(constraint) => constraint.as_ref().clone(),
+                ModuleBinding::ExactTokens(ids) => compile_exact_token_adapter(&vocab, ids)?,
+            };
+            child.end_tokens = Arc::from([]);
+            child.install_template_parser()?;
+            Ok((name.clone(), Arc::new(child)))
+        }).collect::<Result<Vec<_>>>()?;
+        crate::error::catch_internal_invariant(|| {
+            crate::runtime::parser_backend::link::compose(parent, &children, &vocab)
+        })?
+    }
+
     /// Link a fully bound artifact with final build options.
     pub fn link_with(&self, options: BuildOptions) -> Result<RuntimeConstraint> {
         if let Some((name, kind)) = self.first_open_slot()? {
@@ -2133,7 +2165,9 @@ impl UnlinkedConstraint {
                 kind.name(),
             )));
         }
-        let mut constraint = self.materialize(options.optimization_value())?;
+        let mut constraint = if options.parser_backend == ParserBackend::TemplateDfa && self.contains_template_component() {
+            self.materialize_template_components(options.optimization_value())?
+        } else { self.materialize(options.optimization_value())? };
         ensure_runnable_constraint(&constraint)?;
         if options.parser_backend == ParserBackend::TemplateDfa {
             constraint.install_template_parser()?;

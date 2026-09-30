@@ -564,7 +564,7 @@ fn pure_same_label_push_target(dfa: &UnweightedDfa, old_state: u32, label: i32) 
 /// of the original two-symbol word `x, -x`: inspect the top stack symbol and
 /// push the same symbol back. Expanding every read edge this way gives an NFA
 /// over exactly the unsplit template alphabet.
-fn recombine_split_commit_template_language(split: &CommitTemplateDfas) -> NFA {
+pub fn recombine_split_commit_template_language(split: &CommitTemplateDfas) -> NFA {
     let mut nfa = NFA::new_empty();
     let pop_offset = 0u32;
     let read_offset = split.pop.states.len() as u32;

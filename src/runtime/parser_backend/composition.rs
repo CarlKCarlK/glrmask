@@ -221,6 +221,10 @@ impl Constraint {
         let mut parser = TemplateParser::compile(layout.total_states, outer_count,
             table.skip_terminals.iter().copied().filter(|terminal| *terminal < outer_count).collect(),
             &programs, completion)?;
+        parser.embedding = super::embedding::TemplateEmbedding::from_table(&table,
+            self.composition_start_nullable().map_err(crate::Error::Compilation)?,
+            self.composition_child_return_pop().map_err(crate::Error::Compilation)?,
+            self.late_grammar_slots.iter().map(|slot| slot.terminal_id)).ok().map(Arc::new);
         parser.composition = Some(Arc::new(TemplateComposition::compile(
             layout.total_states, layout.total_leaf_terminals, &programs, extra)?));
 

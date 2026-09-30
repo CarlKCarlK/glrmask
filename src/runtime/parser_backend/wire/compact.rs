@@ -60,7 +60,8 @@ fn program(out: &mut Vec<u8>, template: &CommitTemplateDfas, alphabet: u32) {
 pub(super) fn encode(parser: &TemplateParser, templates: &TemplateDfasByTerminal) -> Vec<u8> {
     assert_eq!(templates.len(),parser.terminal_count as usize);
     let mut out=Vec::new();
-    out.extend_from_slice(if parser.composition.is_some() { b"TPR3" } else { MAGIC });
+    out.extend_from_slice(if parser.embedding.is_some() { b"TPR4" }
+        else if parser.composition.is_some() { b"TPR3" } else { MAGIC });
     put(&mut out,parser.state_count); put(&mut out,parser.terminal_count);
     count(&mut out,parser.skip_terminals.len());
     let mut previous=None;
@@ -71,12 +72,20 @@ pub(super) fn encode(parser: &TemplateParser, templates: &TemplateDfasByTerminal
         program(&mut out,template.as_ref().expect("every terminal has an explicit template"),parser.state_count);
     }
     program(&mut out,&parser.completion_template,parser.state_count);
+    if parser.embedding.is_some() { put(&mut out, u32::from(parser.composition.is_some())); }
     if let Some(composition) = &parser.composition {
         put(&mut out, composition.control_start);
         count(&mut out, composition.programs.len());
         for template in &composition.programs {
             program(&mut out, template.as_ref().expect("validated scoped relation"), parser.state_count);
         }
+    }
+    if let Some(embedding) = &parser.embedding {
+        put(&mut out, u32::from(embedding.nullable));
+        put(&mut out, embedding.return_pop);
+        count(&mut out, embedding.entries.len());
+        for &terminal in &embedding.entries { put(&mut out, terminal); }
+        program(&mut out, &embedding.finish, parser.state_count);
     }
     out
 }
@@ -169,8 +178,9 @@ struct Budget {states:usize,edges:usize}
 pub(super) fn decode(bytes:&[u8])->Result<ParserSeed,String> {
     let mut input=Input{bytes,offset:0};
     let magic = input.take::<4>()?;
-    let composed = &magic == b"TPR3";
-    if &magic != MAGIC && !composed {return Err("invalid compact parser section".into());}
+    let has_embedding = &magic == b"TPR4";
+    let mut composed = &magic == b"TPR3";
+    if &magic != MAGIC && !composed && !has_embedding {return Err("invalid compact parser section".into());}
     let state_count=input.var()?; let terminal_count=input.var()?;
     validate_dimensions(state_count,terminal_count)?;
     let count=input.variable_count(1)?;
@@ -195,6 +205,10 @@ pub(super) fn decode(bytes:&[u8])->Result<ParserSeed,String> {
         templates.push(Some(Arc::new(input.compact_program(state_count,&mut budget)?)));
     }
     let completion=input.compact_program(state_count,&mut budget)?;
+    if has_embedding {
+        composed = match input.var()? { 0 => false, 1 => true,
+            _ => return Err("invalid embedding composition flag".into()) };
+    }
     let composition = if composed {
         let control_start = input.var()?;
         let extra_count = input.variable_count(6)?;
@@ -215,8 +229,27 @@ pub(super) fn decode(bytes:&[u8])->Result<ParserSeed,String> {
         }
         Some((control_start, programs))
     } else { None };
+    let embedding = if has_embedding {
+        let nullable = match input.var()? { 0 => false, 1 => true,
+            _ => return Err("invalid embedding nullability flag".into()) };
+        let return_pop = input.var()?;
+        if !matches!(return_pop, 1 | 2) { return Err("invalid embedding return convention".into()); }
+        let count = input.variable_count(1)?;
+        if count > terminal_count as usize { return Err("embedding slot inventory exceeds terminals".into()); }
+        let mut entries = BTreeSet::new();
+        let mut previous = None;
+        for _ in 0..count {
+            let terminal = input.var()?;
+            if terminal >= terminal_count || previous.is_some_and(|old| old >= terminal) {
+                return Err("invalid or unordered embedding slot".into());
+            }
+            entries.insert(terminal); previous = Some(terminal);
+        }
+        let finish = Arc::new(input.compact_program(state_count, &mut budget)?);
+        Some(super::super::embedding::TemplateEmbedding { nullable, return_pop, entries, finish })
+    } else { None };
     if input.offset!=bytes.len() {return Err("trailing compact parser bytes".into());}
     // Cycle/phase validation is shared with domain derivation during install.
     // No materialization path can expose these graphs before it succeeds.
-    Ok(ParserSeed {state_count,terminal_count,skip_terminals,completion,programs:Some(templates),composition})
+    Ok(ParserSeed {state_count,terminal_count,skip_terminals,completion,programs:Some(templates),composition,embedding})
 }

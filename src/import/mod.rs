@@ -476,10 +476,18 @@ fn compile_bounded_template_from_source(
         let mut compiled = Vec::with_capacity(alternatives.len());
         for alternative in alternatives {
             let grammar = ast::lower(&alternative)?;
+            // Standalone normalization removes the empty start alternative.
+            // A later component linker still needs its original body-language
+            // nullability, just as the ordinary static and dynamic frontends do.
+            let source_start_nullable = grammar.start_is_nullable();
             let prepared = crate::compiler::grammar::transforms::prepare_grammar_transforms_only(grammar);
-            compiled.push(compile_dynamic_owned_with_vocab_partition_with_table_construction(
+            let mut component = compile_dynamic_owned_with_vocab_partition_with_table_construction(
                 prepared, vocab, table_construction,
-            )?);
+            )?;
+            for body in component.constraints_mut() {
+                body.table.set_embedded_start_nullable(source_start_nullable);
+            }
+            compiled.push(component);
         }
         let mut constraint = DynamicConstraint::from_alternatives(compiled);
         for component in constraint.constraints_mut() { component.install_template_parser()?; }
