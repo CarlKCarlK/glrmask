@@ -6,6 +6,7 @@ mod flat_template;
 pub(crate) mod push_dag;
 pub(crate) mod phase_dag;
 pub(crate) mod single_cursor;
+pub(crate) mod template_prepare;
 pub(crate) use template_advance::advance_stacks_template_dfa;
 pub(crate) mod tokenizer_scan;
 

@@ -70,6 +70,15 @@ impl PreparedInputCursor {
         for (links,source,target) in [(&template.pop_to_read,0,1),(&template.pop_to_push,0,2),(&template.read_to_push,1,2)] {
             if links.len()>graphs[source].states.len() || links.iter().flatten().any(|&i|i as usize>=graphs[target].states.len()) { return None; }
         }
+        Some(Self::from_orders(template, &orders))
+    }
+
+    pub(crate) fn from_prepared(prepared: &super::template_prepare::TemplatePreparation<'_>) -> Self {
+        Self::from_orders(prepared.template(), prepared.orders())
+    }
+
+    fn from_orders(template: &CommitTemplateDfas, orders: &[Vec<usize>; 3]) -> Self {
+        let graphs = [&template.pop, &template.read, &template.push];
         let mut productive:[Box<[bool]>;3]=std::array::from_fn(|phase|vec![false;graphs[phase].states.len()].into_boxed_slice());
         for phase in (0..3).rev() {
             for &id in orders[phase].iter().rev() {
@@ -84,7 +93,7 @@ impl PreparedInputCursor {
                 productive[phase][id]=live;
             }
         }
-        Some(Self{productive})
+        Self { productive }
     }
 
     pub(super) fn apply(&self, template: &CommitTemplateDfas, input: &ParserGSS) -> Option<InputCursorResult> {

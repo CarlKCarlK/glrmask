@@ -1524,11 +1524,30 @@ pub(crate) struct FastCommitTemplateDfas {
 
 impl FastCommitTemplateDfas {
     pub(crate) fn from_template(template: &CommitTemplateDfas) -> Self {
+        let prepared = super::commit::template_prepare::TemplatePreparation::new(template);
+        let (input_cursor, phase_dag, push_suffixes, push_dag) = match prepared.as_ref() {
+            Some(prepared) => (
+                Some(super::commit::single_cursor::PreparedInputCursor::from_prepared(prepared)),
+                super::commit::phase_dag::PreparedPhaseDag::from_prepared(prepared),
+                super::commit::push_suffixes::from_prepared(prepared),
+                super::commit::push_dag::PreparedPushDag::from_prepared(prepared),
+            ),
+            // Preserve the independent helpers' behavior for legacy optional
+            // templates that do not qualify for whole-program preparation.
+            // This is not parser-table fallback; it selects the same derived
+            // views as before and the exact template evaluator remains intact.
+            None => (
+                super::commit::single_cursor::PreparedInputCursor::prepare(template),
+                super::commit::phase_dag::PreparedPhaseDag::prepare(template),
+                super::commit::push_suffixes::prepare(template),
+                super::commit::push_dag::PreparedPushDag::prepare(template),
+            ),
+        };
         Self {
-            input_cursor: super::commit::single_cursor::PreparedInputCursor::prepare(template),
-            phase_dag: super::commit::phase_dag::PreparedPhaseDag::prepare(template),
-            push_suffixes: super::commit::push_suffixes::prepare(template),
-            push_dag: super::commit::push_dag::PreparedPushDag::prepare(template),
+            input_cursor,
+            phase_dag,
+            push_suffixes,
+            push_dag,
             pop: FastTemplateDfa::from_dfa(&template.pop),
             read: FastTemplateDfa::from_dfa(&template.read),
             push: FastTemplateDfa::from_dfa(&template.push),
