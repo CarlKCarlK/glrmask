@@ -257,15 +257,22 @@ impl TemplateDomain {
             let row = merged_domain_row(&state.transitions, &canonical,
                 read.map(|read| read_labels[read].as_slice()), default);
             if default == REJECT && row.is_empty() { continue; }
-            let signature = (default, row);
-            let next_id = if let Some(&id) = row_ids.get(&signature) { id } else {
-                let id = u32::try_from(states.len()).map_err(|_| "template domain too large")?;
-                if id == REJECT { return Err("template domain too large".to_owned()); }
-                states.push(DomainState { accepts_prefix: false, default_target: default,
-                    first_edge: edges.len(), edge_count: signature.1.len() });
-                edges.extend_from_slice(&signature.1);
-                row_ids.insert(signature, id);
-                id
+            // A wide row is expensive to hash. Entry performs the identical
+            // exact-key lookup once, rather than hashing a new row again on
+            // insertion. IDs still follow the fixed topological traversal;
+            // hash-map iteration never determines the compiled representation.
+            let next_id = match row_ids.entry((default, row)) {
+                std::collections::hash_map::Entry::Occupied(entry) => *entry.get(),
+                std::collections::hash_map::Entry::Vacant(entry) => {
+                    let id = u32::try_from(states.len()).map_err(|_| "template domain too large")?;
+                    if id == REJECT { return Err("template domain too large".to_owned()); }
+                    let (default, row) = entry.key();
+                    states.push(DomainState { accepts_prefix: false, default_target: *default,
+                        first_edge: edges.len(), edge_count: row.len() });
+                    edges.extend_from_slice(row);
+                    entry.insert(id);
+                    id
+                }
             };
             canonical[i] = next_id;
         }
@@ -274,14 +281,31 @@ impl TemplateDomain {
     }
 
     fn retain_reachable(start: u32, states: Vec<DomainState>, edges: Vec<(u32, u32)>) -> Self {
+        if start == REJECT {
+            return Self { start: REJECT, states: Box::new([]), edges: Box::new([]) };
+        }
         let mut keep = vec![false; states.len()];
+        keep[start as usize] = true;
+        let mut reachable = 1usize;
         let mut pending = vec![start];
         while let Some(id) = pending.pop() {
-            if id == REJECT || keep[id as usize] { continue; }
-            keep[id as usize] = true;
             let state = &states[id as usize];
-            pending.push(state.default_target);
-            pending.extend(edges[state.first_edge..state.first_edge + state.edge_count].iter().map(|e| e.1));
+            for target in std::iter::once(state.default_target)
+                .chain(edges[state.first_edge..state.first_edge + state.edge_count].iter().map(|edge| edge.1))
+            {
+                if target == REJECT || keep[target as usize] { continue; }
+                // Mark at enqueue time so convergent rows do not repeatedly
+                // retain the same target in scratch before it is visited.
+                keep[target as usize] = true;
+                reachable += 1;
+                pending.push(target);
+            }
+        }
+        if reachable == states.len() {
+            // With every row reachable, the old stable-ID remap is exactly
+            // the identity. Preserve those rows directly instead of copying
+            // the full edge inventory into a second allocation.
+            return Self { start, states: states.into_boxed_slice(), edges: edges.into_boxed_slice() };
         }
         let mut remap = vec![REJECT; states.len()];
         let mut count = 0u32;
@@ -495,6 +519,49 @@ mod tests {
     fn template() -> CommitTemplateDfas {
         CommitTemplateDfas { pop: DFA::new(), read: DFA::new(), push: DFA::new(),
             ..CommitTemplateDfas::default() }
+    }
+
+    #[test]
+    fn domain_reachability_identity_preserves_exact_rows_and_edges() {
+        let states = vec![
+            DomainState { accepts_prefix: true, default_target: REJECT, first_edge: 0, edge_count: 0 },
+            DomainState { accepts_prefix: false, default_target: 0, first_edge: 0, edge_count: 1 },
+            DomainState { accepts_prefix: false, default_target: 1, first_edge: 1, edge_count: 2 },
+        ];
+        // Explicit rejection at row1 must continue to shadow its productive
+        // DEFAULT; row2 has two paths to a shared suffix.
+        let edges = vec![(7, REJECT), (3, 0), (5, 1)];
+        let reference = TemplateDomain { start: 2, states: states.clone().into_boxed_slice(),
+            edges: edges.clone().into_boxed_slice() };
+        let actual = TemplateDomain::retain_reachable(2, states, edges);
+        assert_eq!(actual.to_bytes().unwrap(), reference.to_bytes().unwrap());
+        for word in [vec![], vec![3], vec![5], vec![5, 7], vec![5, 8], vec![1, 8]] {
+            assert_eq!(actual.matches_top_first(word.iter().copied()),
+                reference.matches_top_first(word.iter().copied()));
+        }
+    }
+
+    #[test]
+    fn domain_reachability_prunes_without_reordering_kept_ids() {
+        let states = vec![
+            DomainState { accepts_prefix: true, default_target: REJECT, first_edge: 0, edge_count: 0 },
+            DomainState { accepts_prefix: false, default_target: REJECT, first_edge: 0, edge_count: 1 },
+            DomainState { accepts_prefix: false, default_target: REJECT, first_edge: 1, edge_count: 1 },
+            DomainState { accepts_prefix: false, default_target: 2, first_edge: 2, edge_count: 1 },
+        ];
+        let edges = vec![(1, 0), (2, 0), (3, 2)];
+        let actual = TemplateDomain::retain_reachable(3, states.clone(), edges.clone());
+        let expected = TemplateDomain { start: 2, states: vec![
+            states[0].clone(),
+            DomainState { accepts_prefix: false, default_target: REJECT, first_edge: 0, edge_count: 1 },
+            DomainState { accepts_prefix: false, default_target: 1, first_edge: 1, edge_count: 1 },
+        ].into_boxed_slice(), edges: vec![(2, 0), (3, 1)].into_boxed_slice() };
+        assert_eq!(actual.to_bytes().unwrap(), expected.to_bytes().unwrap());
+        let dead = TemplateDomain::retain_reachable(REJECT, states, edges);
+        assert_eq!(dead.state_count(), 0);
+        assert_eq!(dead.edge_count(), 0);
+        assert_eq!(dead.start(), DomainProbe::Reject);
+        assert_eq!(dead.to_bytes().unwrap().len(), 16);
     }
 
     #[test]
