@@ -59,7 +59,8 @@ fn program(out: &mut Vec<u8>, template: &CommitTemplateDfas, alphabet: u32) {
 
 pub(super) fn encode(parser: &TemplateParser, templates: &TemplateDfasByTerminal) -> Vec<u8> {
     assert_eq!(templates.len(),parser.terminal_count as usize);
-    let mut out=Vec::new(); out.extend_from_slice(MAGIC);
+    let mut out=Vec::new();
+    out.extend_from_slice(if parser.composition.is_some() { b"TPR3" } else { MAGIC });
     put(&mut out,parser.state_count); put(&mut out,parser.terminal_count);
     count(&mut out,parser.skip_terminals.len());
     let mut previous=None;
@@ -70,6 +71,13 @@ pub(super) fn encode(parser: &TemplateParser, templates: &TemplateDfasByTerminal
         program(&mut out,template.as_ref().expect("every terminal has an explicit template"),parser.state_count);
     }
     program(&mut out,&parser.completion_template,parser.state_count);
+    if let Some(composition) = &parser.composition {
+        put(&mut out, composition.control_start);
+        count(&mut out, composition.programs.len());
+        for template in &composition.programs {
+            program(&mut out, template.as_ref().expect("validated scoped relation"), parser.state_count);
+        }
+    }
     out
 }
 
@@ -160,7 +168,9 @@ struct Budget {states:usize,edges:usize}
 
 pub(super) fn decode(bytes:&[u8])->Result<ParserSeed,String> {
     let mut input=Input{bytes,offset:0};
-    if &input.take::<4>()?!=MAGIC {return Err("invalid compact parser section".into());}
+    let magic = input.take::<4>()?;
+    let composed = &magic == b"TPR3";
+    if &magic != MAGIC && !composed {return Err("invalid compact parser section".into());}
     let state_count=input.var()?; let terminal_count=input.var()?;
     validate_dimensions(state_count,terminal_count)?;
     let count=input.variable_count(1)?;
@@ -185,8 +195,28 @@ pub(super) fn decode(bytes:&[u8])->Result<ParserSeed,String> {
         templates.push(Some(Arc::new(input.compact_program(state_count,&mut budget)?)));
     }
     let completion=input.compact_program(state_count,&mut budget)?;
+    let composition = if composed {
+        let control_start = input.var()?;
+        let extra_count = input.variable_count(6)?;
+        if control_start as usize > extra_count {
+            return Err("composition control offset exceeds its scoped relation inventory".into());
+        }
+        let total = terminal_count.checked_add(u32::try_from(extra_count)
+            .map_err(|_| "too many scoped parser relations")?).ok_or("scoped terminal coordinate overflow")?;
+        if total == u32::MAX { return Err("scoped parser labels collide with EOF".into()); }
+        validate_dimensions(state_count, total)?;
+        let controls = extra_count - control_start as usize;
+        if state_count as u64 * (controls as u64 * 4 + 24) > super::MAX_CERTIFICATE_BYTES {
+            return Err("composition control certificates exceed the load budget".into());
+        }
+        let mut programs = Vec::with_capacity(extra_count);
+        for _ in 0..extra_count {
+            programs.push(Some(Arc::new(input.compact_program(state_count, &mut budget)?)));
+        }
+        Some((control_start, programs))
+    } else { None };
     if input.offset!=bytes.len() {return Err("trailing compact parser bytes".into());}
     // Cycle/phase validation is shared with domain derivation during install.
     // No materialization path can expose these graphs before it succeeds.
-    Ok(ParserSeed {state_count,terminal_count,skip_terminals,completion,programs:Some(templates)})
+    Ok(ParserSeed {state_count,terminal_count,skip_terminals,completion,programs:Some(templates),composition})
 }

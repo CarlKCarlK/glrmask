@@ -29,6 +29,10 @@ pub(crate) fn advance_stacks_template_dfa(
     stack: &ParserGSS,
     terminal: TerminalID,
 ) -> Option<ParserGSS> {
+    if let Some(provider) = constraint.template_composition_provider() {
+        return Some(crate::compiler::glr::parser::advance_provider_control_closed_stacks(
+            &provider, stack, terminal));
+    }
     let dfa = constraint
         .template_dfas_by_terminal
         .get(terminal as usize)?
@@ -44,6 +48,10 @@ pub(super) fn advance_stacks_template_dfa_owned(
     stack: ParserGSS,
     terminal: TerminalID,
 ) -> Option<ParserGSS> {
+    if let Some(provider) = constraint.template_composition_provider() {
+        return Some(crate::compiler::glr::parser::advance_provider_control_closed_stacks(
+            &provider, &stack, terminal));
+    }
     let dfa = constraint
         .template_dfas_by_terminal
         .get(terminal as usize)?
@@ -653,7 +661,7 @@ fn advance_with_template(template: &CommitTemplateDfas, stack: ParserGSS) -> Par
     advance_with_prepared_template(template, stack, None)
 }
 
-fn advance_with_prepared_template(template: &CommitTemplateDfas, stack: ParserGSS,
+pub(crate) fn advance_with_prepared_template(template: &CommitTemplateDfas, stack: ParserGSS,
     prepared: Option<&FastCommitTemplateDfas>) -> ParserGSS {
     let sparse_input = stack.single_interface_lower_id().is_some();
     let seeded = prepared.and_then(|index| index.input_cursor.as_ref())

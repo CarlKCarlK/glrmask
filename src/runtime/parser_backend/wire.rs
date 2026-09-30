@@ -24,6 +24,7 @@ pub(crate) struct ParserSeed {
     skip_terminals: BTreeSet<u32>,
     completion: CommitTemplateDfas,
     programs: Option<TemplateDfasByTerminal>,
+    composition: Option<(u32, TemplateDfasByTerminal)>,
 }
 
 pub(crate) fn encode(parser: &TemplateParser, templates: &TemplateDfasByTerminal) -> Vec<u8> {
@@ -124,7 +125,7 @@ fn validate_dimensions(state_count: u32, terminal_count: u32) -> Result<(), Stri
 }
 
 pub(crate) fn decode(bytes: &[u8]) -> Result<ParserSeed, String> {
-    if bytes.starts_with(b"TPR2") { return compact::decode(bytes); }
+    if bytes.starts_with(b"TPR2") || bytes.starts_with(b"TPR3") { return compact::decode(bytes); }
     let mut input = Input { bytes, offset: 0 };
     if &input.take::<4>()? != MAGIC { return Err("invalid template parser section tag".into()); }
     let state_count = input.u32()?;
@@ -151,7 +152,7 @@ pub(crate) fn decode(bytes: &[u8]) -> Result<ParserSeed, String> {
     if input.offset != bytes.len() { return Err("trailing bytes in template parser section".into()); }
     validate_alphabet(&completion, state_count)?;
     super::compile_domain(&completion).map_err(|error| error.to_string())?;
-    Ok(ParserSeed { state_count, terminal_count, skip_terminals, completion, programs: None })
+    Ok(ParserSeed { state_count, terminal_count, skip_terminals, completion, programs: None, composition: None })
 }
 
 fn validate_alphabet(template: &CommitTemplateDfas, state_count: u32) -> Result<(), String> {
@@ -183,17 +184,23 @@ impl ParserSeed {
         if constraint.template_dfas_by_terminal.len() != self.terminal_count as usize {
             return Err("template parser terminal count does not match its relation inventory".into());
         }
-        if constraint.uses_compact_segmented_parser_runtime() || !constraint.late_grammar_slots.is_empty()
-            || constraint.static_dynamic_overlay.is_some()
-        {
-            return Err("template parser artifact cannot contain unsupported composition machinery".into());
-        }
+        // Component bodies are restored from the runtime section after this
+        // parser section. Coordinate/layout validation runs after that restore,
+        // before any derived caches or public runtime state can be published.
         for template in &constraint.template_dfas_by_terminal {
             let template = template.as_deref().ok_or("missing template parser terminal relation")?;
             validate_alphabet(template, self.state_count)?;
         }
-        let parser = TemplateParser::compile(self.state_count, self.terminal_count, self.skip_terminals,
+        let mut parser = TemplateParser::compile(self.state_count, self.terminal_count, self.skip_terminals,
             &constraint.template_dfas_by_terminal, self.completion).map_err(|error| error.to_string())?;
+        if let Some((control_start, programs)) = self.composition {
+            for template in &programs {
+                validate_alphabet(template.as_deref().ok_or("missing scoped template")?, self.state_count)?;
+            }
+            parser.composition = Some(Arc::new(super::composition::TemplateComposition::compile(
+                self.state_count, control_start, &constraint.template_dfas_by_terminal, programs,
+            ).map_err(|error| error.to_string())?));
+        }
         constraint.template_parser = Some(Arc::new(parser));
         constraint.table = ParserTableStorage::absent();
         constraint.deferred_table_rules_blob = None;

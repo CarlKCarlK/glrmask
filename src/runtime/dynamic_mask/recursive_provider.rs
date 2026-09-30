@@ -64,19 +64,19 @@ impl<'scan, 'constraint> RecursiveConfigTransitions<'scan, 'constraint> {
         let source = self.routing.leaves[leaf].constraint;
         // A row-based upper bound is allowed only for a control-free leaf;
         // otherwise retain the ordinary unprojected exact configuration.
-        if !source.table.control_terminals.is_empty() { return lexer; }
-        let mut admitted = BitSet::new(source.table.num_terminals as usize);
+        if source.parser_has_controls() { return lexer; }
+        let mut admitted = BitSet::new(source.parser_terminal_count() as usize);
         for top in cache.nodes[parser as usize].gss.peek_values() {
             let Some((owner, state)) = self.routing.constraint.recursive_parser_leaf_state(top)
                 else { return lexer; };
             if owner != leaf { return lexer; }
-            let Some(row) = source.table.advance_row(state) else { return lexer; };
-            for terminal in row.iter_ones().take_while(|&t| t < source.table.num_terminals as usize) {
+            let Some(row) = source.parser_advance_row(state) else { return lexer; };
+            for terminal in row.iter_ones().take_while(|&t| t < source.parser_terminal_count() as usize) {
                 admitted.set(terminal);
             }
         }
         if let Some(ignore) = source.ignore_terminal { admitted.set(ignore as usize); }
-        for &skip in &source.table.skip_terminals { admitted.set(skip as usize); }
+        for &skip in source.parser_skip_terminals() { admitted.set(skip as usize); }
         if admitted.count_ones() > 16 || admitted.is_empty() { return lexer; }
         let projected = self.tables[leaf].parser_initial_state(local, &admitted);
         let result = match self.intern(leaf, projected) {
@@ -241,10 +241,10 @@ impl FullWalkTransitionTable for RecursiveConfigTransitions<'_, '_> {
             || (!is_reset && (source.tokenizer.has_any_virtual_runtime()
                 || raw >= source.tokenizer.num_states()))
         { return fallback(self); }
-        if !source.table.control_terminals.is_empty() { return fallback(self); }
+        if source.parser_has_controls() { return fallback(self); }
         let layout = self.routing.constraint.recursive_parser_layout()?
             .ok_or("missing recursive layout for initial projection")?;
-        let mut admitted = BitSet::new(source.table.num_terminals as usize);
+        let mut admitted = BitSet::new(source.parser_terminal_count() as usize);
         for top in parser.peek_values() {
             let Some((owner, state)) = self.routing.constraint.recursive_parser_leaf_state(top)
                 else { return fallback(self); };
@@ -252,21 +252,29 @@ impl FullWalkTransitionTable for RecursiveConfigTransitions<'_, '_> {
             // Synthetic provider calls/returns need not occur in the local
             // table's control-terminal list. Preserve the full interpreter
             // whenever a zero-width owner change cannot be ruled out cheaply.
-            if source.table.action(state, u32::MAX).is_some()
+            // Template rows are conservative input-domain certificates, not
+            // LR actions. A possible control is enough to decline projection;
+            // the ordinary exact lexer/parser walk remains authoritative.
+            let may_act = |terminal| if source.has_template_parser() {
+                source.parser_advance_row_allows(state, terminal)
+            } else {
+                source.table.action(state, terminal).is_some()
+            };
+            if may_act(u32::MAX)
                 || layout.links.iter().any(|link| {
                     (link.parent_component as usize == leaf
-                        && source.table.action(state, link.slot_terminal).is_some())
+                        && may_act(link.slot_terminal))
                     || (link.child_component as usize == leaf
                         && link.child_start_nullable && state == link.child_start)
                 })
             { return fallback(self); }
-            let Some(row) = source.table.advance_row(state) else { return fallback(self); };
-            for terminal in row.iter_ones().take_while(|&t| t < source.table.num_terminals as usize) {
+            let Some(row) = source.parser_advance_row(state) else { return fallback(self); };
+            for terminal in row.iter_ones().take_while(|&t| t < source.parser_terminal_count() as usize) {
                 admitted.set(terminal);
             }
         }
         if let Some(ignore) = source.ignore_terminal { admitted.set(ignore as usize); }
-        for &skip in &source.table.skip_terminals { admitted.set(skip as usize); }
+        for &skip in source.parser_skip_terminals() { admitted.set(skip as usize); }
         let count = admitted.count_ones();
         if count == 0 || count > 16 { return fallback(self); }
         if !is_reset {

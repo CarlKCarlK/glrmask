@@ -1,6 +1,6 @@
 use crate::automata::lexer::Lexer;
 pub(crate) mod profile;
-mod template_advance;
+pub(crate) mod template_advance;
 pub(crate) mod push_suffixes;
 mod flat_template;
 pub(crate) mod push_dag;

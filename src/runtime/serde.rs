@@ -3299,7 +3299,7 @@ fn serialized_component_root_entry_terminals(
     let mut terminals = crate::ds::bitset::BitSet::new(global_terminal_count);
     let end = component
         .terminal_offset
-        .saturating_add(component.constraint.table.num_terminals)
+        .saturating_add(component.constraint.parser_terminal_count())
         .min(global_terminal_count as u32);
     for terminal in component.terminal_offset..end {
         terminals.set(terminal as usize);
@@ -3427,10 +3427,13 @@ fn segmented_runtime_artifact_ref(
         .expect("validated recursive runtime must derive its parser layout before serialization")
         .expect("provider-native segmented runtime must have a recursive parser layout");
     let overlay = constraint.static_dynamic_overlay.as_ref()?;
-    let recursive_compiler_table = overlay
-        .recursive_compiler_table
-        .get()
-        .expect("recursive runtime must retain its compiler table blob");
+    let recursive_compiler_table: &[u8] = if constraint.has_template_parser() {
+        assert!(overlay.recursive_compiler_table.get().is_none(), "template runtime retained an LR compiler blob");
+        &[]
+    } else {
+        overlay.recursive_compiler_table.get()
+            .expect("LR recursive runtime must retain its compiler table blob").as_ref()
+    };
     if overlay.recursive_tokenizer_internal_tsids.get().is_none() {
         let compatibility_omission = recursive_compiler_table.is_empty()
             && !overlay.segmented_parser_components.is_empty()
@@ -3472,7 +3475,7 @@ fn segmented_runtime_artifact_ref(
             local_tsid_to_global_tsids: &component.local_tsid_to_global_tsids,
             root_entry_terminals: serialized_component_root_entry_terminals(
                 component,
-                constraint.table.num_terminals as usize,
+                constraint.parser_terminal_count() as usize,
             ),
             root_disallowed_terminal: component.root_disallowed_terminal,
         })
@@ -4315,9 +4318,13 @@ fn restore_recursive_segmented_runtime_v27(
             "recursive v27 segmented runtime must be mask-authoritative".to_owned(),
         ));
     }
+    let template_backend = constraint.has_template_parser();
     let recursive_compiler_table = runtime.recursive_compiler_table;
+    if template_backend && !recursive_compiler_table.is_empty() {
+        return Err(crate::GlrMaskError::Serialization("template composition contains a packed LR compiler table".into()));
+    }
     let recursive_tokenizer_internal_tsids = runtime.recursive_tokenizer_internal_tsids;
-    let global_terminal_count = constraint.table.num_terminals as usize;
+    let global_terminal_count = constraint.parser_terminal_count() as usize;
     let global_tokenizer_states = constraint.tokenizer.num_states();
     // Immediate component artifacts are independent. Decode them in parallel
     // before validating their placement in the outer compiler-oracle
@@ -4344,7 +4351,7 @@ fn restore_recursive_segmented_runtime_v27(
         }
         if component
             .terminal_offset
-            .checked_add(child.table.num_terminals)
+            .checked_add(child.parser_terminal_count())
             .is_none_or(|end| end as usize > global_terminal_count)
         {
             return Err(crate::GlrMaskError::Serialization(format!(
@@ -4370,14 +4377,14 @@ fn restore_recursive_segmented_runtime_v27(
             })?;
         if component
             .root_disallowed_terminal
-            .is_some_and(|terminal| terminal >= child.table.num_terminals)
+            .is_some_and(|terminal| terminal >= child.parser_terminal_count())
         {
             return Err(crate::GlrMaskError::Serialization(format!(
                 "recursive v27 component {index} root-disallowed terminal lies outside the component"
             )));
         }
         if component.global_terminal_aliases.iter().any(|&(global, local)| {
-            global >= constraint.table.num_terminals || local >= child.table.num_terminals
+            global >= constraint.parser_terminal_count() || local >= child.parser_terminal_count()
         }) {
             return Err(crate::GlrMaskError::Serialization(format!(
                 "recursive v27 component {index} contains an invalid terminal alias"
@@ -4430,14 +4437,11 @@ fn restore_recursive_segmented_runtime_v27(
         overlay.segmented_boundary_shards.clear();
         overlay.segmented_boundary_parser = None;
         overlay.segmented_boundary_terminal_trie = None;
-        overlay
-            .recursive_compiler_table
-            .set(Arc::from(recursive_compiler_table.into_boxed_slice()))
-            .map_err(|_| {
-                crate::GlrMaskError::Serialization(
-                    "recursive compiler table was initialized twice".to_owned(),
-                )
-            })?;
+        if !template_backend {
+            overlay.recursive_compiler_table
+                .set(Arc::from(recursive_compiler_table.into_boxed_slice()))
+                .map_err(|_| crate::GlrMaskError::Serialization("recursive compiler table was initialized twice".into()))?;
+        }
     }
     let layout = constraint
         .recursive_parser_layout_for_pending_root()
@@ -8434,6 +8438,9 @@ impl Constraint {
         };
         let deserialize_ms = deserialize_started
             .map_or(0.0, |started| started.elapsed().as_secs_f64() * 1000.0);
+        if constraint.has_template_parser() {
+            constraint.validate_template_composition_layout().map_err(crate::GlrMaskError::Serialization)?;
+        }
         if !constraint.parser_state_domain_labels.is_empty() {
             if constraint.parser_state_domain_labels.len() != constraint.parser_symbol_count() as usize {
                 return Err(crate::GlrMaskError::Serialization(format!(

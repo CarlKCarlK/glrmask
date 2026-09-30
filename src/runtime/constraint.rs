@@ -3018,6 +3018,37 @@ impl Constraint {
         Some(partitions)
     }
 
+    /// Project the exact scoped one-step relations, retaining controls as
+    /// private labels. Exact leaf terminal IDs occupy their existing runtime
+    /// namespace after the outer (possibly aliased) terminal coordinate.
+    pub(crate) fn recursive_explicit_control_parser_table(&self) -> Result<GLRTable, String> {
+        let layout = self.recursive_parser_layout_for_pending_root()?
+            .ok_or_else(|| "missing recursive parser layout".to_owned())?;
+        let tables = RecursiveSegmentedParserTables { root: self, layout: &layout };
+        let provider = DisjointComponentActionProvider::with_state_offsets(
+            &tables, &layout.links, &layout.leaf_state_offsets,
+        )?;
+        let mut symbols = layout.terminal_targets.iter().map(|targets| {
+            targets.iter().map(|&(component, terminal)| ScopedParserSymbol::Terminal {
+                component, terminal,
+            }).collect::<SmallVec<[ScopedParserSymbol; 4]>>()
+        }).collect::<Vec<_>>();
+        for (component, leaf) in layout.leaves.iter().enumerate() {
+            let constraint = self.constraint_at_recursive_component_path(&leaf.component_path)
+                .ok_or_else(|| "composition leaf path no longer resolves".to_owned())?;
+            for terminal in 0..constraint.parser_terminal_count() {
+                symbols.push(smallvec::smallvec![ScopedParserSymbol::Terminal {
+                    component: component as u32, terminal,
+                }]);
+            }
+        }
+        crate::compiler::glr::parser::materialize_scoped_provider_table(
+            &provider, &symbols, Some(ScopedParserSymbol::Terminal {
+                component: 0, terminal: crate::compiler::glr::analysis::EOF,
+            }),
+        )
+    }
+
     /// Exact ordinary-terminal GLR table for compiler-side analyses that still
     /// consume a table rather than a `ParserActionProvider`. Its parser-state
     /// alphabet is the live recursive leaf coordinate; CALL/RETURN are first
@@ -3257,6 +3288,9 @@ impl Constraint {
         &self,
         stack: &ParserGSS,
     ) -> Option<ParserGSS> {
+        if let Some(provider) = self.template_composition_provider() {
+            return Some(close_provider_control_stacks(&provider, stack));
+        }
         if !self.uses_compact_segmented_parser_runtime() {
             return None;
         }
@@ -3281,6 +3315,9 @@ impl Constraint {
         stack: &ParserGSS,
         global_terminal: u32,
     ) -> Option<ParserGSS> {
+        if let Some(provider) = self.template_composition_provider() {
+            return Some(advance_provider_control_closed_stacks(&provider, stack, global_terminal));
+        }
         if !self.uses_compact_segmented_parser_runtime() {
             return None;
         }
@@ -3322,6 +3359,9 @@ impl Constraint {
         stack: &ParserGSS,
         global_terminal: u32,
     ) -> Option<bool> {
+        if let Some(provider) = self.template_composition_provider() {
+            return Some(stack_may_advance_on_with_provider(&provider, stack, global_terminal));
+        }
         if !self.uses_compact_segmented_parser_runtime() {
             return None;
         }
@@ -3358,6 +3398,10 @@ impl Constraint {
         stack: &ParserGSS,
         terminals: &BitSet,
     ) -> Option<bool> {
+        if let Some(provider) = self.template_composition_provider() {
+            return Some(stack_may_advance_on_any_with_provider(&provider, stack,
+                terminals.iter_ones().map(|terminal| terminal as u32)));
+        }
         if !self.uses_compact_segmented_parser_runtime() {
             return None;
         }
@@ -3382,6 +3426,9 @@ impl Constraint {
         stack: &ParserGSS,
         candidates: &BitSet,
     ) -> Option<BitSet> {
+        if self.template_composition_provider().is_some() {
+            return Some(self.template_parser.as_ref().unwrap().admitted(stack, candidates));
+        }
         if !self.uses_compact_segmented_parser_runtime() {
             return None;
         }
@@ -3413,6 +3460,11 @@ impl Constraint {
         candidates: impl IntoIterator<Item = u32>,
         mut matches: impl FnMut(u32) -> bool,
     ) -> Option<bool> {
+        if let Some(provider) = self.template_composition_provider() {
+            return Some(find_admitted_symbol_with_provider(&provider, stack,
+                candidates.into_iter().map(|terminal| (terminal, terminal)),
+                |&terminal| matches(terminal)).is_some());
+        }
         if !self.uses_compact_segmented_parser_runtime() {
             return None;
         }
@@ -3438,6 +3490,10 @@ impl Constraint {
         &self,
         stack: &ParserGSS,
     ) -> Option<bool> {
+        if let Some(provider) = self.template_composition_provider() {
+            return Some(stacks_finished_with_provider(&provider, stack,
+                crate::compiler::glr::analysis::EOF));
+        }
         if !self.uses_compact_segmented_parser_runtime() {
             return None;
         }

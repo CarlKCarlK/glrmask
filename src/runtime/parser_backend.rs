@@ -7,6 +7,7 @@
 //! remain in their existing shared implementations.
 
 pub(crate) mod wire;
+pub(crate) mod composition;
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::ops::{ControlFlow, Deref, DerefMut};
@@ -91,6 +92,7 @@ pub(crate) struct TemplateParser {
     pub(crate) terminal_count: u32,
     pub(crate) skip_terminals: BTreeSet<TerminalID>,
     pub(crate) completion_template: Arc<CommitTemplateDfas>,
+    pub(crate) composition: Option<Arc<composition::TemplateComposition>>,
     domains: Vec<TemplateDomain>,
     completion: TemplateDomain,
     /// Possible is an upper bound over every lower stack suffix; unconditional
@@ -171,7 +173,7 @@ impl TemplateParser {
         }
         let profile = std::env::var_os("GLRMASK_PROFILE_TEMPLATE_BACKEND").is_some();
         Ok(Self { state_count, terminal_count, skip_terminals,
-            completion_template: Arc::new(completion_template), domains, completion,
+            completion_template: Arc::new(completion_template), composition: None, domains, completion,
             possible, unconditional, profile,
             advances: AtomicU64::new(0), admissions: AtomicU64::new(0), completions: AtomicU64::new(0),
         })
@@ -184,7 +186,22 @@ impl TemplateParser {
 
     #[inline]
     pub(crate) fn admits(&self, stack: &ParserGSS, terminal: TerminalID) -> bool {
+        if let Some(provider) = self.composition_provider() {
+            return if terminal == EOF {
+                crate::compiler::glr::parser::stacks_finished_with_provider(&provider, stack, EOF)
+            } else {
+                crate::compiler::glr::parser::stack_may_advance_on_with_provider(&provider, stack, terminal)
+            };
+        }
+        self.admits_control_closed(stack, terminal)
+    }
+
+    fn admits_control_closed(&self, stack: &ParserGSS, terminal: TerminalID) -> bool {
         if self.profile { self.admissions.fetch_add(1, Ordering::Relaxed); }
+        if terminal != EOF && terminal >= self.terminal_count {
+            return self.composition.as_ref().is_some_and(|composition|
+                composition.admits(stack, terminal - self.terminal_count));
+        }
         let (bit, domain) = if terminal == EOF {
             (self.terminal_count as usize, &self.completion)
         } else {
@@ -207,6 +224,10 @@ impl TemplateParser {
     }
 
     pub(crate) fn admits_any(&self, stack: &ParserGSS, candidates: &BitSet) -> bool {
+        if let Some(provider) = self.composition_provider() {
+            return crate::compiler::glr::parser::stack_may_advance_on_any_with_provider(
+                &provider, stack, candidates.iter().map(|terminal| terminal as u32));
+        }
         if let Some(top) = stack.single_exclusive_top_value()
             && let Some(possible) = self.possible.get(top as usize)
         {
@@ -240,6 +261,13 @@ impl TemplateParser {
     }
 
     pub(crate) fn admitted(&self, stack: &ParserGSS, candidates: &BitSet) -> BitSet {
+        if let Some(provider) = self.composition_provider() {
+            let mut admitted = BitSet::new(candidates.len());
+            crate::compiler::glr::parser::for_each_admitted_symbol_with_provider(
+                &provider, stack, candidates.iter().map(|terminal| (terminal, terminal as u32)),
+                |terminal| admitted.set(terminal));
+            return admitted;
+        }
         if self.profile { self.admissions.fetch_add(1, Ordering::Relaxed); }
         let mut result = BitSet::new(candidates.len());
         let mut possible = BitSet::new(candidates.len());
@@ -280,6 +308,11 @@ impl TemplateParser {
     /// Input-only query for the shared allocation-free flat commit frontier.
     /// No output stack, GSS node, or LR action is materialized.
     pub(crate) fn admits_flat_any(&self, stack: &[u32], candidates: &BitSet) -> bool {
+        if self.composition.is_some() {
+            let gss = ParserGSS::from_single_stack(stack.to_vec(),
+                crate::compiler::glr::accumulator::TerminalsDisallowed::new());
+            return self.admits_any(&gss, candidates);
+        }
         if self.profile { self.admissions.fetch_add(1, Ordering::Relaxed); }
         let top = stack.last().copied();
         if top.and_then(|top| self.unconditional.get(top as usize)).is_some_and(|row|
@@ -313,6 +346,7 @@ impl TemplateParser {
             "domain_edges":self.domains.iter().map(TemplateDomain::edge_count).sum::<usize>(),
             "domain_heap_payload_bytes":self.domains.iter().map(TemplateDomain::heap_payload_bytes).sum::<usize>(),
             "completion_domain_states":self.completion.state_count(),
+            "composition":self.composition.as_ref().map(|composition| composition.report()),
             "counters_enabled":self.profile,
             "template_advances":self.advances.load(Ordering::Relaxed),
             "template_admission_queries":self.admissions.load(Ordering::Relaxed),
@@ -387,7 +421,9 @@ impl Constraint {
     }
     #[inline]
     pub(crate) fn parser_has_controls(&self) -> bool {
-        self.template_parser.is_none() && !self.table.control_terminals.is_empty()
+        self.template_parser.as_ref().map_or_else(
+            || !self.table.control_terminals.is_empty(),
+            |parser| parser.composition.as_ref().is_some_and(|composition| composition.has_controls()))
     }
     #[inline]
     pub(crate) fn parser_skip_terminals(&self) -> &BTreeSet<TerminalID> {
@@ -399,10 +435,14 @@ impl Constraint {
     }
     #[inline]
     pub(crate) fn parser_advance_row(&self, top: u32) -> Option<&BitSet> {
+        if self.template_composition_provider().is_some() { return None; }
         self.template_parser.as_ref().map_or_else(|| self.table.advance_row(top), |parser| parser.possible.get(top as usize))
     }
     #[inline]
     pub(crate) fn parser_advance_row_allows(&self, top: u32, terminal: u32) -> bool {
+        if self.template_composition_provider().is_some() {
+            return top < self.parser_symbol_count();
+        }
         if let Some(parser) = &self.template_parser {
             let bit = if terminal == EOF { parser.terminal_count as usize } else { terminal as usize };
             parser.possible.get(top as usize).is_some_and(|row| row.contains(bit))
@@ -410,22 +450,36 @@ impl Constraint {
     }
     #[inline]
     pub(crate) fn parser_advance_row_intersects(&self, top: u32, terminals: &BitSet) -> bool {
+        if self.template_composition_provider().is_some() {
+            return top < self.parser_symbol_count() && !terminals.is_empty();
+        }
         if let Some(parser) = &self.template_parser {
             parser.possible.get(top as usize).is_some_and(|row| row.words().iter().zip(terminals.words()).any(|(a,b)| a & b != 0))
         } else { self.table.advance_row_intersects(top, terminals) }
     }
     #[inline]
     pub(crate) fn parser_unconditional_row(&self, top: u32) -> Option<&BitSet> {
+        if self.template_composition_provider().is_some() { return None; }
         self.template_parser.as_ref().map_or_else(|| self.table.unconditional_advance_row(top), |parser| parser.unconditional.get(top as usize))
     }
 
     pub(crate) fn install_template_parser(&mut self) -> crate::Result<()> {
+        self.install_template_parser_in_coordinate(false)
+    }
+
+    pub(crate) fn install_template_parser_in_coordinate(&mut self, preserve_coordinate: bool) -> crate::Result<()> {
         if self.has_template_parser() { return Ok(()); }
-        if self.parser_has_controls() || self.uses_compact_segmented_parser_runtime() || !self.late_grammar_slots.is_empty() {
+        if self.uses_compact_segmented_parser_runtime() {
+            return self.install_composition_template_parser();
+        }
+        if self.parser_has_controls() {
             return Err(crate::Error::Compilation("template-only parser composition/control closure is not implemented; no LR fallback is permitted".into()));
         }
         let terminal_count = self.table.num_terminals;
-        let (templates, completion, state_count) = if self.uses_sparse_direct_regular_runtime() {
+        if preserve_coordinate && self.uses_sparse_direct_regular_runtime() {
+            return Err(crate::Error::Compilation("cannot replace a composed sparse parser's stack coordinate".into()));
+        }
+        let (templates, completion, state_count) = if !preserve_coordinate && self.uses_sparse_direct_regular_runtime() {
             sparse_regular_templates(self.direct_regular_automaton.as_ref().unwrap(), terminal_count)?
         } else {
             let selected = vec![true; terminal_count as usize];
@@ -458,7 +512,13 @@ impl Constraint {
         match &self.template_parser {
             Some(parser) => {
                 assert!(!self.table.is_present(), "template-only constraint retained an LR table");
-                parser.report()
+                let mut report = parser.report();
+                if let Some(overlay) = &self.static_dynamic_overlay {
+                    report["component_parsers"] = serde_json::Value::Array(overlay.segmented_parser_components.iter()
+                        .map(|component| component.constraint.parser_backend_report()).collect());
+                    report["packed_lr_compiler_table_present"] = overlay.recursive_compiler_table.get().is_some().into();
+                }
+                report
             }
             None => serde_json::json!({"backend":"lr-table", "lr_table_present":self.table.is_present()}),
         }

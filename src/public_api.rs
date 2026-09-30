@@ -252,10 +252,7 @@ impl<'a> Grammar<'a> {
         options: BuildOptions,
     ) -> Result<RuntimeConstraint> {
         if options.parser_backend == ParserBackend::TemplateDfa {
-            if !self.bindings.is_empty() {
-                return Err(Error::Compilation("template-parser component composition is not implemented; no LR fallback is permitted".into()));
-            }
-            if options.optimization == Optimization::FastBuild {
+            if options.optimization == Optimization::FastBuild && self.bindings.is_empty() {
                 // Use the existing O2 runtime with the bounded grammar normal
                 // form required by finite templates. Ordinary dynamic grammar
                 // preparation intentionally allows recursive action closures.
@@ -2130,9 +2127,6 @@ impl UnlinkedConstraint {
 
     /// Link a fully bound artifact with final build options.
     pub fn link_with(&self, options: BuildOptions) -> Result<RuntimeConstraint> {
-        if options.parser_backend == ParserBackend::TemplateDfa && !self.bindings.is_empty() {
-            return Err(Error::Compilation("template-parser component composition is not implemented; no LR fallback is permitted".into()));
-        }
         if let Some((name, kind)) = self.first_open_slot()? {
             return Err(Error::Compilation(format!(
                 "external {} {name:?} is still unbound",

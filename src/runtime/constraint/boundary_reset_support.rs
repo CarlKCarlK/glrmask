@@ -161,6 +161,10 @@ impl Constraint {
     fn bounded_mask_control_tops_cursor(
         &self,input:&ControlCursor,
     )->Option<SmallVec<[u32;8]>> {
+        // This optional proof interprets individual LR actions. Template
+        // relations instead use the ordinary exact control/lexer walk; do not
+        // reconstruct a table merely to enable this rejection-only shortcut.
+        if self.has_template_parser() { return None; }
         // Decline before cloning a long frontier or scanning many links.
         if input.len()>256{return None;}
         let layout=self.recursive_parser_layout_ref()?;
@@ -181,6 +185,7 @@ impl Constraint {
     pub(crate) fn bounded_mask_same_leaf_support_empty_cursor(
         &self,input:&ControlCursor,leaf_index:usize,
     )->Option<bool> {
+        if self.has_template_parser() { return None; }
         let leaf=self.recursive_leaf_constraint(leaf_index)?;
         // Bound necessary-support bitset scans as well as control traversal.
         if leaf.table.num_terminals > 16_384 { return None; }

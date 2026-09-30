@@ -33,6 +33,15 @@ impl<P: ParserActionProvider> ParserActionProvider for AlreadyClosed<'_, P> {
         self.0.goto_target(scope, from, nonterminal)
     }
     fn state_count_hint(&self) -> usize { self.0.state_count_hint() }
+    fn advance_relation(&self, stack: &ParserGSS, symbol: Self::Symbol) -> Option<ParserGSS> {
+        self.0.advance_relation(stack, symbol)
+    }
+    fn relation_admits(&self, stack: &ParserGSS, symbol: Self::Symbol) -> Option<bool> {
+        self.0.relation_admits(stack, symbol)
+    }
+    fn relation_finished(&self, stack: &ParserGSS, symbol: Self::Symbol) -> Option<bool> {
+        self.0.relation_finished(stack, symbol)
+    }
 }
 
 impl ScopedAdmissionSupport<'_> {
@@ -49,6 +58,15 @@ impl ScopedAdmissionSupport<'_> {
         &self, candidates: &BitSet, mut lexical: impl FnMut(u32) -> bool,
     ) -> bool {
         if self.support.is_empty() { return false; }
+        if let Some(provider) = self.root.template_composition_provider() {
+            let symbols = self.support.iter_ones().filter_map(|local| {
+                let terminal = self.offset + local as u32;
+                candidates.contains(terminal as usize).then_some((terminal, terminal))
+            });
+            return find_admitted_symbol_with_provider(
+                &AlreadyClosed(&provider), &self.closed, symbols, |&terminal| lexical(terminal),
+            ).is_some();
+        }
         let tables = RecursiveSegmentedParserTables { root: self.root, layout: self.layout };
         let provider = DisjointComponentActionProvider::with_state_offsets(
             &tables, &self.layout.links, &self.layout.leaf_state_offsets,
@@ -73,10 +91,34 @@ impl Constraint {
         let layout = self.recursive_parser_layout_ref()?;
         let descriptor = layout.leaves.get(leaf)?;
         let source = self.constraint_at_recursive_component_path(&descriptor.component_path)?;
-        let count = source.table.num_terminals;
+        let count = source.parser_terminal_count();
         if count as usize > MAX_TERMINALS { return None; }
         let offset = layout.outer_terminal_count.checked_add(*layout.leaf_terminal_offsets.get(leaf)?)?;
         offset.checked_add(count)?;
+        if let Some(provider) = self.template_composition_provider() {
+            let closed = close_provider_control_stacks(&provider, input);
+            if closed.max_depth() > MAX_DEPTH { return None; }
+            let tops = closed.peek_values();
+            if tops.len() > MAX_TOPS { return None; }
+            let mut support = BitSet::new(count as usize);
+            let mut remaining_keys = MAX_ROW_KEYS;
+            for top in tops {
+                let (owner, local) = self.recursive_parser_leaf_state(top)?;
+                if owner != leaf { continue; }
+                // Input-domain rows are conservative over lower stack suffixes.
+                // The whole-relation query in matches remains the exact oracle.
+                let row = source.parser_advance_row(local)?;
+                for terminal in row.iter_ones().take_while(|&t| t < count as usize) {
+                    remaining_keys = remaining_keys.checked_sub(1)?;
+                    support.set(terminal);
+                }
+                if let Some(ignore) = source.ignore_terminal { support.set(ignore as usize); }
+                for &skip in source.parser_skip_terminals() { support.set(skip as usize); }
+            }
+            return Some(ScopedAdmissionSupport {
+                root: self, layout, closed, leaf: leaf as u32, offset, support,
+            });
+        }
         let tables = RecursiveSegmentedParserTables { root: self, layout };
         let provider = DisjointComponentActionProvider::with_state_offsets(
             &tables, &layout.links, &layout.leaf_state_offsets,

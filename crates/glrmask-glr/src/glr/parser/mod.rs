@@ -97,6 +97,29 @@ pub trait ParserActionProvider {
     fn control_symbols(&self, _state: u32, _out: &mut SmallVec<[Self::Symbol; 4]>) {}
 
     fn state_count_hint(&self) -> usize;
+
+    /// Optional parser-independent relation implementation. Returning `Some`
+    /// owns the entire operation, including an empty result; the action/goto
+    /// interface is not consulted. This keeps zero-width composition closure
+    /// shared by LR actions and precompiled stack transducers.
+    #[inline]
+    fn advance_relation(&self, _stack: &ParserGSS, _symbol: Self::Symbol) -> Option<ParserGSS> {
+        None
+    }
+
+    /// Exact input-domain query for a supplied relation, without materializing
+    /// output stacks. The input here is already control-closed.
+    #[inline]
+    fn relation_admits(&self, _stack: &ParserGSS, _symbol: Self::Symbol) -> Option<bool> {
+        None
+    }
+
+    /// Exact completion predicate for a relation-backed provider. Completion
+    /// is deliberately separate from ordinary advancement under an EOF label.
+    #[inline]
+    fn relation_finished(&self, _stack: &ParserGSS, _symbol: Self::Symbol) -> Option<bool> {
+        None
+    }
 }
 
 fn scoped_provider_nonterminal(
@@ -252,6 +275,27 @@ pub fn materialize_control_eliminated_scoped_provider_table<P>(
 where
     P: ParserActionProvider<Symbol = ScopedParserSymbol>,
 {
+    let mut table = materialize_scoped_provider_table(provider, terminal_symbols, None)?;
+    table.eliminate_control_terminals_exact()?;
+    table.num_terminals = terminal_symbols.len() as u32;
+    table.rebuild_advance_rows_from_actions();
+    table.rebuild_unconditional_advance_rows();
+    table.rebuild_guarded_shift_index();
+    Ok(table)
+}
+
+/// Construction-only action projection in the provider's existing stack
+/// coordinate. Controls remain explicit so each can be compiled into a finite
+/// stack relation independently, without expanding `control* ; terminal`.
+/// An optional completion symbol projects the root EOF predicate as well.
+pub fn materialize_scoped_provider_table<P>(
+    provider: &P,
+    terminal_symbols: &[SmallVec<[ScopedParserSymbol; 4]>],
+    completion_symbol: Option<ScopedParserSymbol>,
+) -> Result<GLRTable, String>
+where
+    P: ParserActionProvider<Symbol = ScopedParserSymbol>,
+{
     let state_count = provider.state_count_hint();
     let num_states = u32::try_from(state_count)
         .map_err(|_| "scoped provider state coordinate overflow".to_owned())?;
@@ -294,6 +338,15 @@ where
                 }
                 rows[state as usize].push((terminal, action));
             }
+        }
+        if let Some(symbol) = completion_symbol
+            && let Some(provided) = provider.action(state, symbol)
+        {
+            if !provided.extra_stack_shifts.is_empty() {
+                return Err("root completion unexpectedly contains return alternatives".into());
+            }
+            rows[state as usize].push((EOF,
+                materialize_scoped_provided_action(provider, &provided, &mut nonterminals)?));
         }
     }
 
@@ -374,14 +427,6 @@ where
         guarded_shift_index: Vec::new(),
         direct_regular_wide_frontiers: Vec::new(),
     };
-    table.rebuild_advance_rows_from_actions();
-    table.rebuild_unconditional_advance_rows();
-    table.rebuild_guarded_shift_index();
-    table.eliminate_control_terminals_exact()?;
-    // Private controls are gone from every action row. Shrink the externally
-    // visible terminal domain back to the real composed terminal coordinate so
-    // downstream parser-DWA compilation sees exactly its existing alphabet.
-    table.num_terminals = ordinary_terminals;
     table.rebuild_advance_rows_from_actions();
     table.rebuild_unconditional_advance_rows();
     table.rebuild_guarded_shift_index();
@@ -4812,6 +4857,18 @@ fn advance_provider_traversal<P: ParserActionProvider>(
     symbol: P::Symbol,
     mode: ProviderAdvanceMode,
 ) -> ProviderAdvanceResult {
+    match mode {
+        ProviderAdvanceMode::Advance => {
+            if let Some(shifted) = provider.advance_relation(&closure, symbol) {
+                return ProviderAdvanceResult { shifted, accepted: false };
+            }
+        }
+        ProviderAdvanceMode::Completion => {
+            if let Some(accepted) = provider.relation_finished(&closure, symbol) {
+                return ProviderAdvanceResult { shifted: ParserGSS::empty(), accepted };
+            }
+        }
+    }
     static ENABLED: OnceLock<bool> = OnceLock::new();
     if mode == ProviderAdvanceMode::Advance
         && *ENABLED.get_or_init(|| provider_reduction_policy_value(std::env::var("GLRMASK_PROVIDER_REDUCTION_PREFIX").ok().as_deref()))
@@ -5200,6 +5257,9 @@ fn provider_closed_symbol_may_advance<P: ParserActionProvider>(
     tops: &[u32],
     symbol: P::Symbol,
 ) -> bool {
+    if let Some(admitted) = provider.relation_admits(closed, symbol) {
+        return admitted;
+    }
     let mut has_action = false;
     for &top in tops {
         let Some(provided) = provider.action(top, symbol) else {
