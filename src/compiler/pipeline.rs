@@ -6290,15 +6290,13 @@ pub(crate) fn compile_dynamic_owned_with_vocab_partition_with_table_construction
         grammar,
         vocab,
         default_table_construction,
-        true,
-        true,
+        DynamicPartitionFinalization::Lr,
     )
 }
 
-/// Finalize the ordinary O2 runtime for immediate parser replacement. The
-/// caller will invalidate the LR transfer snapshot when it installs its new
-/// parser, so preparing that snapshot here would serialize data only to drop
-/// it. Keep all lexer, quotient, and runtime preparation identical.
+/// Prepare the table-free parser on the core-build lane while the independent
+/// vocabulary quotient is being constructed. The resulting runtime has no LR
+/// table, and no discarded intermediate LR transfer snapshot is serialized.
 pub(crate) fn compile_dynamic_owned_with_vocab_partition_for_parser_replacement(
     grammar: GrammarDef,
     vocab: &Vocab,
@@ -6308,8 +6306,7 @@ pub(crate) fn compile_dynamic_owned_with_vocab_partition_for_parser_replacement(
         grammar,
         vocab,
         default_table_construction,
-        true,
-        false,
+        DynamicPartitionFinalization::Template,
     )
 }
 
@@ -6322,18 +6319,24 @@ pub(crate) fn compile_dynamic_owned_with_vocab_partition_unfinalized_with_table_
         grammar,
         vocab,
         default_table_construction,
-        false,
-        false,
+        DynamicPartitionFinalization::Deferred,
     )
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum DynamicPartitionFinalization {
+    Deferred,
+    Lr,
+    Template,
 }
 
 fn compile_dynamic_owned_with_vocab_partition_impl(
     grammar: GrammarDef,
     vocab: &Vocab,
     default_table_construction: GlrTableConstruction,
-    finalize_runtime: bool,
-    cache_transfer_artifact: bool,
+    finalization: DynamicPartitionFinalization,
 ) -> crate::Result<DynamicConstraint> {
+    let finalize_runtime = finalization != DynamicPartitionFinalization::Deferred;
     let profile = compile_profile_enabled();
     let total_started = profile.then(Instant::now);
 
@@ -6353,7 +6356,18 @@ fn compile_dynamic_owned_with_vocab_partition_impl(
                         vocab,
                         default_table_construction,
                         false,
-                    );
+                    ).and_then(|mut constraint| {
+                        if finalization == DynamicPartitionFinalization::Template {
+                            // Parser relations depend on the complete core
+                            // table, not on the model-token quotient. Derive
+                            // them here instead of extending the critical path
+                            // after the quotient lane has already completed.
+                            for alternative in constraint.constraints_mut() {
+                                alternative.install_template_parser()?;
+                            }
+                        }
+                        Ok(constraint)
+                    });
                     (constraint, elapsed_ms(started))
                 },
                 || {
@@ -6398,11 +6412,13 @@ fn compile_dynamic_owned_with_vocab_partition_impl(
         // a material fraction of compile latency while the first on-demand save
         // remains comfortably sub-millisecond. Larger quotients/tables keep the
         // established eager cache so persistence tails stay bounded.
-        let tiny_save_artifact = constraint.inner.dynamic_mask_vocab.canonical_token_count() <= 8
-            && constraint.inner.tokenizer.num_states() <= 64
-            && constraint.inner.table.num_states <= 32;
-        if cache_transfer_artifact && !tiny_save_artifact {
-            constraint.cache_external_vocab_artifact_for_save();
+        if finalization == DynamicPartitionFinalization::Lr {
+            let tiny_save_artifact = constraint.inner.dynamic_mask_vocab.canonical_token_count() <= 8
+                && constraint.inner.tokenizer.num_states() <= 64
+                && constraint.inner.table.num_states <= 32;
+            if !tiny_save_artifact {
+                constraint.cache_external_vocab_artifact_for_save();
+            }
         }
     }
     let rebuild_ms = rebuild_started.map_or(0.0, elapsed_ms);
