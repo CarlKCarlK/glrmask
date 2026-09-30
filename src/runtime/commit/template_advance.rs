@@ -12,8 +12,9 @@ use crate::runtime::constraint::Constraint;
 use rustc_hash::FxHashMap;
 use smallvec::SmallVec;
 
-// The token-local language evaluator is an optimization with an exact table
-// fallback. Keep every internal representation explicitly bounded so a compact
+// The token-local language evaluator is a bounded optimization. Mandatory
+// template mode resumes the exact template interpreter when its budget is
+// exhausted; only the separate legacy LR mode may use its own table fallback. Keep every internal representation explicitly bounded so a compact
 // but adversarial GSS/template product cannot turn the fast path into a runtime
 // cliff before fallback.
 const LANGUAGE_QUEUE_MAX_SEMANTIC_NODES: usize = 1_024;
@@ -90,10 +91,10 @@ fn debug_validate_template_output(
                             work.push((Phase::Pop, next, popped));
                         }
                     }
-                    if let Some(next) = template.pop_to_read[id as usize] {
+                    if let Some(next) = template.pop_to_read.get(id as usize).copied().flatten() {
                         work.push((Phase::Read, next, stack.clone()));
                     }
-                    if let Some(next) = template.pop_to_push[id as usize] {
+                    if let Some(next) = template.pop_to_push.get(id as usize).copied().flatten() {
                         work.push((Phase::Push, next, stack));
                     }
                 }
@@ -103,7 +104,7 @@ fn debug_validate_template_output(
                             work.push((Phase::Read, next, stack.clone()));
                         }
                     }
-                    if let Some(next) = template.read_to_push[id as usize] {
+                    if let Some(next) = template.read_to_push.get(id as usize).copied().flatten() {
                         work.push((Phase::Push, next, stack));
                     }
                 }
