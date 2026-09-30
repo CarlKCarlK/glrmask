@@ -4572,10 +4572,17 @@ impl<'a> PackedRuntimePoolTokenSetRef<'a> {
     #[inline]
     pub fn id(self) -> u32 { self.id }
 
+    /// Read the encoded range count without visiting or materializing ranges.
+    /// This lets optional runtime caches reject oversized sets before decoding.
+    #[inline]
+    pub fn range_count(self) -> usize {
+        let mut pos = 0usize;
+        pooled_take_var_u32(self.body, &mut pos).map_or(0, |count| count as usize)
+    }
+
     #[inline]
     pub fn is_empty(self) -> bool {
-        let mut pos = 0usize;
-        pooled_take_var_u32(self.body, &mut pos).map_or(true, |count| count == 0)
+        self.range_count() == 0
     }
 
     pub fn for_each_range(self, mut visit: impl FnMut(u32, u32)) {
@@ -4617,6 +4624,12 @@ impl<'a> PackedRuntimePoolWeightRef<'a> {
     pub fn id(self) -> u32 { self.id }
     #[inline]
     pub fn is_full(self) -> bool { self.pool.weight_spans[self.id as usize].full }
+    /// Number of encoded TSID intervals, available without allocating the
+    /// decoded entry vector. Full weights have no explicit intervals.
+    #[inline]
+    pub fn entry_count(self) -> usize {
+        self.pool.weight_spans[self.id as usize].entry_count as usize
+    }
     #[inline]
     pub fn is_empty(self) -> bool {
         let span = self.pool.weight_spans[self.id as usize];
@@ -5289,6 +5302,61 @@ impl<'de> Deserialize<'de> for Weight {
 #[cfg(test)]
 mod packed_reserialization_tests {
     use super::*;
+
+    #[test]
+    fn packed_runtime_counts_match_decoded_weights_and_token_sets() {
+        let tokens = RangeSetBlaze::from_iter([0, 2, 3, 5, 17, u32::MAX]);
+        let weights = [
+            Weight::empty(),
+            Weight::all(),
+            Weight::from_uniform(7..=13, tokens.clone()),
+            Weight::from_per_tsid_token_sets([
+                (0, tokens.clone()),
+                (2, RangeSetBlaze::from_iter([1, 8])),
+                (u32::MAX, tokens),
+            ]),
+        ];
+        let wire = pack_pooled_weights(&weights);
+        let pool = PackedRuntimeWeightPool::from_packed_bytes(&wire).unwrap();
+        for (id, expected) in weights.iter().enumerate() {
+            let packed = pool.weight(id as u32).unwrap();
+            assert_eq!(packed.entry_count(), packed.entries().len());
+            let expected_entries = if expected.is_full() {
+                0
+            } else {
+                expected.0.range_values_len()
+            };
+            assert_eq!(packed.entry_count(), expected_entries);
+            for (_, tokens) in packed.entries() {
+                let mut actual_ranges = 0;
+                tokens.for_each_range(|_, _| actual_ranges += 1);
+                assert_eq!(tokens.range_count(), actual_ranges);
+                assert_eq!(tokens.is_empty(), actual_ranges == 0);
+            }
+        }
+    }
+
+    #[test]
+    fn packed_runtime_count_queries_do_not_allocate_from_declared_counts() {
+        // A length-framed but truncated payload can advertise a huge count.
+        // The cache admission query must remain constant-space; callers can
+        // decline it without invoking the allocating entries() decoder.
+        let mut wire = b"WPL3".to_vec();
+        pooled_put_var_u32(&mut wire, 1);
+        let mut token_body = Vec::new();
+        pooled_put_var_u32(&mut token_body, u32::MAX);
+        pooled_put_var_u32(&mut wire, token_body.len() as u32);
+        wire.extend_from_slice(&token_body);
+        pooled_put_var_u32(&mut wire, 1);
+        let mut weight_body = vec![0];
+        pooled_put_var_u32(&mut weight_body, u32::MAX);
+        pooled_put_var_u32(&mut wire, weight_body.len() as u32);
+        wire.extend_from_slice(&weight_body);
+
+        let pool = PackedRuntimeWeightPool::from_packed_bytes(&wire).unwrap();
+        assert_eq!(pool.token_set(0).unwrap().range_count(), u32::MAX as usize);
+        assert_eq!(pool.weight(0).unwrap().entry_count(), u32::MAX as usize);
+    }
 
     #[test]
     fn packed_reserialization_preserves_distinct_ids_for_empty_placeholders() {
