@@ -11,6 +11,7 @@
 //! retained when it overrides an otherwise productive DEFAULT transition.
 
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
+use rustc_hash::FxHashMap;
 
 use crate::automata::unweighted_u32::dfa::DFA;
 use crate::compiler::glr::labels::DEFAULT_LABEL;
@@ -122,6 +123,32 @@ fn linked_productive(links: &[Option<u32>], source: usize, productive: &[bool]) 
     links.get(source).copied().flatten().is_some_and(|target| productive[target as usize])
 }
 
+/// Merge two already-ordered sources of root transitions. READ acceptance
+/// dominates a POP continuation on the same symbol; a POP's explicit dead
+/// target remains an exception when DEFAULT is productive. Omit only edges
+/// whose target is exactly the default target.
+fn merged_domain_row(
+    transitions: &BTreeMap<i32, u32>,
+    canonical: &[u32],
+    read_labels: Option<&BTreeSet<u32>>,
+    default: u32,
+) -> Vec<(u32, u32)> {
+    let mut pop = transitions.iter().filter(|(label, _)| **label != DEFAULT_LABEL)
+        .map(|(&label, &target)| (label as u32, canonical[target as usize])).peekable();
+    let read_len = read_labels.map_or(0, BTreeSet::len);
+    let mut row = Vec::with_capacity(transitions.len().saturating_add(read_len));
+    for &label in read_labels.into_iter().flatten() {
+        while pop.peek().is_some_and(|&(top, _)| top < label) {
+            let edge = pop.next().unwrap();
+            if edge.1 != default { row.push(edge); }
+        }
+        if pop.peek().is_some_and(|&(top, _)| top == label) { pop.next(); }
+        if default != 0 { row.push((label, 0)); }
+    }
+    row.extend(pop.filter(|&(_, target)| target != default));
+    row
+}
+
 impl TemplateDomain {
     pub fn compile(template: &CommitTemplateDfas) -> Result<Self, String> {
         let pop_order = topological_order(&template.pop, Phase::Pop)?;
@@ -161,7 +188,9 @@ impl TemplateDomain {
         }];
         let mut edges = Vec::new();
         let mut canonical = vec![REJECT; template.pop.states.len()];
-        let mut row_ids: BTreeMap<(u32, Vec<(u32, u32)>), u32> = BTreeMap::new();
+        // This map is used only for equality lookup. IDs are still assigned
+        // by the fixed topological traversal, never by hash-map iteration.
+        let mut row_ids: FxHashMap<(u32, Vec<(u32, u32)>), u32> = FxHashMap::default();
         for &id in pop_order.iter().rev() {
             let i = id as usize;
             let state = &template.pop.states[i];
@@ -174,20 +203,10 @@ impl TemplateDomain {
             }
             let default = state.transitions.get(&DEFAULT_LABEL)
                 .map_or(REJECT, |&target| canonical[target as usize]);
-            let mut row: BTreeMap<u32, u32> = state.transitions.iter()
-                .filter(|(label, _)| **label != DEFAULT_LABEL)
-                .map(|(&label, &target)| (label as u32, canonical[target as usize])).collect();
-            if let Some(read) = read {
-                for &label in &read_labels[read] {
-                    // Exists-a-READ output dominates all longer POP paths on
-                    // this same symbol. Consume it in the *recognizer* only;
-                    // no parser stack is modified by an admissibility query.
-                    row.insert(label, 0);
-                }
-            }
-            row.retain(|_, target| *target != default);
-            if default == REJECT && row.values().all(|&target| target == REJECT) { continue; }
-            let signature = (default, row.into_iter().collect::<Vec<_>>());
+            let row = merged_domain_row(&state.transitions, &canonical,
+                read.map(|read| &read_labels[read]), default);
+            if default == REJECT && row.is_empty() { continue; }
+            let signature = (default, row);
             let next_id = if let Some(&id) = row_ids.get(&signature) { id } else {
                 let id = u32::try_from(states.len()).map_err(|_| "template domain too large")?;
                 if id == REJECT { return Err("template domain too large".to_owned()); }
@@ -425,6 +444,39 @@ mod tests {
     fn template() -> CommitTemplateDfas {
         CommitTemplateDfas { pop: DFA::new(), read: DFA::new(), push: DFA::new(),
             ..CommitTemplateDfas::default() }
+    }
+
+    #[test]
+    fn linear_root_merge_matches_ordered_map_reference() {
+        let mut seed = 0x6088941134u64;
+        let mut next = || {
+            seed ^= seed << 13; seed ^= seed >> 7; seed ^= seed << 17;
+            seed
+        };
+        for _ in 0..2048 {
+            let canonical = (0..12).map(|_| match next() % 5 {
+                0 => REJECT, value => value as u32 - 1,
+            }).collect::<Vec<_>>();
+            let mut transitions = BTreeMap::new();
+            let mut reads = BTreeSet::new();
+            for label in 0..24 {
+                if next() % 3 == 0 { transitions.insert(label, (next() % 12) as u32); }
+                if next() % 4 == 0 { reads.insert(label as u32); }
+            }
+            transitions.insert(DEFAULT_LABEL, (next() % 12) as u32);
+            for default in [REJECT, 0, 1, 2, 3] {
+                for read in [None, Some(&reads)] {
+                    let actual = merged_domain_row(&transitions, &canonical, read, default);
+                    let mut reference: BTreeMap<u32, u32> = transitions.iter()
+                        .filter(|(label, _)| **label != DEFAULT_LABEL)
+                        .map(|(&label, &target)| (label as u32, canonical[target as usize])).collect();
+                    for &label in read.into_iter().flatten() { reference.insert(label, 0); }
+                    reference.retain(|_, target| *target != default);
+                    assert_eq!(actual, reference.into_iter().collect::<Vec<_>>());
+                    assert!(actual.windows(2).all(|pair| pair[0].0 < pair[1].0));
+                }
+            }
+        }
     }
 
     // Independent literal split-transducer interpreter. It materializes output
