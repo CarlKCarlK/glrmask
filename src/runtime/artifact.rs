@@ -2497,7 +2497,9 @@ pub(crate) enum DynamicMaskAliasStore {
 struct DynamicMaskCacheEntry {
     hash: u64,
     state: DynamicMaskStateKey,
-    mask: DynamicMaskCachePayload,
+    // None retains the existing first-use probation state. Equal, already
+    // materialized masks can be shared without encoding another payload.
+    mask: Option<Arc<DynamicMaskCachePayload>>,
 }
 
 #[derive(Debug, Default)]
@@ -2506,6 +2508,7 @@ struct DynamicMaskCache {
     entries: Vec<Option<DynamicMaskCacheEntry>>,
     by_hash: FxHashMap<u64, SmallVec<[usize; 1]>>,
     next_slot: usize,
+    values: super::mask_cache_values::MaskValueIndex,
 }
 
 #[inline]
@@ -8042,7 +8045,9 @@ impl DynamicMaskVocab {
         }) else {
             return false;
         };
-        Self::copy_dynamic_mask_cache_payload(self.all_original_token_words(), &entry.mask, buf)
+        entry.mask.as_ref().is_some_and(|payload| {
+            Self::copy_dynamic_mask_cache_payload(self.all_original_token_words(), payload, buf)
+        })
     }
 
     pub(crate) fn has_cached_mask_with_predicate<F: Fn(&DynamicMaskStateKey) -> bool>(
@@ -8063,8 +8068,7 @@ impl DynamicMaskVocab {
                 .get(slot)
                 .and_then(Option::as_ref)
                 .is_some_and(|entry| {
-                    matches(&entry.state)
-                        && !matches!(entry.mask, DynamicMaskCachePayload::Probation)
+                    matches(&entry.state) && entry.mask.is_some()
                 })
         })
     }
@@ -8160,6 +8164,7 @@ impl DynamicMaskVocab {
         let mask_bytes = mask.len().saturating_mul(std::mem::size_of::<u32>()).max(1);
         let max_entries = ((budget_mib * 1024 * 1024) / mask_bytes)
             .clamp(MIN_MASK_CACHE_ENTRIES, MAX_MASK_CACHE_ENTRIES);
+        let value_hash = super::mask_cache_values::mask_hash(mask);
         let mut cache = self
             .mask_cache
             .lock()
@@ -8177,21 +8182,32 @@ impl DynamicMaskVocab {
                 }
                 let needs_upgrade = cache.entries[slot]
                     .as_ref()
-                    .is_some_and(|entry| matches!(entry.mask, DynamicMaskCachePayload::Probation));
+                    .is_some_and(|entry| entry.mask.is_none());
                 if needs_upgrade {
-                    let payload = self.dynamic_mask_cache_payload(mask);
+                    let payload = match cache.values.get(value_hash, mask, self.all_original_token_words()) {
+                        Some(existing) => existing,
+                        None => {
+                            let payload = Arc::new(self.dynamic_mask_cache_payload(mask));
+                            cache.values.insert(value_hash, mask.len(), &payload);
+                            payload
+                        }
+                    };
                     cache.entries[slot]
                         .as_mut()
                         .expect("probation cache slot disappeared")
-                        .mask = payload;
+                        .mask = Some(payload);
                 }
                 return;
             }
         }
-        let payload = if probation_if_absent {
-            DynamicMaskCachePayload::Probation
+        let payload = if let Some(existing) = cache.values.get(value_hash, mask, self.all_original_token_words()) {
+            Some(existing)
+        } else if probation_if_absent {
+            None
         } else {
-            self.dynamic_mask_cache_payload(mask)
+            let payload = Arc::new(self.dynamic_mask_cache_payload(mask));
+            cache.values.insert(value_hash, mask.len(), &payload);
+            Some(payload)
         };
         let entry = DynamicMaskCacheEntry {
             hash,
