@@ -1394,8 +1394,15 @@ pub(crate) enum FastTemplateTransitionRow {
 }
 
 impl FastTemplateTransitionRow {
-    fn from_entries(entries: impl IntoIterator<Item = (i32, u32)>) -> Self {
+    fn from_entries(entries: impl IntoIterator<Item = (i32, u32)>, count: usize) -> Self {
+        if count > INLINE_TEMPLATE_TRANSITION_LIMIT {
+            let mut row = FxHashMap::with_capacity_and_hasher(count, Default::default());
+            row.extend(entries);
+            debug_assert_eq!(row.len(), count);
+            return Self::Hash(row);
+        }
         let entries = entries.into_iter().collect::<SmallVec<[_; 4]>>();
+        debug_assert_eq!(entries.len(), count);
         match entries.len() {
             0 => Self::Empty,
             len if len <= INLINE_TEMPLATE_TRANSITION_LIMIT => Self::Inline(entries),
@@ -1451,19 +1458,51 @@ impl FastTemplateDfa {
             states: dfa
                 .states
                 .iter()
-                .map(|state| FastTemplateDfaState {
+                .map(|state| {
+                    let default_target = state.transitions.get(&DEFAULT_LABEL).copied();
+                    FastTemplateDfaState {
                     is_accepting: state.is_accepting,
-                    default_target: state.transitions.get(&DEFAULT_LABEL).copied(),
+                    default_target,
                     transitions: FastTemplateTransitionRow::from_entries(
                         state
                             .transitions
                             .iter()
                             .filter(|(label, _)| **label != DEFAULT_LABEL)
                             .map(|(&label, &target)| (label, target)),
+                        state.transitions.len() - usize::from(default_target.is_some()),
                     ),
-                })
+                }})
                 .collect(),
             start_state: dfa.start_state,
+        }
+    }
+}
+
+#[cfg(test)]
+mod fast_template_row_construction_tests {
+    use super::*;
+
+    #[test]
+    fn sized_rows_retain_lookup_iteration_and_hash_capacity() {
+        for count in [0usize, 1, 4, 8, 9, 16, 65, 129] {
+            let pairs = (0..count).map(|i| (i as i32 * 7 - 400, i as u32)).collect::<Vec<_>>();
+            let new = FastTemplateTransitionRow::from_entries(pairs.iter().copied(), count);
+            let entries = pairs.iter().copied().collect::<SmallVec<[_; 4]>>();
+            let old = match count {
+                0 => FastTemplateTransitionRow::Empty,
+                n if n <= INLINE_TEMPLATE_TRANSITION_LIMIT => FastTemplateTransitionRow::Inline(entries),
+                _ => FastTemplateTransitionRow::Hash(entries.into_iter().collect()),
+            };
+            for key in -420..520 {
+                assert_eq!(new.get(key), old.get(key));
+            }
+            let mut old_order = Vec::new(); let mut new_order = Vec::new();
+            old.for_each(|label, target| old_order.push((label, target)));
+            new.for_each(|label, target| new_order.push((label, target)));
+            assert_eq!(new_order, old_order);
+            if let (FastTemplateTransitionRow::Hash(a), FastTemplateTransitionRow::Hash(b)) = (&new, &old) {
+                assert_eq!(a.capacity(), b.capacity());
+            }
         }
     }
 }
