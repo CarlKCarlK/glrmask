@@ -291,6 +291,40 @@ impl TemplateDomain {
         }
     }
 
+    /// Partition top-symbol certificates into a default and sparse exceptions.
+    ///
+    /// This is exactly `classify_top` for every possible top value, including
+    /// symbols absent from the root row. In particular, an explicit rejection
+    /// must still shadow a productive DEFAULT. The returned certificates say
+    /// nothing about the rest of the relation: two different residual domains
+    /// can both require a deeper suffix query.
+    ///
+    /// This lets a caller build all top rows by cloning one default bitset and
+    /// visiting root edges, instead of searching this row once per alphabet
+    /// symbol. It allocates no output stacks or additional graph data.
+    pub fn top_admission_partition(
+        &self,
+    ) -> (TopAdmission, impl Iterator<Item = (u32, TopAdmission)> + '_) {
+        let classify = |probe| match probe {
+            DomainProbe::Accept => TopAdmission::Always,
+            DomainProbe::Reject => TopAdmission::Never,
+            DomainProbe::NeedMore(_) => TopAdmission::DependsOnSuffix,
+        };
+        let (default, edges): (_, &[(u32, u32)]) = match self.states.get(self.start as usize) {
+            None => (TopAdmission::Never, &[]),
+            Some(state) if state.accepts_prefix => (TopAdmission::Always, &[]),
+            Some(state) => (
+                classify(self.at(state.default_target)),
+                &self.edges[state.first_edge..state.first_edge + state.edge_count],
+            ),
+        };
+        let exceptions = edges.iter().filter_map(move |&(label, target)| {
+            let certificate = classify(self.at(target));
+            (certificate != default).then_some((label, certificate))
+        });
+        (default, exceptions)
+    }
+
     /// Encode the already-compiled domain in a versioned internal cache wire.
     /// This representation contains only input-prefix transitions, never LR
     /// actions/gotos or a PUSH/output program. It is not a stable public format.
@@ -443,6 +477,40 @@ mod tests {
         assert_eq!(domain.classify_top(5), TopAdmission::Never);
         assert_eq!(domain.classify_top(6), TopAdmission::Always);
         assert_eq!(domain.edge_count(), 1); // The rejecting exception is essential.
+        let (default, exceptions) = domain.top_admission_partition();
+        assert_eq!(default, TopAdmission::Always);
+        assert_eq!(exceptions.collect::<Vec<_>>(), vec![(5, TopAdmission::Never)]);
+    }
+
+    #[test]
+    fn top_partition_retains_suffix_dependence_and_needs_no_alphabet_bound() {
+        let mut t = template();
+        let more = t.pop.add_state();
+        let yes = t.pop.add_state();
+        let no = t.pop.add_state();
+        t.pop.set_accepting(yes, true);
+        t.pop.add_transition(0, DEFAULT_LABEL, more);
+        t.pop.add_transition(0, 2, yes);
+        t.pop.add_transition(0, 5, no);
+        t.pop.add_transition(more, 7, yes);
+        let domain = TemplateDomain::compile(&t).unwrap();
+        let (default, exceptions) = domain.top_admission_partition();
+        assert_eq!(default, TopAdmission::DependsOnSuffix);
+        let exceptions: BTreeMap<_, _> = exceptions.collect();
+        assert_eq!(exceptions, BTreeMap::from([
+            (2, TopAdmission::Always), (5, TopAdmission::Never),
+        ]));
+        for top in [0, 1, 2, 5, 7, 999, i32::MAX as u32, u32::MAX] {
+            assert_eq!(exceptions.get(&top).copied().unwrap_or(default), domain.classify_top(top));
+        }
+        for accepted in [false, true] {
+            let mut t = template();
+            t.pop.set_accepting(0, accepted);
+            let domain = TemplateDomain::compile(&t).unwrap();
+            let (default, exceptions) = domain.top_admission_partition();
+            assert_eq!(default, if accepted { TopAdmission::Always } else { TopAdmission::Never });
+            assert_eq!(exceptions.count(), 0);
+        }
     }
 
     #[test]
@@ -550,6 +618,17 @@ mod tests {
             let wire = compiled.to_bytes().unwrap();
             let domain = TemplateDomain::from_bytes(&wire).unwrap();
             assert_eq!(domain.to_bytes().unwrap(), wire, "wire roundtrip seed={seed}");
+            // Partition building and classify_top use different paths through
+            // the root. Compare them independently for each generated graph,
+            // both before and after the existing domain-wire roundtrip.
+            for candidate in [&compiled, &domain] {
+                let (default, exceptions) = candidate.top_admission_partition();
+                let exceptions: BTreeMap<_, _> = exceptions.collect();
+                for top in (0..9).chain([1234, i32::MAX as u32, u32::MAX]) {
+                    assert_eq!(exceptions.get(&top).copied().unwrap_or(default),
+                        candidate.classify_top(top), "seed={seed} top={top}");
+                }
+            }
             for stack in &stacks {
                 assert_eq!(domain.matches_top_first(stack.iter().copied()), output_exists(&t, stack),
                     "seed={seed} top_first={stack:?}");

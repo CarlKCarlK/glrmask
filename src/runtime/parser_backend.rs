@@ -154,21 +154,7 @@ impl TemplateParser {
             domains.push(compile_domain(template)?);
         }
         let completion = compile_domain(&completion_template)?;
-        let mut possible = Vec::with_capacity(state_count as usize);
-        let mut unconditional = Vec::with_capacity(state_count as usize);
-        for top in 0..state_count {
-            let mut maybe = BitSet::new(terminal_count as usize + 1);
-            let mut always = BitSet::new(terminal_count as usize + 1);
-            for (terminal, domain) in domains.iter().chain(std::iter::once(&completion)).enumerate() {
-                match domain.classify_top(top) {
-                    TopAdmission::Never => {},
-                    TopAdmission::Always => { maybe.set(terminal); always.set(terminal); },
-                    TopAdmission::DependsOnSuffix => maybe.set(terminal),
-                }
-            }
-            possible.push(maybe);
-            unconditional.push(always);
-        }
+        let (possible, unconditional) = top_certificate_rows(state_count, &domains, &completion);
         let profile = std::env::var_os("GLRMASK_PROFILE_TEMPLATE_BACKEND").is_some();
         Ok(Self { state_count, terminal_count, skip_terminals,
             completion_template: Arc::new(completion_template), domains, completion,
@@ -319,6 +305,48 @@ impl TemplateParser {
             "template_completion_queries":self.completions.load(Ordering::Relaxed),
         })
     }
+}
+
+/// Build the exact same dense runtime rows from sparse domain-root partitions.
+/// The dense product remains the runtime representation; only preparation is
+/// changed. An implicit root transition is shared by all missing symbols, so
+/// begin with its bitsets and patch the explicit certificate exceptions.
+fn top_certificate_rows(
+    state_count: u32,
+    domains: &[TemplateDomain],
+    completion: &TemplateDomain,
+) -> (Vec<BitSet>, Vec<BitSet>) {
+    let mut default_possible = BitSet::new(domains.len() + 1);
+    let mut default_unconditional = BitSet::new(domains.len() + 1);
+    for (terminal, domain) in domains.iter().chain(std::iter::once(completion)).enumerate() {
+        match domain.top_admission_partition().0 {
+            TopAdmission::Never => {},
+            TopAdmission::Always => {
+                default_possible.set(terminal);
+                default_unconditional.set(terminal);
+            },
+            TopAdmission::DependsOnSuffix => default_possible.set(terminal),
+        }
+    }
+    let mut possible = Vec::with_capacity(state_count as usize);
+    let mut unconditional = Vec::with_capacity(state_count as usize);
+    for _ in 0..state_count {
+        // Keep the prior interleaved row allocation order.
+        possible.push(default_possible.clone());
+        unconditional.push(default_unconditional.clone());
+    }
+    for (terminal, domain) in domains.iter().chain(std::iter::once(completion)).enumerate() {
+        for (top, certificate) in domain.top_admission_partition().1 {
+            let Some(maybe) = possible.get_mut(top as usize) else { continue; };
+            let always = &mut unconditional[top as usize];
+            match certificate {
+                TopAdmission::Never => { maybe.clear(terminal); always.clear(terminal); },
+                TopAdmission::Always => { maybe.set(terminal); always.set(terminal); },
+                TopAdmission::DependsOnSuffix => { maybe.set(terminal); always.clear(terminal); },
+            }
+        }
+    }
+    (possible, unconditional)
 }
 
 /// Convert the pre-existing sparse regular frontend directly to depth-one
@@ -485,6 +513,63 @@ mod tests {
         pop.set_accepting(cursor, accepting);
         CommitTemplateDfas { pop, read: DFA::new(), push: DFA::new(),
             pop_to_read: Vec::new(), pop_to_push: Vec::new(), read_to_push: Vec::new() }
+    }
+
+    #[test]
+    fn sparse_preparation_matches_every_dense_top_certificate() {
+        use crate::compiler::glr::labels::DEFAULT_LABEL;
+        for terminal_count in [0, 1, 5, 63, 64, 65, 129] {
+            let mut domains = Vec::new();
+            for terminal in 0..terminal_count {
+                let label = (terminal % 70) as i32;
+                let t = match terminal % 6 {
+                    0 => pop_word(&[], true),
+                    1 => pop_word(&[], false),
+                    2 => pop_word(&[label], true),
+                    3 => pop_word(&[label, DEFAULT_LABEL], true),
+                    4 => {
+                        let mut t = pop_word(&[DEFAULT_LABEL], true);
+                        let dead = t.pop.add_state();
+                        t.pop.add_transition(0, label, dead);
+                        t
+                    },
+                    _ => {
+                        let mut t = pop_word(&[DEFAULT_LABEL, 2], true);
+                        let yes = t.pop.add_state();
+                        t.pop.set_accepting(yes, true);
+                        t.pop.add_transition(0, label, yes);
+                        t
+                    },
+                };
+                domains.push(compile_domain(&t).unwrap());
+            }
+            for completion in [pop_word(&[0], true), pop_word(&[], true), pop_word(&[], false)] {
+                let completion = compile_domain(&completion).unwrap();
+                for state_count in [0, 1, 4, 64, 71, 129] {
+                    let (possible, unconditional) = top_certificate_rows(state_count, &domains, &completion);
+                    assert_eq!(possible.len(), state_count as usize);
+                    assert_eq!(unconditional.len(), state_count as usize);
+                    for top in 0..state_count {
+                        let mut expected_possible = BitSet::new(terminal_count + 1);
+                        let mut expected_unconditional = BitSet::new(terminal_count + 1);
+                        for (terminal, domain) in domains.iter().chain(std::iter::once(&completion)).enumerate() {
+                            match domain.classify_top(top) {
+                                TopAdmission::Never => {},
+                                TopAdmission::Always => {
+                                    expected_possible.set(terminal);
+                                    expected_unconditional.set(terminal);
+                                },
+                                TopAdmission::DependsOnSuffix => expected_possible.set(terminal),
+                            }
+                        }
+                        assert_eq!(possible[top as usize], expected_possible,
+                            "possible: alphabet={state_count}, terminals={terminal_count}, top={top}");
+                        assert_eq!(unconditional[top as usize], expected_unconditional,
+                            "unconditional: alphabet={state_count}, terminals={terminal_count}, top={top}");
+                    }
+                }
+            }
+        }
     }
 
     #[test]
