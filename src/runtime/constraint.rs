@@ -2263,7 +2263,7 @@ impl Constraint {
         Ok(total)
     }
 
-    fn constraint_at_recursive_component_path(&self, path: &[u32]) -> Option<&Constraint> {
+    pub(crate) fn constraint_at_recursive_component_path(&self, path: &[u32]) -> Option<&Constraint> {
         let mut current = self;
         for &component_index in path {
             let overlay = current.static_dynamic_overlay.as_ref()?;

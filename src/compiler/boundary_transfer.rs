@@ -30,6 +30,9 @@
 //!   child-start/return-pop/nullability (the provider dispatches Finish by
 //!   first-incoming-link, which must not define semantics accidentally).
 
+#[path = "boundary_template_program.rs"]
+pub(crate) mod template_program;
+
 #[path = "boundary_owner_program.rs"]
 mod owner_program;
 #[path = "boundary_template_top.rs"]
@@ -2721,6 +2724,12 @@ fn compile_signed_shard_parser_with_support(
     let compose_started = Instant::now();
     let no_controls_diagnostic = std::env::var_os("GLRMASK_SIGNED_SHARD_NO_CONTROLS").is_some();
     let assemble_unrestricted = || -> Result<(NWA,usize,usize),String> {
+    if !deterministic_bundles && !admission_tails && !no_controls_diagnostic {
+        let controls = library.entry_keys.iter().zip(&library.finish_keys)
+            .flat_map(|(&entry, &finish)| [entry, finish]).collect::<Vec<_>>();
+        return template_program::assemble(&library.templates, &controls,
+            context.closure.max_controls_per_gap, shard_dwa, None);
+    }
     let mut arena = NWA::new(0, 0);
     let mut ready = vec![u32::MAX; shard_dwa.states().len() * depths];
     let port = |ports: &[u32], vertex: usize, depth: usize| ports[vertex * depths + depth];

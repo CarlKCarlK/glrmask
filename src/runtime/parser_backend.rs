@@ -528,6 +528,12 @@ impl Constraint {
                     report["component_parsers"] = serde_json::Value::Array(overlay.segmented_parser_components.iter()
                         .map(|component| component.constraint.parser_backend_report()).collect());
                     report["packed_lr_compiler_table_present"] = overlay.recursive_compiler_table.get().is_some().into();
+                    report["static_boundary_shards"] = overlay.segmented_parser_components.iter().filter(|component|
+                        matches!(component.boundary.as_ref().map(|shard| &shard.backend),
+                            Some(super::SegmentedBoundaryShardBackend::StaticParser(_)))).count().into();
+                    report["dynamic_boundary_shards"] = overlay.segmented_parser_components.iter().filter(|component|
+                        matches!(component.boundary.as_ref().map(|shard| &shard.backend),
+                            Some(super::SegmentedBoundaryShardBackend::DynamicDirect))).count().into();
                 }
                 report
             }

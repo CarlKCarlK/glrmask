@@ -16,7 +16,7 @@
 //! Component composition is rejected explicitly. Built-in grammars can select
 //! [`crate::ParserBackend::TemplateDfa`] through their ordinary build options.
 
-mod static_compile;
+pub(crate) mod static_compile;
 mod grammar_constructor;
 
 pub use glrmask_grammar::{ParserAutomaton, ParserAutomatonState, ParserExpr,

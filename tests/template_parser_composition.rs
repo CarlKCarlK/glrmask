@@ -3,6 +3,106 @@ use glrmask::{BuildOptions, Constraint, Grammar, Optimization, ParserBackend, Vo
 
 const HOST: &str = r#"glrm 1; start root; extern grammar child; nt root = "x" child "y";"#;
 
+fn assert_static_boundaries(constraint: &Constraint) {
+    fn check(report: &serde_json::Value) {
+        assert_eq!(report["lr_table_present"], false);
+        if let Some(children) = report["component_parsers"].as_array() {
+            assert_eq!(report["dynamic_boundary_shards"], 0, "{report}");
+            assert_eq!(report["packed_lr_compiler_table_present"], false);
+            for child in children { check(child); }
+        }
+    }
+    let report = glrmask::__private::parser_backend_report(constraint);
+    assert!(report["static_boundary_shards"].as_u64().unwrap_or(0) > 0, "{report}");
+    check(&report);
+}
+
+#[test]
+fn strict_static_crossings_preserve_delayed_lexemes_sparse_ids_and_aliases() {
+    const CHILD: &str = "GLRMASK_TEMPLATE_STATIC_EXCLUSIONS_CHILD";
+    if std::env::var_os(CHILD).is_none() {
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .arg("--exact").arg("strict_static_crossings_preserve_delayed_lexemes_sparse_ids_and_aliases")
+            .arg("--nocapture").arg("--test-threads=1")
+            .env(CHILD, "1").env("GLRMASK_STRICT_STATIC_TRAP_DYNAMIC", "1")
+            .output().unwrap();
+        assert!(output.status.success(), "{}\n{}", String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr));
+        return;
+    }
+    let (_, mut tokens) = vocabulary();
+    tokens.extend([(1000, b"xaby".to_vec()), (1001, b"xaby".to_vec()), (1033, b"xabby".to_vec()),
+        (2048, b"abby".to_vec()), (2051, b"aay".to_vec()), (2052, b"xaaay".to_vec()),
+        (2060, b"aq".to_vec()), (3000, b"ayq".to_vec())]);
+    let vocab = Vocab::new(tokens.clone());
+    let cases: &[(&str, &[&[u8]])] = &[
+        (r#"start root; t A ::= "a" | "ab"; nt root ::= A "b"?;"#,
+            &[b"xay", b"xaby", b"xabby"]),
+        (r#"start root; t A ::= "a" | "aa"; nt root ::= A "a"?;"#,
+            &[b"xay", b"xaay", b"xaaay"]),
+    ];
+    let options = || BuildOptions::default().optimization(Optimization::FastRuntime).parser_backend(ParserBackend::TemplateDfa);
+    for (source, words) in cases {
+        let child = Grammar::from_glrm(source).compile_with(&vocab, options()).unwrap();
+        let bound = Grammar::from_glrm(HOST).compile_unlinked(&vocab).unwrap().bind("child", &child).unwrap();
+        let candidate = bound.link_with(options()).unwrap();
+        let loaded = Constraint::load(candidate.save()).unwrap();
+        let external = Constraint::load_with_vocab(candidate.save_with_external_vocab().unwrap(), &vocab).unwrap();
+        for candidate in [&candidate, &loaded, &external] {
+            assert_static_boundaries(candidate);
+            assert_language(candidate, &tokens, words);
+            assert!(!candidate.start().mask().get(999 / 32).is_some_and(|word| word & (1 << (999 % 32)) != 0));
+        }
+    }
+}
+
+#[test]
+fn strict_static_table_free_nested_composition_uses_no_dynamic_boundary() {
+    const CHILD: &str = "GLRMASK_TEMPLATE_STATIC_TEST_CHILD";
+    if std::env::var_os(CHILD).is_none() {
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .arg("--exact").arg("strict_static_table_free_nested_composition_uses_no_dynamic_boundary")
+            .arg("--nocapture").arg("--test-threads=1")
+            .env(CHILD, "1").env("GLRMASK_STRICT_STATIC_TRAP_DYNAMIC", "1")
+            .output().unwrap();
+        assert!(output.status.success(), "{}\n{}", String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr));
+        return;
+    }
+    let (vocab, tokens) = vocabulary();
+    let build = |optimization| BuildOptions::default().optimization(optimization).parser_backend(ParserBackend::TemplateDfa);
+    let leaf = Grammar::from_ebnf(r#"start ::= "a" | "b""#).compile_with(&vocab, build(Optimization::FastRuntime)).unwrap();
+    // The nested component starts with a dynamic boundary. The outer static
+    // construction must materialize that boundary too, not hide a fallback.
+    let middle = Grammar::from_glrm(r#"glrm 1; start mid; extern grammar leaf; nt mid = "p" leaf "q";"#)
+        .compile_unlinked(&vocab).unwrap().bind("leaf", &leaf).unwrap().link_with(build(Optimization::FastBuild)).unwrap();
+    let middle = Constraint::load(middle.save()).unwrap();
+    let outer = Grammar::from_glrm(r#"glrm 1; start root; extern grammar middle; nt root = "x" middle middle "y";"#)
+        .compile_unlinked(&vocab).unwrap().bind("middle", &middle).unwrap().link_with(build(Optimization::FastRuntime)).unwrap();
+    let words: &[&[u8]] = &[b"xpaqpaqy", b"xpaqpbqy", b"xpbqpaqy", b"xpbqpbqy"];
+    let loaded = Constraint::load(outer.save()).unwrap();
+    let external = Constraint::load_with_vocab(outer.save_with_external_vocab().unwrap(), &vocab).unwrap();
+    for candidate in [&outer, &loaded, &external] {
+        assert_static_boundaries(candidate);
+        assert_language(candidate, &tokens, words);
+    }
+    // The user's reusable dynamic child is immutable and remains reusable.
+    let original = glrmask::__private::parser_backend_report(&middle);
+    assert!(original["dynamic_boundary_shards"].as_u64().unwrap_or(0) > 0);
+}
+
+#[test]
+fn unbounded_nullable_static_control_requests_fail_without_dynamic_fallback() {
+    let (vocab, _) = vocabulary();
+    let child = Grammar::from_ebnf(r#"start ::= "a"?"#).compile_with(&vocab,
+        BuildOptions::default().optimization(Optimization::FastBuild).parser_backend(ParserBackend::TemplateDfa)).unwrap();
+    let bound = Grammar::from_glrm(HOST).compile_unlinked(&vocab).unwrap().bind("child", &child).unwrap();
+    let error = bound.link_with(BuildOptions::default().optimization(Optimization::FastRuntime)
+        .parser_backend(ParserBackend::TemplateDfa)).unwrap_err();
+    assert!(error.to_string().contains("nullable"), "{error}");
+    assert_eq!(child.parser_backend(), ParserBackend::TemplateDfa);
+}
+
 #[test]
 fn nullable_nested_table_free_children_keep_every_repetition_count() {
     let (vocab, tokens) = vocabulary();
@@ -86,7 +186,8 @@ fn already_table_free_children_link_without_reconstructing_tables() {
             for child in [&child, &loaded] {
                 assert_eq!(glrmask::__private::parser_backend_report(child)["finite_embedding"], true);
                 let bound = Grammar::from_glrm(HOST).compile_unlinked(&vocab).unwrap().bind("child", child).unwrap();
-                for mode in [Optimization::FastBuild, Optimization::Auto] {
+                for mode in [Optimization::FastBuild, Optimization::Auto, Optimization::FastRuntime] {
+                    if nullable && mode == Optimization::FastRuntime { continue; }
                     let result = bound.link_with(BuildOptions::default().optimization(mode)
                         .parser_backend(ParserBackend::TemplateDfa)).unwrap();
                     let words: &[&[u8]] = if nullable { &[b"xy", b"xay"] } else { &[b"xay", b"xby", b"xaby"] };

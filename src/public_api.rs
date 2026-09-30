@@ -2163,9 +2163,6 @@ impl UnlinkedConstraint {
 
     fn materialize_template_components(&self, optimization: Optimization) -> Result<RuntimeConstraint> {
         self.validate_slot_manifest()?;
-        if !self.bindings.is_empty() && optimization == Optimization::FastRuntime {
-            return Err(Error::Compilation("static boundary compilation from already table-free components is not implemented; choose FastBuild or Auto, not an implicit fallback".into()));
-        }
         let mut parent = self.inner.as_ref().clone();
         parent.install_template_parser()?;
         if self.bindings.is_empty() { return Ok(parent); }
@@ -2181,7 +2178,11 @@ impl UnlinkedConstraint {
             Ok((name.clone(), Arc::new(child)))
         }).collect::<Result<Vec<_>>>()?;
         crate::error::catch_internal_invariant(|| {
-            crate::runtime::parser_backend::link::compose(parent, &children, &vocab)
+            let mut linked = crate::runtime::parser_backend::link::compose(parent, &children, &vocab)?;
+            if optimization == Optimization::FastRuntime {
+                crate::compiler::template_boundary::install(&mut linked, &vocab)?;
+            }
+            Ok(linked)
         })?
     }
 

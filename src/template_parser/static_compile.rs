@@ -186,7 +186,7 @@ fn bounded_determinize(nfa: &NFA, budget: &mut ExpansionBudget) -> Result<DFA> {
 /// grammar rules, nonterminals, productions or parser automaton. Empty follow
 /// certificates and global observation prohibit grammar-specific shortcuts;
 /// all real parser semantics come exclusively from the supplied templates.
-fn lexical_context(terminals: u32) -> AnalyzedGrammar {
+pub(crate) fn lexical_context(terminals: u32) -> AnalyzedGrammar {
     let mut protected = BitSet::new(terminals as usize);
     for terminal in 0..terminals {
         protected.set(terminal as usize);
@@ -208,6 +208,23 @@ fn lexical_context(terminals: u32) -> AnalyzedGrammar {
     }
 }
 
+/// Shared exact action-word preparation. Resolve DEFAULT priority inside
+/// each source row before any epsilon/subset union. No LR facts are required.
+pub(crate) fn prepare_static_templates(
+    programs: &[Option<Arc<CommitTemplateDfas>>], symbol_count: u32,
+) -> Result<Templates> {
+    let mut budget = ExpansionBudget::default();
+    let mut terminal_templates = BTreeMap::new();
+    for (terminal, split) in programs.iter().enumerate() {
+        let split = split
+            .as_ref()
+            .ok_or_else(|| Error::Compilation("missing custom terminal relation".into()))?;
+        let nfa = concrete_action_nfa(split, symbol_count, &mut budget)?;
+        terminal_templates.insert(terminal as u32, bounded_determinize(&nfa, &mut budget)?);
+    }
+    Ok(Templates::from_terminal_dfas(terminal_templates))
+}
+
 pub(super) fn compile(
     program: &ParserProgram,
     tokenizer: crate::automata::lexer::tokenizer::Tokenizer,
@@ -216,16 +233,7 @@ pub(super) fn compile(
     specials: &[crate::runtime::SpecialTokenTerminal],
 ) -> Result<crate::runtime::Constraint> {
     let context = lexical_context(program.parser.terminal_count);
-    let mut budget = ExpansionBudget::default();
-    let mut terminal_templates = BTreeMap::new();
-    for (terminal, split) in program.templates.iter().enumerate() {
-        let split = split
-            .as_ref()
-            .ok_or_else(|| Error::Compilation("missing custom terminal relation".into()))?;
-        let nfa = concrete_action_nfa(split, program.parser.state_count, &mut budget)?;
-        terminal_templates.insert(terminal as u32, bounded_determinize(&nfa, &mut budget)?);
-    }
-    let templates = Templates::from_terminal_dfas(terminal_templates);
+    let templates = prepare_static_templates(&program.templates, program.parser.state_count)?;
     let (terminal, _, _) = tdwa::build_id_map_and_terminal_dwa(
         &tokenizer,
         vocab,
