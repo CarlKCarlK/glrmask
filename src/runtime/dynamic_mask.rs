@@ -9984,9 +9984,13 @@ fn fill_mask_dynamic_impl(
                         })
                 };
                 let root_relevant_signature = relevant_signature(&root_admissible);
-                let top_action_fingerprint = (!state
-                    .constraint
-                    .uses_compact_segmented_parser_runtime())
+                // These two optional signatures describe LR action bodies.
+                // Admission, stack and post-advance diagnostics above/below
+                // are backend-neutral; a template-only constraint has no LR
+                // body to print and must never reconstruct or dereference one.
+                let diagnostic_lr_available = !state.constraint.has_template_parser()
+                    && !state.constraint.uses_compact_segmented_parser_runtime();
+                let top_action_fingerprint = diagnostic_lr_available
                 .then(|| stacks.single_top_value())
                 .flatten()
                 .map(|top| {
@@ -10007,9 +10011,7 @@ fn fill_mask_dynamic_impl(
                     .tokenizer
                     .possible_future_terminals_iter(tokenizer_state);
                 let sole_future = futures.next().filter(|_| futures.next().is_none());
-                let sole_future_action = (!state
-                    .constraint
-                    .uses_compact_segmented_parser_runtime())
+                let sole_future_action = diagnostic_lr_available
                 .then_some(sole_future)
                 .flatten()
                 .and_then(|terminal| {
