@@ -1032,6 +1032,23 @@ impl DynamicConstraint {
         parser: Arc<crate::runtime::parser_backend::TemplateParser>,
         vocab: &Vocab,
     ) -> Constraint {
+        let dynamic_vocab = crate::compiler::constraint_possible_matches::runtime_dynamic_vocab_for_vocab(vocab);
+        let mut inner = Self::from_template_runtime_parts_unfinalized(
+            tokenizer, terminal_display_names, ignore_terminal, templates, parser, vocab, dynamic_vocab,
+        );
+        inner.rebuild_dynamic_runtime_caches();
+        inner
+    }
+
+    pub(crate) fn from_template_runtime_parts_unfinalized(
+        tokenizer: Tokenizer,
+        terminal_display_names: Vec<String>,
+        ignore_terminal: Option<TerminalID>,
+        templates: Vec<Option<Arc<crate::runtime::CommitTemplateDfas>>>,
+        parser: Arc<crate::runtime::parser_backend::TemplateParser>,
+        vocab: &Vocab,
+        dynamic_vocab: DynamicMaskVocab,
+    ) -> Constraint {
         let ignore_expr = ignore_terminal.and_then(|t|tokenizer.terminal_expr(t).cloned());
         let terminal_exprs = tokenizer.terminal_exprs().map(ToOwned::to_owned);
         let payload = DynamicConstraintPayloadV2 {
@@ -1043,13 +1060,11 @@ impl DynamicConstraint {
             },
             special_token_terminals: Vec::new(),
         };
-        let dynamic_vocab = crate::compiler::constraint_possible_matches::runtime_dynamic_vocab_for_vocab(vocab);
         let mut inner = Self::constraint_from_runtime_parts(payload, dynamic_vocab);
         inner.template_dfas_by_terminal = templates;
         inner.template_parser = Some(parser);
         inner.fast_template_dfas_by_terminal = inner.compute_fast_template_dfas();
         let _ = inner.late_bind_vocab.set(vocab.clone());
-        inner.rebuild_dynamic_runtime_caches();
         assert!(!inner.table.is_present(), "data-only constructor created an LR table");
         inner
     }

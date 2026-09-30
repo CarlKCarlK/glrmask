@@ -42,10 +42,10 @@ parenthesis. The stack may grow without bound across tokens, although every
 single-terminal automaton is acyclic.
 
 ```rust
-use glrmask::{ParserBackend, Vocab};
+use glrmask::{Optimization, ParserBackend, Vocab};
 use glrmask::template_parser::{
     LexerDefinition, ParserDefinition, ParserProgram, StackLabel, StackTemplate,
-    TerminalPattern,
+    TemplateBuildOptions, TerminalPattern,
 };
 
 let definition = ParserDefinition {
@@ -67,7 +67,10 @@ let vocab = Vocab::new(vec![
     (0, b"(".to_vec()), (1, b")".to_vec()),
     (2, b"()".to_vec()), (3, b"((".to_vec()),
 ]);
-let constraint = program.compile(&lexer, &vocab)?;
+let constraint = program.compile_with(
+    &lexer, &vocab,
+    TemplateBuildOptions::default().optimization(Optimization::FastRuntime),
+)?;
 assert_eq!(constraint.parser_backend(), ParserBackend::TemplateDfa);
 let mut state = constraint.start();
 state.commit_token(2)?;
@@ -75,24 +78,53 @@ assert!(state.is_accepting());
 # Ok::<(), Box<dyn std::error::Error>>(())
 ```
 
-The data-only constructor assembles the existing dynamic lexer/mask/commit
-runtime with an **absent table from the beginning**. It does not build a dummy
-LR grammar, reconstruct a table from the program, or call a user parser at each
-token. `ParserProgram` is immutable and reusable with multiple vocabularies.
-`ParserProvider` is a compile-time trait returning `ParserDefinition`; a provider
-is called when constructing the program, not while generating tokens.
+The data-only constructor assembles an **absent table from the beginning**.
+It does not construct an LR table, reconstruct one from the program, or call a
+user parser at each token. `ParserProgram` is immutable and reusable with multiple
+vocabularies. `ParserProvider` is a compile-time trait returning
+`ParserDefinition`; it is called when validating the program, not during token
+generation.
 
-This direct constructor currently uses the shared dynamic mask engine. Building
-an arbitrary custom program's static token-mask DWA and composing custom parser
-components are not implemented. These limitations do not apply to the
-single-component built-in static template backend above.
+`TemplateBuildOptions::optimization(Optimization::FastRuntime)` compiles the
+program through the existing static token-mask DWA pipeline.
+`FastBuild`, `Auto`, and the convenience `program.compile(...)` use the existing
+dynamic mask engine. This is a build-time choice; an oversized static expansion
+returns an error rather than silently changing modes. Both choices retain the
+same token-level commit code and template parser primitives. Compiled-component
+composition remains explicitly unsupported for this backend.
+
+### Static compilation without a grammar or table
+
+The static route builds the ordinary terminal automaton from the lexer and
+vocabulary, substitutes the supplied terminal relations, cancels signed stack
+actions, and compiles a stack-prefix predicate. Possible-match data is compiled
+independently. Its equivalence mapping is then reconciled with the terminal
+compiler's mapping before constructing the ordinary static runtime. No mask or
+commit algorithm is duplicated.
+
+The lexical compiler currently receives a conservative metadata adapter:
+terminal names/count, identity terminal colouring, and global observation. It
+contains **no productions, nonterminals, FIRST/FOLLOW certificates, or parser
+states**. It cannot introduce an LR parser or apply grammar-specific lexical
+shortcuts.
+
+Static normalization is exact over all finite concrete stack words. In
+particular, it does not inherit the old LR-only assumptions that a stack suffix
+is nonempty or that symbols missing from a transition row are unreachable.
+A DEFAULT edge consumes a real top symbol even when every symbol has that edge;
+it is not epsilon acceptance. Missing symbols reject unless their own DEFAULT
+branch accepts them. The static compiler shares determinization, row compression,
+final-weight subtraction and minimization with the ordinary compiler, with these
+reachability assumptions disabled explicitly.
 
 ## Relation semantics
 
 A definition contains one complete `StackTemplate` for each lexer terminal, plus
 one completion relation. Terminal indices and lexer-pattern indices must agree.
 Sequences start with stack `[0]`; all stack symbols must belong to the declared
-alphabet.
+alphabet. A program may pop the initial `0`, leaving an empty concrete stack;
+that is not the same as a rejected state with no possible stacks. Epsilon and
+PUSH actions may subsequently accept or extend the empty stack.
 
 A template consists of three acyclic deterministic phase graphs and optional
 forward epsilon links: POP-to-READ, POP-to-PUSH, and READ-to-PUSH. POP consumes a
@@ -141,6 +173,20 @@ Construction rejects cyclic graphs, including unreachable cycles; invalid
 starts and targets; duplicate labels; out-of-alphabet symbols; wrong-phase
 DEFAULT edges; and invalid epsilon links. It bounds the total graph input and
 top-certificate allocation/work before constructing runtime indices.
+
+Static compilation also bounds concrete DEFAULT expansion and unweighted
+subset construction. Across terminal relations, current ceilings are 131,072
+constructed states, 1,048,576 edges, 2,097,152 retained subset members and
+33,554,432 accounted work items. These are implementation resource ceilings,
+not language restrictions that truncate a result. Exceeding one returns a build
+error; the caller may explicitly choose `FastBuild` instead. The later shared
+weighted compiler retains its own resource characteristics; these counters are
+not a whole-process memory or wall-clock guarantee.
+
+DEFAULT specialization happens before epsilon/subset union, preserving an
+explicit rejecting edge's shadow. READ is lowered to a matching pop/push pair
+before signed cancellation. Compact DAGs remain graphs: a linear PUSH graph
+representing millions of output words is not enumerated by this conversion.
 
 The direct lexer rejects empty or nullable terminals and malformed regular
 expressions. Ignoring a terminal requires the canonical

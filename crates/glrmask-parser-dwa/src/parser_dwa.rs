@@ -7350,6 +7350,15 @@ fn optimize_parser_dwa_defaults(
     possible_by_state: &[PossibleOutgoingIds],
     num_parser_states: u32,
 ) {
+    optimize_parser_dwa_defaults_mode(dwa, possible_by_state, num_parser_states, true);
+}
+
+fn optimize_parser_dwa_defaults_mode(
+    dwa: &mut DWA,
+    possible_by_state: &[PossibleOutgoingIds],
+    num_parser_states: u32,
+    lift_default_acceptance: bool,
+) {
     loop {
         let mut changed = false;
 
@@ -7461,7 +7470,14 @@ fn optimize_parser_dwa_defaults(
             }
         }
 
-        for state_id in 0..dwa.states().len() {
+        // A default transition still consumes a concrete stack symbol. LR
+        // reachable-stack compilation historically promotes its target's
+        // acceptance under a nonempty-prefix invariant. A user-supplied stack
+        // relation has no such invariant: it can pop the final concrete symbol.
+        // In that domain, retain the consuming edge even when every symbol
+        // shares the same target. Merely compressing rows remains exact.
+        let lift_states = if lift_default_acceptance { dwa.states().len() } else { 0 };
+        for state_id in 0..lift_states {
             let Some((default_target, default_weight)) =
                 dwa.states()[state_id].transitions.get(&DEFAULT_LABEL).cloned()
             else {
@@ -8955,6 +8971,18 @@ fn normalize_weighted_parser_stack_nwa_impl(
     small_boundary_coordinate: Option<(usize, usize)>,
     source_tsid_map: Option<&[u32]>,
 ) -> DWA {
+    normalize_weighted_parser_stack_nwa_mode(
+        num_parser_states, parser_nwa, small_boundary_coordinate, source_tsid_map, true,
+    )
+}
+
+fn normalize_weighted_parser_stack_nwa_mode(
+    num_parser_states: u32,
+    parser_nwa: &NWA,
+    small_boundary_coordinate: Option<(usize, usize)>,
+    source_tsid_map: Option<&[u32]>,
+    lift_default_acceptance: bool,
+) -> DWA {
     let profile = std::env::var_os("GLRMASK_PROFILE_COMPILE").is_some()
         || std::env::var_os("GLRMASK_PROFILE_COMPILE_SUMMARY").is_some();
     let total_started_at = profile.then(Instant::now);
@@ -8975,7 +9003,14 @@ fn normalize_weighted_parser_stack_nwa_impl(
     let compact_fallback = small_boundary_coordinate.is_some()
         && std::env::var_os("GLRMASK_EXPERIMENT_SMALL_BOUNDARY_COMPACT_FALLBACK").is_some();
     let possible_started_at = Instant::now();
-    let possible_by_state = if compact_fallback {
+    let possible_by_state = if !lift_default_acceptance {
+        // Exact general predicates cannot assume that an input symbol belongs
+        // to the subset mentioned by an outgoing NWA row. Unmentioned symbols
+        // are valid inputs that must REJECT, not unreachable LR states that
+        // may be covered by a DEFAULT shortcut. The full finite alphabet is
+        // the only sound context without an additional provider certificate.
+        (0..parser_dwa.num_states()).map(|_| PossibleOutgoingIds::All).collect()
+    } else if compact_fallback {
         Vec::new()
     } else {
         build_possible_outgoing_ids_by_state(parser_nwa, &determinized.supports, num_parser_states)
@@ -8988,7 +9023,9 @@ fn normalize_weighted_parser_stack_nwa_impl(
     if !compact_post
         && std::env::var_os("GLRMASK_EXPERIMENT_LAZY_DIRECT_DISABLE_DEFAULT_OPT").is_none()
     {
-        optimize_parser_dwa_defaults(&mut parser_dwa, &possible_by_state, num_parser_states);
+        optimize_parser_dwa_defaults_mode(
+            &mut parser_dwa, &possible_by_state, num_parser_states, lift_default_acceptance,
+        );
     }
     let default_ms = elapsed_ms(default_started_at);
     let subtract_started_at = Instant::now();
@@ -9048,6 +9085,18 @@ pub fn normalize_weighted_parser_stack_nwa_for_parser_state_count(
     parser_nwa: &NWA,
 ) -> DWA {
     normalize_weighted_parser_stack_nwa_impl(num_parser_states, parser_nwa, None, None)
+}
+
+/// Compile a positive stack-prefix predicate exactly over **all** finite stack
+/// words, including the empty word and empty suffixes. Unlike the historical
+/// reachable-LR-stack entry point, this does not turn a DEFAULT read into an
+/// epsilon acceptance. Row compression, determinization, final-weight
+/// subtraction and minimization use the same compiler implementations.
+pub fn normalize_weighted_stack_predicate_for_symbol_count(
+    symbol_count: u32,
+    predicate: &NWA,
+) -> DWA {
+    normalize_weighted_parser_stack_nwa_mode(symbol_count, predicate, None, None, false)
 }
 
 pub fn normalize_weighted_parser_stack_nwa_small_boundary(
@@ -11486,3 +11535,7 @@ fn exact_guard_class_union_preserves_empty_rows_full_explicit_and_wildcards(){
         }
     }
 }
+
+#[cfg(test)]
+#[path = "empty_stack_domain_tests.rs"]
+mod empty_stack_domain_tests;

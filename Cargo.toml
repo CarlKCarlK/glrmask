@@ -236,3 +236,13 @@ required-features = ["internal-api"]
 [[test]]
 name = "template_parser_provider"
 path = "tests/template_parser_provider.rs"
+
+[[test]]
+name = "template_parser_static"
+path = "tests/template_parser_static.rs"
+required-features = ["internal-api"]
+
+[[test]]
+name = "template_parser_static_oracle"
+path = "tests/template_parser_static_oracle.rs"
+required-features = ["internal-api"]

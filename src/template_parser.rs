@@ -16,6 +16,8 @@
 //! Built-in grammars can separately select [`crate::ParserBackend::TemplateDfa`]
 //! with their ordinary compile options, including the static mask engine.
 
+mod static_compile;
+
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 
@@ -182,14 +184,28 @@ impl LexerDefinition {
     pub fn ignoring(mut self, terminal: u32) -> Self { self.ignore_terminal = Some(terminal); self }
 }
 
-/// Final generation controls for a data-only parser. This constructor always
-/// uses the shared dynamic masker and has no LR backend to switch back to.
-#[derive(Debug, Clone, Default)]
+/// Generation controls for a data-only parser. Both choices use template
+/// parser primitives with no LR backend, including during compilation.
+#[derive(Debug, Clone)]
 pub struct TemplateBuildOptions {
     end_tokens: Vec<u32>,
+    optimization: crate::Optimization,
+}
+
+impl Default for TemplateBuildOptions {
+    fn default() -> Self {
+        Self { end_tokens: Vec::new(), optimization: crate::Optimization::FastBuild }
+    }
 }
 
 impl TemplateBuildOptions {
+    /// Select eager static masking with FastRuntime, or the shared dynamic
+    /// mask engine with FastBuild/Auto. Default is FastBuild.
+    pub fn optimization(mut self, optimization: crate::Optimization) -> Self {
+        self.optimization = optimization;
+        self
+    }
+
     pub fn end_tokens(mut self, ids: impl IntoIterator<Item = u32>) -> Self {
         self.end_tokens = ids.into_iter().collect(); self
     }
@@ -308,9 +324,18 @@ impl ParserProgram {
         }
         let names = (0..expressions.len()).map(|i|format!("terminal_{i}")).collect::<Vec<_>>();
         let tokenizer = crate::compiler::pipeline::build_tokenizer_from_exprs(&expressions, Some(&names));
-        let constraint = crate::dynamic_constraint::DynamicConstraint::from_template_runtime_parts(
-            tokenizer, names, lexer.ignore_terminal, self.templates.to_vec(), self.parser.clone(), vocab,
-        );
+        let constraint = match options.optimization {
+            crate::Optimization::Auto | crate::Optimization::FastBuild => {
+                crate::dynamic_constraint::DynamicConstraint::from_template_runtime_parts(
+                    tokenizer, names, lexer.ignore_terminal, self.templates.to_vec(), self.parser.clone(), vocab,
+                )
+            }
+            crate::Optimization::FastRuntime => {
+                crate::error::catch_internal_invariant(|| {
+                    static_compile::compile(self, tokenizer, lexer.ignore_terminal, vocab)
+                })??
+            }
+        };
         constraint.with_end_tokens(&options.end_tokens)
     }
 }
