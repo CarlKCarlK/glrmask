@@ -2,8 +2,27 @@
 
 ## Unreleased
 
+### Added
+
+- Explicit table-free parser selection through Rust `ParserBackend::TemplateDfa`
+  and Python `ParserBackend.TEMPLATE_DFA`. The runtime and saved artifacts omit
+  the LR table; parser advancement and exact admissibility use acyclic
+  POP/READ/PUSH programs beneath the existing mask and commit engines.
+- Data-only `ParserProgram` providers can supply their own finite stack-action
+  graphs without an LR grammar or runtime callbacks. They support static and
+  dynamic masking, completion relations, validated serialization, and artifacts
+  bound to an external vocabulary. Cycles, invalid coordinates and oversized
+  expansion requests are rejected rather than truncated or sent to an LR
+  fallback. Compiled-component composition is deferred for this backend.
+
 ### Improved
 
+- Table-free loads reuse the exact validated parser indices already prepared
+  during decoding instead of rebuilding them. Dynamic result-cache payloads
+  classify sparse representations in one pass while preserving the original
+  storage choice, tie-breaking, allocation path, and cache-admission policy.
+  LR remains the default: template-mode latency, construction and loading
+  tradeoffs depend on the grammar and execution mode.
 - Static masks bound speculative concrete-stack expansion per parser graph,
   retaining shared-graph evaluation for wide ambiguities. Deterministic
   reductions reuse common output prefixes, single-top commits avoid a duplicate
@@ -41,7 +60,7 @@
   therefore avoid the previous hundreds-of-megabytes serialization spike;
   loading also bounds decompression by the declared raw length before parsing.
 - Runtime mask and commit paths now reuse bounded parser, tokenizer, accumulator, and bitmap storage for common deterministic and small-frontier states, avoiding allocator activity during ordinary decoding. Tokenizer epsilon-closure data is finalized during compile/load rather than on the first commit. The Python extension keeps delayed automatic mimalloc purging enabled but defaults purges to reset (`MADV_FREE`/`MEM_RESET`) rather than synchronous decommit. Pages remain OS-reclaimable without requiring caller-managed trimming; `MIMALLOC_PURGE_DECOMMITS=1` restores immediate RSS-oriented decommit behaviour.
-- Constraints with at most 16 initially admissible tokens now exercise those initial commit transitions during runtime-cache finalization. This moves a bounded amount of cold parser/tokenizer execution into compile or load, reducing first-token TBM without adding work to `Constraint::start()` or displacing it to the second token; larger initial masks skip the step entirely.
+- Constraints with at most 16 initially admissible tokens exercise those initial commit transitions during runtime-cache finalization. LR-backed constraints with larger initial masks retain their existing skip policy; table-free static constraints sample at most 16 admissible tokens. This preparation uses the shared commit implementation and is included in compilation or loading cost, rather than deferred to `Constraint::start()` or hidden from startup measurements.
 - Large bounded JSON Schema string patterns now retain exact `maxLength`
   semantics by compiling terminal/parser automata against a certified smaller
   residual representative while keeping the full exact lexer for runtime

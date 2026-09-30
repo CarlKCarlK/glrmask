@@ -32,8 +32,8 @@ cargo add glrmask
 
 GLRMask has three ordinary public layers:
 
-- `Grammar` is a source description. It can contain source `Grammar` children and vocabulary-qualified exact-token bindings.
-- `UnlinkedConstraint` is reusable compiled machinery for one exact vocabulary in pre-link form. It may deliberately remain open and is not runnable.
+- `Grammar` is a source or mixed description. It can contain source children, compiled children, and vocabulary-qualified exact-token bindings.
+- `UnlinkedConstraint` is reusable compiled machinery for one exact vocabulary. It may deliberately remain open and is not runnable.
 - `Constraint` is closed, rooted, and immediately runnable. `ConstraintState` is the mutable per-sequence state.
 
 Bindings are immutable. Calling `bind(...)` returns a new `Grammar` or `UnlinkedConstraint`; the original remains reusable.
@@ -179,7 +179,7 @@ control/EOG/empty-piece IDs this way automatically.
 
 ### Cached parents with `UnlinkedConstraint`
 
-Use `compile_unlinked` when a compiled parent will be reused with request-specific children. An `UnlinkedConstraint` may remain open, can be saved and loaded, and is deliberately not runnable.
+Use `compile_unlinked` when a compiled parent will be reused with request-specific children. A `UnlinkedConstraint` may remain open, can be saved and loaded, and is deliberately not runnable.
 
 ```rust
 # use glrmask::{BuildOptions, Grammar, Optimization, Result, Vocab};
@@ -203,7 +203,7 @@ let _constraint_b = b.link()?;
 # }
 ```
 
-`UnlinkedConstraint::bind` is compiled-only: grammar slots accept already-compiled `Constraint` children (and token slots accept exact-token values). It does not accept source `Grammar` values or another `UnlinkedConstraint`. Composition stays deferred until `link`/`link_with`, so the final optimization preference can choose the boundary construction strategy.
+`UnlinkedConstraint::bind` is compiled-only: it accepts a compiled `Constraint` or a vocabulary-qualified exact-token value. It does not accept an unresolved `UnlinkedConstraint`, and it does not parse or compile source children. Link a child first before binding it to the parent. Composition stays deferred until `link`/`link_with`, so the final optimization preference can choose the boundary construction strategy.
 
 Python uses the same lifecycle:
 
@@ -228,6 +228,49 @@ constraint = host.bind("payload", child).link(
 
 All three modes preserve accepted-language semantics and produce the same public `Constraint` type.
 
+### Optional table-free parser backend
+
+The parser backend is a separate choice from the build/runtime preference. The
+default remains `LR_TABLE` / `LrTable`. Select the acyclic template backend
+explicitly for a standalone constraint:
+
+```python
+constraint = grammar.compile(
+    vocab,
+    optimization=glrmask.Optimization.FAST_RUNTIME,
+    parser_backend=glrmask.ParserBackend.TEMPLATE_DFA,
+)
+assert constraint.parser_backend == glrmask.ParserBackend.TEMPLATE_DFA
+```
+
+```rust
+# use glrmask::{BuildOptions, Grammar, Optimization, ParserBackend, Result, Vocab};
+# fn demo(grammar: &Grammar, vocab: &Vocab) -> Result<()> {
+let constraint = grammar.compile_with(
+    vocab,
+    BuildOptions::default()
+        .optimization(Optimization::FastRuntime)
+        .parser_backend(ParserBackend::TemplateDfa),
+)?;
+assert_eq!(constraint.parser_backend(), ParserBackend::TemplateDfa);
+# Ok(())
+# }
+```
+
+The selected runtime and its artifact contain the template relations, not an
+LR table. Mask generation and token commitment use the existing shared engines;
+parser advancement and admissibility use those relations. Built-in grammar
+compilation can still use LR machinery to derive the program. Data-only
+`ParserProgram` providers bypass that frontend and support both static and
+dynamic mask compilation.
+
+Compiled-component composition is not supported with this backend. An
+unsupported request returns an error; it does not retain a hidden table or
+silently switch backends. Performance and load-time tradeoffs depend on the
+grammar and mode, so template selection is not an automatic speed guarantee.
+See [the template parser contract](docs/template-parser.md) for provider
+examples, exact POP/READ/PUSH semantics, validation, and persistence.
+
 ### End tokens are final-root policy
 
 End-token policy belongs to the final `compile`/`compile_with` or `link`/`link_with` operation. It is not inherited when a completed `Constraint` is embedded as a child.
@@ -245,14 +288,14 @@ A state reports `is_accepting()` for grammar-body acceptance, `is_rejected()` fo
 Both compiled object types are serializable:
 
 ```python
-unlinked_bytes = host.save()
-host = glrmask.UnlinkedConstraint.load(unlinked_bytes)
+module_bytes = host.save()
+host = glrmask.UnlinkedConstraint.load(module_bytes)
 
 constraint_bytes = constraint.save()
 constraint = glrmask.Constraint.load(constraint_bytes)
 ```
 
-A loaded `Constraint` remains composable as a child. Its standalone end-token policy is stripped when embedded; its compiled grammar body is retained.
+A loaded LR-backed `Constraint` remains composable as a child. Its standalone end-token policy is stripped when embedded; its compiled grammar body is retained. Template-backed constraints retain their backend through loading, but compiled-component composition is not yet supported for them.
 
 ## Grammar formats
 

@@ -224,6 +224,49 @@ constraint = host.bind("payload", child).link(
 
 All three modes preserve accepted-language semantics and produce the same public `Constraint` type.
 
+### Optional table-free parser backend
+
+The parser backend is a separate choice from the build/runtime preference. The
+default remains `LR_TABLE` / `LrTable`. Select the acyclic template backend
+explicitly for a standalone constraint:
+
+```python
+constraint = grammar.compile(
+    vocab,
+    optimization=glrmask.Optimization.FAST_RUNTIME,
+    parser_backend=glrmask.ParserBackend.TEMPLATE_DFA,
+)
+assert constraint.parser_backend == glrmask.ParserBackend.TEMPLATE_DFA
+```
+
+```rust
+# use glrmask::{BuildOptions, Grammar, Optimization, ParserBackend, Result, Vocab};
+# fn demo(grammar: &Grammar, vocab: &Vocab) -> Result<()> {
+let constraint = grammar.compile_with(
+    vocab,
+    BuildOptions::default()
+        .optimization(Optimization::FastRuntime)
+        .parser_backend(ParserBackend::TemplateDfa),
+)?;
+assert_eq!(constraint.parser_backend(), ParserBackend::TemplateDfa);
+# Ok(())
+# }
+```
+
+The selected runtime and its artifact contain the template relations, not an
+LR table. Mask generation and token commitment use the existing shared engines;
+parser advancement and admissibility use those relations. Built-in grammar
+compilation can still use LR machinery to derive the program. Data-only
+`ParserProgram` providers bypass that frontend and support both static and
+dynamic mask compilation.
+
+Compiled-component composition is not supported with this backend. An
+unsupported request returns an error; it does not retain a hidden table or
+silently switch backends. Performance and load-time tradeoffs depend on the
+grammar and mode, so template selection is not an automatic speed guarantee.
+See [the template parser contract](docs/template-parser.md) for provider
+examples, exact POP/READ/PUSH semantics, validation, and persistence.
+
 ### End tokens are final-root policy
 
 End-token policy belongs to the final `compile`/`compile_with` or `link`/`link_with` operation. It is not inherited when a completed `Constraint` is embedded as a child.
@@ -248,7 +291,7 @@ constraint_bytes = constraint.save()
 constraint = glrmask.Constraint.load(constraint_bytes)
 ```
 
-A loaded `Constraint` remains composable as a child. Its standalone end-token policy is stripped when embedded; its compiled grammar body is retained.
+A loaded LR-backed `Constraint` remains composable as a child. Its standalone end-token policy is stripped when embedded; its compiled grammar body is retained. Template-backed constraints retain their backend through loading, but compiled-component composition is not yet supported for them.
 
 ## Grammar formats
 
