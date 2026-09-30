@@ -1,4 +1,5 @@
 mod boundary_reset_support;
+pub(crate) mod packed_final_masks;
 
 use crate::automata::lexer::{
     tokenizer::{Tokenizer, TokenizerStateSet},
@@ -201,6 +202,7 @@ pub(crate) enum RuntimeWeightRef<'a> {
     Materialized(&'a Weight),
     PackedDwa(PackedRuntimeWeightRef<'a>),
     PackedPool(PackedRuntimePoolWeightRef<'a>),
+    IndexedPool(&'a packed_final_masks::PackedWeightIndex),
 }
 
 impl<'a> RuntimeWeightRef<'a> {
@@ -210,6 +212,7 @@ impl<'a> RuntimeWeightRef<'a> {
             Self::Materialized(weight) => weight.is_full(),
             Self::PackedDwa(weight) => weight.is_full(),
             Self::PackedPool(weight) => weight.is_full(),
+            Self::IndexedPool(weight) => weight.is_full(),
         }
     }
 
@@ -219,6 +222,7 @@ impl<'a> RuntimeWeightRef<'a> {
             Self::Materialized(weight) => weight.is_empty(),
             Self::PackedDwa(weight) => weight.is_empty(),
             Self::PackedPool(weight) => weight.is_empty(),
+            Self::IndexedPool(weight) => weight.is_empty(),
         }
     }
 
@@ -235,6 +239,9 @@ impl<'a> RuntimeWeightRef<'a> {
                 )
             }),
             Self::PackedPool(weight) => weight
+                .token_set_for_tsid(tsid)
+                .map(RuntimeTokenSetRef::PackedPool),
+            Self::IndexedPool(weight) => weight
                 .token_set_for_tsid(tsid)
                 .map(RuntimeTokenSetRef::PackedPool),
         }
@@ -287,6 +294,9 @@ impl<'a> RuntimeWeightRef<'a> {
                     f(start, end, RuntimeTokenSetRef::PackedPool(tokens));
                 }
             }
+            Self::IndexedPool(weight) => weight.for_each_entry(|start, end, tokens| {
+                f(start, end, RuntimeTokenSetRef::PackedPool(tokens));
+            }),
         }
     }
 }
@@ -2087,6 +2097,9 @@ impl Constraint {
     #[inline]
     fn runtime_pooled_weight(&self, id: u32) -> Option<RuntimeWeightRef<'_>> {
         let packed = self.packed_non_dwa_weights.as_ref()?;
+        if let Some(index) = packed.final_masks.indices.get(&id) {
+            return Some(RuntimeWeightRef::IndexedPool(index));
+        }
         packed.pool.weight(id).map(RuntimeWeightRef::PackedPool)
     }
 
@@ -9984,6 +9997,7 @@ impl Constraint {
         self.weight_token_sparse_buf_masks = weight_token_sparse_buf_masks;
         self.direct_sparse_weight_token_sets = direct_sparse_weight_token_sets;
         let weight_sparse_ms = 0.0;
+        self.rebuild_packed_final_mask_cache();
         self.dwa_fast_transitions = fast_transitions;
         self.parser_runtime_caches_prebuilt = true;
         let indexed_dag_dense_started_at = profile.then(std::time::Instant::now);
@@ -10109,18 +10123,18 @@ impl Constraint {
         if tokenizer.has_any_virtual_runtime() {
             return FastTokenizerTransitions::Fallback(num_states as usize);
         }
-        // Current backed fast-wire loads already retain an allocation-light exact packed
-        // transition table. Rebuilding a second state x 256 Flat16 slab here is
-        // duplicate load-time work; ordinary commit/scan can call through to the
-        // packed tokenizer directly. The strict dynamic mask walker owns a
-        // separate mask-projection transition table, so this does not remove its
-        // dense full-walk acceleration.
-        if tokenizer.has_backed_runtime_transitions() {
-            return FastTokenizerTransitions::Fallback(num_states as usize);
-        }
-        // Fresh compiler tokenizers do not yet own packed runtime rows. Give small
-        // exact tokenizers one compact direct transition cell per consumed byte.
-        if num_states <= 8_192
+        // A borrowed packed tokenizer is the canonical storage, not a reason
+        // to discard a bounded runtime acceleration that fresh constraints
+        // receive. The generic packed lookup is measurably slower in commit
+        // scanning even though the separate dynamic mask projection is fast.
+        // Restore the same exact <=8 MiB Flat16 cache for loaded and freshly
+        // compiled tokenizers. Above the old 8,192-state cutoff, fresh dense
+        // u32 rows were twice as large while reload had no corresponding
+        // acceleration. Bound the cache by bytes, independently of parser kind.
+        // Virtual states remain excluded above; larger or nonrepresentable
+        // tokenizers retain the existing dense/packed fallback policy.
+        const MAX_EXACT_TRANSITION_BYTES: usize = 8 * 1024 * 1024;
+        if (num_states as usize) <= MAX_EXACT_TRANSITION_BYTES / (256 * std::mem::size_of::<u16>())
             && let Some(flat16) = FastTokenizerTransitions::flat16_transitions_only_for(tokenizer)
         {
             return flat16;
@@ -10162,6 +10176,33 @@ impl Constraint {
             state_to_dense_row,
             dense_rows,
         }
+    }
+
+    /// Exhaustively compare derived direct-byte transitions with the canonical
+    /// tokenizer. Regression support only: never run this before a timing pass.
+    #[cfg(any(test, feature = "internal-api"))]
+    pub(crate) fn check_tokenizer_fast_transitions_against_uncached(&self) -> usize {
+        if self.tokenizer.has_any_virtual_runtime()
+            || matches!(
+                &self.tokenizer_fast_transitions,
+                FastTokenizerTransitions::Fallback(_)
+            )
+        {
+            return 0;
+        }
+        let mut checked = 0;
+        for state in 0..self.tokenizer.num_states() {
+            for byte in 0..=u8::MAX {
+                assert_eq!(
+                    self.tokenizer_fast_transitions
+                        .transition(&self.tokenizer, state, byte),
+                    self.tokenizer.get_transition(state, byte),
+                    "cached tokenizer state {state}, byte {byte}"
+                );
+                checked += 1;
+            }
+        }
+        checked
     }
 
     fn compute_buf_masks(&self) -> Vec<InternalTokenBufMasks> {
@@ -10706,44 +10747,75 @@ impl Constraint {
         max_tokens: u64,
         buf: &mut [u32],
     ) -> Option<bool> {
+        self.or_runtime_token_set_to_buf_sparse(
+            dense,
+            RuntimeTokenSetRef::Materialized(token_set),
+            max_tokens,
+            buf,
+        )
+    }
+
+    #[inline(always)]
+    pub(crate) fn or_runtime_token_set_to_buf_sparse(
+        &self,
+        dense: &[u64],
+        token_set: RuntimeTokenSetRef<'_>,
+        max_tokens: u64,
+        buf: &mut [u32],
+    ) -> Option<bool> {
         if dense.is_empty() || token_set.is_empty() {
             return Some(false);
         }
-
         let mut total = 0u64;
-        for range in token_set.ranges() {
-            total = total.saturating_add((*range.end() as u64).saturating_sub(*range.start() as u64) + 1);
-            if total > max_tokens {
-                return None;
+        match token_set {
+            RuntimeTokenSetRef::Materialized(tokens) => {
+                // Preserve the ordinary fast path's early exit: an oversized
+                // materialized set must not scan all of its ranges first.
+                for range in tokens.ranges() {
+                    total = total.saturating_add(*range.end() as u64 - *range.start() as u64 + 1);
+                    if total > max_tokens {
+                        return None;
+                    }
+                }
+            }
+            packed => {
+                let ranges = match packed {
+                    RuntimeTokenSetRef::PackedDwa(tokens) => tokens.range_count() as u64,
+                    RuntimeTokenSetRef::PackedPool(tokens) => tokens.range_count() as u64,
+                    RuntimeTokenSetRef::Materialized(_) => unreachable!(),
+                };
+                // Every nonempty range contributes at least one token. Bound
+                // this decoding pass without duplicating the projection loop.
+                if ranges > max_tokens {
+                    return None;
+                }
+                packed.for_each_range(|start, end| {
+                    total = total.saturating_add(end as u64 - start as u64 + 1);
+                });
             }
         }
-
+        if total > max_tokens {
+            return None;
+        }
         let n_internal = self.internal_token_count();
         let mut any = false;
         let mut stats_entries = 0u64;
-        for range in token_set.ranges() {
-            let start = *range.start() as usize;
-            let end = (*range.end() as usize).min(n_internal.saturating_sub(1));
-            if start > end {
-                continue;
+        token_set.for_each_range(|start, end| {
+            let start = start as usize;
+            let end = (end as usize).min(n_internal.saturating_sub(1));
+            if n_internal == 0 || start > end {
+                return;
             }
-            for internal_token in start..=end {
-                let word_idx = internal_token / 64;
-                let bit = internal_token % 64;
+            for token in start..=end {
                 if dense
-                    .get(word_idx)
-                    .is_some_and(|word| (word & (1u64 << bit)) != 0)
+                    .get(token / 64)
+                    .is_some_and(|word| word & (1u64 << (token % 64)) != 0)
                 {
-                    self.or_internal_token_to_buf_fast::<false>(
-                        internal_token,
-                        buf,
-                        &mut stats_entries,
-                    );
+                    self.or_internal_token_to_buf_fast::<false>(token, buf, &mut stats_entries);
                     any = true;
                 }
             }
-        }
-
+        });
         Some(any)
     }
 

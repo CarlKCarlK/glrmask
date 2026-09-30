@@ -5731,6 +5731,7 @@ fn attach_packed_non_dwa_weights(
 
     constraint.packed_non_dwa_weights = Some(std::sync::Arc::new(
         crate::runtime::artifact::PackedNonDwaWeights {
+            final_masks: Default::default(),
             pool,
             parser_top_accept,
             parser_top_accept_parts,

@@ -312,6 +312,19 @@ pub mod __private {
         Ok(constraint)
     }
 
+    /// Check derived packed final-weight indices and projections against the
+    /// original wire decoder and original-token fragments. Internal regression
+    /// support only; never called by compilation, loading, or timed execution.
+    pub fn assert_packed_final_mask_cache(constraint: &Constraint, rounds: usize) -> usize {
+        constraint.check_packed_final_cache_against_uncached(rounds)
+    }
+
+    /// Check every cached tokenizer state/byte against its canonical decoder.
+    /// Internal regression support only; do not call during a timing pass.
+    pub fn assert_tokenizer_transition_cache(constraint: &Constraint) -> usize {
+        constraint.check_tokenizer_fast_transitions_against_uncached()
+    }
+
     pub fn parser_backend_report(constraint: &Constraint) -> serde_json::Value {
         constraint.parser_backend_report()
     }

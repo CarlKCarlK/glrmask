@@ -238,6 +238,11 @@ name = "template_parser_provider"
 path = "tests/template_parser_provider.rs"
 
 [[test]]
+name = "packed_final_mask_cache"
+path = "tests/packed_final_mask_cache.rs"
+required-features = ["internal-api"]
+
+[[test]]
 name = "template_parser_static"
 path = "tests/template_parser_static.rs"
 required-features = ["internal-api"]

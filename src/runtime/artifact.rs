@@ -231,8 +231,9 @@ pub(crate) struct CompositionGrammarSummary {
     pub(crate) root_nullable: bool,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub(crate) struct PackedNonDwaWeights {
+    pub(crate) final_masks: Arc<super::constraint::packed_final_masks::PackedFinalMaskCache>,
     pub(crate) pool: Arc<crate::ds::weight::PackedRuntimeWeightPool>,
     pub(crate) parser_top_accept: BTreeMap<i32, u32>,
     pub(crate) parser_top_accept_parts: BTreeMap<i32, Vec<u32>>,

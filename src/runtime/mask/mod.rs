@@ -7336,6 +7336,14 @@ impl<'a> ConstraintState<'a> {
             }
         }
 
+        if let (Some(buf), RuntimeTokenSetRef::PackedPool(tokens)) =
+            (direct_buf.as_deref_mut(), token_set)
+            && self.constraint.or_packed_final_tokens_to_buf(dense, tokens, buf)
+        {
+            *direct_buf_dirty = true;
+            return true;
+        }
+
         DenseMaskAcc::or_dense_and_runtime_token_set_into(dense, token_set, precomputed, merged);
         false
     }
