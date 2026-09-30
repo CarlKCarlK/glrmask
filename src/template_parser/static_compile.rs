@@ -213,6 +213,7 @@ pub(super) fn compile(
     tokenizer: crate::automata::lexer::tokenizer::Tokenizer,
     ignore_terminal: Option<u32>,
     vocab: &Vocab,
+    specials: &[crate::runtime::SpecialTokenTerminal],
 ) -> Result<crate::runtime::Constraint> {
     let context = lexical_context(program.parser.terminal_count);
     let mut budget = ExpansionBudget::default();
@@ -267,6 +268,7 @@ pub(super) fn compile(
             possible.runtime_dynamic_vocab.vocab,
         );
     inner.runtime_backend = ConstraintRuntimeBackend::Static;
+    inner.special_token_terminals = specials.to_vec();
     inner.parser_dwa = parser_dwa.share_exact_transition_rows_owned();
     inner.possible_matches = possible_matches;
     inner.possible_matches_complete = possible.complete;

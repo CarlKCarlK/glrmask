@@ -258,3 +258,7 @@ required-features = ["internal-api"]
 # Upstream tracking: https://github.com/rust-lang/rust/issues/157750
 [profile.release.package._glrmask]
 strip = "none"
+
+[[test]]
+name = "parser_grammar_constructor"
+path = "tests/parser_grammar_constructor.rs"

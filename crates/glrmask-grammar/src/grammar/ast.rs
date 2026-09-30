@@ -19,6 +19,8 @@ use crate::grammar::flat::{
 };
 use crate::grammar::expr_nfa::ExprNFA;
 
+pub mod parser_grammar;
+
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum Quantifier {
     Optional,
@@ -645,6 +647,7 @@ struct Lowerer<'a> {
     /// Shared cache for repeat-min1-max nonterminals, keyed by (symbol, max).
     /// repeat_min1_max_N matches exactly 1..N elements (N >= 1).
     repeat_min1_max_cache: BTreeMap<(Symbol, usize), NonterminalID>,
+    parser_cfg_shape: Option<(RepeatTreeShape, CommaSepShape, bool)>,
     direct_regular_automaton: Option<DirectRegularAutomaton>,
 }
 
@@ -759,7 +762,20 @@ impl<'a> Lowerer<'a> {
             repeat_max_cache: BTreeMap::new(),
             repeat_min1_max_cache: BTreeMap::new(),
             direct_regular_automaton: None,
+            parser_cfg_shape: None,
         }
+    }
+
+    fn repeat_shape(&self) -> RepeatTreeShape {
+        self.parser_cfg_shape.map_or_else(repeat_tree_shape, |shape| shape.0)
+    }
+    fn separator_shape(&self) -> CommaSepShape {
+        self.parser_cfg_shape.map_or_else(comma_sep_shape, |shape| shape.1)
+    }
+    fn repeat_rhs(&self, lhs: NonterminalID, symbol: Symbol) -> Vec<Symbol> {
+        if self.parser_cfg_shape.is_some_and(|shape| shape.2) {
+            vec![symbol, Symbol::Nonterminal(lhs)]
+        } else { vec![Symbol::Nonterminal(lhs), symbol] }
     }
 
     fn nonterminal_id(&mut self, name: &str) -> NonterminalID {
@@ -1200,7 +1216,7 @@ impl<'a> Lowerer<'a> {
                     });
                     self.rules.push(Rule {
                         lhs,
-                        rhs: vec![Symbol::Nonterminal(lhs), symbol],
+                        rhs: self.repeat_rhs(lhs, symbol),
                     });
                 }
             }
@@ -1213,7 +1229,7 @@ impl<'a> Lowerer<'a> {
                     if adjusted_min > *max {
                         return Ok(());
                     }
-                    let shape = repeat_tree_shape();
+                    let shape = self.repeat_shape();
                     let range_nonterminal = self.repeat_range_nonterminal(
                         &symbol,
                         adjusted_min,
@@ -1229,7 +1245,7 @@ impl<'a> Lowerer<'a> {
                 }
             }
             GrammarExpr::SeparatedSequence { items, separator, .. } => {
-                let shape = comma_sep_shape();
+                let shape = self.separator_shape();
                 let (symbol, _) = self.lower_separated_sequence_inner(items, separator, shape)?;
                 self.rules.push(Rule {
                     lhs,
@@ -1628,7 +1644,7 @@ impl<'a> Lowerer<'a> {
         max: Option<usize>,
     ) -> Result<(), GlrMaskError> {
         let symbol = self.lower_expr_terminalish(inner)?;
-        let shape = repeat_tree_shape();
+        let shape = self.repeat_shape();
         if let Some(max) = max {
             debug_assert!(min <= max);
             let range_nonterminal = self.repeat_range_nonterminal(&symbol, min, max, shape);
@@ -1644,7 +1660,7 @@ impl<'a> Lowerer<'a> {
         self.rules.push(Rule { lhs: suffix_nt, rhs: Vec::new() });
         self.rules.push(Rule {
             lhs: suffix_nt,
-            rhs: vec![Symbol::Nonterminal(suffix_nt), symbol.clone()],
+            rhs: self.repeat_rhs(suffix_nt, symbol.clone()),
         });
 
         if min == 0 {
@@ -2409,7 +2425,7 @@ impl<'a> Lowerer<'a> {
                     lowerer.rules.push(Rule { lhs, rhs: Vec::new() });
                     lowerer.rules.push(Rule {
                         lhs,
-                        rhs: vec![Symbol::Nonterminal(lhs), symbol],
+                        rhs: lowerer.repeat_rhs(lhs, symbol),
                     });
                 }
                 GrammarExpr::Quantified(inner, Quantifier::OnePlus) => {
@@ -2420,14 +2436,14 @@ impl<'a> Lowerer<'a> {
                     });
                     lowerer.rules.push(Rule {
                         lhs,
-                        rhs: vec![Symbol::Nonterminal(lhs), symbol],
+                        rhs: lowerer.repeat_rhs(lhs, symbol),
                     });
                 }
                 GrammarExpr::Quantified(expr, Quantifier::Range(min, max)) => {
                     lowerer.emit_repeat_range(lhs, expr, *min, *max)?;
                 }
                 GrammarExpr::SeparatedSequence { items, separator, allow_empty } => {
-                    let shape = comma_sep_shape();
+                    let shape = lowerer.separator_shape();
                     let (sym, can_be_empty) =
                         lowerer.lower_separated_sequence_inner(items, separator, shape)?;
                     lowerer.rules.push(Rule { lhs, rhs: vec![sym] });
@@ -2575,7 +2591,7 @@ impl<'a> Lowerer<'a> {
             rhs: vec![sep_sym, item_sym.clone()],
         });
         let pair_symbol = Symbol::Nonterminal(pair_nt);
-        let shape = repeat_tree_shape();
+        let shape = self.repeat_shape();
 
         if max.is_none() {
             let min = min.max(1);
@@ -2594,7 +2610,7 @@ impl<'a> Lowerer<'a> {
             self.rules.push(Rule { lhs: tail_nt, rhs: Vec::new() });
             self.rules.push(Rule {
                 lhs: tail_nt,
-                rhs: vec![Symbol::Nonterminal(tail_nt), pair_symbol],
+                rhs: self.repeat_rhs(tail_nt, pair_symbol),
             });
             let result_nt = self.fresh_nonterminal();
             self.rules.push(Rule {
@@ -3299,7 +3315,7 @@ fn dedup_rules_preserving_first_occurrence(rules: &mut Vec<Rule>) {
 }
 
 pub fn lower(grammar: &NamedGrammar) -> Result<GrammarDef, GlrMaskError> {
-    lower_with_resolved_terminal_exprs_impl(grammar, None)
+    lower_with_resolved_terminal_exprs_impl(grammar, None, None)
 }
 
 /// Lower a named grammar while reusing terminal expressions that were already
@@ -3313,7 +3329,7 @@ pub fn lower_with_resolved_terminal_exprs(
     grammar: &NamedGrammar,
     resolved_terminal_exprs: BTreeMap<String, Expr>,
 ) -> Result<GrammarDef, GlrMaskError> {
-    lower_with_resolved_terminal_exprs_impl(grammar, Some(resolved_terminal_exprs))
+    lower_with_resolved_terminal_exprs_impl(grammar, Some(resolved_terminal_exprs), None)
 }
 
 fn grammar_expr_node_count(expr: &GrammarExpr) -> usize {
@@ -3347,6 +3363,7 @@ fn grammar_expr_node_count(expr: &GrammarExpr) -> usize {
 fn lower_with_resolved_terminal_exprs_impl(
     grammar: &NamedGrammar,
     resolved_terminal_exprs: Option<BTreeMap<String, Expr>>,
+    parser_cfg_shape: Option<(RepeatTreeShape, CommaSepShape, bool)>,
 ) -> Result<GrammarDef, GlrMaskError> {
     let profile_enabled = std::env::var_os("GLRMASK_PROFILE_COMPILE").is_some()
         || std::env::var_os("GLRMASK_PROFILE_COMPILE_SUMMARY").is_some();
@@ -3357,6 +3374,7 @@ fn lower_with_resolved_terminal_exprs_impl(
 
     let setup_started_at = profile_enabled.then(std::time::Instant::now);
     let mut lowerer = Lowerer::new();
+    lowerer.parser_cfg_shape = parser_cfg_shape;
     const COMPOUND_EXPR_CACHE_NODE_THRESHOLD: usize = 2048;
     lowerer.cache_compound_exprs = grammar
         .rules
@@ -3592,12 +3610,12 @@ fn lower_with_resolved_terminal_exprs_impl(
             GrammarExpr::Quantified(inner, Quantifier::ZeroPlus) => {
                 let symbol = lowerer.lower_expr_terminalish(inner)?;
                 lowerer.rules.push(Rule { lhs, rhs: Vec::new() });
-                lowerer.rules.push(Rule { lhs, rhs: vec![Symbol::Nonterminal(lhs), symbol] });
+                lowerer.rules.push(Rule { lhs, rhs: lowerer.repeat_rhs(lhs, symbol) });
             }
             GrammarExpr::Quantified(inner, Quantifier::OnePlus) => {
                 let symbol = lowerer.lower_expr_terminalish(inner)?;
                 lowerer.rules.push(Rule { lhs, rhs: vec![symbol.clone()] });
-                lowerer.rules.push(Rule { lhs, rhs: vec![Symbol::Nonterminal(lhs), symbol] });
+                lowerer.rules.push(Rule { lhs, rhs: lowerer.repeat_rhs(lhs, symbol) });
             }
             GrammarExpr::Quantified(expr, Quantifier::Range(min, max)) => {
                 lowerer.emit_repeat_range(lhs, expr, *min, *max)?;

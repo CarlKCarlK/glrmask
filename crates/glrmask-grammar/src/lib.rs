@@ -48,6 +48,9 @@ pub(crate) mod import {
 }
 
 pub use grammar::ast::{GrammarExpr, NamedGrammar, NamedRule, Quantifier};
+pub use grammar::ast::parser_grammar::{ParserAutomaton, ParserAutomatonState,
+    ParserExpr, ParserGrammar, ParserRule, CfgRecursion, FlatParserGrammar,
+    ParserAnalysis, ParserProduction, ParserSymbol};
 pub use import::ebnf::parse_ebnf_to_named;
 pub use import::lark::{parse_lark_to_named, parse_lark_to_named_uncompressed};
 

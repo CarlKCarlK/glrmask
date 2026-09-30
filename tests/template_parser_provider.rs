@@ -141,7 +141,8 @@ fn malformed_provider_graphs_fail_before_runtime_construction() {
     let mut d=definition();d.stack_symbol_count=0;assert!(ParserProgram::new(d).is_err());
     let mut d=definition();d.stack_symbol_count=u32::MAX;assert!(ParserProgram::new(d).is_err());
     let mut d=definition();d.stack_symbol_count=100_000_000;assert!(ParserProgram::new(d).is_err());
-    let mut d=definition();d.terminals.clear();assert!(ParserProgram::new(d).is_err());
+    // Zero-terminal grammars can denote epsilon or the empty language.
+    let mut d=definition();d.terminals.clear();assert!(ParserProgram::new(d).is_ok());
     let mut d=definition();d.terminals[0].pop.states.clear();assert!(ParserProgram::new(d).is_err());
     let mut d=definition();d.terminals[0].read.start=99;assert!(ParserProgram::new(d).is_err());
     let mut d=definition();d.terminals[0].read.states[0].transitions[0].target=99;assert!(ParserProgram::new(d).is_err());

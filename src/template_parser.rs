@@ -17,6 +17,12 @@
 //! [`crate::ParserBackend::TemplateDfa`] through their ordinary build options.
 
 mod static_compile;
+mod grammar_constructor;
+
+pub use glrmask_grammar::{ParserAutomaton, ParserAutomatonState, ParserExpr,
+    ParserGrammar, ParserRule, Quantifier, CfgRecursion, FlatParserGrammar,
+    ParserAnalysis, ParserProduction, ParserSymbol};
+pub use grammar_constructor::{GrammarParserProgram, ParserCompiler, PreparedParserGrammar};
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
@@ -276,7 +282,6 @@ impl ParserProgram {
         let symbols = definition.stack_symbol_count;
         if symbols == 0 || symbols >= DEFAULT_LABEL as u32 { return Err(fail("stack alphabet must include initial symbol 0 and exclude reserved label values")); }
         let terminals = u32::try_from(definition.terminals.len()).map_err(|_|fail("too many terminals"))?;
-        if terminals == 0 { return Err(fail("at least one explicit terminal relation is required")); }
         if u64::from(symbols) * (u64::from(terminals) + 1) > 16_000_000 {
             return Err(fail("template top-certificate construction exceeds 16 million symbol/terminal pairs"));
         }
@@ -324,18 +329,29 @@ impl ParserProgram {
         }
         let names = (0..expressions.len()).map(|i|format!("terminal_{i}")).collect::<Vec<_>>();
         let tokenizer = crate::compiler::pipeline::build_tokenizer_from_exprs(&expressions, Some(&names));
-        let constraint = match options.optimization {
+        self.compile_tokenizer(tokenizer, names, lexer.ignore_terminal, Vec::new(), vocab, options)
+    }
+
+    fn compile_tokenizer(&self, tokenizer: crate::automata::lexer::tokenizer::Tokenizer,
+        names: Vec<String>, ignore: Option<u32>, specials: Vec<crate::runtime::SpecialTokenTerminal>,
+        vocab: &Vocab, options: TemplateBuildOptions) -> Result<Constraint> {
+        let mut constraint = match options.optimization {
             crate::Optimization::Auto | crate::Optimization::FastBuild => {
-                crate::dynamic_constraint::DynamicConstraint::from_template_runtime_parts(
-                    tokenizer, names, lexer.ignore_terminal, self.templates.to_vec(), self.parser.clone(), vocab,
-                )
+                let dynamic_vocab = crate::compiler::constraint_possible_matches::runtime_dynamic_vocab_for_vocab(vocab);
+                let mut inner = crate::dynamic_constraint::DynamicConstraint::from_template_runtime_parts_unfinalized(
+                    tokenizer, names.clone(), ignore, self.templates.to_vec(), self.parser.clone(), vocab, dynamic_vocab,
+                );
+                inner.special_token_terminals = specials.clone();
+                inner.rebuild_dynamic_runtime_caches();
+                inner
             }
             crate::Optimization::FastRuntime => {
                 crate::error::catch_internal_invariant(|| {
-                    static_compile::compile(self, tokenizer, lexer.ignore_terminal, vocab)
+                    static_compile::compile(self, tokenizer, ignore, vocab, &specials)
                 })??
             }
         };
+        constraint.terminal_display_names = names;
         constraint.with_end_tokens(&options.end_tokens)
     }
 }
