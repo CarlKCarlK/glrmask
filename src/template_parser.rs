@@ -11,10 +11,10 @@
 //! bottom first. Each terminal relation is acyclic, but repeated terminal
 //! advances can recognize recursive languages with unbounded stack depth.
 //!
-//! The direct constructor currently uses the shared dynamic mask engine. It
-//! does not synthesize a static token-mask DWA or support component composition.
-//! Built-in grammars can separately select [`crate::ParserBackend::TemplateDfa`]
-//! with their ordinary compile options, including the static mask engine.
+//! Direct programs can use the shared static token-mask DWA compiler through
+//! [`TemplateBuildOptions::optimization`] or the shared dynamic mask engine.
+//! Component composition is rejected explicitly. Built-in grammars can select
+//! [`crate::ParserBackend::TemplateDfa`] through their ordinary build options.
 
 mod static_compile;
 

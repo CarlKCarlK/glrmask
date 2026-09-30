@@ -7,11 +7,11 @@ use pyo3::types::{PyAny, PyBytes, PyModule};
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
-fn api_error(error: impl std::fmt::Display) -> PyErr {
+pub(super) fn api_error(error: impl std::fmt::Display) -> PyErr {
     PyValueError::new_err(error.to_string())
 }
 
-fn constraint(inner: glrmask::Constraint) -> PyConstraint {
+pub(super) fn constraint(inner: glrmask::Constraint) -> PyConstraint {
     let max_token = inner.max_original_token_id().unwrap_or(0);
     PyConstraint { inner: Arc::new(inner), max_token }
 }
@@ -26,13 +26,57 @@ pub(super) enum PyOptimization {
     FAST_RUNTIME,
 }
 
-fn options(end_tokens: Option<Vec<u32>>, optimization: Option<PyRef<'_, PyOptimization>>) -> glrmask::BuildOptions {
+/// Parser execution and storage backend, independent of mask optimization.
+#[allow(non_camel_case_types)]
+#[pyclass(name = "ParserBackend", module = "glrmask", eq, eq_int)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum PyParserBackend {
+    LR_TABLE,
+    TEMPLATE_DFA,
+}
+
+impl From<PyParserBackend> for glrmask::ParserBackend {
+    fn from(value: PyParserBackend) -> Self {
+        match value {
+            PyParserBackend::LR_TABLE => Self::LrTable,
+            PyParserBackend::TEMPLATE_DFA => Self::TemplateDfa,
+        }
+    }
+}
+
+impl TryFrom<glrmask::ParserBackend> for PyParserBackend {
+    type Error = PyErr;
+
+    fn try_from(value: glrmask::ParserBackend) -> PyResult<Self> {
+        match value {
+            glrmask::ParserBackend::LrTable => Ok(Self::LR_TABLE),
+            glrmask::ParserBackend::TemplateDfa => Ok(Self::TEMPLATE_DFA),
+            _ => Err(PyValueError::new_err("parser backend is not supported by this Python binding")),
+        }
+    }
+}
+
+pub(super) fn optimization(value: PyOptimization) -> glrmask::Optimization {
+    match value {
+        PyOptimization::AUTO => glrmask::Optimization::Auto,
+        PyOptimization::FAST_BUILD => glrmask::Optimization::FastBuild,
+        PyOptimization::FAST_RUNTIME => glrmask::Optimization::FastRuntime,
+    }
+}
+
+fn options(
+    end_tokens: Option<Vec<u32>>,
+    optimization: Option<PyRef<'_, PyOptimization>>,
+    parser_backend: Option<PyRef<'_, PyParserBackend>>,
+) -> glrmask::BuildOptions {
     let mode = match optimization.as_deref().copied().unwrap_or(PyOptimization::AUTO) {
         PyOptimization::AUTO => glrmask::Optimization::Auto,
         PyOptimization::FAST_BUILD => glrmask::Optimization::FastBuild,
         PyOptimization::FAST_RUNTIME => glrmask::Optimization::FastRuntime,
     };
-    glrmask::BuildOptions::default().end_tokens(end_tokens.unwrap_or_default()).optimization(mode)
+    let backend = parser_backend.as_deref().copied().unwrap_or(PyParserBackend::LR_TABLE);
+    glrmask::BuildOptions::default().end_tokens(end_tokens.unwrap_or_default())
+        .optimization(mode).parser_backend(backend.into())
 }
 
 /// One exact model token, retaining its complete vocabulary identity.
@@ -179,12 +223,13 @@ impl PyGrammar {
     ///
     /// end_tokens are reserved generation controls, allowed only at acceptance.
     /// Their policy is not inherited when the result is later embedded as a child.
-    #[pyo3(signature = (vocab, *, end_tokens=None, optimization=None))]
+    #[pyo3(signature = (vocab, *, end_tokens=None, optimization=None, parser_backend=None))]
     fn compile(
         &self, py: Python<'_>, vocab: &PyVocab,
         end_tokens: Option<Vec<u32>>, optimization: Option<PyRef<'_, PyOptimization>>,
+        parser_backend: Option<PyRef<'_, PyParserBackend>>,
     ) -> PyResult<PyConstraint> {
-        let options = options(end_tokens, optimization);
+        let options = options(end_tokens, optimization, parser_backend);
         let grammar = self.as_rust().map_err(api_error)?;
         let vocab = vocab.inner.clone();
         py.allow_threads(move || grammar.compile_with(&vocab, options))
@@ -223,12 +268,13 @@ impl PyUnlinkedConstraint {
     }
 
     /// Produce a runnable root. Every required slot must already be bound.
-    #[pyo3(signature = (*, end_tokens=None, optimization=None))]
+    #[pyo3(signature = (*, end_tokens=None, optimization=None, parser_backend=None))]
     fn link(
         &self, py: Python<'_>, end_tokens: Option<Vec<u32>>,
         optimization: Option<PyRef<'_, PyOptimization>>,
+        parser_backend: Option<PyRef<'_, PyParserBackend>>,
     ) -> PyResult<PyConstraint> {
-        let options = options(end_tokens, optimization);
+        let options = options(end_tokens, optimization, parser_backend);
         py.allow_threads(|| self.inner.link_with(options)).map(constraint).map_err(api_error)
     }
 
@@ -257,5 +303,7 @@ pub(super) fn register(module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_class::<PyExactToken>()?;
     module.add_class::<PyExactTokens>()?;
     module.add_class::<PyOptimization>()?;
+    module.add_class::<PyParserBackend>()?;
+    super::template_api::register(module)?;
     Ok(())
 }

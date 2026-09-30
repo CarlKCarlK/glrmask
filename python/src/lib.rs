@@ -17,6 +17,7 @@
 //! NumPy `i32` to `u32` bitmask view cast used by `fill_mask`.
 
 mod final_api;
+mod template_api;
 
 #[cfg(feature = "allocation-tracking")]
 mod allocation_tracking;
@@ -791,6 +792,20 @@ impl PyConstraint {
 
 #[pymethods]
 impl PyConstraint {
+    /// The parser backend retained by this artifact, including after load.
+    #[getter]
+    fn parser_backend(&self) -> PyResult<final_api::PyParserBackend> {
+        self.inner.parser_backend().try_into()
+    }
+
+    /// Serialize without embedding the model vocabulary. Loading requires the
+    /// exact same vocabulary mapping, not merely the same vocabulary size.
+    fn save_with_external_vocab<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyBytes>> {
+        let bytes = py.allow_threads(|| self.inner.save_with_external_vocab())
+            .map_err(final_api::api_error)?;
+        Ok(PyBytes::new(py, &bytes))
+    }
+
     /// Serialize the compiled body and final termination policy as bytes.
     fn save<'py>(&self, py: Python<'py>) -> Bound<'py, PyBytes> {
         let bytes = py.allow_threads(|| self.inner.save());
@@ -1955,6 +1970,8 @@ fn _glrmask(m: &Bound<'_, PyModule>) -> PyResult<()> {
             "ExactToken",
             "ExactTokens",
             "Optimization",
+            "ParserBackend",
+            "ParserProgram",
             "Vocab",
             "Constraint",
             "ConstraintState",

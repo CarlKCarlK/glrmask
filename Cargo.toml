@@ -251,3 +251,10 @@ required-features = ["internal-api"]
 name = "template_parser_static_oracle"
 path = "tests/template_parser_static_oracle.rs"
 required-features = ["internal-api"]
+
+# Older supported Rust toolchains can misalign a stripped Mach-O string pool,
+# which prevents Python from loading the extension on macOS 27. This affects
+# only the Python shared library, not runtime artifacts or native benchmarks.
+# Upstream tracking: https://github.com/rust-lang/rust/issues/157750
+[profile.release.package._glrmask]
+strip = "none"
