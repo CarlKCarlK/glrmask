@@ -5970,9 +5970,17 @@ impl Constraint {
             else if self.has_template_parser() { TEMPLATE_CONSTRAINT_VERSION } else { CONSTRAINT_VERSION };
         if let Some(bytes) = &self.serialized_artifact_cache {
             // A loaded external body cannot be returned as a self-contained
-            // save, or vice versa. All other unchanged same-mode saves retain
-            // the existing bulk-copy fast path.
-            if bytes.get(8..10) == Some(artifact_version.to_le_bytes().as_slice()) {
+            // save, or vice versa. Likewise, conversion between parser
+            // backends must never return the other backend's cached program.
+            // This cache holds only validated, unchanged artifact bodies.
+            // Preserve older LR envelopes instead of silently upgrading them
+            // during an otherwise no-op save.
+            let cached_version = bytes.get(8..10)
+                .map(|version| u16::from_le_bytes([version[0], version[1]]));
+            let compatible = cached_version == Some(artifact_version)
+                || (!external_vocab && !self.has_template_parser()
+                    && cached_version.is_some_and(|version| version < TEMPLATE_CONSTRAINT_VERSION));
+            if compatible {
                 return clone_serialized_artifact(bytes.as_slice());
             }
         }
@@ -9847,7 +9855,9 @@ mod tests {
     fn constraint_envelope_rejects_version_and_length_mismatches() {
         let constraint = tiny_constraint();
         let mut wrong_version = constraint.save();
-        wrong_version[8..10].copy_from_slice(&(CONSTRAINT_VERSION + 1).to_le_bytes());
+        // The next numeric version is now a supported table-free format.
+        // Check an actually unsupported version instead of assuming adjacency.
+        wrong_version[8..10].copy_from_slice(&u16::MAX.to_le_bytes());
         assert!(Constraint::load(&wrong_version)
             .unwrap_err()
             .to_string()
