@@ -472,6 +472,17 @@ impl Constraint {
     }
 
     pub(crate) fn install_template_parser(&mut self) -> crate::Result<()> {
+        self.install_template_parser_impl(false)
+    }
+
+    /// Source compilation has just produced the retained terminal templates
+    /// from this exact immutable LR table. Reuse those compiler-owned graphs;
+    /// generic conversion of a loaded artifact deliberately does not opt in.
+    pub(crate) fn install_template_parser_from_compile(&mut self) -> crate::Result<()> {
+        self.install_template_parser_impl(true)
+    }
+
+    fn install_template_parser_impl(&mut self, reuse_compiler_templates: bool) -> crate::Result<()> {
         if self.has_template_parser() { return Ok(()); }
         if self.parser_has_controls() || self.uses_compact_segmented_parser_runtime() || !self.late_grammar_slots.is_empty() {
             return Err(crate::Error::Compilation("template-only parser composition/control closure is not implemented; no LR fallback is permitted".into()));
@@ -480,15 +491,53 @@ impl Constraint {
         let (templates, completion, state_count) = if self.uses_sparse_direct_regular_runtime() {
             sparse_regular_templates(self.direct_regular_automaton.as_ref().unwrap(), terminal_count)?
         } else {
-            let selected = vec![true; terminal_count as usize];
-            let characterizations = try_characterize_selected_terminals_for_terminal_count(&self.table, terminal_count, &selected)
-                .map_err(crate::Error::Compilation)?;
-            let raw = Templates::from_characterizations(&characterizations);
+            let retained = if reuse_compiler_templates && !self.uses_dynamic_runtime()
+                && self.composition_parser_templates_by_terminal.len() == terminal_count as usize
+            {
+                self.composition_parser_templates_by_terminal.as_slice()
+            } else {
+                &[]
+            };
+            let selected = (0..terminal_count as usize)
+                .map(|terminal| retained.get(terminal).is_none_or(Option::is_none))
+                .collect::<Vec<_>>();
+            let raw = if selected.iter().any(|&missing| missing) {
+                let characterizations = try_characterize_selected_terminals_for_terminal_count(
+                    &self.table, terminal_count, &selected,
+                ).map_err(crate::Error::Compilation)?;
+                Templates::from_characterizations(&characterizations)
+            } else {
+                Templates::default()
+            };
+            let mut rebuilt = raw.by_terminal.into_iter();
             let mut templates = vec![None; terminal_count as usize];
-            for (terminal, dfa) in raw.by_terminal {
-                let dfa = specialize_template_dfa_defaults_for_commit_split_input(&dfa);
+            for terminal in 0..terminal_count {
+                let input = match retained.get(terminal as usize).and_then(Option::as_ref) {
+                    Some(dfa) => std::borrow::Cow::Borrowed(dfa),
+                    None => {
+                        let (rebuilt_terminal, dfa) = rebuilt.next().ok_or_else(||
+                            crate::Error::Compilation(format!(
+                                "missing complete template for terminal {terminal}; refusing table fallback"
+                            )))?;
+                        if rebuilt_terminal != terminal {
+                            return Err(crate::Error::Compilation(format!(
+                                "template inventory mismatch for terminal {terminal}: found {rebuilt_terminal}"
+                            )));
+                        }
+                        std::borrow::Cow::Owned(dfa)
+                    }
+                };
+                let dfa = specialize_template_dfa_defaults_for_commit_split_input(input.as_ref());
                 let split = try_split_commit_template_dfas(&dfa).ok_or_else(|| crate::Error::Compilation(format!("terminal {terminal} template is not acyclic pop/read/push; refusing table fallback")))?;
                 templates[terminal as usize] = Some(Arc::new(split));
+                // Reconstructed inputs are owned by this iteration, preserving
+                // the original conversion path's prompt release of each raw
+                // DFA rather than retaining the whole rebuilt inventory.
+            }
+            if rebuilt.next().is_some() {
+                return Err(crate::Error::Compilation(
+                    "unexpected extra reconstructed terminal template".into()
+                ));
             }
             let completion = glrmask_parser_dwa::__private::templates::completion::compile_completion_template(&self.table)
                 .map_err(crate::Error::Compilation)?;
@@ -528,6 +577,65 @@ impl Constraint {
 mod tests {
     use super::*;
     use crate::compiler::glr::accumulator::TerminalsDisallowed;
+
+    #[test]
+    fn fresh_compiler_template_reuse_matches_reconstructed_programs() {
+        let vocab = crate::Vocab::new(["a", "b", "(", ")", "ab", "aa", " ", "aab", "(()"]
+            .into_iter().enumerate().map(|(id, value)| (id as u32, value.as_bytes().to_vec())).collect());
+        let sources = [
+            r#"start root; nt root ::= "a" | "(" root ")";"#,
+            r#"start root; ignore WS; t WS ::= " "+; nt root ::= "a" root "b" | "";"#,
+        ];
+        let mut retained_total = 0;
+        for source in sources {
+            let ordinary = Constraint::compile(crate::Grammar::glrm(source), &vocab).unwrap();
+            retained_total += ordinary.composition_parser_templates_by_terminal.iter()
+                .filter(|template| template.is_some()).count();
+            let mut reference = ordinary.clone();
+            reference.install_template_parser().unwrap();
+            for missing in 0..4 {
+                let mut candidate = ordinary.clone();
+                match missing {
+                    1 => {
+                        if let Some(slot) = candidate.composition_parser_templates_by_terminal
+                            .iter_mut().find(|template| template.is_some())
+                        {
+                            *slot = None;
+                        }
+                    }
+                    2 => candidate.composition_parser_templates_by_terminal.clear(),
+                    3 => candidate.composition_parser_templates_by_terminal.push(None),
+                    _ => {}
+                }
+                candidate.install_template_parser_from_compile().unwrap();
+                assert!(candidate.table.as_lr().is_none());
+                assert_eq!(candidate.template_dfas_by_terminal.len(), reference.template_dfas_by_terminal.len());
+                for (a, b) in candidate.template_dfas_by_terminal.iter()
+                    .zip(&reference.template_dfas_by_terminal)
+                {
+                    let (a, b) = (a.as_ref().unwrap(), b.as_ref().unwrap());
+                    assert_eq!(a.pop, b.pop);
+                    assert_eq!(a.read, b.read);
+                    assert_eq!(a.push, b.push);
+                    assert_eq!(a.pop_to_read, b.pop_to_read);
+                    assert_eq!(a.pop_to_push, b.pop_to_push);
+                    assert_eq!(a.read_to_push, b.read_to_push);
+                }
+                for bytes in [b"".as_slice(), b"a", b"(a)", b"aa", b"aab", b"aabb", b" "] {
+                    let mut left = reference.start();
+                    let mut right = candidate.start();
+                    assert_eq!(left.commit_bytes(bytes).is_ok(), right.commit_bytes(bytes).is_ok());
+                    assert_eq!(left.is_accepting(), right.is_accepting());
+                    let mut a = vec![0; reference.mask_len()];
+                    let mut b = vec![0; candidate.mask_len()];
+                    left.fill_mask(&mut a);
+                    right.fill_mask(&mut b);
+                    assert_eq!(a, b, "prefix {bytes:?}, missing mode {missing}");
+                }
+            }
+        }
+        assert!(retained_total > 0, "fixture must exercise compiler template reuse");
+    }
 
     fn pop_word(labels: &[i32], accepting: bool) -> CommitTemplateDfas {
         let mut pop = DFA::new();
