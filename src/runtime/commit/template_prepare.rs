@@ -1,90 +1,7 @@
-//! One validation/topological pass for the derived views of an immutable
-//! acyclic stack program. This is preparation-only scratch, not another
-//! runtime parser, a persisted index, or a global cache.
-use crate::automata::unweighted_u32::dfa::DFA;
-use crate::compiler::glr::labels::{DEFAULT_LABEL, is_negative_label};
-use crate::runtime::CommitTemplateDfas;
-
-pub(crate) struct TemplatePreparation<'a> {
-    template: &'a CommitTemplateDfas,
-    orders: [Vec<usize>; 3],
-}
-
-fn validated_order(graph: &DFA, phase: usize) -> Option<Vec<usize>> {
-    if graph.states.is_empty() {
-        return (graph.start_state == 0).then(Vec::new);
-    }
-    graph.states.get(graph.start_state as usize)?;
-    let mut incoming = vec![0usize; graph.states.len()];
-    for row in &graph.states {
-        for (&label, &target) in &row.transitions {
-            let legal = match phase {
-                0 => !is_negative_label(label),
-                1 => !is_negative_label(label) && label != DEFAULT_LABEL,
-                2 => is_negative_label(label),
-                _ => return None,
-            };
-            if !legal {
-                return None;
-            }
-            let degree = incoming.get_mut(target as usize)?;
-            *degree = degree.checked_add(1)?;
-        }
-    }
-    let mut order = incoming
-        .iter()
-        .enumerate()
-        .filter_map(|(id, &degree)| (degree == 0).then_some(id))
-        .collect::<Vec<_>>();
-    let mut head = 0;
-    while head < order.len() {
-        let source = order[head];
-        head += 1;
-        for &target in graph.states[source].transitions.values() {
-            incoming[target as usize] -= 1;
-            if incoming[target as usize] == 0 {
-                order.push(target as usize);
-            }
-        }
-    }
-    (order.len() == graph.states.len()).then_some(order)
-}
-
-impl<'a> TemplatePreparation<'a> {
-    pub(crate) fn new(template: &'a CommitTemplateDfas) -> Option<Self> {
-        let graphs = [&template.pop, &template.read, &template.push];
-        for (links, source, target) in [
-            (&template.pop_to_read, 0, 1),
-            (&template.pop_to_push, 0, 2),
-            (&template.read_to_push, 1, 2),
-        ] {
-            if links.len() > graphs[source].states.len()
-                || links
-                    .iter()
-                    .flatten()
-                    .any(|&id| id as usize >= graphs[target].states.len())
-            {
-                return None;
-            }
-        }
-        let orders = [
-            validated_order(graphs[0], 0)?,
-            validated_order(graphs[1], 1)?,
-            validated_order(graphs[2], 2)?,
-        ];
-        Some(Self { template, orders })
-    }
-
-    pub(crate) fn template(&self) -> &'a CommitTemplateDfas {
-        self.template
-    }
-    pub(crate) fn orders(&self) -> &[Vec<usize>; 3] {
-        &self.orders
-    }
-    pub(crate) fn push_order(&self) -> &[usize] {
-        &self.orders[2]
-    }
-}
+//! Shared, immutable validation used by both input domains and fast views.
+//! The borrowed proof owns only temporary topological orders; all runtime
+//! indices retain their existing representations and independent fallbacks.
+pub(crate) use glrmask_parser_dwa::__private::templates::admissibility::ValidatedTemplate as TemplatePreparation;
 
 #[cfg(test)]
 mod tests {
@@ -93,6 +10,9 @@ mod tests {
         single_cursor::PreparedInputCursor,
     };
     use super::*;
+    use crate::automata::unweighted_u32::dfa::DFA;
+    use crate::compiler::glr::labels::DEFAULT_LABEL;
+    use crate::runtime::CommitTemplateDfas;
     use crate::compiler::glr::labels::encode_negative_label;
 
     fn assert_same(template: &CommitTemplateDfas) {
@@ -213,21 +133,21 @@ mod tests {
         let mut t = base.clone();
         t.pop.add_state();
         t.pop.add_transition(1, DEFAULT_LABEL, 1);
-        assert!(TemplatePreparation::new(&t).is_none());
+        assert!(TemplatePreparation::new(&t).is_err());
         let mut t = base.clone();
         t.read.add_transition(0, DEFAULT_LABEL, 0);
-        assert!(TemplatePreparation::new(&t).is_none());
+        assert!(TemplatePreparation::new(&t).is_err());
         let mut t = base.clone();
         t.push.add_transition(0, 1, 0);
-        assert!(TemplatePreparation::new(&t).is_none());
+        assert!(TemplatePreparation::new(&t).is_err());
         let mut t = base.clone();
         t.pop_to_push = vec![Some(100)];
-        assert!(TemplatePreparation::new(&t).is_none());
+        assert!(TemplatePreparation::new(&t).is_err());
         let mut t = base.clone();
         t.read_to_push = vec![None, None];
-        assert!(TemplatePreparation::new(&t).is_none());
+        assert!(TemplatePreparation::new(&t).is_err());
         let mut t = base;
         t.pop.start_state = 1;
-        assert!(TemplatePreparation::new(&t).is_none());
+        assert!(TemplatePreparation::new(&t).is_err());
     }
 }

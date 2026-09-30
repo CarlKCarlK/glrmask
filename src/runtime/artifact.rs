@@ -1524,8 +1524,17 @@ pub(crate) struct FastCommitTemplateDfas {
 
 impl FastCommitTemplateDfas {
     pub(crate) fn from_template(template: &CommitTemplateDfas) -> Self {
-        let prepared = super::commit::template_prepare::TemplatePreparation::new(template);
-        let (input_cursor, phase_dag, push_suffixes, push_dag) = match prepared.as_ref() {
+        let prepared = super::commit::template_prepare::TemplatePreparation::new(template).ok();
+        Self::from_preparation(template, prepared.as_ref())
+    }
+
+    pub(crate) fn from_prepared(prepared: &super::commit::template_prepare::TemplatePreparation<'_>) -> Self {
+        Self::from_preparation(prepared.template(), Some(prepared))
+    }
+
+    fn from_preparation(template: &CommitTemplateDfas,
+        prepared: Option<&super::commit::template_prepare::TemplatePreparation<'_>>) -> Self {
+        let (input_cursor, phase_dag, push_suffixes, push_dag) = match prepared {
             Some(prepared) => (
                 Some(super::commit::single_cursor::PreparedInputCursor::from_prepared(prepared)),
                 super::commit::phase_dag::PreparedPhaseDag::from_prepared(prepared),

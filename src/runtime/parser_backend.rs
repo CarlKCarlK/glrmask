@@ -139,28 +139,52 @@ fn intersecting_bits<'a>(left: &'a BitSet, right: &'a BitSet) -> impl Iterator<I
 
 impl TemplateParser {
     pub(crate) fn compile(
-        state_count: u32,
-        terminal_count: u32,
-        skip_terminals: BTreeSet<TerminalID>,
-        templates: &[Option<Arc<CommitTemplateDfas>>],
-        completion_template: CommitTemplateDfas,
+        state_count: u32, terminal_count: u32, skip_terminals: BTreeSet<TerminalID>,
+        templates: &[Option<Arc<CommitTemplateDfas>>], completion_template: CommitTemplateDfas,
     ) -> crate::Result<Self> {
+        Self::compile_inner(state_count, terminal_count, skip_terminals, templates,
+            completion_template, false).map(|(parser, _)| parser)
+    }
+
+    pub(crate) fn compile_with_runtime(
+        state_count: u32, terminal_count: u32, skip_terminals: BTreeSet<TerminalID>,
+        templates: &[Option<Arc<CommitTemplateDfas>>], completion_template: CommitTemplateDfas,
+    ) -> crate::Result<(Self, crate::runtime::artifact::FastTemplateDfasByTerminal)> {
+        Self::compile_inner(state_count, terminal_count, skip_terminals, templates,
+            completion_template, true)
+    }
+
+    fn compile_inner(
+        state_count: u32, terminal_count: u32, skip_terminals: BTreeSet<TerminalID>,
+        templates: &[Option<Arc<CommitTemplateDfas>>], completion_template: CommitTemplateDfas,
+        prepare_runtime: bool,
+    ) -> crate::Result<(Self, crate::runtime::artifact::FastTemplateDfasByTerminal)> {
         if templates.len() != terminal_count as usize {
             return Err(crate::Error::Compilation("template parser must provide every terminal relation, including explicit empty relations".into()));
         }
         let mut domains = Vec::with_capacity(templates.len());
+        let mut runtime = Vec::with_capacity(if prepare_runtime { templates.len() } else { 0 });
         for (terminal, template) in templates.iter().enumerate() {
             let template = template.as_deref().ok_or_else(|| crate::Error::Compilation(format!("missing template for terminal {terminal}")))?;
-            domains.push(compile_domain(template)?);
+            let validated = super::commit::template_prepare::TemplatePreparation::new(template)
+                .map_err(crate::Error::Compilation)?;
+            validated.validate_alphabet(state_count).map_err(crate::Error::Compilation)?;
+            domains.push(TemplateDomain::from_validated(&validated).map_err(crate::Error::Compilation)?);
+            if prepare_runtime {
+                runtime.push(Some(Arc::new(crate::runtime::artifact::FastCommitTemplateDfas::from_prepared(&validated))));
+            }
         }
-        let completion = compile_domain(&completion_template)?;
+        let validated = super::commit::template_prepare::TemplatePreparation::new(&completion_template)
+            .map_err(crate::Error::Compilation)?;
+        validated.validate_alphabet(state_count).map_err(crate::Error::Compilation)?;
+        let completion = TemplateDomain::from_validated(&validated).map_err(crate::Error::Compilation)?;
         let (possible, unconditional) = top_certificate_rows(state_count, &domains, &completion);
         let profile = std::env::var_os("GLRMASK_PROFILE_TEMPLATE_BACKEND").is_some();
-        Ok(Self { state_count, terminal_count, skip_terminals,
+        Ok((Self { state_count, terminal_count, skip_terminals,
             completion_template: Arc::new(completion_template), domains, completion,
             possible, unconditional, profile,
             advances: AtomicU64::new(0), admissions: AtomicU64::new(0), completions: AtomicU64::new(0),
-        })
+        }, runtime))
     }
 
     #[inline]
@@ -470,9 +494,10 @@ impl Constraint {
                 .map_err(crate::Error::Compilation)?;
             (templates, completion, self.table.num_states)
         };
-        let parser = TemplateParser::compile(state_count, terminal_count, self.table.skip_terminals.clone(), &templates, completion)?;
+        let (parser, runtime) = TemplateParser::compile_with_runtime(state_count, terminal_count,
+            self.table.skip_terminals.clone(), &templates, completion)?;
         self.template_dfas_by_terminal = templates;
-        self.fast_template_dfas_by_terminal = self.compute_fast_template_dfas();
+        self.fast_template_dfas_by_terminal = runtime;
         self.serialized_artifact_cache = None;
         self.deferred_table_rules_blob = None;
         self.deferred_table_rules = Default::default();

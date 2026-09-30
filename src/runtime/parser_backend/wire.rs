@@ -188,17 +188,17 @@ impl ParserSeed {
         {
             return Err("template parser artifact cannot contain unsupported composition machinery".into());
         }
-        for template in &constraint.template_dfas_by_terminal {
-            let template = template.as_deref().ok_or("missing template parser terminal relation")?;
-            validate_alphabet(template, self.state_count)?;
-        }
-        let parser = TemplateParser::compile(self.state_count, self.terminal_count, self.skip_terminals,
-            &constraint.template_dfas_by_terminal, self.completion).map_err(|error| error.to_string())?;
+        // Complete graph and alphabet validation is shared with input-domain
+        // and fast-view preparation. This also checks legacy core programs;
+        // no persisted flag is trusted and no validation is deferred to runtime.
+        let (parser, runtime) = TemplateParser::compile_with_runtime(self.state_count,
+            self.terminal_count, self.skip_terminals, &constraint.template_dfas_by_terminal,
+            self.completion).map_err(|error| error.to_string())?;
         constraint.template_parser = Some(Arc::new(parser));
         constraint.table = ParserTableStorage::absent();
         constraint.deferred_table_rules_blob = None;
         constraint.deferred_table_rules = Default::default();
-        constraint.fast_template_dfas_by_terminal = constraint.compute_fast_template_dfas();
+        constraint.fast_template_dfas_by_terminal = runtime;
         Ok(())
     }
 }

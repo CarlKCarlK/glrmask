@@ -64,7 +64,7 @@ pub struct TemplateDomain {
 #[derive(Debug, Clone, Copy)]
 enum Phase { Pop, Read, Push }
 
-fn topological_order(dfa: &DFA, phase: Phase) -> Result<Vec<u32>, String> {
+fn topological_order(dfa: &DFA, phase: Phase) -> Result<(Vec<usize>, Option<u32>), String> {
     if !dfa.states.is_empty() && dfa.start_state as usize >= dfa.states.len() {
         return Err(format!("{phase:?} start {} outside {} states", dfa.start_state, dfa.states.len()));
     }
@@ -75,6 +75,7 @@ fn topological_order(dfa: &DFA, phase: Phase) -> Result<Vec<u32>, String> {
         return Err(format!("{phase:?} state count exceeds the template domain coordinate"));
     }
     let mut indegree = vec![0usize; dfa.states.len()];
+    let mut largest_symbol = None;
     for (source, state) in dfa.states.iter().enumerate() {
         for (&label, &target) in &state.transitions {
             let legal = match phase {
@@ -85,26 +86,30 @@ fn topological_order(dfa: &DFA, phase: Phase) -> Result<Vec<u32>, String> {
             if !legal {
                 return Err(format!("{phase:?} state {source} contains wrong-phase label {label}"));
             }
+            if label != DEFAULT_LABEL {
+                let symbol = if label < 0 { label.wrapping_sub(i32::MIN) as u32 } else { label as u32 };
+                largest_symbol = Some(largest_symbol.map_or(symbol, |old: u32| old.max(symbol)));
+            }
             let Some(degree) = indegree.get_mut(target as usize) else {
                 return Err(format!("{phase:?} state {source} targets missing state {target}"));
             };
             *degree += 1;
         }
     }
-    let mut pending: VecDeque<u32> = indegree.iter().enumerate()
-        .filter_map(|(id, &degree)| (degree == 0).then_some(id as u32)).collect();
+    let mut pending: VecDeque<usize> = indegree.iter().enumerate()
+        .filter_map(|(id, &degree)| (degree == 0).then_some(id)).collect();
     let mut order = Vec::with_capacity(dfa.states.len());
     while let Some(source) = pending.pop_front() {
         order.push(source);
         for &target in dfa.states[source as usize].transitions.values() {
             indegree[target as usize] -= 1;
-            if indegree[target as usize] == 0 { pending.push_back(target); }
+            if indegree[target as usize] == 0 { pending.push_back(target as usize); }
         }
     }
     if order.len() != dfa.states.len() {
         return Err(format!("{phase:?} template is cyclic"));
     }
-    Ok(order)
+    Ok((order, largest_symbol))
 }
 
 fn validate_links(links: &[Option<u32>], source_len: usize, target_len: usize, name: &str) -> Result<(), String> {
@@ -151,14 +156,55 @@ fn merged_domain_row(
     row
 }
 
-impl TemplateDomain {
-    pub fn compile(template: &CommitTemplateDfas) -> Result<Self, String> {
-        let pop_order = topological_order(&template.pop, Phase::Pop)?;
-        let read_order = topological_order(&template.read, Phase::Read)?;
-        let push_order = topological_order(&template.push, Phase::Push)?;
+/// A borrow of an immutable, completely validated split stack program.
+///
+/// The validation covers every node, including unreachable nodes, every phase
+/// label and link, and acyclicity. The graph orders are preparation scratch:
+/// consumers may share them but cannot construct this proof for another graph.
+/// No parser table, output-stack enumeration, or persisted trusted flag is used.
+#[derive(Debug)]
+pub struct ValidatedTemplate<'a> {
+    template: &'a CommitTemplateDfas,
+    orders: [Vec<usize>; 3],
+    largest_symbol: Option<u32>,
+}
+
+impl<'a> ValidatedTemplate<'a> {
+    pub fn new(template: &'a CommitTemplateDfas) -> Result<Self, String> {
+        let (pop, pop_symbol) = topological_order(&template.pop, Phase::Pop)?;
+        let (read, read_symbol) = topological_order(&template.read, Phase::Read)?;
+        let (push, push_symbol) = topological_order(&template.push, Phase::Push)?;
         validate_links(&template.pop_to_read, template.pop.states.len(), template.read.states.len(), "POP->READ")?;
         validate_links(&template.pop_to_push, template.pop.states.len(), template.push.states.len(), "POP->PUSH")?;
         validate_links(&template.read_to_push, template.read.states.len(), template.push.states.len(), "READ->PUSH")?;
+        let largest_symbol = [pop_symbol, read_symbol, push_symbol].into_iter().flatten().max();
+        Ok(Self { template, orders: [pop, read, push], largest_symbol })
+    }
+
+    pub fn template(&self) -> &'a CommitTemplateDfas { self.template }
+    pub fn orders(&self) -> &[Vec<usize>; 3] { &self.orders }
+    pub fn push_order(&self) -> &[usize] { &self.orders[2] }
+
+    /// Alphabet checks reuse the maximum observed during graph validation,
+    /// including labels in unreachable states. This is not a promise about an
+    /// unchecked caller-supplied bound or a flag read from an artifact.
+    pub fn validate_alphabet(&self, symbols: u32) -> Result<(), String> {
+        if let Some(symbol) = self.largest_symbol && symbol >= symbols {
+            return Err(format!("template stack symbol {symbol} outside alphabet {symbols}"));
+        }
+        Ok(())
+    }
+}
+
+impl TemplateDomain {
+    pub fn compile(template: &CommitTemplateDfas) -> Result<Self, String> {
+        Self::from_validated(&ValidatedTemplate::new(template)?)
+    }
+
+    /// Derive the exact input domain while reusing a complete graph validation.
+    pub fn from_validated(validated: &ValidatedTemplate<'_>) -> Result<Self, String> {
+        let template = validated.template();
+        let [pop_order, read_order, push_order] = validated.orders();
 
         let mut push_good = vec![false; template.push.states.len()];
         for &id in push_order.iter().rev() {
