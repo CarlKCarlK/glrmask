@@ -26,15 +26,15 @@ use crate::compiler::glr::table::GlrTableConstruction;
 use crate::runtime::Constraint;
 use crate::dynamic_constraint::DynamicConstraint;
 
-fn parse_ebnf_to_named(source: &str) -> crate::Result<ast::NamedGrammar> {
+pub(crate) fn parse_ebnf_to_named(source: &str) -> crate::Result<ast::NamedGrammar> {
     Ok(ebnf::parse_ebnf_to_named(source)?)
 }
 
-fn parse_lark_to_named(source: &str) -> crate::Result<ast::NamedGrammar> {
+pub(crate) fn parse_lark_to_named(source: &str) -> crate::Result<ast::NamedGrammar> {
     Ok(lark::parse_lark_to_named(source)?)
 }
 
-fn parse_glrm_to_named(source: &str) -> crate::Result<ast::NamedGrammar> {
+pub(crate) fn parse_glrm_to_named(source: &str) -> crate::Result<ast::NamedGrammar> {
     Ok(crate::grammar::glrm::from_glrm(source)?)
 }
 
@@ -60,7 +60,7 @@ const LARGE_IMPORT_SOURCE_BYTES: usize = 64 * 1024;
 #[cfg(windows)]
 const WINDOWS_LARGE_IMPORT_STACK_BYTES: usize = 64 * 1024 * 1024;
 
-fn with_large_import_stack<T, F>(source_len: usize, compile: F) -> T
+pub(crate) fn with_large_import_stack<T, F>(source_len: usize, compile: F) -> T
 where
     T: Send,
     F: FnOnce() -> T + Send,
@@ -786,7 +786,7 @@ pub fn __profile_json_schema_import(schema_json: &str) -> crate::Result<()> {
     Ok(())
 }
 
-fn parse_json_schema_to_named(schema_json: &str) -> crate::Result<ast::NamedGrammar> {
+pub(crate) fn parse_json_schema_to_named(schema_json: &str) -> crate::Result<ast::NamedGrammar> {
     let profile_top = std::env::var_os("GLRMASK_PROFILE_DYNAMIC_TOP").is_some();
     let parse_top_started = profile_top.then(std::time::Instant::now);
     let json_parse_started_at = emit_import_phase_start("serde_json_from_str");

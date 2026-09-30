@@ -1,0 +1,16 @@
+[package]
+name = "glrmask-parser-constructor-external-smoke"
+version = "0.0.0"
+edition = "2024"
+publish = false
+
+# This separate workspace tests an ordinary dependency without the parent's
+# dev-dependency feature unification or its internal-api feature.
+[workspace]
+
+[dependencies]
+glrmask = { path = "../../..", default-features = false }
+
+[[bin]]
+name = "parser-compiler-public-smoke"
+path = "../../../examples/parser_grammar_constructor.rs"

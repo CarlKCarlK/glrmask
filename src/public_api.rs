@@ -149,6 +149,34 @@ enum GrammarSource<'a> {
 }
 
 impl<'a> Grammar<'a> {
+
+    /// Resolve the parser-facing expression graph without selecting an LR
+    /// normal form. Source bindings are not part of this constructor boundary;
+    /// use a closed grammar or the ordinary compiled-component linker.
+    pub fn prepare_parser_grammar(&self) -> Result<crate::template_parser::PreparedParserGrammar> {
+        if !self.bindings.is_empty() {
+            return Err(Error::Compilation("custom parser construction requires a source without external bindings".into()));
+        }
+        let (source, parse): (&str, fn(&str) -> Result<glrmask_grammar::NamedGrammar>) = match self.source {
+            GrammarSource::Ebnf(source) => (source, crate::import::parse_ebnf_to_named),
+            GrammarSource::Lark(source) => (source, crate::import::parse_lark_to_named),
+            GrammarSource::JsonSchema(source) => (source, crate::import::parse_json_schema_to_named),
+            GrammarSource::Glrm(source) => (source, crate::import::parse_glrm_to_named),
+        };
+        crate::import::with_large_import_stack(source.len(), || {
+            crate::template_parser::PreparedParserGrammar::from_named(&parse(source)?)
+        })
+    }
+
+    /// Resolve this grammar, invoke a compile-time parser constructor once, and
+    /// assemble its template relations using the ordinary masking machinery.
+    /// For repeated experiments, retain `prepare_parser_grammar()` instead.
+    pub fn compile_with_parser(&self, vocab: &Vocab,
+        compiler: &(impl crate::template_parser::ParserCompiler + ?Sized),
+        options: crate::template_parser::TemplateBuildOptions) -> Result<crate::Constraint> {
+        self.prepare_parser_grammar()?.compile_parser(compiler)?.compile_with(vocab, options)
+    }
+
     #[cfg(any(test, feature = "internal-api"))]
     #[doc(hidden)]
     pub fn ebnf(source: &'a str) -> Self { Self::new(GrammarSource::Ebnf(source)) }

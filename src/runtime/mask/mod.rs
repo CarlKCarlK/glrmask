@@ -6492,8 +6492,13 @@ impl<'a> ConstraintState<'a> {
     /// a linker control chain. Ordinary parser-DWA weights remain the fast path;
     /// constraints without explicit controls pay nothing here.
     fn update_control_special_token_mask(&self, buf: &mut [u32]) {
+        if self.constraint.special_token_terminals.is_empty() { return; }
+        // A data-only constructor's static byte DWA deliberately has no exact
+        // token edges. Query the same complete parser relation for those IDs;
+        // exact-only tokens must never be reinterpreted as their vocabulary bytes.
         if !self.constraint.parser_has_controls()
             && !self.constraint.uses_compact_segmented_parser_runtime()
+            && !self.constraint.has_template_parser()
         {
             return;
         }
