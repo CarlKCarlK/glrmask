@@ -39,12 +39,34 @@ pub(crate) fn advance_stacks_template_dfa(
         .as_ref()?;
     let fast = constraint.fast_template_dfas_by_terminal
         .get(terminal as usize).and_then(|t| t.as_deref());
-    let output = match fast.and_then(|fast| super::simple_read_shift::apply(dfa, fast, stack)) {
-        Some(output) => output,
-        None => advance_with_prepared_template(dfa, stack.clone(), fast),
-    };
+    let output = advance_prepared_relation(dfa, stack, fast);
     debug_validate_template_output(dfa, stack, &output, terminal);
     Some(output)
+}
+
+/// Shared borrowed relation dispatch for ordinary and scoped composition
+/// advances. The prepared shift is an exact specialization of the same finite
+/// program, not an LR shortcut. Try it before cloning the interpreter input.
+#[inline]
+pub(crate) fn advance_prepared_relation(
+    template: &CommitTemplateDfas,
+    stack: &ParserGSS,
+    prepared: Option<&FastCommitTemplateDfas>,
+) -> ParserGSS {
+    if let Some(output) = prepared.and_then(|fast|
+        super::simple_read_shift::apply(template, fast, stack))
+    {
+        #[cfg(test)]
+        PREPARED_RELATION_SHORTCUTS.with(|count| count.set(count.get() + 1));
+        output
+    } else {
+        advance_with_prepared_template(template, stack.clone(), prepared)
+    }
+}
+
+#[cfg(test)]
+std::thread_local! {
+    pub(crate) static PREPARED_RELATION_SHORTCUTS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
 pub(super) fn advance_stacks_template_dfa_owned(

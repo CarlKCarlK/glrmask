@@ -11,7 +11,7 @@ use crate::compiler::glr::analysis::EOF;
 use crate::compiler::glr::parser::{ParserActionProvider, ParserGSS, ProvidedAction};
 use crate::compiler::glr::table::GLRTable;
 use crate::runtime::artifact::TemplateDfasByTerminal;
-use crate::runtime::commit::template_advance::advance_with_prepared_template;
+use crate::runtime::commit::template_advance::advance_prepared_relation;
 use crate::runtime::FastCommitTemplateDfas;
 use super::{Constraint, ParserTableStorage, TemplateParser,
     TemplateDomain, TopAdmission, matches_gss};
@@ -73,14 +73,27 @@ impl TemplateComposition {
     }
 
     pub(crate) fn admits(&self, stack: &ParserGSS, index: u32) -> bool {
-        self.domains.get(index as usize).is_some_and(|domain| matches_gss(domain, stack))
+        self.domains.get(index as usize).is_some_and(|domain| {
+            // The domain certificate quantifies every possible lower suffix.
+            // An exclusive concrete top can answer without traversing the GSS.
+            // Ambiguous frontiers and suffix-dependent rows use the exact
+            // existing domain interpreter, with no additional retained cache.
+            if let Some(top) = stack.single_exclusive_top_value() {
+                match domain.classify_top(top) {
+                    TopAdmission::Always => return true,
+                    TopAdmission::Never => return false,
+                    TopAdmission::DependsOnSuffix => {}
+                }
+            }
+            matches_gss(domain, stack)
+        })
     }
 
     fn advance(&self, stack: &ParserGSS, index: u32) -> ParserGSS {
         let Some(template) = self.programs.get(index as usize).and_then(Option::as_deref) else {
             return ParserGSS::empty();
         };
-        advance_with_prepared_template(template, stack.clone(),
+        advance_prepared_relation(template, stack,
             self.fast.get(index as usize).map(Arc::as_ref))
     }
 
@@ -123,7 +136,7 @@ impl ParserActionProvider for TemplateCompositionProvider<'_> {
         Some(if terminal < self.parser.terminal_count {
             let template = self.composition.outer_programs[terminal as usize].as_deref()
                 .expect("validated outer composition template");
-            advance_with_prepared_template(template, stack.clone(),
+            advance_prepared_relation(template, stack,
                 self.composition.outer_fast.get(terminal as usize).map(Arc::as_ref))
         } else if terminal != EOF {
             self.composition.advance(stack, terminal - self.parser.terminal_count)
@@ -138,6 +151,110 @@ impl ParserActionProvider for TemplateCompositionProvider<'_> {
 
     fn relation_finished(&self, stack: &ParserGSS, terminal: u32) -> Option<bool> {
         Some(terminal == EOF && self.parser.admits_control_closed(stack, EOF))
+    }
+}
+
+#[cfg(test)]
+mod prepared_relation_tests {
+    use super::*;
+    use crate::automata::unweighted_u32::dfa::DFA;
+    use crate::compiler::glr::accumulator::TerminalsDisallowed;
+    use crate::compiler::glr::labels::encode_negative_label;
+    use crate::runtime::CommitTemplateDfas;
+    use crate::runtime::commit::template_advance::{
+        advance_with_prepared_template, PREPARED_RELATION_SHORTCUTS,
+    };
+
+    fn rejecting() -> CommitTemplateDfas {
+        CommitTemplateDfas {
+            pop: DFA::new(), read: DFA::new(), push: DFA::new(),
+            pop_to_read: vec![None], pop_to_push: vec![None], read_to_push: vec![None],
+        }
+    }
+
+    fn shift() -> CommitTemplateDfas {
+        let mut t = rejecting();
+        let read = t.read.add_state();
+        t.read.add_transition(0, 5, read);
+        let end = t.push.add_state();
+        t.push.add_transition(0, encode_negative_label(7), end);
+        t.push.set_accepting(end, true);
+        t.pop_to_read[0] = Some(0);
+        t.read_to_push = vec![None, Some(0)];
+        t
+    }
+
+    fn suffix_dependent() -> CommitTemplateDfas {
+        let mut t = rejecting();
+        let first = t.pop.add_state();
+        let second = t.pop.add_state();
+        t.pop.add_transition(0, 5, first);
+        t.pop.add_transition(first, 4, second);
+        t.pop.set_accepting(second, true);
+        t.pop_to_read.resize(3, None);
+        t.pop_to_push.resize(3, None);
+        t
+    }
+
+    fn inputs() -> Vec<ParserGSS> {
+        vec![
+            ParserGSS::empty(),
+            ParserGSS::from_single_stack(vec![], TerminalsDisallowed::new()),
+            ParserGSS::from_single_stack(vec![0, 5], TerminalsDisallowed::new()),
+            ParserGSS::from_single_stack(vec![0, 4, 5], TerminalsDisallowed::new().with_insert(1, 3)),
+            ParserGSS::from_single_stack(vec![0, 3, 5], TerminalsDisallowed::new()),
+            ParserGSS::from_single_stack(vec![0, 6], TerminalsDisallowed::new()),
+            ParserGSS::from_stacks(&[
+                (vec![0, 4, 5], TerminalsDisallowed::new()),
+                (vec![0, 3, 5], TerminalsDisallowed::new().with_insert(2, 4)),
+                (vec![0, 6], TerminalsDisallowed::new().with_insert(0, 1)),
+            ]),
+        ]
+    }
+
+    #[test]
+    fn composition_scoped_and_outer_advance_use_the_shared_prepared_shift() {
+        let outer = vec![Some(Arc::new(shift()))];
+        let scoped = vec![Some(Arc::new(shift())), Some(Arc::new(suffix_dependent()))];
+        let mut parser = TemplateParser::compile(8, 1, Default::default(), &outer, rejecting()).unwrap();
+        parser.composition = Some(Arc::new(TemplateComposition::compile(8, 2, &outer, scoped).unwrap()));
+        let provider = parser.composition_provider().unwrap();
+        for input in inputs() {
+            let before = input.to_stacks(128).unwrap();
+            for terminal in [0, 1, 2] {
+                let program = if terminal == 0 { outer[0].as_deref().unwrap() }
+                    else { parser.composition.as_ref().unwrap().programs[(terminal-1) as usize].as_deref().unwrap() };
+                let expected = advance_with_prepared_template(program, input.clone(), None);
+                let actual = provider.advance_relation(&input, terminal).unwrap();
+                assert_eq!(actual.semantically_eq(&expected, 65536), Some(true));
+                assert_eq!(before, input.to_stacks(128).unwrap());
+            }
+        }
+        let input = ParserGSS::from_single_stack(vec![0, 5], TerminalsDisallowed::new());
+        for terminal in [0, 1] {
+            PREPARED_RELATION_SHORTCUTS.with(|count| count.set(0));
+            let actual = provider.advance_relation(&input, terminal).unwrap();
+            assert_eq!(PREPARED_RELATION_SHORTCUTS.with(|count| count.get()), 1,
+                "both outer and scoped composition must reach the common fast path");
+            assert_eq!(actual.semantically_eq(&input.push(7), 65536), Some(true));
+        }
+    }
+
+    #[test]
+    fn composition_scoped_admission_preserves_suffix_dependent_and_empty_cases() {
+        let outer = vec![Some(Arc::new(shift()))];
+        let scoped = vec![Some(Arc::new(shift())), Some(Arc::new(suffix_dependent())),
+                          Some(Arc::new(rejecting()))];
+        let composition = TemplateComposition::compile(8, 2, &outer, scoped).unwrap();
+        assert_eq!(composition.domains[0].classify_top(5), TopAdmission::Always);
+        assert_eq!(composition.domains[0].classify_top(6), TopAdmission::Never);
+        assert_eq!(composition.domains[1].classify_top(5), TopAdmission::DependsOnSuffix);
+        for input in inputs() {
+            for (index, domain) in composition.domains.iter().enumerate() {
+                assert_eq!(composition.admits(&input, index as u32), matches_gss(domain, &input));
+            }
+            assert!(!composition.admits(&input, u32::MAX));
+        }
     }
 }
 
