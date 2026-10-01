@@ -281,3 +281,12 @@ required-features = ["internal-api"]
 name = "template_follow_support_oracle"
 path = "tests/template_follow_support_oracle.rs"
 required-features = ["internal-api"]
+
+[[test]]
+name = "template_parser_randomized"
+path = "tests/template_parser_randomized.rs"
+
+[[test]]
+name = "template_parser_artifact_bounds"
+path = "tests/template_parser_artifact_bounds.rs"
+required-features = ["internal-api"]

@@ -8488,11 +8488,18 @@ impl Constraint {
                         inventory,
                     );
                 }
-                if loaded_packed_dwa_dense_masks {
-                    constraint.rebuild_runtime_caches_preserving_packed_dwa_dense_masks();
-                } else {
-                    constraint.rebuild_runtime_caches();
-                }
+                // ParserSeed::install already prepared these exact indices.
+                // Nothing between installation and here mutates the template
+                // inventory; lexical/vocabulary restoration is independent of
+                // FastCommitTemplateDfas. Cloning the Arc vector retains the
+                // existing indices during finalization without deep-copying
+                // graphs or adding a persistent cache-provenance field.
+                let prepared_template_indices = constraint.has_template_parser()
+                    .then(|| constraint.fast_template_dfas_by_terminal.clone());
+                constraint.rebuild_runtime_caches_impl(
+                    loaded_packed_dwa_dense_masks,
+                    prepared_template_indices,
+                );
             }
         }
         if let Some(total_started) = total_started {

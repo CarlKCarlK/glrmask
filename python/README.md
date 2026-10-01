@@ -141,6 +141,56 @@ The intent-level optimization choices are:
 
 They preserve language semantics and all return the same `Constraint` type. They do not expose GLRMask's internal static/dynamic/O1/O2/O3 engines.
 
+### Select a table-free parser
+
+`parser_backend` is independent of `optimization`. The default remains
+`ParserBackend.LR_TABLE`; select the acyclic template backend explicitly:
+
+```python
+constraint = grammar.compile(
+    vocab,
+    optimization=glrmask.Optimization.FAST_RUNTIME,
+    parser_backend=glrmask.ParserBackend.TEMPLATE_DFA,
+)
+assert constraint.parser_backend == glrmask.ParserBackend.TEMPLATE_DFA
+```
+
+The runtime and saved artifact do not retain an LR table. Built-in grammar
+compilation may use LR machinery transiently to derive the template relations.
+The ordinary mask and commit engines remain shared, and the backend selection
+survives serialization. This is not a promise that every grammar, latency
+percentile, or load operation is faster.
+
+To supply a parser without an LR grammar, construct
+`glrmask.ParserProgram(definition)` from a JSON string or a JSON-serializable
+mapping describing its acyclic POP/READ/PUSH graphs. The program validates and
+owns the data; no Python callback executes during token generation. Compile it
+with a matching ordered list of terminal patterns: `bytes` means a literal,
+and `str` means a regular expression.
+
+```python
+program = glrmask.ParserProgram(definition)
+constraint = program.compile(
+    vocab,
+    terminal_patterns,
+    optimization=glrmask.Optimization.FAST_RUNTIME,
+)
+```
+
+For data-only programs, `FAST_RUNTIME` requests the shared static mask compiler;
+`FAST_BUILD`, `AUTO`, and the default use the shared dynamic engine. An oversized
+static expansion raises an error instead of silently choosing a different mode.
+See the [template parser contract](../docs/template-parser.md) and the
+[executable Python examples](tests/test_template_parser.py) for the exact graph
+format and independent language checks.
+
+Compiled-component composition is explicitly unsupported for template-backed
+constraints. Such a link raises `ValueError`; it does not fall back to an LR
+table. Ordinary LR-backed composition remains unchanged.
+The [validation report](../docs/template-parser-validation-2026-09-30.md)
+includes measured results and the remaining performance and compatibility
+tradeoffs behind the unchanged default.
+
 ### Bind source children
 
 Source composition stays in the source world:
@@ -222,7 +272,9 @@ An end token is allowed only when the grammar body is accepting. A child's previ
 
 ### Constraint persistence
 
-`Constraint` objects are immutable/shareable and remain composable after loading:
+`Constraint` objects are immutable/shareable and retain their selected backend
+after loading. LR-backed constraints remain composable; template-backed
+compiled-component composition is not yet supported:
 
 ```python
 artifact = constraint.save()
@@ -230,6 +282,18 @@ constraint = glrmask.Constraint.load(artifact)
 ```
 
 Passing `vocab=` to `Constraint.load` or `UnlinkedConstraint.load` is optional and validates/shares an already-existing exact vocabulary object.
+
+For a template-backed `Constraint`, `save_with_external_vocab()` omits the model
+vocabulary. Loading this form requires the original exact vocabulary mapping:
+
+```python
+artifact = constraint.save_with_external_vocab()
+constraint = glrmask.Constraint.load(artifact, vocab=vocab)
+```
+
+Loading an external-vocabulary artifact without its vocabulary, or with a
+different mapping, raises an error. Do not treat matching vocabulary size alone
+as a matching mapping.
 
 ## Grammar formats
 
