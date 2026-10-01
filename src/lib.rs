@@ -809,7 +809,7 @@ pub mod __private {
         }
 
         fn num_terminals(&self) -> u32 {
-            self.table.num_terminals
+            self.parser_terminal_count()
         }
 
         fn num_tokenizer_states(&self) -> usize {
