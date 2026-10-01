@@ -6,6 +6,8 @@ use std::collections::{HashMap as StdHashMap, HashSet, VecDeque};
 use std::hash::{Hash, Hasher};
 use std::sync::{Arc, OnceLock};
 
+mod prefix_projection;
+
 /// Type alias for segment values. Set `STACKVEC` before process startup:
 ///   normal builds: `vec` (default), `arc`
 type SV<T> = DynStackVec<T>;

@@ -50,21 +50,50 @@ fn complete_possible_match_coordinate(
     })
 }
 
+fn local_boundaries_are_static(constraint: &Constraint) -> bool {
+    !constraint.uses_dynamic_runtime() && constraint.static_dynamic_overlay.as_ref().is_some_and(|overlay|
+        overlay.segmented_parser_components.iter().all(|component| match component.boundary.as_ref() {
+            Some(shard) => matches!(shard.backend, SegmentedBoundaryShardBackend::StaticParser(_)),
+            None => true,
+        }))
+}
+
+fn needs_static_boundaries(constraint: &Constraint) -> bool {
+    constraint.uses_compact_segmented_parser_runtime() && (!local_boundaries_are_static(constraint)
+        || constraint.static_dynamic_overlay.as_ref().is_some_and(|overlay|
+            overlay.segmented_parser_components.iter().any(|component| needs_static_boundaries(&component.constraint))))
+}
+
 pub(crate) fn install(constraint: &mut Constraint, vocab: &Vocab) -> Result<()> {
     if !constraint.uses_compact_segmented_parser_runtime() { return Ok(()); }
     if !constraint.has_template_parser() { return Err(fail("static template boundary requires a table-free parser")); }
+    if !needs_static_boundaries(constraint) { return Ok(()); }
     // A nested reusable component keeps its literal structure. Upgrade only
     // its boundary implementation, leaving parser/lexer coordinates unchanged.
     if let Some(overlay) = constraint.static_dynamic_overlay.as_mut() {
         for component in &mut overlay.segmented_parser_components {
-            if component.constraint.uses_compact_segmented_parser_runtime() {
+            if needs_static_boundaries(&component.constraint) {
                 install(Arc::make_mut(&mut component.constraint), vocab)?;
             }
         }
     }
+    // Conversion to templates preserves every local parser/lexer coordinate.
+    // An existing static B therefore remains a complete exact program. Only
+    // changed child serialization needs invalidation when a descendant's B
+    // was upgraded; no parser, lexer or boundary graph is rebuilt here.
+    constraint.serialized_artifact_cache = None;
+    if local_boundaries_are_static(constraint) { return Ok(()); }
     let layout = constraint.recursive_parser_layout().map_err(fail)?
         .ok_or_else(|| fail("static template boundary has no scoped layout"))?;
-    let certificate = super::boundary_transfer::certify_bounded_closure(&layout.links).map_err(fail)?;
+    let profile = std::env::var_os("GLRMASK_PROFILE_COMPILE_SUMMARY").is_some();
+    let started = std::time::Instant::now();
+    if profile { eprintln!("[glrmask/profile][static_template_boundary] phase=begin leaves={} links={} stack_symbols={}",
+        layout.leaves.len(), layout.links.len(), layout.total_states); }
+    let certificate = if layout.links.iter().any(|link| link.child_start_nullable) {
+        None
+    } else {
+        Some(super::boundary_transfer::certify_bounded_closure(&layout.links).map_err(fail)?)
+    };
     let parser = constraint.template_parser.as_ref().ok_or_else(|| fail("missing template parser"))?;
     let composition = parser.composition.as_ref().ok_or_else(|| fail("missing composed template inventory"))?;
     if composition.control_start != layout.total_leaf_terminals {
@@ -115,21 +144,40 @@ pub(crate) fn install(constraint: &mut Constraint, vocab: &Vocab) -> Result<()> 
         if starts.iter().any(|value| *value) {
             plans.push(BoundaryShardWalkPlan { start_component: component,
                 crossing_owner: ImmediateComponentId(component as u32), commit_states: starts,
-                retain_non_crossing_paths: false });
+                // A nullable call can enable a terminal word entirely within
+                // its caller's lexical scope. A cannot recognize the unresolved
+                // placeholder, so B must keep these same-owner paths as well.
+                // The exact control-star program below still decides viability.
+                retain_non_crossing_paths: certificate.is_none() });
         }
     }
     let context = crate::template_parser::static_compile::lexical_context(layout.total_leaf_terminals);
-    let follows = BTreeMap::new();
+    let follow_started = std::time::Instant::now();
+    let proof_rows = super::template_follow_support::disallowed(&composition.programs,
+        layout.total_leaf_terminals as usize, 32_000_000).map_err(fail)?;
+    let mut follows = BTreeMap::new();
+    let mut excluded_pairs = 0usize;
+    for (terminal, exclusions) in proof_rows.into_iter().enumerate() {
+        if exclusions.is_empty() { continue; }
+        excluded_pairs += exclusions.len();
+        let mut row = BitSet::new(layout.total_leaf_terminals as usize);
+        for excluded in exclusions { row.set(excluded as usize); }
+        follows.insert(terminal as u32, row);
+    }
+    if profile { eprintln!("[glrmask/profile][static_template_boundary] phase=follow_support rows={} excluded_pairs={} elapsed_ms={:.3}",
+        follows.len(), excluded_pairs, follow_started.elapsed().as_secs_f64() * 1000.0); }
     let inputs = BoundaryShardLinkInputs {
         merged_tokenizer: &merged, vocab, grammar: &context, disallowed_follows: &follows,
         ignore_terminal: None, follow_transparent_ignores: Some(&transparent),
         terminal_offsets: &layout.leaf_terminal_offsets, leaf_to_immediate: Some(&owners),
         tokenizer_offsets: &tokenizer_offsets, component_state_counts: &state_counts,
-        candidate_tokens_by_component: None, retain_parent_non_crossing_paths: false,
+        candidate_tokens_by_component: None, retain_parent_non_crossing_paths: certificate.is_none(),
         walk_plans: Some(plans),
     };
     let (walks, _) = super::boundary_walk::build_boundary_shard_walks(&inputs)
         .ok_or_else(|| fail("static template boundary lexical walk could not certify its scope"))?;
+    if profile { eprintln!("[glrmask/profile][static_template_boundary] phase=lexical_done shards={} elapsed_ms={:.3}",
+        walks.len(), started.elapsed().as_secs_f64() * 1000.0); }
     // A remembers a delayed lexical decision using exact leaf terminal IDs.
     // Materialize its exclusions now, independently of the B quotient. The
     // shared static evaluator must never fall back to a vocabulary walk merely
@@ -147,16 +195,24 @@ pub(crate) fn install(constraint: &mut Constraint, vocab: &Vocab) -> Result<()> 
         }).collect::<Result<BTreeMap<_, _>>>()?;
     let templates = crate::template_parser::static_compile::prepare_static_templates(
         &composition.programs, parser.state_count)?;
+    if profile { eprintln!("[glrmask/profile][static_template_boundary] phase=programs_ready templates={} elapsed_ms={:.3}",
+        composition.programs.len(), started.elapsed().as_secs_f64() * 1000.0); }
     let controls = (composition.control_start..composition.programs.len() as u32).collect::<Vec<_>>();
     let mut published = Vec::with_capacity(walks.len());
     for walk in walks {
-        let output = super::boundary_transfer::template_program::compile(
-            &templates, &controls, &certificate, &walk.output.dwa, parser.state_count).map_err(fail)?;
+        let output = match &certificate {
+            Some(certificate) => super::boundary_transfer::template_program::compile(
+                &templates, &controls, certificate, &walk.output.dwa, parser.state_count),
+            None => super::boundary_transfer::template_program::compile_saturated(
+                &templates, &controls, &walk.output.dwa, parser.state_count),
+        }.map_err(fail)?;
         let work = WalkBoundaryShardWork { start_component: walk.start_component as u32,
             terminal_automaton: TerminalAutomaton::Dwa(walk.output.dwa), id_map: walk.output.id_map,
             candidate_tokens: Arc::from(walk.candidate_tokens.into_iter().collect::<Vec<_>>()) };
         let (shard, _) = super::boundary_transfer::publish_signed_shard(work, output,
             &tokenizer_offsets, &state_counts).map_err(fail)?;
+        if profile { eprintln!("[glrmask/profile][static_template_boundary] phase=shard_done component={} elapsed_ms={:.3}",
+            shard.start_component, started.elapsed().as_secs_f64() * 1000.0); }
         published.push(shard);
     }
     let overlay = constraint.static_dynamic_overlay.as_mut().unwrap();
@@ -204,5 +260,33 @@ pub(crate) fn install(constraint: &mut Constraint, vocab: &Vocab) -> Result<()> 
     constraint.serialized_artifact_cache = None;
     constraint.validate_template_composition_layout().map_err(fail)?;
     constraint.rebuild_runtime_caches();
+    if profile { eprintln!("[glrmask/profile][static_template_boundary] phase=done elapsed_ms={:.3}",
+        started.elapsed().as_secs_f64() * 1000.0); }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{BuildOptions, Grammar, Optimization};
+
+    #[test]
+    fn existing_static_component_bodies_are_retained_without_cloning_or_rebuilding() {
+        let vocab = Vocab::new(vec![(0, b"x".to_vec()), (1, b"a".to_vec()), (2, b"y".to_vec()), (3, b"xay".to_vec())]);
+        let child = Grammar::from_ebnf(r#"start ::= "a""#).compile(&vocab).unwrap();
+        let mut c = Grammar::from_glrm(r#"glrm 1; start root; extern grammar child; nt root = "x" child "y";"#)
+            .compile_unlinked(&vocab).unwrap().bind("child", &child).unwrap()
+            .link_with(BuildOptions::default().optimization(Optimization::FastRuntime)).unwrap();
+        c.install_template_parser().unwrap();
+        let bodies = c.static_dynamic_overlay.as_ref().unwrap().segmented_parser_components.iter()
+            .map(|component| Arc::clone(&component.constraint)).collect::<Vec<_>>();
+        let bytes = c.save();
+        assert!(!needs_static_boundaries(&c));
+        install(&mut c, &vocab).unwrap();
+        for (body, component) in bodies.iter().zip(&c.static_dynamic_overlay.as_ref().unwrap().segmented_parser_components) {
+            assert!(Arc::ptr_eq(body, &component.constraint));
+        }
+        assert_eq!(bytes, c.save());
+        let mut state = c.start(); state.commit_token(3).unwrap(); assert!(state.is_accepting());
+    }
 }

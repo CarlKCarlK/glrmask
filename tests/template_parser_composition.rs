@@ -92,15 +92,57 @@ fn strict_static_table_free_nested_composition_uses_no_dynamic_boundary() {
 }
 
 #[test]
-fn unbounded_nullable_static_control_requests_fail_without_dynamic_fallback() {
-    let (vocab, _) = vocabulary();
-    let child = Grammar::from_ebnf(r#"start ::= "a"?"#).compile_with(&vocab,
-        BuildOptions::default().optimization(Optimization::FastBuild).parser_backend(ParserBackend::TemplateDfa)).unwrap();
-    let bound = Grammar::from_glrm(HOST).compile_unlinked(&vocab).unwrap().bind("child", &child).unwrap();
-    let error = bound.link_with(BuildOptions::default().optimization(Optimization::FastRuntime)
-        .parser_backend(ParserBackend::TemplateDfa)).unwrap_err();
-    assert!(error.to_string().contains("nullable"), "{error}");
-    assert_eq!(child.parser_backend(), ParserBackend::TemplateDfa);
+fn strict_static_nullable_controls_have_no_unfolding_depth_limit() {
+    const CHILD: &str = "GLRMASK_TEMPLATE_NULLABLE_STATIC_TEST_CHILD";
+    if std::env::var_os(CHILD).is_none() {
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .arg("--exact").arg("strict_static_nullable_controls_have_no_unfolding_depth_limit")
+            .arg("--nocapture").arg("--test-threads=1")
+            .env(CHILD, "1").env("GLRMASK_STRICT_STATIC_TRAP_DYNAMIC", "1")
+            .output().unwrap();
+        assert!(output.status.success(), "{}\n{}", String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr));
+        return;
+    }
+    let (vocab, tokens) = vocabulary();
+    let options = || BuildOptions::default().optimization(Optimization::FastRuntime).parser_backend(ParserBackend::TemplateDfa);
+    let child = Grammar::from_ebnf(r#"start ::= "a"?"#).compile_with(&vocab, options()).unwrap();
+    // A single gap can require 128 CALL/RETURN events despite link depth 1.
+    let parent = Grammar::from_glrm(r#"glrm 1; start root; extern grammar child; nt root = "x" child{64} "y";"#)
+        .compile_unlinked(&vocab).unwrap();
+    let c = parent.bind("child", &child).unwrap().link_with(options()).unwrap();
+    let words = (0..=64).map(|count| format!("x{}y", "a".repeat(count)).into_bytes()).collect::<Vec<_>>();
+    let words = words.iter().map(Vec::as_slice).collect::<Vec<_>>();
+    let loaded = Constraint::load(c.save()).unwrap();
+    let external = Constraint::load_with_vocab(c.save_with_external_vocab().unwrap(), &vocab).unwrap();
+    for c in [&c, &loaded, &external] { assert_static_boundaries(c); assert_language(c, &tokens, &words); }
+
+    // Nullable repetition has no finite control-word enumeration bound.
+    // Its language is x a* y; check against a direct byte-language predicate.
+    let parent = Grammar::from_glrm(r#"glrm 1; start root; extern grammar child; nt root = "x" child* "y";"#)
+        .compile_unlinked(&vocab).unwrap();
+    let c = parent.bind("child", &child).unwrap().link_with(options()).unwrap();
+    let loaded = Constraint::load(c.save()).unwrap();
+    fn viable(word: &[u8]) -> bool {
+        if word.is_empty() { return true; }
+        if word[0] != b'x' { return false; }
+        let tail = word[1..].strip_suffix(b"y").unwrap_or(&word[1..]);
+        tail.iter().all(|&byte| byte == b'a')
+    }
+    for c in [&c, &loaded] {
+        assert_static_boundaries(c);
+        for count in [0usize, 1, 2, 7, 31, 65, 128] {
+            let prefix = format!("x{}", "a".repeat(count)).into_bytes();
+            let mut state = c.start(); state.commit_bytes(&prefix).unwrap(); assert!(!state.is_accepting());
+            let mask = state.mask();
+            for (id, bytes) in &tokens {
+                let mut candidate = prefix.clone(); candidate.extend(bytes);
+                let actual = mask.get(*id as usize / 32).is_some_and(|word| word & (1 << (*id % 32)) != 0);
+                assert_eq!(actual, viable(&candidate), "prefix_len={} token={bytes:?}", prefix.len());
+            }
+            state.commit_bytes(b"y").unwrap(); assert!(state.is_accepting());
+        }
+    }
 }
 
 #[test]
@@ -187,7 +229,6 @@ fn already_table_free_children_link_without_reconstructing_tables() {
                 assert_eq!(glrmask::__private::parser_backend_report(child)["finite_embedding"], true);
                 let bound = Grammar::from_glrm(HOST).compile_unlinked(&vocab).unwrap().bind("child", child).unwrap();
                 for mode in [Optimization::FastBuild, Optimization::Auto, Optimization::FastRuntime] {
-                    if nullable && mode == Optimization::FastRuntime { continue; }
                     let result = bound.link_with(BuildOptions::default().optimization(mode)
                         .parser_backend(ParserBackend::TemplateDfa)).unwrap();
                     let words: &[&[u8]] = if nullable { &[b"xy", b"xay"] } else { &[b"xay", b"xby", b"xaby"] };
@@ -262,7 +303,7 @@ fn assert_language(constraint: &Constraint, tokens: &[(u32, Vec<u8>)], words: &[
             if actual {
                 let mut replay = constraint.start();
                 replay.commit_bytes(&prefix).unwrap();
-                replay.commit_token(*id).unwrap();
+                replay.commit_token(*id).unwrap_or_else(|error| panic!("prefix={prefix:?} token={bytes:?} id={id}: {error}"));
                 assert_eq!(replay.is_accepting(), words.contains(&candidate.as_slice()), "commit {candidate:?}");
             }
         }

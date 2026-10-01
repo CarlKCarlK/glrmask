@@ -12,8 +12,24 @@ pub(super) fn assemble(
     lexical: &DWA,
     state_budget: Option<usize>,
 ) -> Result<(NWA, usize, usize), String> {
-    let depths = usize::try_from(max_controls_per_gap).ok()
-        .and_then(|n| n.checked_add(1)).ok_or("static template control depth overflow")?;
+    assemble_impl(templates, controls, Some(max_controls_per_gap), lexical, state_budget)
+}
+
+fn assemble_impl(
+    templates: &Templates,
+    controls: &[u32],
+    bounded_depth: Option<u32>,
+    lexical: &DWA,
+    state_budget: Option<usize>,
+) -> Result<(NWA, usize, usize), String> {
+    let depths = match bounded_depth {
+        Some(depth) => usize::try_from(depth).ok().and_then(|n| n.checked_add(1))
+            .ok_or("static template control depth overflow")?,
+        // Exact C*: only the after-consuming port 0 may publish a lexical
+        // final. The after-control port 1 loops through arbitrary controls.
+        // Two ports do not bound the number of zero-width parser advances.
+        None => 2,
+    };
     let port_count = lexical.states().len().checked_mul(depths)
         .filter(|&n| n <= u32::MAX as usize).ok_or("static template port count overflow")?;
     let mut arena = NWA::new(0, 0);
@@ -59,7 +75,8 @@ pub(super) fn assemble(
         }
     }
     for index in 0..lexical.states().len() {
-        for depth in 0..depths - 1 {
+        let control_layers = if bounded_depth.is_some() { depths - 1 } else { 1 };
+        for depth in 0..control_layers {
             for &control in controls {
                 let template = templates.by_terminal_nwa.get(&control)
                     .ok_or_else(|| format!("static query has no template for control {control}"))?;
@@ -69,6 +86,9 @@ pub(super) fn assemble(
                 control_states += template.states().len();
                 for &entry in &body.start_states {
                     arena.add_epsilon(ports[index * depths + depth], entry, Weight::all());
+                    if bounded_depth.is_none() {
+                        arena.add_epsilon(ports[index * depths + 1], entry, Weight::all());
+                    }
                 }
             }
         }
@@ -86,11 +106,33 @@ pub(crate) fn compile(
     lexical: &DWA,
     symbol_count: u32,
 ) -> Result<SignedShardOutput, String> {
+    compile_impl(templates, controls, Some(certificate.max_controls_per_gap), lexical, symbol_count)
+}
+
+/// Exact unbounded control closure for nullable components. This finite cyclic
+/// signed NWA is solved by the shared weighted cancellation and normalization
+/// fixed point, not by truncating a control path to a chosen depth.
+pub(crate) fn compile_saturated(
+    templates: &Templates,
+    controls: &[u32],
+    lexical: &DWA,
+    symbol_count: u32,
+) -> Result<SignedShardOutput, String> {
+    compile_impl(templates, controls, None, lexical, symbol_count)
+}
+
+fn compile_impl(
+    templates: &Templates,
+    controls: &[u32],
+    bounded_depth: Option<u32>,
+    lexical: &DWA,
+    symbol_count: u32,
+) -> Result<SignedShardOutput, String> {
     if !lexical.is_acyclic() { return Err("static template lexical query is cyclic".into()); }
     let start = Instant::now();
-    let (mut program, _, _) = assemble(templates, controls,
-        certificate.max_controls_per_gap, lexical, Some(1_000_000))?;
-    if !program.is_acyclic() {
+    let (mut program, _, _) = assemble_impl(templates, controls,
+        bounded_depth, lexical, Some(1_000_000))?;
+    if bounded_depth.is_some() && !program.is_acyclic() {
         return Err("static template program violates its finite control certificate".into());
     }
     let signed_states = program.states().len();

@@ -4530,6 +4530,25 @@ impl<'a> ConstraintState<'a> {
         );
 
         for (&global_tokenizer_state, gss) in self.state.iter() {
+            // A control-closed recursive frontier can represent exponentially
+            // many valid stacks. Project its shared graph instead of declaring
+            // a static-mask failure after enumerating 128 concrete paths.
+            if self.constraint.uses_compact_segmented_parser_runtime() && !gss.is_single_path() {
+                for (component_index, component) in overlay.segmented_parser_components.iter().enumerate() {
+                    let local_tokenizer_states = self.segmented_local_tokenizer_states(
+                        component_index, component, global_tokenizer_state);
+                    if local_tokenizer_states.is_empty() { continue; }
+                    let projected = gss.map_nonempty_top_prefixes(|&global|
+                        self.segmented_local_parser_state(component_index, component, global));
+                    if projected.is_empty() { continue; }
+                    let projected = projected.apply_and_prune(|acc|
+                        Some(self.segmented_local_disallowed(component_index, component, acc)));
+                    for local_state in local_tokenizer_states {
+                        projected_states[component_index].merge_insert(local_state, projected.clone());
+                    }
+                }
+                continue;
+            }
             let complete = gss.for_each_stack_top_first_bounded(128, |top_first, acc| {
                 // The old materialized segmented union had one synthetic root
                 // whose final language was the union of every component start

@@ -139,3 +139,5 @@ mod boundary_prefix_dominance;
 mod boundary_first_completion;
 mod boundary_finite_lexer;
 pub(crate) mod boundary_precomputed_completion;
+
+pub(crate) mod template_follow_support;

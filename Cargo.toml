@@ -267,3 +267,17 @@ strip = "none"
 [[test]]
 name = "parser_grammar_constructor"
 path = "tests/parser_grammar_constructor.rs"
+
+[[test]]
+name = "template_control_closure_oracle"
+path = "tests/template_control_closure_oracle.rs"
+required-features = ["internal-api"]
+
+[[example]]
+name = "template_precompiled_composition"
+required-features = ["internal-api"]
+
+[[test]]
+name = "template_follow_support_oracle"
+path = "tests/template_follow_support_oracle.rs"
+required-features = ["internal-api"]

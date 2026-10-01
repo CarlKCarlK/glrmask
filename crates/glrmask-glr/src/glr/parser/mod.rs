@@ -21,6 +21,9 @@ use std::sync::OnceLock;
 
 mod profile;
 
+#[cfg(test)]
+mod control_closure_tests;
+
 pub use profile::{
     AdvanceTrace,
     AdvanceTraceGoto,
@@ -5112,43 +5115,56 @@ pub fn close_provider_control_stacks<P: ParserActionProvider>(
     provider: &P,
     stack: &ParserGSS,
 ) -> ParserGSS {
-    if stack.is_empty() {
-        return stack.clone();
-    }
+    close_provider_control_stacks_budgeted(provider, stack, 16_000_000)
+}
+
+fn close_provider_control_stacks_budgeted<P: ParserActionProvider>(
+    provider: &P,
+    stack: &ParserGSS,
+    mut work_left: usize,
+) -> ParserGSS {
+    if stack.is_empty() { return stack.clone(); }
     let mut closure = stack.clone();
-    let pass_limit = provider.state_count_hint().saturating_mul(4).saturating_add(2);
+    let mut frontier = stack.clone();
     let mut symbols = SmallVec::<[P::Symbol; 4]>::new();
-    for _ in 0..pass_limit {
+    let mut rounds = 0usize;
+    loop {
         symbols.clear();
-        for state in closure.peek_values() {
-            provider.control_symbols(state, &mut symbols);
-        }
+        let tops = frontier.peek_values();
+        for &state in &tops { provider.control_symbols(state, &mut symbols); }
         let mut unique = SmallVec::<[P::Symbol; 4]>::new();
         for symbol in symbols.drain(..) {
-            if !unique.contains(&symbol) {
-                unique.push(symbol);
-            }
+            if !unique.contains(&symbol) { unique.push(symbol); }
         }
-        if unique.is_empty() {
-            return closure;
+        if unique.is_empty() { return closure; }
+        // State count is NOT a bound on closure rounds. A compressed bounded
+        // repetition can require hundreds of nullable calls with few states.
+        // Work/representation ceilings abort explicitly, never publish an
+        // incomplete closure as a successful parser state.
+        let cost = unique.len().saturating_mul(tops.len().max(1))
+            .saturating_mul(frontier.max_depth() as usize + 1);
+        work_left = work_left.checked_sub(cost).unwrap_or_else(|| {
+            glrmask_invariant::__private::fail_compilation_resource_limit(
+                "parser control closure exceeded its work budget; no partial closure was returned")
+        });
+        if rounds & 15 == 0 && closure.node_count_at_most(1_000_001) > 1_000_000 {
+            glrmask_invariant::__private::fail_compilation_resource_limit(
+                "parser control closure exceeded one million GSS nodes; no partial closure was returned");
         }
+        rounds += 1;
         let mut additions = ParserGSS::empty();
         for symbol in unique {
-            merge_into(
-                &mut additions,
-                advance_stacks_with_provider(provider, closure.clone(), symbol),
-            );
+            merge_into(&mut additions,
+                advance_stacks_with_provider(provider, frontier.clone(), symbol));
         }
-        if additions.is_empty() {
-            return closure;
-        }
+        if additions.is_empty() { return closure; }
         let merged = closure.merge(&additions);
-        if merged == closure {
-            return closure;
-        }
+        if merged == closure { return closure; }
+        // Stack relations distribute over union. Only the previous wave needs
+        // advancing; prior waves have already contributed all their images.
         closure = merged;
+        frontier = additions;
     }
-    closure
 }
 
 /// Advance one visible/provider symbol from a control-closed frontier and

@@ -8830,10 +8830,27 @@ impl<'a> ConstraintState<'a> {
         Some(Ok(()))
     }
 
-    pub(crate) fn commit_token_raw(
-        &mut self,
-        token_id: u32,
-    ) -> Result<(), String> {
+    pub(crate) fn commit_token_raw(&mut self, token_id: u32) -> Result<(), String> {
+        if !self.constraint.parser_has_controls() { return self.commit_token_raw_inner(token_id); }
+        match glrmask_invariant::__private::catch_compilation_resource_limit(|| self.commit_token_raw_inner(token_id)) {
+            Ok(result) => result,
+            Err(message) => self.reject_control_resource_limit(message),
+        }
+    }
+
+    fn reject_control_resource_limit(&mut self, message: String) -> Result<(), String> {
+        self.state.clear();
+        self.buffers = Default::default();
+        self.generation = self.generation.wrapping_add(1);
+        // An unwind may have crossed a diagnostic mask guard. Do not retain
+        // a poisoned mutex or a cached pre-failure mask in the rejected state.
+        self.mask_cache = std::sync::Mutex::new(None);
+        self.mask_scratch = std::sync::Arc::new(std::sync::Mutex::new(
+            crate::runtime::state::MaskScratch::for_constraint(self.constraint)));
+        Err(format!("parser resource limit: {message}"))
+    }
+
+    fn commit_token_raw_inner(&mut self, token_id: u32) -> Result<(), String> {
         if let Some(result) = self.commit_end_token(token_id) { return result; }
         let constraint = self.constraint;
         let bytes = token_bytes_for_id(constraint, token_id);
@@ -9074,6 +9091,14 @@ impl<'a> ConstraintState<'a> {
     }
 
     pub(crate) fn commit_bytes_raw(&mut self, bytes: &[u8]) -> Result<(), String> {
+        if !self.constraint.parser_has_controls() { return self.commit_bytes_raw_inner(bytes); }
+        match glrmask_invariant::__private::catch_compilation_resource_limit(|| self.commit_bytes_raw_inner(bytes)) {
+            Ok(result) => result,
+            Err(message) => self.reject_control_resource_limit(message),
+        }
+    }
+
+    fn commit_bytes_raw_inner(&mut self, bytes: &[u8]) -> Result<(), String> {
         if self.terminated {
             return Err("sequence has already terminated".to_owned());
         }
