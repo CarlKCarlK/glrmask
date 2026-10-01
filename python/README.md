@@ -184,9 +184,12 @@ See the [template parser contract](../docs/template-parser.md) and the
 [executable Python examples](tests/test_template_parser.py) for the exact graph
 format and independent language checks.
 
-Compiled-component composition is explicitly unsupported for template-backed
-constraints. Such a link raises `ValueError`; it does not fall back to an LR
-table. Ordinary LR-backed composition remains unchanged.
+Built-in template-backed children with finite embedding transfers support
+[compiled composition](../docs/template-parser-composition.md). Select
+`parser_backend=glrmask.ParserBackend.TEMPLATE_DFA` when linking them. Arbitrary
+data-only or older artifacts may lack the required embedding transfer; those
+links raise `ValueError` rather than reconstructing an LR table. Ordinary
+LR-backed composition remains unchanged.
 The [validation report](../docs/template-parser-validation-2026-09-30.md)
 includes measured results and the remaining performance and compatibility
 tradeoffs behind the unchanged default.
@@ -273,8 +276,8 @@ An end token is allowed only when the grammar body is accepting. A child's previ
 ### Constraint persistence
 
 `Constraint` objects are immutable/shareable and retain their selected backend
-after loading. LR-backed constraints remain composable; template-backed
-compiled-component composition is not yet supported:
+after loading. Built-in template-backed children also retain their finite
+embedding transfers for subsequent links with the template backend:
 
 ```python
 artifact = constraint.save()

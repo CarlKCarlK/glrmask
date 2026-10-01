@@ -90,8 +90,10 @@ program through the existing static token-mask DWA pipeline.
 `FastBuild`, `Auto`, and the convenience `program.compile(...)` use the existing
 dynamic mask engine. This is a build-time choice; an oversized static expansion
 returns an error rather than silently changing modes. Both choices retain the
-same token-level commit code and template parser primitives. Compiled-component
-composition remains explicitly unsupported for this backend.
+same token-level commit code and template parser primitives. Built-in compiled
+components with finite embedding transfers support
+[template composition](template-parser-composition.md). An arbitrary data-only
+program supplies no return-frame contract and is not implicitly composable.
 
 ### Static compilation without a grammar or table
 

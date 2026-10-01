@@ -155,13 +155,12 @@ def test_python_template_validation_is_early_and_does_not_retain_python_callback
         program.compile(vocab, ["(", b")", "[ ]+"])
 
 
-def test_python_compiled_composition_rejects_templates_without_changing_the_default():
+def test_python_compiled_composition_selects_templates_without_changing_the_default():
     vocab = glrmask.Vocab.from_id_to_bytes({0: b"a"})
     child = glrmask.Grammar.from_ebnf('start ::= "a"').compile(
         vocab, parser_backend=glrmask.ParserBackend.TEMPLATE_DFA)
     parent = glrmask.Grammar.from_glrm('glrm 1; start root; extern grammar C; nt root = C;').compile_unlinked(vocab)
-    # Binding only records an immutable attachment; final linking is the point
-    # where unsupported component composition must fail instead of using LR.
+    # An unchanged LR default cannot reinterpret a table-free child as LR.
     bound = parent.bind("C", child)
     with pytest.raises(ValueError, match="template-parser|table-free"):
         bound.link()
@@ -171,8 +170,37 @@ def test_python_compiled_composition_rejects_templates_without_changing_the_defa
     linked = parent.bind("C", ordinary).link()
     assert linked.parser_backend == glrmask.ParserBackend.LR_TABLE
     assert linked.start().mask()[0]
-    with pytest.raises(ValueError):
-        parent.bind("C", ordinary).link(parser_backend=glrmask.ParserBackend.TEMPLATE_DFA)
+    for source in [ordinary, child]:
+        linked = parent.bind("C", source).link(parser_backend=glrmask.ParserBackend.TEMPLATE_DFA)
+        for compiled in representations(linked, vocab):
+            assert compiled.parser_backend == glrmask.ParserBackend.TEMPLATE_DFA
+            state = compiled.start()
+            assert state.mask()[0]
+            state.commit_token(0)
+            assert state.is_accepting()
+
+
+@pytest.mark.parametrize("mode", [glrmask.Optimization.FAST_RUNTIME, glrmask.Optimization.FAST_BUILD])
+def test_python_precompiled_nullable_composition_preserves_crossings_and_root_end(mode):
+    vocab = glrmask.Vocab.from_id_to_bytes({0: b"x", 1: b"a", 2: b"y", 3: b"xay",
+                                          4: b"xy", 5: b"xx", 6: b""})
+    child = glrmask.Grammar.from_ebnf('start ::= "a"?').compile(
+        vocab, optimization=glrmask.Optimization.FAST_RUNTIME,
+        parser_backend=glrmask.ParserBackend.TEMPLATE_DFA)
+    parent = glrmask.Grammar.from_glrm(
+        'glrm 1; start root; extern grammar C; nt root = "x" C "y";').compile_unlinked(vocab)
+    linked = parent.bind("C", child).link(optimization=mode,
+        parser_backend=glrmask.ParserBackend.TEMPLATE_DFA, end_tokens=[6])
+    for compiled in representations(linked, vocab):
+        state = compiled.start()
+        assert np.array_equal(state.mask(), np.array([True, False, False, True, True, False, False]))
+        for token in [3, 4]:
+            state = compiled.start()
+            state.commit_token(token)
+            assert state.is_accepting()
+            assert state.mask()[6]
+            state.commit_token(6)
+            assert state.is_terminated()
 
 
 def test_python_backend_selection_does_not_accept_untyped_flags():

@@ -300,8 +300,8 @@ pub mod __private {
     }
 
     /// Experimental mandatory template backend. The LR table is dropped and
-    /// any accidental runtime table access fails loudly. Composition is not
-    /// supported by this experimental internal bridge.
+    /// any accidental runtime table access fails loudly. Composed constraints
+    /// are converted recursively without retaining packed compiler tables.
     pub fn into_template_parser(mut constraint: Constraint) -> Result<Constraint> {
         constraint.install_template_parser()?;
         Ok(constraint)

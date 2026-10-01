@@ -264,9 +264,11 @@ compilation can still use LR machinery to derive the program. Data-only
 `ParserProgram` providers bypass that frontend and support both static and
 dynamic mask compilation.
 
-Compiled-component composition is not supported with this backend. An
-unsupported request returns an error; it does not retain a hidden table or
-silently switch backends. Performance and load-time tradeoffs depend on the
+Built-in compiled components with finite embedding transfers support nested
+and nullable [template composition](docs/template-parser-composition.md).
+Select `TemplateDfa` explicitly when linking a template-backed child. Unsupported
+requests return errors rather than retaining a hidden table or switching
+backends. Performance and load-time tradeoffs depend on the
 grammar and mode, so template selection is not an automatic speed guarantee.
 See [the template parser contract](docs/template-parser.md) for provider
 examples, exact POP/READ/PUSH semantics, validation, and persistence.
@@ -298,7 +300,7 @@ constraint_bytes = constraint.save()
 constraint = glrmask.Constraint.load(constraint_bytes)
 ```
 
-A loaded LR-backed `Constraint` remains composable as a child. Its standalone end-token policy is stripped when embedded; its compiled grammar body is retained. Template-backed constraints retain their backend through loading, but compiled-component composition is not yet supported for them.
+A loaded `Constraint` retains its selected backend. Built-in template-backed children retain their finite embedding transfers and can be linked with the template backend; arbitrary data-only and older artifacts may lack those transfers. A child's standalone end-token policy is stripped when embedded, while its compiled grammar body is retained.
 
 ## Grammar formats
 
