@@ -359,3 +359,32 @@ fn dynamic_mask_diagnostics_do_not_request_an_lr_table() {
         assert!(state.is_accepting());
     }
 }
+
+
+#[test]
+fn table_free_metadata_queries_preserve_counts_across_reloads() {
+    use glrmask::__private::{ConstraintExt, parser_backend_report};
+    use glrmask::{BuildOptions, Constraint, Grammar, Optimization, ParserBackend, Vocab};
+    let vocab = Vocab::new(vec![(0, b"true".to_vec()), (1, b"false".to_vec()),
+        (2, b"t".to_vec()), (3, b"rue".to_vec())]);
+    for mode in [Optimization::FastBuild, Optimization::FastRuntime] {
+        let compiled = Grammar::from_json_schema(r#"{"type":"boolean"}"#)
+            .compile_with(&vocab, BuildOptions::default().optimization(mode)
+                .parser_backend(ParserBackend::TemplateDfa)).unwrap();
+        let loaded = Constraint::load(compiled.save()).unwrap();
+        let external = Constraint::load_with_vocab(
+            compiled.save_with_external_vocab().unwrap(), &vocab).unwrap();
+        for constraint in [&compiled, &loaded, &external] {
+            let report = parser_backend_report(constraint);
+            assert_eq!(report["lr_table_present"], false);
+            assert_eq!(u64::from(ConstraintExt::num_terminals(constraint)),
+                report["terminal_count"].as_u64().unwrap());
+            assert_eq!(u64::from(ConstraintExt::num_parser_states(constraint)),
+                report["stack_symbol_count"].as_u64().unwrap());
+            assert!(ConstraintExt::num_tokenizer_states(constraint) > 0);
+            let mut state = constraint.start();
+            state.commit_token(0).unwrap();
+            assert!(state.is_accepting());
+        }
+    }
+}

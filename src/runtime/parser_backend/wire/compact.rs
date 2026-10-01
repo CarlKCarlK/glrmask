@@ -119,6 +119,7 @@ impl Input<'_> {
         if count==0 { return Ok(graph); }
         graph.start_state=self.var()?;
         if graph.start_state as usize >= count { return Err("compact template start outside graph".into()); }
+        graph.states.reserve_exact(count);
         for _ in 0..count {
             let flags=self.var()?; let edges=(flags>>1) as usize;
             if edges>self.bytes.len().saturating_sub(self.offset)/2 {
@@ -128,6 +129,10 @@ impl Input<'_> {
             if budget.edges>MAX_DECODED_EDGES { return Err("template graph exceeds decoded-edge budget".into()); }
             let id=graph.add_state(); graph.states[id as usize].is_accepting=flags&1!=0;
             let mut previous:Option<u32>=None;
+            // Small rows retain their one-leaf insertion path. Larger rows
+            // have already-ordered unique labels; collect validated pairs
+            // once and let the ordered-map bulk constructor build the tree.
+            let mut ordered = (edges > 8).then(|| Vec::with_capacity(edges));
             for _ in 0..edges {
                 let delta=self.var()?;
                 let symbol=if let Some(old)=previous {
@@ -141,8 +146,12 @@ impl Input<'_> {
                 } else { return Err("compact template edge outside its phase alphabet".into()); };
                 let target=self.var()?;
                 if target as usize>=count { return Err("compact template edge targets a missing state".into()); }
-                graph.states[id as usize].transitions.insert(label,target);
+                if let Some(entries) = &mut ordered { entries.push((label, target)); }
+                else { graph.states[id as usize].transitions.insert(label,target); }
                 previous=Some(symbol);
+            }
+            if let Some(entries) = ordered {
+                graph.states[id as usize].transitions = entries.into_iter().collect();
             }
         }
         Ok(graph)
@@ -170,6 +179,45 @@ impl Input<'_> {
         let pop_to_push=self.compact_links(pop.states.len(),push.states.len())?;
         let read_to_push=self.compact_links(read.states.len(),push.states.len())?;
         Ok(CommitTemplateDfas {pop,read,push,pop_to_read,pop_to_push,read_to_push})
+    }
+}
+
+#[cfg(test)]
+mod bulk_decode_tests {
+    use super::*;
+
+    #[test]
+    fn compact_rows_preserve_exact_graphs_across_bulk_boundary() {
+        for phase in [Phase::Pop, Phase::Read, Phase::Push] {
+            for width in [0, 1, 4, 8, 9, 11, 16, 64, 129] {
+                let alphabet = 256;
+                let mut graph = DFA::new();
+                let yes = graph.add_state();
+                let dead = graph.add_state();
+                graph.set_accepting(yes, true);
+                for symbol in 0..width {
+                    let label = match phase {
+                        Phase::Push => encode_negative_label(symbol),
+                        _ => symbol as i32,
+                    };
+                    graph.add_transition(0, label, if symbol % 3 == 0 { dead } else { yes });
+                }
+                if matches!(phase, Phase::Pop) { graph.add_transition(0, DEFAULT_LABEL, yes); }
+                let mut bytes = Vec::new();
+                dfa(&mut bytes, &graph, phase, alphabet);
+                let mut input = Input { bytes: &bytes, offset: 0 };
+                let decoded = input.compact_dfa(phase, alphabet, &mut Budget::default()).unwrap();
+                assert_eq!(decoded, graph);
+                assert_eq!(input.offset, bytes.len());
+                let mut roundtrip = Vec::new();
+                dfa(&mut roundtrip, &decoded, phase, alphabet);
+                assert_eq!(roundtrip, bytes);
+                for end in 0..bytes.len() {
+                    let mut truncated = Input { bytes: &bytes[..end], offset: 0 };
+                    assert!(truncated.compact_dfa(phase, alphabet, &mut Budget::default()).is_err());
+                }
+            }
+        }
     }
 }
 #[derive(Default)]

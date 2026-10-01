@@ -188,12 +188,12 @@ impl ParserSeed {
         // Component bodies are restored from the runtime section after this
         // parser section. Coordinate/layout validation runs after that restore,
         // before any derived caches or public runtime state can be published.
-        for template in &constraint.template_dfas_by_terminal {
-            let template = template.as_deref().ok_or("missing template parser terminal relation")?;
-            validate_alphabet(template, self.state_count)?;
-        }
-        let mut parser = TemplateParser::compile(self.state_count, self.terminal_count, self.skip_terminals,
-            &constraint.template_dfas_by_terminal, self.completion).map_err(|error| error.to_string())?;
+        // Core graph/alphabet validation and runtime-view preparation share the
+        // standalone backend's complete validated preparation path.
+        let (mut parser, runtime) = TemplateParser::compile_with_runtime(
+            self.state_count, self.terminal_count, self.skip_terminals,
+            &constraint.template_dfas_by_terminal, self.completion,
+        ).map_err(|error| error.to_string())?;
         if let Some((control_start, programs)) = self.composition {
             for template in &programs {
                 validate_alphabet(template.as_deref().ok_or("missing scoped template")?, self.state_count)?;
@@ -211,7 +211,7 @@ impl ParserSeed {
         constraint.table = ParserTableStorage::absent();
         constraint.deferred_table_rules_blob = None;
         constraint.deferred_table_rules = Default::default();
-        constraint.fast_template_dfas_by_terminal = constraint.compute_fast_template_dfas();
+        constraint.fast_template_dfas_by_terminal = runtime;
         Ok(())
     }
 }

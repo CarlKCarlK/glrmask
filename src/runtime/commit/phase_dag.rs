@@ -47,8 +47,12 @@ fn ranks(graph: &DFA) -> Option<Box<[u32]>> {
         }
     }
     if order.len() != n { return None; }
-    let mut rank = vec![0u32; n];
-    for (i, id) in order.into_iter().enumerate() { rank[id] = u32::try_from(i).ok()?; }
+    ranks_from_order(&order)
+}
+
+fn ranks_from_order(order: &[usize]) -> Option<Box<[u32]>> {
+    let mut rank = vec![0u32; order.len()];
+    for (i, &id) in order.iter().enumerate() { rank[id] = u32::try_from(i).ok()?; }
     Some(rank.into_boxed_slice())
 }
 
@@ -70,6 +74,14 @@ impl PreparedPhaseDag {
             template.push.states.get(*target as usize)?;
         }
         Some(Self { ranks: [ranks(&template.pop)?, ranks(&template.read)?, ranks(&template.push)?] })
+    }
+
+    pub(crate) fn from_prepared(prepared: &super::template_prepare::TemplatePreparation<'_>) -> Option<Self> {
+        let orders = prepared.orders();
+        // Preserve this index's existing empty-phase eligibility rule.
+        if orders.iter().any(Vec::is_empty) { return None; }
+        Some(Self { ranks: [ranks_from_order(&orders[0])?,
+            ranks_from_order(&orders[1])?, ranks_from_order(&orders[2])?] })
     }
 
     fn phase_number(phase: Phase) -> u8 {

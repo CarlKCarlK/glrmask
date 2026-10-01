@@ -8549,6 +8549,21 @@ fn parser_child(
     if Some(terminal) == constraint.ignore_terminal {
         return Some(stacks.clone());
     }
+    // A proved pure push commutes with mapping every annotation to the empty
+    // value. Apply that same generic GSS primitive directly, rather than
+    // allocating two annotation-mapping memos/interfaces around the advance.
+    // All nontrivial effects retain the complete annotated parser evaluator.
+    if let Some(parser) = &constraint.template_parser
+        && !constraint.parser_skip_terminals().contains(&terminal)
+        && let Some(Some(template)) = constraint.template_dfas_by_terminal.get(terminal as usize)
+        && let Some(Some(fast)) = constraint.fast_template_dfas_by_terminal.get(terminal as usize)
+        && let Some(advanced) = super::commit::simple_read_shift::apply(template, fast, stacks)
+    {
+        parser.record_advance();
+        #[cfg(test)]
+        super::commit::simple_read_shift::MASK_SUCCESSES.with(|count| count.set(count.get() + 1));
+        return Some(advanced);
+    }
     let parser_gss = with_empty_accumulators(stacks);
     // The actual structural advance is already the definitive admissibility
     // test. Running exact admission first would duplicate reduction simulation

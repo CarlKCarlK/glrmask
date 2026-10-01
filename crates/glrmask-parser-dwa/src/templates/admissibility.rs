@@ -10,7 +10,10 @@
 //! prefix accepts every remaining stack suffix. An explicit rejection edge is
 //! retained when it overrides an otherwise productive DEFAULT transition.
 
-use std::collections::{BTreeMap, BTreeSet, VecDeque};
+use std::collections::{BTreeMap, VecDeque};
+#[cfg(test)]
+use std::collections::BTreeSet;
+use rustc_hash::FxHashMap;
 
 use crate::automata::unweighted_u32::dfa::DFA;
 use crate::compiler::glr::labels::DEFAULT_LABEL;
@@ -61,7 +64,7 @@ pub struct TemplateDomain {
 #[derive(Debug, Clone, Copy)]
 enum Phase { Pop, Read, Push }
 
-fn topological_order(dfa: &DFA, phase: Phase) -> Result<Vec<u32>, String> {
+fn topological_order(dfa: &DFA, phase: Phase) -> Result<(Vec<usize>, Option<u32>), String> {
     if !dfa.states.is_empty() && dfa.start_state as usize >= dfa.states.len() {
         return Err(format!("{phase:?} start {} outside {} states", dfa.start_state, dfa.states.len()));
     }
@@ -72,6 +75,7 @@ fn topological_order(dfa: &DFA, phase: Phase) -> Result<Vec<u32>, String> {
         return Err(format!("{phase:?} state count exceeds the template domain coordinate"));
     }
     let mut indegree = vec![0usize; dfa.states.len()];
+    let mut largest_symbol = None;
     for (source, state) in dfa.states.iter().enumerate() {
         for (&label, &target) in &state.transitions {
             let legal = match phase {
@@ -82,26 +86,30 @@ fn topological_order(dfa: &DFA, phase: Phase) -> Result<Vec<u32>, String> {
             if !legal {
                 return Err(format!("{phase:?} state {source} contains wrong-phase label {label}"));
             }
+            if label != DEFAULT_LABEL {
+                let symbol = if label < 0 { label.wrapping_sub(i32::MIN) as u32 } else { label as u32 };
+                largest_symbol = Some(largest_symbol.map_or(symbol, |old: u32| old.max(symbol)));
+            }
             let Some(degree) = indegree.get_mut(target as usize) else {
                 return Err(format!("{phase:?} state {source} targets missing state {target}"));
             };
             *degree += 1;
         }
     }
-    let mut pending: VecDeque<u32> = indegree.iter().enumerate()
-        .filter_map(|(id, &degree)| (degree == 0).then_some(id as u32)).collect();
+    let mut pending: VecDeque<usize> = indegree.iter().enumerate()
+        .filter_map(|(id, &degree)| (degree == 0).then_some(id)).collect();
     let mut order = Vec::with_capacity(dfa.states.len());
     while let Some(source) = pending.pop_front() {
         order.push(source);
         for &target in dfa.states[source as usize].transitions.values() {
             indegree[target as usize] -= 1;
-            if indegree[target as usize] == 0 { pending.push_back(target); }
+            if indegree[target as usize] == 0 { pending.push_back(target as usize); }
         }
     }
     if order.len() != dfa.states.len() {
         return Err(format!("{phase:?} template is cyclic"));
     }
-    Ok(order)
+    Ok((order, largest_symbol))
 }
 
 fn validate_links(links: &[Option<u32>], source_len: usize, target_len: usize, name: &str) -> Result<(), String> {
@@ -122,14 +130,81 @@ fn linked_productive(links: &[Option<u32>], source: usize, productive: &[bool]) 
     links.get(source).copied().flatten().is_some_and(|target| productive[target as usize])
 }
 
-impl TemplateDomain {
-    pub fn compile(template: &CommitTemplateDfas) -> Result<Self, String> {
-        let pop_order = topological_order(&template.pop, Phase::Pop)?;
-        let read_order = topological_order(&template.read, Phase::Read)?;
-        let push_order = topological_order(&template.push, Phase::Push)?;
+/// Merge two already-ordered sources of root transitions. READ acceptance
+/// dominates a POP continuation on the same symbol; a POP's explicit dead
+/// target remains an exception when DEFAULT is productive. Omit only edges
+/// whose target is exactly the default target.
+fn merged_domain_row(
+    transitions: &BTreeMap<i32, u32>,
+    canonical: &[u32],
+    read_labels: Option<&[u32]>,
+    default: u32,
+) -> Vec<(u32, u32)> {
+    let mut pop = transitions.iter().filter(|(label, _)| **label != DEFAULT_LABEL)
+        .map(|(&label, &target)| (label as u32, canonical[target as usize])).peekable();
+    let read_len = read_labels.map_or(0, <[u32]>::len);
+    let mut row = Vec::with_capacity(transitions.len().saturating_add(read_len));
+    for &label in read_labels.into_iter().flatten() {
+        while pop.peek().is_some_and(|&(top, _)| top < label) {
+            let edge = pop.next().unwrap();
+            if edge.1 != default { row.push(edge); }
+        }
+        if pop.peek().is_some_and(|&(top, _)| top == label) { pop.next(); }
+        if default != 0 { row.push((label, 0)); }
+    }
+    row.extend(pop.filter(|&(_, target)| target != default));
+    row
+}
+
+/// A borrow of an immutable, completely validated split stack program.
+///
+/// The validation covers every node, including unreachable nodes, every phase
+/// label and link, and acyclicity. The graph orders are preparation scratch:
+/// consumers may share them but cannot construct this proof for another graph.
+/// No parser table, output-stack enumeration, or persisted trusted flag is used.
+#[derive(Debug)]
+pub struct ValidatedTemplate<'a> {
+    template: &'a CommitTemplateDfas,
+    orders: [Vec<usize>; 3],
+    largest_symbol: Option<u32>,
+}
+
+impl<'a> ValidatedTemplate<'a> {
+    pub fn new(template: &'a CommitTemplateDfas) -> Result<Self, String> {
+        let (pop, pop_symbol) = topological_order(&template.pop, Phase::Pop)?;
+        let (read, read_symbol) = topological_order(&template.read, Phase::Read)?;
+        let (push, push_symbol) = topological_order(&template.push, Phase::Push)?;
         validate_links(&template.pop_to_read, template.pop.states.len(), template.read.states.len(), "POP->READ")?;
         validate_links(&template.pop_to_push, template.pop.states.len(), template.push.states.len(), "POP->PUSH")?;
         validate_links(&template.read_to_push, template.read.states.len(), template.push.states.len(), "READ->PUSH")?;
+        let largest_symbol = [pop_symbol, read_symbol, push_symbol].into_iter().flatten().max();
+        Ok(Self { template, orders: [pop, read, push], largest_symbol })
+    }
+
+    pub fn template(&self) -> &'a CommitTemplateDfas { self.template }
+    pub fn orders(&self) -> &[Vec<usize>; 3] { &self.orders }
+    pub fn push_order(&self) -> &[usize] { &self.orders[2] }
+
+    /// Alphabet checks reuse the maximum observed during graph validation,
+    /// including labels in unreachable states. This is not a promise about an
+    /// unchecked caller-supplied bound or a flag read from an artifact.
+    pub fn validate_alphabet(&self, symbols: u32) -> Result<(), String> {
+        if let Some(symbol) = self.largest_symbol && symbol >= symbols {
+            return Err(format!("template stack symbol {symbol} outside alphabet {symbols}"));
+        }
+        Ok(())
+    }
+}
+
+impl TemplateDomain {
+    pub fn compile(template: &CommitTemplateDfas) -> Result<Self, String> {
+        Self::from_validated(&ValidatedTemplate::new(template)?)
+    }
+
+    /// Derive the exact input domain while reusing a complete graph validation.
+    pub fn from_validated(validated: &ValidatedTemplate<'_>) -> Result<Self, String> {
+        let template = validated.template();
+        let [pop_order, read_order, push_order] = validated.orders();
 
         let mut push_good = vec![false; template.push.states.len()];
         for &id in push_order.iter().rev() {
@@ -138,16 +213,19 @@ impl TemplateDomain {
                 || state.transitions.values().any(|&target| push_good[target as usize]);
         }
         let mut read_without_input = vec![false; template.read.states.len()];
-        let mut read_labels = vec![BTreeSet::<u32>::new(); template.read.states.len()];
+        // Each input row already has strictly ordered, unique labels. Filtering
+        // it preserves those properties; no ordered-tree insertion is needed
+        // for the derived READ certificate set.
+        let mut read_labels = vec![Vec::<u32>::new(); template.read.states.len()];
         for &id in read_order.iter().rev() {
             let i = id as usize;
             let state = &template.read.states[i];
             read_without_input[i] = state.is_accepting
                 || linked_productive(&template.read_to_push, i, &push_good);
             if read_without_input[i] { continue; }
-            let labels: BTreeSet<u32> = state.transitions.iter().filter_map(|(&label, &target)| {
+            let labels: Vec<u32> = state.transitions.iter().filter_map(|(&label, &target)| {
                 let target = target as usize;
-                (read_without_input[target] || read_labels[target].contains(&(label as u32)))
+                (read_without_input[target] || read_labels[target].binary_search(&(label as u32)).is_ok())
                     .then_some(label as u32)
             }).collect();
             read_labels[i] = labels;
@@ -161,7 +239,9 @@ impl TemplateDomain {
         }];
         let mut edges = Vec::new();
         let mut canonical = vec![REJECT; template.pop.states.len()];
-        let mut row_ids: BTreeMap<(u32, Vec<(u32, u32)>), u32> = BTreeMap::new();
+        // This map is used only for equality lookup. IDs are still assigned
+        // by the fixed topological traversal, never by hash-map iteration.
+        let mut row_ids: FxHashMap<(u32, Vec<(u32, u32)>), u32> = FxHashMap::default();
         for &id in pop_order.iter().rev() {
             let i = id as usize;
             let state = &template.pop.states[i];
@@ -174,28 +254,25 @@ impl TemplateDomain {
             }
             let default = state.transitions.get(&DEFAULT_LABEL)
                 .map_or(REJECT, |&target| canonical[target as usize]);
-            let mut row: BTreeMap<u32, u32> = state.transitions.iter()
-                .filter(|(label, _)| **label != DEFAULT_LABEL)
-                .map(|(&label, &target)| (label as u32, canonical[target as usize])).collect();
-            if let Some(read) = read {
-                for &label in &read_labels[read] {
-                    // Exists-a-READ output dominates all longer POP paths on
-                    // this same symbol. Consume it in the *recognizer* only;
-                    // no parser stack is modified by an admissibility query.
-                    row.insert(label, 0);
+            let row = merged_domain_row(&state.transitions, &canonical,
+                read.map(|read| read_labels[read].as_slice()), default);
+            if default == REJECT && row.is_empty() { continue; }
+            // A wide row is expensive to hash. Entry performs the identical
+            // exact-key lookup once, rather than hashing a new row again on
+            // insertion. IDs still follow the fixed topological traversal;
+            // hash-map iteration never determines the compiled representation.
+            let next_id = match row_ids.entry((default, row)) {
+                std::collections::hash_map::Entry::Occupied(entry) => *entry.get(),
+                std::collections::hash_map::Entry::Vacant(entry) => {
+                    let id = u32::try_from(states.len()).map_err(|_| "template domain too large")?;
+                    if id == REJECT { return Err("template domain too large".to_owned()); }
+                    let (default, row) = entry.key();
+                    states.push(DomainState { accepts_prefix: false, default_target: *default,
+                        first_edge: edges.len(), edge_count: row.len() });
+                    edges.extend_from_slice(row);
+                    entry.insert(id);
+                    id
                 }
-            }
-            row.retain(|_, target| *target != default);
-            if default == REJECT && row.values().all(|&target| target == REJECT) { continue; }
-            let signature = (default, row.into_iter().collect::<Vec<_>>());
-            let next_id = if let Some(&id) = row_ids.get(&signature) { id } else {
-                let id = u32::try_from(states.len()).map_err(|_| "template domain too large")?;
-                if id == REJECT { return Err("template domain too large".to_owned()); }
-                states.push(DomainState { accepts_prefix: false, default_target: default,
-                    first_edge: edges.len(), edge_count: signature.1.len() });
-                edges.extend_from_slice(&signature.1);
-                row_ids.insert(signature, id);
-                id
             };
             canonical[i] = next_id;
         }
@@ -204,14 +281,31 @@ impl TemplateDomain {
     }
 
     fn retain_reachable(start: u32, states: Vec<DomainState>, edges: Vec<(u32, u32)>) -> Self {
+        if start == REJECT {
+            return Self { start: REJECT, states: Box::new([]), edges: Box::new([]) };
+        }
         let mut keep = vec![false; states.len()];
+        keep[start as usize] = true;
+        let mut reachable = 1usize;
         let mut pending = vec![start];
         while let Some(id) = pending.pop() {
-            if id == REJECT || keep[id as usize] { continue; }
-            keep[id as usize] = true;
             let state = &states[id as usize];
-            pending.push(state.default_target);
-            pending.extend(edges[state.first_edge..state.first_edge + state.edge_count].iter().map(|e| e.1));
+            for target in std::iter::once(state.default_target)
+                .chain(edges[state.first_edge..state.first_edge + state.edge_count].iter().map(|edge| edge.1))
+            {
+                if target == REJECT || keep[target as usize] { continue; }
+                // Mark at enqueue time so convergent rows do not repeatedly
+                // retain the same target in scratch before it is visited.
+                keep[target as usize] = true;
+                reachable += 1;
+                pending.push(target);
+            }
+        }
+        if reachable == states.len() {
+            // With every row reachable, the old stable-ID remap is exactly
+            // the identity. Preserve those rows directly instead of copying
+            // the full edge inventory into a second allocation.
+            return Self { start, states: states.into_boxed_slice(), edges: edges.into_boxed_slice() };
         }
         let mut remap = vec![REJECT; states.len()];
         let mut count = 0u32;
@@ -289,6 +383,40 @@ impl TemplateDomain {
             DomainProbe::Reject => TopAdmission::Never,
             DomainProbe::NeedMore(_) => TopAdmission::DependsOnSuffix,
         }
+    }
+
+    /// Partition top-symbol certificates into a default and sparse exceptions.
+    ///
+    /// This is exactly `classify_top` for every possible top value, including
+    /// symbols absent from the root row. In particular, an explicit rejection
+    /// must still shadow a productive DEFAULT. The returned certificates say
+    /// nothing about the rest of the relation: two different residual domains
+    /// can both require a deeper suffix query.
+    ///
+    /// This lets a caller build all top rows by cloning one default bitset and
+    /// visiting root edges, instead of searching this row once per alphabet
+    /// symbol. It allocates no output stacks or additional graph data.
+    pub fn top_admission_partition(
+        &self,
+    ) -> (TopAdmission, impl Iterator<Item = (u32, TopAdmission)> + '_) {
+        let classify = |probe| match probe {
+            DomainProbe::Accept => TopAdmission::Always,
+            DomainProbe::Reject => TopAdmission::Never,
+            DomainProbe::NeedMore(_) => TopAdmission::DependsOnSuffix,
+        };
+        let (default, edges): (_, &[(u32, u32)]) = match self.states.get(self.start as usize) {
+            None => (TopAdmission::Never, &[]),
+            Some(state) if state.accepts_prefix => (TopAdmission::Always, &[]),
+            Some(state) => (
+                classify(self.at(state.default_target)),
+                &self.edges[state.first_edge..state.first_edge + state.edge_count],
+            ),
+        };
+        let exceptions = edges.iter().filter_map(move |&(label, target)| {
+            let certificate = classify(self.at(target));
+            (certificate != default).then_some((label, certificate))
+        });
+        (default, exceptions)
     }
 
     /// Encode the already-compiled domain in a versioned internal cache wire.
@@ -393,6 +521,83 @@ mod tests {
             ..CommitTemplateDfas::default() }
     }
 
+    #[test]
+    fn domain_reachability_identity_preserves_exact_rows_and_edges() {
+        let states = vec![
+            DomainState { accepts_prefix: true, default_target: REJECT, first_edge: 0, edge_count: 0 },
+            DomainState { accepts_prefix: false, default_target: 0, first_edge: 0, edge_count: 1 },
+            DomainState { accepts_prefix: false, default_target: 1, first_edge: 1, edge_count: 2 },
+        ];
+        // Explicit rejection at row1 must continue to shadow its productive
+        // DEFAULT; row2 has two paths to a shared suffix.
+        let edges = vec![(7, REJECT), (3, 0), (5, 1)];
+        let reference = TemplateDomain { start: 2, states: states.clone().into_boxed_slice(),
+            edges: edges.clone().into_boxed_slice() };
+        let actual = TemplateDomain::retain_reachable(2, states, edges);
+        assert_eq!(actual.to_bytes().unwrap(), reference.to_bytes().unwrap());
+        for word in [vec![], vec![3], vec![5], vec![5, 7], vec![5, 8], vec![1, 8]] {
+            assert_eq!(actual.matches_top_first(word.iter().copied()),
+                reference.matches_top_first(word.iter().copied()));
+        }
+    }
+
+    #[test]
+    fn domain_reachability_prunes_without_reordering_kept_ids() {
+        let states = vec![
+            DomainState { accepts_prefix: true, default_target: REJECT, first_edge: 0, edge_count: 0 },
+            DomainState { accepts_prefix: false, default_target: REJECT, first_edge: 0, edge_count: 1 },
+            DomainState { accepts_prefix: false, default_target: REJECT, first_edge: 1, edge_count: 1 },
+            DomainState { accepts_prefix: false, default_target: 2, first_edge: 2, edge_count: 1 },
+        ];
+        let edges = vec![(1, 0), (2, 0), (3, 2)];
+        let actual = TemplateDomain::retain_reachable(3, states.clone(), edges.clone());
+        let expected = TemplateDomain { start: 2, states: vec![
+            states[0].clone(),
+            DomainState { accepts_prefix: false, default_target: REJECT, first_edge: 0, edge_count: 1 },
+            DomainState { accepts_prefix: false, default_target: 1, first_edge: 1, edge_count: 1 },
+        ].into_boxed_slice(), edges: vec![(2, 0), (3, 1)].into_boxed_slice() };
+        assert_eq!(actual.to_bytes().unwrap(), expected.to_bytes().unwrap());
+        let dead = TemplateDomain::retain_reachable(REJECT, states, edges);
+        assert_eq!(dead.state_count(), 0);
+        assert_eq!(dead.edge_count(), 0);
+        assert_eq!(dead.start(), DomainProbe::Reject);
+        assert_eq!(dead.to_bytes().unwrap().len(), 16);
+    }
+
+    #[test]
+    fn linear_root_merge_matches_ordered_map_reference() {
+        let mut seed = 0x6088941134u64;
+        let mut next = || {
+            seed ^= seed << 13; seed ^= seed >> 7; seed ^= seed << 17;
+            seed
+        };
+        for _ in 0..2048 {
+            let canonical = (0..12).map(|_| match next() % 5 {
+                0 => REJECT, value => value as u32 - 1,
+            }).collect::<Vec<_>>();
+            let mut transitions = BTreeMap::new();
+            let mut reads = BTreeSet::new();
+            for label in 0..24 {
+                if next() % 3 == 0 { transitions.insert(label, (next() % 12) as u32); }
+                if next() % 4 == 0 { reads.insert(label as u32); }
+            }
+            transitions.insert(DEFAULT_LABEL, (next() % 12) as u32);
+            for default in [REJECT, 0, 1, 2, 3] {
+                let read_values = reads.iter().copied().collect::<Vec<_>>();
+                for read in [None, Some(read_values.as_slice())] {
+                    let actual = merged_domain_row(&transitions, &canonical, read, default);
+                    let mut reference: BTreeMap<u32, u32> = transitions.iter()
+                        .filter(|(label, _)| **label != DEFAULT_LABEL)
+                        .map(|(&label, &target)| (label as u32, canonical[target as usize])).collect();
+                    for &label in read.into_iter().flatten() { reference.insert(label, 0); }
+                    reference.retain(|_, target| *target != default);
+                    assert_eq!(actual, reference.into_iter().collect::<Vec<_>>());
+                    assert!(actual.windows(2).all(|pair| pair[0].0 < pair[1].0));
+                }
+            }
+        }
+    }
+
     // Independent literal split-transducer interpreter. It materializes output
     // stacks only in tests, and uses neither domain construction nor shortcuts.
     fn output_exists(t: &CommitTemplateDfas, top_first: &[u32]) -> bool {
@@ -443,6 +648,40 @@ mod tests {
         assert_eq!(domain.classify_top(5), TopAdmission::Never);
         assert_eq!(domain.classify_top(6), TopAdmission::Always);
         assert_eq!(domain.edge_count(), 1); // The rejecting exception is essential.
+        let (default, exceptions) = domain.top_admission_partition();
+        assert_eq!(default, TopAdmission::Always);
+        assert_eq!(exceptions.collect::<Vec<_>>(), vec![(5, TopAdmission::Never)]);
+    }
+
+    #[test]
+    fn top_partition_retains_suffix_dependence_and_needs_no_alphabet_bound() {
+        let mut t = template();
+        let more = t.pop.add_state();
+        let yes = t.pop.add_state();
+        let no = t.pop.add_state();
+        t.pop.set_accepting(yes, true);
+        t.pop.add_transition(0, DEFAULT_LABEL, more);
+        t.pop.add_transition(0, 2, yes);
+        t.pop.add_transition(0, 5, no);
+        t.pop.add_transition(more, 7, yes);
+        let domain = TemplateDomain::compile(&t).unwrap();
+        let (default, exceptions) = domain.top_admission_partition();
+        assert_eq!(default, TopAdmission::DependsOnSuffix);
+        let exceptions: BTreeMap<_, _> = exceptions.collect();
+        assert_eq!(exceptions, BTreeMap::from([
+            (2, TopAdmission::Always), (5, TopAdmission::Never),
+        ]));
+        for top in [0, 1, 2, 5, 7, 999, i32::MAX as u32, u32::MAX] {
+            assert_eq!(exceptions.get(&top).copied().unwrap_or(default), domain.classify_top(top));
+        }
+        for accepted in [false, true] {
+            let mut t = template();
+            t.pop.set_accepting(0, accepted);
+            let domain = TemplateDomain::compile(&t).unwrap();
+            let (default, exceptions) = domain.top_admission_partition();
+            assert_eq!(default, if accepted { TopAdmission::Always } else { TopAdmission::Never });
+            assert_eq!(exceptions.count(), 0);
+        }
     }
 
     #[test]
@@ -550,6 +789,17 @@ mod tests {
             let wire = compiled.to_bytes().unwrap();
             let domain = TemplateDomain::from_bytes(&wire).unwrap();
             assert_eq!(domain.to_bytes().unwrap(), wire, "wire roundtrip seed={seed}");
+            // Partition building and classify_top use different paths through
+            // the root. Compare them independently for each generated graph,
+            // both before and after the existing domain-wire roundtrip.
+            for candidate in [&compiled, &domain] {
+                let (default, exceptions) = candidate.top_admission_partition();
+                let exceptions: BTreeMap<_, _> = exceptions.collect();
+                for top in (0..9).chain([1234, i32::MAX as u32, u32::MAX]) {
+                    assert_eq!(exceptions.get(&top).copied().unwrap_or(default),
+                        candidate.classify_top(top), "seed={seed} top={top}");
+                }
+            }
             for stack in &stacks {
                 assert_eq!(domain.matches_top_first(stack.iter().copied()), output_exists(&t, stack),
                     "seed={seed} top_first={stack:?}");

@@ -50,13 +50,6 @@ pub(crate) fn prepare(template: &CommitTemplateDfas) -> Vec<Option<PreparedPushS
     let graph = &template.push;
     let n = graph.states.len();
     let empty = || (0..n).map(|_| None).collect::<Vec<_>>();
-    // Only actual phase entry points need prepared suffix languages. Intermediate
-    // PUSH cursors remain in the generic path when an entry exceeds this budget.
-    let mut entry = vec![false; n];
-    for target in template.pop_to_push.iter().chain(&template.read_to_push).flatten() {
-        let Some(slot) = entry.get_mut(*target as usize) else { return empty(); };
-        *slot = true;
-    }
     let mut indegree = vec![0usize; n];
     for state in &graph.states {
         for (&label, &target) in &state.transitions {
@@ -76,6 +69,26 @@ pub(crate) fn prepare(template: &CommitTemplateDfas) -> Vec<Option<PreparedPushS
         }
     }
     if order.len() != n { return empty(); }
+    prepare_with_order(template, &order)
+}
+
+pub(crate) fn from_prepared(
+    prepared: &super::template_prepare::TemplatePreparation<'_>,
+) -> Vec<Option<PreparedPushSuffixes>> {
+    prepare_with_order(prepared.template(), prepared.push_order())
+}
+
+fn prepare_with_order(template: &CommitTemplateDfas, order: &[usize]) -> Vec<Option<PreparedPushSuffixes>> {
+    let graph = &template.push;
+    let n = graph.states.len();
+    let empty = || (0..n).map(|_| None).collect::<Vec<_>>();
+    // Only actual phase entry points need prepared suffix languages. Intermediate
+    // PUSH cursors remain in the generic path when an entry exceeds this budget.
+    let mut entry = vec![false; n];
+    for target in template.pop_to_push.iter().chain(&template.read_to_push).flatten() {
+        let Some(slot) = entry.get_mut(*target as usize) else { return empty(); };
+        *slot = true;
+    }
     let mut counts = vec![0usize; n];
     let mut lengths = vec![0usize; n];
     for &i in order.iter().rev() {

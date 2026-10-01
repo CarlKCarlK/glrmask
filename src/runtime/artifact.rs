@@ -1394,8 +1394,15 @@ pub(crate) enum FastTemplateTransitionRow {
 }
 
 impl FastTemplateTransitionRow {
-    fn from_entries(entries: impl IntoIterator<Item = (i32, u32)>) -> Self {
+    pub(crate) fn from_entries(entries: impl IntoIterator<Item = (i32, u32)>, count: usize) -> Self {
+        if count > INLINE_TEMPLATE_TRANSITION_LIMIT {
+            let mut row = FxHashMap::with_capacity_and_hasher(count, Default::default());
+            row.extend(entries);
+            debug_assert_eq!(row.len(), count);
+            return Self::Hash(row);
+        }
         let entries = entries.into_iter().collect::<SmallVec<[_; 4]>>();
+        debug_assert_eq!(entries.len(), count);
         match entries.len() {
             0 => Self::Empty,
             len if len <= INLINE_TEMPLATE_TRANSITION_LIMIT => Self::Inline(entries),
@@ -1451,16 +1458,20 @@ impl FastTemplateDfa {
             states: dfa
                 .states
                 .iter()
-                .map(|state| FastTemplateDfaState {
-                    is_accepting: state.is_accepting,
-                    default_target: state.transitions.get(&DEFAULT_LABEL).copied(),
-                    transitions: FastTemplateTransitionRow::from_entries(
-                        state
-                            .transitions
-                            .iter()
-                            .filter(|(label, _)| **label != DEFAULT_LABEL)
-                            .map(|(&label, &target)| (label, target)),
-                    ),
+                .map(|state| {
+                    let default_target = state.transitions.get(&DEFAULT_LABEL).copied();
+                    FastTemplateDfaState {
+                        is_accepting: state.is_accepting,
+                        default_target,
+                        transitions: FastTemplateTransitionRow::from_entries(
+                            state
+                                .transitions
+                                .iter()
+                                .filter(|(label, _)| **label != DEFAULT_LABEL)
+                                .map(|(&label, &target)| (label, target)),
+                            state.transitions.len() - usize::from(default_target.is_some()),
+                        ),
+                    }
                 })
                 .collect(),
             start_state: dfa.start_state,
@@ -1468,8 +1479,38 @@ impl FastTemplateDfa {
     }
 }
 
+#[cfg(test)]
+mod fast_template_row_construction_tests {
+    use super::*;
+
+    #[test]
+    fn sized_rows_retain_lookup_iteration_and_hash_capacity() {
+        for count in [0usize, 1, 4, 8, 9, 16, 65, 129] {
+            let pairs = (0..count).map(|i| (i as i32 * 7 - 400, i as u32)).collect::<Vec<_>>();
+            let new = FastTemplateTransitionRow::from_entries(pairs.iter().copied(), count);
+            let entries = pairs.iter().copied().collect::<SmallVec<[_; 4]>>();
+            let old = match count {
+                0 => FastTemplateTransitionRow::Empty,
+                n if n <= INLINE_TEMPLATE_TRANSITION_LIMIT => FastTemplateTransitionRow::Inline(entries),
+                _ => FastTemplateTransitionRow::Hash(entries.into_iter().collect()),
+            };
+            for key in -420..520 {
+                assert_eq!(new.get(key), old.get(key));
+            }
+            let mut old_order = Vec::new(); let mut new_order = Vec::new();
+            old.for_each(|label, target| old_order.push((label, target)));
+            new.for_each(|label, target| new_order.push((label, target)));
+            assert_eq!(new_order, old_order);
+            if let (FastTemplateTransitionRow::Hash(a), FastTemplateTransitionRow::Hash(b)) = (&new, &old) {
+                assert_eq!(a.capacity(), b.capacity());
+            }
+        }
+    }
+}
+
 #[derive(Debug, Clone, Default)]
 pub(crate) struct FastCommitTemplateDfas {
+    pub(crate) read_shift: Option<Box<super::commit::simple_read_shift::PreparedReadShift>>,
     pub(crate) input_cursor: Option<super::commit::single_cursor::PreparedInputCursor>,
     pub(crate) phase_dag: Option<super::commit::phase_dag::PreparedPhaseDag>,
     pub(crate) push_dag: Option<super::commit::push_dag::PreparedPushDag>,
@@ -1484,11 +1525,40 @@ pub(crate) struct FastCommitTemplateDfas {
 
 impl FastCommitTemplateDfas {
     pub(crate) fn from_template(template: &CommitTemplateDfas) -> Self {
+        let prepared = super::commit::template_prepare::TemplatePreparation::new(template).ok();
+        Self::from_preparation(template, prepared.as_ref())
+    }
+
+    pub(crate) fn from_prepared(prepared: &super::commit::template_prepare::TemplatePreparation<'_>) -> Self {
+        Self::from_preparation(prepared.template(), Some(prepared))
+    }
+
+    fn from_preparation(template: &CommitTemplateDfas,
+        prepared: Option<&super::commit::template_prepare::TemplatePreparation<'_>>) -> Self {
+        let (input_cursor, phase_dag, push_suffixes, push_dag) = match prepared {
+            Some(prepared) => (
+                Some(super::commit::single_cursor::PreparedInputCursor::from_prepared(prepared)),
+                super::commit::phase_dag::PreparedPhaseDag::from_prepared(prepared),
+                super::commit::push_suffixes::from_prepared(prepared),
+                super::commit::push_dag::PreparedPushDag::from_prepared(prepared),
+            ),
+            // Preserve the independent helpers' behavior for legacy optional
+            // templates that do not qualify for whole-program preparation.
+            // This is not parser-table fallback; it selects the same derived
+            // views as before and the exact template evaluator remains intact.
+            None => (
+                super::commit::single_cursor::PreparedInputCursor::prepare(template),
+                super::commit::phase_dag::PreparedPhaseDag::prepare(template),
+                super::commit::push_suffixes::prepare(template),
+                super::commit::push_dag::PreparedPushDag::prepare(template),
+            ),
+        };
         Self {
-            input_cursor: super::commit::single_cursor::PreparedInputCursor::prepare(template),
-            phase_dag: super::commit::phase_dag::PreparedPhaseDag::prepare(template),
-            push_suffixes: super::commit::push_suffixes::prepare(template),
-            push_dag: super::commit::push_dag::PreparedPushDag::prepare(template),
+            read_shift: prepared.and_then(|_| super::commit::simple_read_shift::PreparedReadShift::prepare(template)),
+            input_cursor,
+            phase_dag,
+            push_suffixes,
+            push_dag,
             pop: FastTemplateDfa::from_dfa(&template.pop),
             read: FastTemplateDfa::from_dfa(&template.read),
             push: FastTemplateDfa::from_dfa(&template.push),
@@ -2429,7 +2499,9 @@ pub(crate) enum DynamicMaskAliasStore {
 struct DynamicMaskCacheEntry {
     hash: u64,
     state: DynamicMaskStateKey,
-    mask: DynamicMaskCachePayload,
+    // None retains the existing first-use probation state. Equal, already
+    // materialized masks can be shared without encoding another payload.
+    mask: Option<Arc<DynamicMaskCachePayload>>,
 }
 
 #[derive(Debug, Default)]
@@ -2438,6 +2510,7 @@ struct DynamicMaskCache {
     entries: Vec<Option<DynamicMaskCacheEntry>>,
     by_hash: FxHashMap<u64, SmallVec<[usize; 1]>>,
     next_slot: usize,
+    values: super::mask_cache_values::MaskValueIndex,
 }
 
 #[inline]
@@ -7974,7 +8047,9 @@ impl DynamicMaskVocab {
         }) else {
             return false;
         };
-        Self::copy_dynamic_mask_cache_payload(self.all_original_token_words(), &entry.mask, buf)
+        entry.mask.as_ref().is_some_and(|payload| {
+            Self::copy_dynamic_mask_cache_payload(self.all_original_token_words(), payload, buf)
+        })
     }
 
     pub(crate) fn has_cached_mask_with_predicate<F: Fn(&DynamicMaskStateKey) -> bool>(
@@ -7995,8 +8070,7 @@ impl DynamicMaskVocab {
                 .get(slot)
                 .and_then(Option::as_ref)
                 .is_some_and(|entry| {
-                    matches(&entry.state)
-                        && !matches!(entry.mask, DynamicMaskCachePayload::Probation)
+                    matches(&entry.state) && entry.mask.is_some()
                 })
         })
     }
@@ -8092,6 +8166,7 @@ impl DynamicMaskVocab {
         let mask_bytes = mask.len().saturating_mul(std::mem::size_of::<u32>()).max(1);
         let max_entries = ((budget_mib * 1024 * 1024) / mask_bytes)
             .clamp(MIN_MASK_CACHE_ENTRIES, MAX_MASK_CACHE_ENTRIES);
+        let value_hash = super::mask_cache_values::mask_hash(mask);
         let mut cache = self
             .mask_cache
             .lock()
@@ -8109,21 +8184,32 @@ impl DynamicMaskVocab {
                 }
                 let needs_upgrade = cache.entries[slot]
                     .as_ref()
-                    .is_some_and(|entry| matches!(entry.mask, DynamicMaskCachePayload::Probation));
+                    .is_some_and(|entry| entry.mask.is_none());
                 if needs_upgrade {
-                    let payload = self.dynamic_mask_cache_payload(mask);
+                    let payload = match cache.values.get(value_hash, mask, self.all_original_token_words()) {
+                        Some(existing) => existing,
+                        None => {
+                            let payload = Arc::new(self.dynamic_mask_cache_payload(mask));
+                            cache.values.insert(value_hash, mask.len(), &payload);
+                            payload
+                        }
+                    };
                     cache.entries[slot]
                         .as_mut()
                         .expect("probation cache slot disappeared")
-                        .mask = payload;
+                        .mask = Some(payload);
                 }
                 return;
             }
         }
-        let payload = if probation_if_absent {
-            DynamicMaskCachePayload::Probation
+        let payload = if let Some(existing) = cache.values.get(value_hash, mask, self.all_original_token_words()) {
+            Some(existing)
+        } else if probation_if_absent {
+            None
         } else {
-            self.dynamic_mask_cache_payload(mask)
+            let payload = Arc::new(self.dynamic_mask_cache_payload(mask));
+            cache.values.insert(value_hash, mask.len(), &payload);
+            Some(payload)
         };
         let entry = DynamicMaskCacheEntry {
             hash,

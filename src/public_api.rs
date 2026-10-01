@@ -309,7 +309,7 @@ impl<'a> Grammar<'a> {
         let mut constraint = spec.compile_final(options.optimization_value())?;
         ensure_runnable_constraint(&constraint)?;
         if options.parser_backend == ParserBackend::TemplateDfa {
-            constraint.install_template_parser()?;
+            constraint.install_template_parser_from_compile()?;
         }
         constraint.with_end_tokens(options.end_token_ids())
     }

@@ -38,6 +38,10 @@ impl PreparedPushDag {
         Self::compile(template, SMALL_OUTPUT_PATHS)
     }
 
+    pub(crate) fn from_prepared(prepared: &super::template_prepare::TemplatePreparation<'_>) -> Option<Self> {
+        Self::from_order(prepared.template(), SMALL_OUTPUT_PATHS, prepared.push_order())
+    }
+
     fn compile(template: &CommitTemplateDfas, minimum_paths: usize) -> Option<Self> {
         let graph = &template.push;
         let n = graph.states.len();
@@ -59,6 +63,12 @@ impl PreparedPushDag {
             }
         }
         if order.len() != n { return None; }
+        Self::from_order(template, minimum_paths, &order)
+    }
+
+    fn from_order(template: &CommitTemplateDfas, minimum_paths: usize, order: &[usize]) -> Option<Self> {
+        let graph = &template.push;
+        let n = graph.states.len();
         let mut counts = vec![0usize; n];
         for &source in order.iter().rev() {
             counts[source] = usize::from(graph.states[source].is_accepting);
@@ -76,7 +86,7 @@ impl PreparedPushDag {
             }
         }
         if entries.iter().all(Option::is_none) { return None; }
-        let states = order.into_iter().map(|source| State {
+        let states = order.iter().copied().map(|source| State {
             accepting: graph.states[source].is_accepting,
             edges: graph.states[source].transitions.iter()
                 .filter(|(_, target)| counts[**target as usize] != 0)
