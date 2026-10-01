@@ -2724,6 +2724,17 @@ impl VirtualResidualMaskProjection {
         }
     }
 
+    /// Canonical transport parameters for a checked finite observation view.
+    /// Mutable reached-state stores and pointer identities are not serialized.
+    #[doc(hidden)]
+    pub fn observation_descriptor(&self) -> Vec<u8> {
+        bincode::serialize(&(self.runtime.terminal(), self.state_offset,
+            self.pattern_states, self.body_states, self.prefix_len, self.suffix_len,
+            self.min, self.full_max, self.mask_max, self.crossed_boundaries,
+            self.local_to_mask_state.as_ref()))
+            .expect("finite residual descriptor serialization")
+    }
+
     #[doc(hidden)]
     pub fn artifact_wire_parts(&self) -> (TerminalID, u32, &[u32], Vec<u8>, usize, usize) {
         (

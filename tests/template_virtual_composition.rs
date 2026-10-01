@@ -143,6 +143,23 @@ fn virtual_parent_observation_is_not_its_component_mask_quotient() {
     let mut prefixes = (0..=word.len()).map(|len| word[..len].to_vec()).collect::<Vec<_>>();
     let mut near_end = b"\"x:".to_vec(); near_end.extend(std::iter::repeat_n(b'a', 4998)); prefixes.push(near_end);
     verify_forms(&reference, &candidate, &vocab, &tokens, &prefixes);
+
+    // An already static composition whose root lexer is virtual is not itself
+    // an intact lexer leaf. Reusing it must retain its leaf observations rather
+    // than trying to prepare a projection over the coordinator's tokenizer.
+    let saved = candidate.save();
+    let middle = Constraint::load(&saved).unwrap();
+    let outer = Grammar::from_glrm(r#"glrm 1; start root; extern grammar middle; nt root = "p" middle "q";"#)
+        .compile_unlinked(&vocab).unwrap().bind("middle", &middle).unwrap();
+    let outer_reference = outer.link_with(options(Optimization::FastBuild)).unwrap();
+    let outer_candidate = outer.link_with(options(Optimization::FastRuntime)).unwrap();
+    let mut outer_prefixes = vec![vec![], b"p".to_vec()];
+    outer_prefixes.extend(prefixes.iter().map(|prefix| {
+        let mut word = vec![b'p']; word.extend(prefix); word
+    }));
+    outer_prefixes.push(b"p\"x:a\"!q".to_vec());
+    verify_forms(&outer_reference, &outer_candidate, &vocab, &tokens, &outer_prefixes);
+    assert_eq!(middle.save(), saved, "linking must not mutate the reusable virtual-root component");
 }
 
 #[test]
@@ -175,6 +192,103 @@ fn malformed_projected_observation_offsets_are_rejected_on_load() {
         let error = Constraint::load(corrupted).unwrap_err().to_string();
         assert!(error.contains("observation"), "{error}");
     }
+    let descriptor = base + needle.len();
+    for (offset, replacement) in [(descriptor, 0u32), (descriptor + 4, 1u32)] {
+        let mut corrupted = saved.clone();
+        corrupted[offset..offset + 4].copy_from_slice(&replacement.to_le_bytes());
+        let error = Constraint::load(corrupted).unwrap_err().to_string();
+        assert!(error.contains("observation"), "{error}");
+    }
+    let count = u64::from_le_bytes(saved[descriptor + 8..descriptor + 16].try_into().unwrap()) as usize;
+    assert_eq!(count, offsets.len() - 1);
+    let mut digest = descriptor + 16;
+    for _ in 0..count {
+        let present = saved[digest]; digest += 1;
+        if present != 0 {
+            assert_eq!(present, 1);
+            let mut corrupted = saved.clone(); corrupted[digest] ^= 1;
+            let error = Constraint::load(corrupted).unwrap_err().to_string();
+            assert!(error.contains("observation"), "{error}");
+            break;
+        }
+    }
     let loaded = Constraint::load(saved).unwrap();
     let mut state = loaded.start(); state.commit_token(3).unwrap(); assert!(state.is_accepting());
+}
+
+#[test]
+fn virtual_repeat_observations_preserve_literal_lower_and_upper_bounds() {
+    if isolated("virtual_repeat_observations_preserve_literal_lower_and_upper_bounds") { return; }
+    let mut tokens = (0..128).map(|id| (id, vec![id as u8])).collect::<Vec<_>>();
+    tokens.extend([(300, b"paaq".to_vec()), (303, b"aaq".to_vec()), (305, b"aaa".to_vec()),
+        (400, b"paaq".to_vec()), (501, b"aq".to_vec()), (502, b"pq".to_vec())]);
+    let mut long_crossing = vec![b'a'; 64]; long_crossing.push(b'q');
+    tokens.push((4097, long_crossing));
+    let vocab = Vocab::new(tokens.clone());
+    for (regex, minimum, maximum) in [("a{2,5000}", 2usize, 5000usize),
+        ("a{4096,8192}", 4096, 8192)] {
+        let source = format!("start root; t A ::= /{regex}/; nt root ::= A;");
+        // FastRuntime may materialize this simple finite repeat. Preserve a
+        // genuinely virtual child, then request static boundary compilation;
+        // its explicitly dynamic local mask engine remains independent.
+        let child = Grammar::from_glrm(&source).compile_with(&vocab, options(Optimization::FastBuild)).unwrap();
+        assert_eq!(glrmask::__private::parser_backend_report(&child)["virtual_lexer"], true,
+            "the fixture must exercise a virtual repeat: {regex}");
+        let parent = Grammar::from_glrm(r#"glrm 1; start root; extern grammar C; nt root = "p" C "q";"#)
+            .compile_unlinked(&vocab).unwrap().bind("C", &child).unwrap();
+        let reference = parent.link_with(options(Optimization::FastBuild)).unwrap();
+        let candidate = parent.link_with(options(Optimization::FastRuntime)).unwrap();
+        let mut prefixes = vec![vec![]];
+        for count in [0, 1, 2, 31, minimum.saturating_sub(65), minimum.saturating_sub(64),
+            minimum.saturating_sub(63), maximum - 65, maximum - 64, maximum - 63,
+            maximum - 40, maximum - 2, maximum - 1, maximum] {
+            let mut word = vec![b'p']; word.extend(std::iter::repeat_n(b'a', count)); prefixes.push(word);
+        }
+        verify_forms(&reference, &candidate, &vocab, &tokens, &prefixes);
+        for prefix in &prefixes {
+            let mut state = candidate.start(); state.commit_bytes(prefix).unwrap();
+            let mask = state.mask();
+            for (id, bytes) in &tokens {
+                let mut word = prefix.clone(); word.extend(bytes);
+                let expected = if let Some(rest) = word.strip_prefix(b"p") {
+                    let (body, complete) = rest.strip_suffix(b"q").map_or((rest, false), |body| (body, true));
+                    body.iter().all(|&byte| byte == b'a') && body.len() <= maximum
+                        && (!complete || body.len() >= minimum)
+                } else { word.is_empty() };
+                let actual = mask.get(*id as usize / 32).is_some_and(|bits| bits & (1 << (*id % 32)) != 0);
+                assert_eq!(actual, expected, "regex={regex} prefix_len={} token={bytes:?}", prefix.len());
+            }
+        }
+        let mut too_long = vec![b'p']; too_long.extend(std::iter::repeat_n(b'a', maximum + 1));
+        assert!(candidate.start().commit_bytes(&too_long).is_err(), "regex={regex}");
+    }
+}
+
+#[test]
+fn unsupported_general_virtual_projection_fails_without_changing_dynamic_language() {
+    if isolated("unsupported_general_virtual_projection_fails_without_changing_dynamic_language") { return; }
+    // This non-prefix-free general residual has no certified finite projector.
+    // Static construction must report that limitation, not silently use the
+    // dynamic B path or reuse an unrelated component-mask projection.
+    let vocab = Vocab::new(vec![(0, b"p".to_vec()), (1, b"a".to_vec()),
+        (2, b"aaa".to_vec()), (3, b"q".to_vec()), (4, b"aq".to_vec())]);
+    let child = Grammar::from_glrm("start root; t A ::= /(a|aa){1,5000}/; nt root ::= A;")
+        .compile_with(&vocab, options(Optimization::FastBuild)).unwrap();
+    assert_eq!(glrmask::__private::parser_backend_report(&child)["virtual_lexer"], true);
+    let parent = Grammar::from_glrm(r#"glrm 1; start root; extern grammar C; nt root = "p" C "q";"#)
+        .compile_unlinked(&vocab).unwrap().bind("C", &child).unwrap();
+    let error = parent.link_with(options(Optimization::FastRuntime)).unwrap_err().to_string();
+    assert!(error.contains("no supported finite boundary observation"), "{error}");
+    let dynamic = parent.link_with(options(Optimization::FastBuild)).unwrap();
+    let loaded = Constraint::load(dynamic.save()).unwrap();
+    for c in [&dynamic, &loaded] {
+        for count in [0usize, 1, 2, 31, 65] {
+            let mut prefix = vec![b'p']; prefix.extend(std::iter::repeat_n(b'a', count));
+            let mut state = c.start(); state.commit_bytes(&prefix).unwrap();
+            let mask = state.mask();
+            assert_eq!(mask[0] & (1 << 3) != 0, count >= 1);
+            assert_ne!(mask[0] & (1 << 4), 0);
+            state.commit_token(4).unwrap(); assert!(state.is_accepting());
+        }
+    }
 }

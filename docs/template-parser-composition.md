@@ -68,6 +68,17 @@ within the compiler's representation limits. The final constraint can itself
 be saved, reloaded, and embedded as a child. Existing static boundary automata
 are reused when their parser and lexer coordinates are unchanged.
 
+Sparse regular frontends use their finite, single-symbol stack representation
+directly. Virtual lexers use a persisted finite observation projection for the
+current vocabulary. Their exact runtime lexer states remain separate from that
+projection, so length limits and other residual conditions are still checked
+when tokens are committed. This works for virtual parents as well as nested or
+repeated virtual children.
+Static linking builds a separate boundary projection covering the full linked
+vocabulary. A child's own projection may cover shorter tokens and is not reused
+as a boundary proof. Neither its local masking coordinate nor the caller's
+reusable child is changed.
+
 Static nullable calls are not expanded to an arbitrary number of iterations.
 Their zero-width closure is compiled by the shared weighted fixed-point solver.
 Runtime control closure similarly stops at its fixed point, not after a number
@@ -77,11 +88,10 @@ budget produces an error rather than a successful partial closure.
 ## Current limits
 
 Direct static construction requires a finite lexical observation coordinate.
-Virtual-lexer components without a supported projection are rejected. Some
-sparse regular frontend artifacts, older template artifacts, and arbitrary
-data-only parser programs lack the finite embedding contract required by the
-linker. These requests return errors; the linker does not reconstruct an LR
-table or guess a child-return convention.
+Virtual-lexer components without a supported finite projection are rejected.
+Older template artifacts and arbitrary data-only parser programs may lack the
+finite embedding contract required by the linker. These requests return errors;
+the linker does not reconstruct an LR table or guess a child-return convention.
 
 Static template and weighted-automaton construction have representation and
 work limits. A successful dynamic build does not imply that a static build will
@@ -102,6 +112,14 @@ sections remain readable for execution. An artifact without an embedding
 contract cannot acquire one merely by being loaded. Invalid indices, cycles,
 alphabet labels, control inventories, and embedding fields are rejected.
 
+Projected virtual compositions save a versioned finite-observation descriptor
+with the full token horizon and fingerprints of both the finite graph and the
+exact-state mapping. Loading reconstructs this vocabulary-dependent lexer
+metadata and checks the fingerprints, leaf offsets, dimensions, and physical
+images before accepting the saved boundary. It does not rebuild the parser.
+Existing non-projected artifact variants remain readable. The unpublished
+horizon-less experimental projected variant must be rebuilt.
+
 `save_with_external_vocab()` omits the separately supplied model vocabulary and
 requires `Constraint::load_with_vocab()` with the exact original binding. Both
 artifact forms retain parser, component, and final-root termination semantics.
@@ -113,6 +131,9 @@ commits, acceptance, scopes, and fresh/self-contained/external-vocabulary forms.
 Strict-static tests fail on a hidden dynamic boundary fallback. Independent
 oracles cover stack-relation scoping, weighted control closure, and safe lexical
 follow exclusions.
+`tests/template_virtual_composition.rs` additionally exercises projected virtual
+parents and children, near-limit residual states, nested reuse, and malformed
+saved observation metadata.
 
 The selected10 regression example is a separate full-vocabulary replay:
 

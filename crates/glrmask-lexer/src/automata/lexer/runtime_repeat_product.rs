@@ -165,6 +165,22 @@ pub struct VirtualBinaryRepeatIntersectionMaskProjection {
 }
 
 impl VirtualBinaryRepeatIntersectionMaskProjection {
+    /// Canonical finite observation transport, independent of reached states
+    /// and the hash-map iteration order of the exact runtime's interner.
+    #[doc(hidden)]
+    pub fn observation_descriptor(&self) -> Vec<u8> {
+        let mut entries = self.mask_state_by_residual.iter().map(|(key, &state)|
+            (key.left.required, key.left.remaining, key.left.body_state,
+                key.right.required, key.right.remaining, key.right.body_state, state))
+            .collect::<Vec<_>>();
+        entries.sort_unstable();
+        bincode::serialize(&(self.far, self.lower_far, self.runtime.terminal,
+            self.runtime.physical_state_count, self.runtime.root_state,
+            self.runtime.left.min, self.runtime.left.max,
+            self.runtime.right.min, self.runtime.right.max, entries))
+            .expect("finite product descriptor serialization")
+    }
+
     #[inline]
     pub fn project(&self, full_state: u32) -> Option<u32> {
         if full_state < self.runtime.physical_state_count {

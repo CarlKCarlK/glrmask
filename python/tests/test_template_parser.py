@@ -209,3 +209,40 @@ def test_python_backend_selection_does_not_accept_untyped_flags():
     for value in ["TEMPLATE_DFA", True, 1, object()]:
         with pytest.raises(TypeError):
             grammar.compile(vocab, parser_backend=value)
+
+
+@pytest.mark.parametrize("mode", [glrmask.Optimization.FAST_RUNTIME, glrmask.Optimization.FAST_BUILD])
+def test_python_projected_virtual_child_preserves_exact_limits_and_reload(mode):
+    tokens = {0: b"p", 1: b'"x:a"', 2: b"q", 3: b'p"x:a"q',
+              4: b'a"q', 5: b"a", 6: b"aaa", 7: b'"q', 8: b""}
+    vocab = glrmask.Vocab.from_id_to_bytes(tokens)
+    child = glrmask.Grammar.from_json_schema(json.dumps({
+        "type": "string", "format": "uri", "minLength": 1, "maxLength": 5000,
+    })).compile(vocab, optimization=glrmask.Optimization.FAST_RUNTIME,
+                parser_backend=glrmask.ParserBackend.TEMPLATE_DFA)
+    child = glrmask.Constraint.load(child.save())
+    parent = glrmask.Grammar.from_glrm(
+        'glrm 1; start root; extern grammar C; nt root = "p" C "q";').compile_unlinked(vocab)
+    compiled = parent.bind("C", child).link(optimization=mode,
+        parser_backend=glrmask.ParserBackend.TEMPLATE_DFA, end_tokens=[8])
+    for compiled in representations(compiled, vocab):
+        assert compiled.parser_backend == glrmask.ParserBackend.TEMPLATE_DFA
+        state = compiled.start()
+        assert state.mask()[3]
+        state.commit_token(3)
+        assert state.is_accepting() and state.mask()[8]
+        state.commit_token(8)
+        assert state.is_terminated()
+
+        for count in [0, 1, 31, 4996, 4997, 4998]:
+            state = compiled.start()
+            state.commit_bytes(b'p"x:' + b"a" * count)
+            mask = state.mask()
+            for token, payload_size in [(5, 1), (6, 3)]:
+                assert bool(mask[token]) == (2 + count + payload_size <= 5000), (count, token)
+            assert mask[7]  # Completing the URI and returning to the parent.
+            state.commit_token(7)
+            assert state.is_accepting()
+        state = compiled.start()
+        with pytest.raises(ValueError):
+            state.commit_bytes(b'p"x:' + b"a" * 4999)

@@ -105,13 +105,11 @@ pub(crate) fn install(constraint: &mut Constraint, vocab: &Vocab) -> Result<()> 
             .ok_or_else(|| fail("static template leaf path is invalid")))
         .collect::<Result<Vec<_>>>()?;
     let projected = leaves.iter().any(|leaf| leaf.tokenizer.has_any_virtual_runtime());
-    let views = leaves.iter().map(|leaf| {
-        if leaf.tokenizer.has_any_virtual_runtime() {
-            let view = leaf.dynamic_mask_vocab.mask_projection_tokenizer()
-                .ok_or_else(|| fail("virtual component requires a persisted finite lexical observation projection"))?;
-            if view.has_any_virtual_runtime() { return Err(fail("virtual lexical observation projection is not finite")); }
-            Ok(view)
-        } else { Ok(leaf.tokenizer.as_ref()) }
+    let observation = projected.then(|| crate::runtime::static_observation::RecursiveStaticObservation::prepare(
+        &leaves, vocab.max_token_byte_len())).transpose().map_err(fail)?;
+    let views = leaves.iter().enumerate().map(|(index, leaf)| {
+        observation.as_ref().map_or(Some(leaf.tokenizer.as_ref()), |o| o.leaf_view(index, leaf))
+            .ok_or_else(|| fail("missing finite boundary observation view"))
     }).collect::<Result<Vec<_>>>()?;
     let tokenizer_inputs = views.iter().zip(&layout.leaf_terminal_offsets)
         .map(|(&view, &offset)| (view, offset)).collect::<Vec<_>>();
@@ -125,10 +123,12 @@ pub(crate) fn install(constraint: &mut Constraint, vocab: &Vocab) -> Result<()> 
         || layout.total_tokenizer_states.checked_add(1) != Some(merged.num_states())) {
         return Err(fail("static lexical observation changed the recursive state coordinate"));
     }
-    let observation = projected.then(|| {
-        let mut leaf_offsets = tokenizer_offsets.clone(); leaf_offsets.push(merged.num_states());
-        crate::runtime::static_observation::RecursiveStaticObservation { leaf_offsets }
-    });
+    if let Some(observation) = &observation {
+        if observation.leaf_offsets[..leaves.len()] != tokenizer_offsets
+            || observation.leaf_offsets.last() != Some(&merged.num_states()) {
+            return Err(fail("finite boundary observation does not match the lexical union"));
+        }
+    }
     if merged.terminal_exprs().is_none() {
         if let Some(exprs) = merged_retained_terminal_exprs(&leaves, &layout.leaf_terminal_offsets,
             layout.total_leaf_terminals) {

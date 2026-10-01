@@ -68,6 +68,15 @@ pub struct VirtualZeroMinUnitRepeatMaskProjection {
 }
 
 impl VirtualZeroMinUnitRepeatMaskProjection {
+    /// Stable construction metadata; excludes mutable runtime history.
+    #[doc(hidden)]
+    pub fn observation_descriptor(&self) -> Vec<u8> {
+        bincode::serialize(&[self.full_min, self.full_max, self.full_physical_state_count,
+            self.mask_state_count, self.deep_lower_state, self.lower_start, self.lower_offset,
+            self.interior_state, self.upper_start, self.upper_offset])
+            .expect("fixed unit-repeat descriptor serialization")
+    }
+
     pub(super) fn new(
         full_min: usize,
         full_max: usize,

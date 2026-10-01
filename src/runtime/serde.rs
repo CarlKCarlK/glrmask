@@ -2754,8 +2754,12 @@ struct RecursiveSegmentedRuntimeArtifactV27 {
 enum SegmentedRuntimeArtifactV27Ref<'a> {
     Recursive(RecursiveSegmentedRuntimeArtifactV27Ref<'a>),
     LegacyV24(SegmentedRuntimeArtifactV24Ref<'a>),
-    /// A new enum tag, not a reinterpretation of either legacy wire shape.
+    // Retain the unpublished, horizon-less experimental discriminant only
+    // for an explicit rebuild error. Never reinterpret its two-field payload.
+    #[allow(dead_code)]
     RecursiveProjected(RecursiveSegmentedRuntimeArtifactV27Ref<'a>,
+        &'a crate::runtime::static_observation::LegacyRecursiveStaticObservation),
+    RecursiveObserved(RecursiveSegmentedRuntimeArtifactV27Ref<'a>,
         &'a crate::runtime::static_observation::RecursiveStaticObservation),
 }
 
@@ -2764,6 +2768,8 @@ enum SegmentedRuntimeArtifactV27 {
     Recursive(RecursiveSegmentedRuntimeArtifactV27),
     LegacyV24(SegmentedRuntimeArtifactV24),
     RecursiveProjected(RecursiveSegmentedRuntimeArtifactV27,
+        crate::runtime::static_observation::LegacyRecursiveStaticObservation),
+    RecursiveObserved(RecursiveSegmentedRuntimeArtifactV27,
         crate::runtime::static_observation::RecursiveStaticObservation),
 }
 
@@ -3542,7 +3548,7 @@ fn segmented_runtime_artifact_ref(
             boundary_shards,
         };
     Some(match overlay.recursive_static_observation.as_deref() {
-        Some(observation) => SegmentedRuntimeArtifactV27Ref::RecursiveProjected(runtime, observation),
+        Some(observation) => SegmentedRuntimeArtifactV27Ref::RecursiveObserved(runtime, observation),
         None => SegmentedRuntimeArtifactV27Ref::Recursive(runtime),
     })
 }
@@ -4551,7 +4557,11 @@ fn restore_segmented_runtime_v27(
         SegmentedRuntimeArtifactV27::LegacyV24(runtime) => {
             restore_segmented_runtime_v24(constraint, runtime)
         }
-        SegmentedRuntimeArtifactV27::RecursiveProjected(runtime, observation) => {
+        SegmentedRuntimeArtifactV27::RecursiveProjected(_runtime, _observation) => {
+            Err(crate::GlrMaskError::Serialization(
+                "experimental projected artifact lacks a full-vocabulary observation contract; rebuild it".into()))
+        }
+        SegmentedRuntimeArtifactV27::RecursiveObserved(runtime, observation) => {
             restore_recursive_segmented_runtime_v27(constraint, runtime)?;
             observation.validate(constraint).map_err(crate::GlrMaskError::Serialization)?;
             constraint.static_dynamic_overlay.as_mut().expect("restored recursive overlay")
