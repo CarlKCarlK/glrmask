@@ -66,6 +66,7 @@ pub(crate) mod merge;
 pub(crate) mod parser_dwa;
 pub(crate) mod parser_equivalence;
 pub(crate) mod resolve_negatives;
+pub(crate) mod pop_classes;
 pub(crate) mod templates;
 
 /// Implementation details shared by the GLRMask workspace.
@@ -85,6 +86,9 @@ pub mod __private {
     }
     pub mod resolve_negatives {
         pub use crate::resolve_negatives::*;
+    }
+    pub mod pop_classes {
+        pub use crate::pop_classes::*;
     }
     pub mod templates {
         pub use crate::templates::*;

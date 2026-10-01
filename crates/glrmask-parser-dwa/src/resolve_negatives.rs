@@ -1046,6 +1046,18 @@ fn compute_cancellations_sources_serial_inner<I>(
 where
     I: IntoIterator<Item = u32>,
 {
+    compute_cancellations_sources_with_pop_classes(nwa, sources, foreign_derived, None)
+}
+
+fn compute_cancellations_sources_with_pop_classes<I>(
+    nwa: &NWA,
+    sources: I,
+    foreign_derived: Option<&DerivedEpsilons>,
+    pop_classes: Option<&crate::pop_classes::PopLabelClasses>,
+) -> Vec<(u32, u32, Weight)>
+where
+    I: IntoIterator<Item = u32>,
+{
     let state_count = nwa.states().len() as u32;
     if state_count == 0 {
         return Vec::new();
@@ -1097,6 +1109,8 @@ where
             && foreign_derived_at_state.is_none_or(SmallTargetWeights::is_empty)
             && positive_targets.is_none()
             && default_targets.is_none()
+            && pop_classes.is_none_or(|classes|
+                classes.matching_targets(state, positive_label as u32).next().is_none())
             && state.epsilons.is_empty()
         {
             continue;
@@ -1137,6 +1151,16 @@ where
                         &mut subset_memo,
                     );
                 }
+            }
+        }
+
+        if let Some(classes) = pop_classes {
+            for (target_state, edge_weight) in classes.matching_targets(state, positive_label as u32) {
+                extend_derived_epsilons(
+                    &query_weight_to_current, query_single.as_ref(), source_state,
+                    *target_state, edge_weight, &mut query_weights, &mut worklist,
+                    &mut derived_epsilons, &mut subset_memo,
+                );
             }
         }
 
@@ -2231,6 +2255,26 @@ pub fn resolve_negative_codes_in_nwa(
     nwa: &mut NWA,
     allow_grouped_cancellation: bool,
 ) -> Option<Vec<u32>> {
+    resolve_negative_codes_in_nwa_impl(nwa, allow_grouped_cancellation, None)
+}
+
+/// Run the ordinary weighted cancellation fixed point with finite consuming
+/// POP classes. This changes only positive-edge matching for a pushed symbol;
+/// class edges are not epsilon/default-finality edges and remain for the exact
+/// positive predicate compiler. The ordinary LR path has no class catalog.
+pub fn resolve_negative_codes_in_nwa_with_pop_classes(
+    nwa: &mut NWA,
+    classes: &crate::pop_classes::PopLabelClasses,
+) -> Result<Option<Vec<u32>>, String> {
+    classes.validate(nwa)?;
+    Ok(resolve_negative_codes_in_nwa_impl(nwa, false, Some(classes)))
+}
+
+fn resolve_negative_codes_in_nwa_impl(
+    nwa: &mut NWA,
+    allow_grouped_cancellation: bool,
+    pop_classes: Option<&crate::pop_classes::PopLabelClasses>,
+) -> Option<Vec<u32>> {
     let profile_enabled = std::env::var_os("GLRMASK_PROFILE_COMPILE").is_some()
         || std::env::var_os("GLRMASK_PROFILE_COMPILE_SUMMARY").is_some();
     let precompute_finality = rayon::current_num_threads() > 1
@@ -2248,7 +2292,9 @@ pub fn resolve_negative_codes_in_nwa(
             && rayon::current_num_threads() > 1
             && state_count >= 4_096;
     let compute_cancellations = || {
-        if use_parallel_reverse_topo {
+        if let Some(classes) = pop_classes {
+            compute_cancellations_sources_with_pop_classes(nwa, 0..state_count, None, Some(classes))
+        } else if use_parallel_reverse_topo {
             compute_cancellations_reverse_topological_parallel(nwa, allow_grouped_cancellation)
                 .unwrap_or_else(|| {
                     compute_cancellations_range(nwa, 0..state_count, allow_grouped_cancellation)

@@ -12,11 +12,11 @@ pub(super) fn assemble(
     lexical: &DWA,
     state_budget: Option<usize>,
 ) -> Result<(NWA, usize, usize), String> {
-    assemble_impl(templates, controls, Some(max_controls_per_gap), lexical, state_budget)
+    assemble_impl(&templates.by_terminal_nwa, controls, Some(max_controls_per_gap), lexical, state_budget)
 }
 
 fn assemble_impl(
-    templates: &Templates,
+    templates: &BTreeMap<u32, NWA>,
     controls: &[u32],
     bounded_depth: Option<u32>,
     lexical: &DWA,
@@ -60,7 +60,7 @@ fn assemble_impl(
         for (terminal, target, weight) in row.transitions.entries() {
             if terminal < 0 { return Err("static lexical query contains a negative terminal label".into()); }
             if weight.is_empty() { continue; }
-            let template = templates.by_terminal_nwa.get(&(terminal as u32))
+            let template = templates.get(&(terminal as u32))
                 .ok_or_else(|| format!("static query has no template for terminal {terminal}"))?;
             let continuation = *ports.get(target as usize * depths)
                 .ok_or("static lexical query edge leaves its graph")?;
@@ -78,7 +78,7 @@ fn assemble_impl(
         let control_layers = if bounded_depth.is_some() { depths - 1 } else { 1 };
         for depth in 0..control_layers {
             for &control in controls {
-                let template = templates.by_terminal_nwa.get(&control)
+                let template = templates.get(&control)
                     .ok_or_else(|| format!("static query has no template for control {control}"))?;
                 check_growth(arena.states().len(), template.states().len())?;
                 let body = append_weighted_fragment(&mut arena, template, &Weight::all(),
@@ -106,7 +106,7 @@ pub(crate) fn compile(
     lexical: &DWA,
     symbol_count: u32,
 ) -> Result<SignedShardOutput, String> {
-    compile_impl(templates, controls, Some(certificate.max_controls_per_gap), lexical, symbol_count)
+    compile_impl(&templates.by_terminal_nwa, controls, Some(certificate.max_controls_per_gap), lexical, symbol_count, None)
 }
 
 /// Exact unbounded control closure for nullable components. This finite cyclic
@@ -118,15 +118,27 @@ pub(crate) fn compile_saturated(
     lexical: &DWA,
     symbol_count: u32,
 ) -> Result<SignedShardOutput, String> {
-    compile_impl(templates, controls, None, lexical, symbol_count)
+    compile_impl(&templates.by_terminal_nwa, controls, None, lexical, symbol_count, None)
+}
+
+pub(crate) fn compile_classed(
+    templates: &BTreeMap<u32, NWA>,
+    controls: &[u32],
+    certificate: Option<&ClosureCertificate>,
+    lexical: &DWA,
+    classes: &glrmask_parser_dwa::__private::pop_classes::PopLabelClasses,
+) -> Result<SignedShardOutput, String> {
+    compile_impl(templates, controls, certificate.map(|c| c.max_controls_per_gap),
+        lexical, classes.symbol_count(), Some(classes))
 }
 
 fn compile_impl(
-    templates: &Templates,
+    templates: &BTreeMap<u32, NWA>,
     controls: &[u32],
     bounded_depth: Option<u32>,
     lexical: &DWA,
     symbol_count: u32,
+    classes: Option<&glrmask_parser_dwa::__private::pop_classes::PopLabelClasses>,
 ) -> Result<SignedShardOutput, String> {
     if !lexical.is_acyclic() { return Err("static template lexical query is cyclic".into()); }
     let start = Instant::now();
@@ -142,7 +154,13 @@ fn compile_impl(
     }
     let compose_ms = start.elapsed().as_secs_f64() * 1000.0;
     let start = Instant::now();
-    resolve_negative_codes_in_nwa(&mut program, false);
+    if let Some(classes) = classes {
+        glrmask_parser_dwa::__private::resolve_negatives::resolve_negative_codes_in_nwa_with_pop_classes(
+            &mut program, classes)?;
+        program = classes.expand_positive_compressed(program, 8_000_000)?;
+    } else {
+        resolve_negative_codes_in_nwa(&mut program, false);
+    }
     let resolve_ms = start.elapsed().as_secs_f64() * 1000.0;
     if program.states().iter().any(|row| row.transitions.keys().any(|&label| is_negative_label(label))) {
         return Err("static template cancellation left a negative stack action".into());
@@ -153,5 +171,5 @@ fn compile_impl(
     Ok(SignedShardOutput { parser_dwa, templates_ms: 0.0, compose_ms, resolve_ms,
         normalize_ms: start.elapsed().as_secs_f64() * 1000.0,
         signed_states, signed_transitions,
-        terms: templates.by_terminal.len().saturating_sub(controls.len()) })
+        terms: templates.len().saturating_sub(controls.len()) })
 }

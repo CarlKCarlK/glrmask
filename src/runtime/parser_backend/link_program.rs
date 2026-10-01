@@ -123,6 +123,7 @@ pub(crate) fn scoped(template: &CommitTemplateDfas, offset: u32, count: u32) -> 
     }
     let has_untouched = nfa.states[untouched as usize].is_accepting || !nfa.states[untouched as usize].transitions.is_empty();
     let start = nfa.add_state(); nfa.start_states = vec![start];
+    let mut guarded_targets = BTreeMap::<Vec<u32>, u32>::new();
     for top in offset..end {
         let mut targets = BTreeSet::new();
         for &id in &initial {
@@ -131,13 +132,65 @@ pub(crate) fn scoped(template: &CommitTemplateDfas, offset: u32, count: u32) -> 
             if let Some(next) = row.get(&(top as i32)).or_else(|| row.get(&DEFAULT_LABEL)) { targets.extend(next.iter().copied()); }
         }
         if targets.is_empty() && !has_untouched { continue; }
+        let targets = targets.into_iter().collect::<Vec<_>>();
+        if !has_untouched && let Some(&branch) = guarded_targets.get(&targets) {
+            nfa.add_transition(start, top as i32, branch);
+            continue;
+        }
         if nfa.states.len() >= MAX_STATES { return Err("template owner guard exceeds state budget".into()); }
         let branch = nfa.add_state();
-        nfa.states[branch as usize].epsilons.extend(targets);
+        nfa.states[branch as usize].epsilons.extend(targets.iter().copied());
+        // Without an input-free output, this branch only dispatches to the
+        // same suffix relation. Its identity need not depend on the top label.
+        // A read-and-restore branch cannot be shared: its PUSH(top) differs.
+        if !has_untouched { guarded_targets.insert(targets, branch); }
         if has_untouched { nfa.add_transition(branch, encode_negative_label(top), untouched); }
         nfa.add_transition(start, top as i32, branch);
     }
     Ok(nfa)
+}
+
+/// Relocate the original phase DAG when its exact input domain already
+/// enforces first-top ownership. All concrete labels are checked, including
+/// unreachable rows, so every out-of-alphabet top has the same DEFAULT
+/// behavior. One such representative therefore proves the owner restriction.
+/// Input-free and genuinely default-topped relations keep the generic guard.
+pub(crate) fn scoped_template(
+    program: &CommitTemplateDfas, offset: u32, count: u32,
+) -> Result<CommitTemplateDfas, String> {
+    offset.checked_add(count).filter(|&end| end < DEFAULT_LABEL as u32)
+        .ok_or("template link stack alphabet overflow")?;
+    let domain = super::compile_domain(program).map_err(|error| error.to_string())?;
+    for graph in [&program.pop, &program.read, &program.push] {
+        for row in &graph.states {
+            for &label in row.transitions.keys() {
+                if label == DEFAULT_LABEL { continue; }
+                let local = if label < 0 { negative_to_positive_label(label) as u32 } else { label as u32 };
+                if local >= count { return Err("template link label lies outside component alphabet".into()); }
+            }
+        }
+    }
+    use glrmask_parser_dwa::__private::templates::admissibility::DomainProbe;
+    let ownership_proved = match domain.start() {
+        DomainProbe::Reject => true,
+        DomainProbe::Accept => false,
+        DomainProbe::NeedMore(cursor) => matches!(domain.step(cursor, count), DomainProbe::Reject),
+    };
+    if !ownership_proved { return compile(&[scoped(program, offset, count)?]); }
+    let mut relocated = program.clone();
+    for graph in [&mut relocated.pop, &mut relocated.read, &mut relocated.push] {
+        for row in &mut graph.states {
+            row.transitions = row.transitions.iter().map(|(&label, &target)| {
+                let label = if label == DEFAULT_LABEL { label } else {
+                    let local = if label < 0 { negative_to_positive_label(label) as u32 } else { label as u32 };
+                    let global = offset + local;
+                    if label < 0 { encode_negative_label(global) } else { global as i32 }
+                };
+                (label, target)
+            }).collect();
+        }
+    }
+    Ok(relocated)
 }
 
 pub(crate) fn append_push(nfa: &mut NFA, symbol: u32) {
@@ -347,6 +400,33 @@ mod tests {
         let stack = ParserGSS::from_single_stack(source.to_vec(), TerminalsDisallowed::new());
         advance_with_prepared_template(program, stack, None).to_stacks(128)
             .expect("small exact test frontier").into_iter().map(|(stack, _)| stack).collect()
+    }
+
+    #[test]
+    fn certified_owner_relocation_preserves_phase_graph_and_foreign_suffix_pops() {
+        let source = rewrite(&[1, DEFAULT_LABEL], &[2]);
+        let scoped = scoped_template(&source, 10, 3).unwrap();
+        assert_eq!(scoped.pop.states.len(), source.pop.states.len());
+        assert_eq!(scoped.read.states.len(), source.read.states.len());
+        assert_eq!(scoped.push.states.len(), source.push.states.len());
+        assert_eq!(outputs(&scoped, &[99, 11]), BTreeSet::from([vec![12]]));
+        assert_eq!(outputs(&scoped, &[77, 99, 11]), BTreeSet::from([vec![77, 12]]));
+        assert!(outputs(&scoped, &[11, 99]).is_empty());
+        assert!(outputs(&scoped, &[]).is_empty());
+        assert!(scoped_template(&rewrite(&[3], &[]), 0, 3).is_err());
+    }
+
+    #[test]
+    fn equal_guard_suffixes_do_not_create_one_phase_state_per_owner_symbol() {
+        let source = rewrite(&[DEFAULT_LABEL], &[]);
+        let graph = scoped(&source, 2, 4096).unwrap();
+        assert!(graph.states.len() < 16, "{} guard states", graph.states.len());
+        let program = scoped_template(&source, 2, 4096).unwrap();
+        assert!(program.pop.states.len() + program.read.states.len() + program.push.states.len() < 16);
+        for top in [2, 17, 4097] {
+            assert_eq!(outputs(&program, &[99, top]), BTreeSet::from([vec![99]]));
+        }
+        for top in [0, 1, 4098, 9000] { assert!(outputs(&program, &[99, top]).is_empty()); }
     }
 
     #[test]

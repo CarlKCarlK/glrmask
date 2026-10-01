@@ -114,6 +114,8 @@ fn randomized_relations_match_literal_phase_execution() {
         let scoped = link_program::compile(&[link_program::scoped(&source, 2, 3).unwrap()])
             .unwrap_or_else(|error| panic!("scope case {case}: {error}, source={source:?}"));
         let domain = super::super::compile_domain(&scoped).unwrap();
+        let preserved = link_program::scoped_template(&source, 2, 3).unwrap();
+        let preserved_domain = super::super::compile_domain(&preserved).unwrap();
         let mut called = link_program::action_nfa(&source).unwrap(); link_program::append_push(&mut called, 5);
         let called = link_program::compile(&[called])
             .unwrap_or_else(|error| panic!("append case {case}: {error}, source={source:?}"));
@@ -122,7 +124,9 @@ fn randomized_relations_match_literal_phase_execution() {
                 outputs(&renamed, stack)
             } else { BTreeSet::new() };
             assert_eq!(outputs(&scoped, stack), expected, "scope case={case}, stack={stack:?}, source={source:?}");
+            assert_eq!(outputs(&preserved, stack), expected, "preserved scope case={case}, stack={stack:?}");
             assert_eq!(domain.matches_top_first(stack.iter().rev().copied()), !expected.is_empty());
+            assert_eq!(preserved_domain.matches_top_first(stack.iter().rev().copied()), !expected.is_empty());
             let expected = outputs(&source, stack).into_iter().map(|mut word| { word.push(5); word }).collect();
             assert_eq!(outputs(&called, stack), expected, "call case={case}, stack={stack:?}, source={source:?}");
             checks += 1;

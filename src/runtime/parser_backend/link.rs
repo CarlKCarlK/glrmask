@@ -22,7 +22,7 @@ fn identity() -> CommitTemplateDfas {
 // These shared bounded transformations preserve per-row DEFAULT priority,
 // including explicit dead edges, before returning to the ordinary executor.
 fn scope(program: &CommitTemplateDfas, alphabet: u32, offset: u32) -> Result<CommitTemplateDfas> {
-    link_program::compile(&[link_program::scoped(program, offset, alphabet).map_err(fail)?]).map_err(fail)
+    link_program::scoped_template(program, offset, alphabet).map_err(fail)
 }
 
 fn append_child_start(program: &CommitTemplateDfas, child_start: u32) -> Result<CommitTemplateDfas> {

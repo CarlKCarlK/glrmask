@@ -193,19 +193,30 @@ pub(crate) fn install(constraint: &mut Constraint, vocab: &Vocab) -> Result<()> 
                 .ok_or_else(|| fail("scoped exclusion terminal overflow"))?;
             Ok((runtime_terminal, weight))
         }).collect::<Result<BTreeMap<_, _>>>()?;
-    let templates = crate::template_parser::static_compile::prepare_static_templates(
-        &composition.programs, parser.state_count)?;
-    if profile { eprintln!("[glrmask/profile][static_template_boundary] phase=programs_ready templates={} elapsed_ms={:.3}",
-        composition.programs.len(), started.elapsed().as_secs_f64() * 1000.0); }
     let controls = (composition.control_start..composition.programs.len() as u32).collect::<Vec<_>>();
+    let mut selected = controls.iter().copied().collect::<std::collections::BTreeSet<_>>();
+    for walk in &walks {
+        for row in walk.output.dwa.states() {
+            for (terminal, _, weight) in row.transitions.entries() {
+                if weight.is_empty() { continue; }
+                let terminal = u32::try_from(terminal).map_err(|_| fail("negative lexical terminal"))?;
+                if terminal >= composition.control_start {
+                    return Err(fail("lexical boundary terminal lies outside the ordinary inventory"));
+                }
+                selected.insert(terminal);
+            }
+        }
+    }
+    if profile { eprintln!("[glrmask/profile][static_template_boundary] phase=programs_selected selected={} total={} elapsed_ms={:.3}",
+        selected.len(), composition.programs.len(), started.elapsed().as_secs_f64() * 1000.0); }
+    let (templates, classes) = crate::template_parser::static_compile::prepare_classed_boundary_programs(
+        &composition.programs, parser.state_count, &selected)?;
+    if profile { eprintln!("[glrmask/profile][static_template_boundary] phase=programs_ready templates={} pop_classes={} elapsed_ms={:.3}",
+        templates.len(), classes.len(), started.elapsed().as_secs_f64() * 1000.0); }
     let mut published = Vec::with_capacity(walks.len());
     for walk in walks {
-        let output = match &certificate {
-            Some(certificate) => super::boundary_transfer::template_program::compile(
-                &templates, &controls, certificate, &walk.output.dwa, parser.state_count),
-            None => super::boundary_transfer::template_program::compile_saturated(
-                &templates, &controls, &walk.output.dwa, parser.state_count),
-        }.map_err(fail)?;
+        let output = super::boundary_transfer::template_program::compile_classed(
+            &templates, &controls, certificate.as_ref(), &walk.output.dwa, &classes).map_err(fail)?;
         let work = WalkBoundaryShardWork { start_component: walk.start_component as u32,
             terminal_automaton: TerminalAutomaton::Dwa(walk.output.dwa), id_map: walk.output.id_map,
             candidate_tokens: Arc::from(walk.candidate_tokens.into_iter().collect::<Vec<_>>()) };

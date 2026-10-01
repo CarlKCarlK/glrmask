@@ -20,6 +20,8 @@ use crate::compiler::stages::templates::Templates;
 use crate::ds::bitset::BitSet;
 use crate::runtime::ConstraintRuntimeBackend;
 use glrmask_parser_dwa::__private::resolve_negatives::resolve_negative_codes_in_nwa;
+use glrmask_parser_dwa::__private::pop_classes::PopLabelClasses;
+use crate::automata::weighted::nwa::{NWA, NWAState};
 use rustc_hash::FxHashMap;
 use std::collections::VecDeque;
 
@@ -44,9 +46,10 @@ impl ExpansionBudget {
             || self.subset_members > 2_097_152
             || self.work > 33_554_432
         {
-            return Err(Error::Compilation(
-                "static template expansion exceeded its representation/work budget; the parser relation was not truncated".into(),
-            ));
+            return Err(Error::Compilation(format!(
+                "static template expansion exceeded its representation/work budget; the parser relation was not truncated (states={}, edges={}, subset_members={}, work={})",
+                self.states, self.edges, self.subset_members, self.work,
+            )));
         }
         Ok(())
     }
@@ -60,6 +63,15 @@ fn concrete_action_nfa(
     symbols: u32,
     budget: &mut ExpansionBudget,
 ) -> Result<NFA> {
+    action_nfa(split, symbols, budget, None)
+}
+
+fn action_nfa(
+    split: &CommitTemplateDfas,
+    symbols: u32,
+    budget: &mut ExpansionBudget,
+    mut classes: Option<&mut PopLabelClasses>,
+) -> Result<NFA> {
     let read_offset = split.pop.states.len();
     let push_offset = read_offset + split.read.states.len();
     let fixed = push_offset + split.push.states.len();
@@ -72,11 +84,22 @@ fn concrete_action_nfa(
         for (&label, &target) in &state.transitions {
             if label == DEFAULT_LABEL {
                 // Even a concrete edge into a dead state shadows DEFAULT.
-                for symbol in 0..symbols {
-                    budget.charge(0, 0, 0, 1)?;
-                    if !state.transitions.contains_key(&(symbol as i32)) {
+                if let Some(classes) = classes.as_deref_mut() {
+                    budget.charge(0, 0, 0, state.transitions.len())?;
+                    if let Some(label) = classes.intern_complement(state.transitions.keys()
+                        .copied().filter(|&label| label != DEFAULT_LABEL).map(|label| label as u32))
+                        .map_err(Error::Compilation)?
+                    {
                         budget.charge(0, 1, 0, 0)?;
-                        nfa.add_transition(id as u32, symbol as i32, target);
+                        nfa.add_transition(id as u32, label, target);
+                    }
+                } else {
+                    for symbol in 0..symbols {
+                        budget.charge(0, 0, 0, 1)?;
+                        if !state.transitions.contains_key(&(symbol as i32)) {
+                            budget.charge(0, 1, 0, 0)?;
+                            nfa.add_transition(id as u32, symbol as i32, target);
+                        }
                     }
                 }
             } else {
@@ -213,16 +236,110 @@ pub(crate) fn lexical_context(terminals: u32) -> AnalyzedGrammar {
 pub(crate) fn prepare_static_templates(
     programs: &[Option<Arc<CommitTemplateDfas>>], symbol_count: u32,
 ) -> Result<Templates> {
+    prepare_static_templates_for_terminals(programs, symbol_count,
+        &(0..programs.len() as u32).collect())
+}
+
+/// Compile exactly the inventory observed by a lexical query, with IDs kept
+/// in the caller's coordinate. Unobserved terminals cannot contribute to this
+/// product; expanding their DEFAULT rows wastes the shared resource budget.
+/// Every selected relation remains complete, including all of its stack paths.
+pub(crate) fn prepare_static_templates_for_terminals(
+    programs: &[Option<Arc<CommitTemplateDfas>>], symbol_count: u32,
+    selected: &BTreeSet<u32>,
+) -> Result<Templates> {
     let mut budget = ExpansionBudget::default();
     let mut terminal_templates = BTreeMap::new();
-    for (terminal, split) in programs.iter().enumerate() {
-        let split = split
-            .as_ref()
-            .ok_or_else(|| Error::Compilation("missing custom terminal relation".into()))?;
-        let nfa = concrete_action_nfa(split, symbol_count, &mut budget)?;
-        terminal_templates.insert(terminal as u32, bounded_determinize(&nfa, &mut budget)?);
+    for &terminal in selected {
+        let split = programs.get(terminal as usize).and_then(Option::as_deref)
+            .ok_or_else(|| Error::Compilation(format!("missing selected terminal relation {terminal}")))?;
+        let result = (|| {
+            let nfa = concrete_action_nfa(split, symbol_count, &mut budget)?;
+            bounded_determinize(&nfa, &mut budget)
+        })().map_err(|error| Error::Compilation(format!("terminal {terminal}: {error}")))?;
+        terminal_templates.insert(terminal, result);
     }
     Ok(Templates::from_terminal_dfas(terminal_templates))
+}
+
+/// Linear-size phase programs for a boundary query. POP complements stay
+/// symbolic until the common cancellation solver knows which concrete PUSH
+/// symbols reach them. Neither a template DFA nor the global stack alphabet is
+/// eagerly expanded merely to build a construction-only intermediate graph.
+pub(crate) fn prepare_classed_boundary_programs(
+    programs: &[Option<Arc<CommitTemplateDfas>>], symbol_count: u32,
+    selected: &BTreeSet<u32>,
+) -> Result<(BTreeMap<u32, NWA>, PopLabelClasses)> {
+    if std::env::var_os("GLRMASK_PROFILE_COMPILE_SUMMARY").is_some() {
+        let mut states = 0usize;
+        let mut edges = 0usize;
+        let mut largest = (0usize, 0u32);
+        for &id in selected {
+            if let Some(program) = programs.get(id as usize).and_then(Option::as_deref) {
+                let n = program.pop.states.len() + program.read.states.len() + program.push.states.len();
+                states += n;
+                edges += [&program.pop, &program.read, &program.push].iter()
+                    .flat_map(|graph| &graph.states).map(|row| row.transitions.len()).sum::<usize>();
+                largest = largest.max((n, id));
+            }
+        }
+        eprintln!("[glrmask/profile][classed_template_inventory] templates={} source_states={states} source_edges={edges} largest_states={} largest_terminal={}",
+            selected.len(), largest.0, largest.1);
+    }
+    let mut budget = ExpansionBudget::default();
+    let mut classes = PopLabelClasses::new(symbol_count).map_err(Error::Compilation)?;
+    let mut result = BTreeMap::new();
+    for &terminal in selected {
+        let split = programs.get(terminal as usize).and_then(Option::as_deref)
+            .ok_or_else(|| Error::Compilation(format!("missing selected terminal relation {terminal}")))?;
+        let nfa = action_nfa(split, symbol_count, &mut budget, Some(&mut classes))
+            .map_err(|error| Error::Compilation(format!("terminal {terminal}: {error}")))?;
+        let states = nfa.states.into_iter().map(|state| NWAState {
+            final_weight: state.is_accepting.then(crate::ds::weight::Weight::all),
+            transitions: state.transitions.into_iter().map(|(label, targets)|
+                (label, targets.into_iter().map(|target| (target, crate::ds::weight::Weight::all())).collect())).collect(),
+            epsilons: state.epsilons.into_iter().map(|target| (target, crate::ds::weight::Weight::all())).collect(),
+        }).collect();
+        result.insert(terminal, NWA::from_parts(states, nfa.start_states));
+    }
+    Ok((result, classes))
+}
+
+#[cfg(test)]
+mod selected_inventory_tests {
+    use super::*;
+
+    fn pop(label: i32) -> Arc<CommitTemplateDfas> {
+        let mut dfa = DFA::new();
+        let end = dfa.add_state();
+        dfa.set_accepting(end, true);
+        dfa.add_transition(dfa.start_state, label, end);
+        Arc::new(CommitTemplateDfas { pop: dfa, read: DFA::new(), push: DFA::new(),
+            pop_to_read: vec![], pop_to_push: vec![], read_to_push: vec![] })
+    }
+
+    #[test]
+    fn selected_inventory_preserves_original_ids_and_exact_programs() {
+        let programs = vec![Some(pop(0)), Some(pop(DEFAULT_LABEL)), Some(pop(2))];
+        let full = prepare_static_templates(&programs, 4).unwrap();
+        let selected = prepare_static_templates_for_terminals(&programs, 4, &BTreeSet::from([1, 2])).unwrap();
+        assert_eq!(selected.by_terminal.keys().copied().collect::<Vec<_>>(), vec![1, 2]);
+        for id in [1, 2] {
+            assert_eq!(bincode::serialize(&selected.by_terminal[&id]).unwrap(),
+                bincode::serialize(&full.by_terminal[&id]).unwrap());
+        }
+    }
+
+    #[test]
+    fn unused_inventory_is_not_expanded_but_missing_selected_program_is_an_error() {
+        let programs = vec![None, None, Some(pop(1))];
+        let selected = prepare_static_templates_for_terminals(&programs, 4, &BTreeSet::from([2])).unwrap();
+        assert_eq!(selected.by_terminal.len(), 1);
+        for id in [0, 3] {
+            let error = prepare_static_templates_for_terminals(&programs, 4, &BTreeSet::from([id])).unwrap_err();
+            assert!(error.to_string().contains("missing selected terminal relation"));
+        }
+    }
 }
 
 pub(super) fn compile(
