@@ -6601,11 +6601,13 @@ impl<'a> ConstraintState<'a> {
 
         let mut missing_pairs = SmallVec::<[(u32, TerminalID); 4]>::new();
         for (&continuation_tokenizer_state, terminals) in terminals_disallowed.iter() {
+            let exclusion_state = self.constraint.static_exclusion_state(continuation_tokenizer_state)
+                .expect("validated recursive lexer state must have a static observation");
             for &terminal_id in terminals.iter() {
                 if let Some(mask) = self
                     .constraint
                     .seed_terminal_dense
-                    .get(&(continuation_tokenizer_state, terminal_id))
+                    .get(&(exclusion_state, terminal_id))
                 {
                     for (blocked_word, mask_word) in blocked.iter_mut().zip(mask.iter()) {
                         *blocked_word |= mask_word;

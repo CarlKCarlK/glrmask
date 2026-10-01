@@ -9773,6 +9773,9 @@ impl RecursiveVirtualTokenizerStates {
 pub(crate) struct RecursiveParserLayout {
     pub(crate) component_offsets: Vec<u32>,
     pub(crate) leaves: Vec<RecursiveParserLeafLayout>,
+    /// Derived once so ordinary recursive commits do not scan every leaf
+    /// merely to discover that no exact residual-liveness query is needed.
+    pub(crate) has_virtual_residuals: bool,
     pub(crate) leaf_state_offsets: Vec<u32>,
     /// Disjoint-union tokenizer-state coordinate over the same intact leaves.
     /// Parser and tokenizer leaves have identical ordering/component paths, but
@@ -9853,6 +9856,10 @@ pub(crate) struct StaticDynamicOverlayMetadata {
     /// image genuinely set-valued, so this must not be collapsed to one TSID.
     #[serde(skip, default)]
     pub(crate) recursive_tokenizer_internal_tsids: OnceLock<Arc<Vec<Vec<u32>>>>,
+    /// Exact finite observation coordinate for virtual component lexers. Kept
+    /// separate from component A's TSID quotient and from exact runtime IDs.
+    #[serde(skip, default)]
+    pub(crate) recursive_static_observation: Option<Arc<super::static_observation::RecursiveStaticObservation>>,
     /// Lazily allocated outer scoped IDs for exact virtual tokenizer states in
     /// retained recursive leaves. Physical states keep their contiguous layout
     /// IDs; only actually reached virtual states enter this runtime-only map.

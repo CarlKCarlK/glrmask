@@ -290,3 +290,8 @@ path = "tests/template_parser_randomized.rs"
 name = "template_parser_artifact_bounds"
 path = "tests/template_parser_artifact_bounds.rs"
 required-features = ["internal-api"]
+
+[[test]]
+name = "template_virtual_composition"
+path = "tests/template_virtual_composition.rs"
+required-features = ["internal-api"]

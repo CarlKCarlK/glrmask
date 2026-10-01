@@ -548,7 +548,13 @@ impl Constraint {
             Some(parser) => {
                 assert!(!self.table.is_present(), "template-only constraint retained an LR table");
                 let mut report = parser.report();
+                report["virtual_lexer"] = self.tokenizer.has_any_virtual_runtime().into();
                 if let Some(overlay) = &self.static_dynamic_overlay {
+                    report["finite_observation_leaves"] = overlay.recursive_static_observation.as_ref()
+                        .map_or(0, |observation| observation.leaf_offsets.len().saturating_sub(1)).into();
+                    if let Some(observation) = &overlay.recursive_static_observation {
+                        report["finite_observation_offsets"] = serde_json::json!(observation.leaf_offsets);
+                    }
                     report["component_parsers"] = serde_json::Value::Array(overlay.segmented_parser_components.iter()
                         .map(|component| component.constraint.parser_backend_report()).collect());
                     report["packed_lr_compiler_table_present"] = overlay.recursive_compiler_table.get().is_some().into();

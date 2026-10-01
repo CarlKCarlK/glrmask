@@ -2754,12 +2754,17 @@ struct RecursiveSegmentedRuntimeArtifactV27 {
 enum SegmentedRuntimeArtifactV27Ref<'a> {
     Recursive(RecursiveSegmentedRuntimeArtifactV27Ref<'a>),
     LegacyV24(SegmentedRuntimeArtifactV24Ref<'a>),
+    /// A new enum tag, not a reinterpretation of either legacy wire shape.
+    RecursiveProjected(RecursiveSegmentedRuntimeArtifactV27Ref<'a>,
+        &'a crate::runtime::static_observation::RecursiveStaticObservation),
 }
 
 #[derive(Deserialize)]
 enum SegmentedRuntimeArtifactV27 {
     Recursive(RecursiveSegmentedRuntimeArtifactV27),
     LegacyV24(SegmentedRuntimeArtifactV24),
+    RecursiveProjected(RecursiveSegmentedRuntimeArtifactV27,
+        crate::runtime::static_observation::RecursiveStaticObservation),
 }
 
 #[derive(Deserialize)]
@@ -3527,8 +3532,7 @@ fn segmented_runtime_artifact_ref(
             }
         })
         .collect();
-    Some(SegmentedRuntimeArtifactV27Ref::Recursive(
-        RecursiveSegmentedRuntimeArtifactV27Ref {
+    let runtime = RecursiveSegmentedRuntimeArtifactV27Ref {
             components,
             segmented_parser_links,
             recursive_compiler_table: recursive_compiler_table.as_ref(),
@@ -3536,8 +3540,11 @@ fn segmented_runtime_artifact_ref(
                 recursive_tokenizer_internal_tsids.as_slice(),
             segmented_mask_authoritative: overlay.segmented_mask_authoritative,
             boundary_shards,
-        },
-    ))
+        };
+    Some(match overlay.recursive_static_observation.as_deref() {
+        Some(observation) => SegmentedRuntimeArtifactV27Ref::RecursiveProjected(runtime, observation),
+        None => SegmentedRuntimeArtifactV27Ref::Recursive(runtime),
+    })
 }
 
 fn restore_boundary_terminal_trie_v22(
@@ -4543,6 +4550,13 @@ fn restore_segmented_runtime_v27(
         }
         SegmentedRuntimeArtifactV27::LegacyV24(runtime) => {
             restore_segmented_runtime_v24(constraint, runtime)
+        }
+        SegmentedRuntimeArtifactV27::RecursiveProjected(runtime, observation) => {
+            restore_recursive_segmented_runtime_v27(constraint, runtime)?;
+            observation.validate(constraint).map_err(crate::GlrMaskError::Serialization)?;
+            constraint.static_dynamic_overlay.as_mut().expect("restored recursive overlay")
+                .recursive_static_observation = Some(Arc::new(observation));
+            Ok(())
         }
     }
 }

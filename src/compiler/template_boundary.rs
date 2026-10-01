@@ -10,7 +10,7 @@ use crate::automata::weighted_u32::terminal_automaton::TerminalAutomaton;
 use crate::compiler::boundary_walk::{BoundaryShardLinkInputs, BoundaryShardWalkPlan};
 use crate::compiler::constraint_compose::{WalkBoundaryShardWork, merged_retained_terminal_exprs};
 use crate::compiler::stages::id_map_and_terminal_dwa::scope::ImmediateComponentId;
-use crate::compiler::stages::equiv_types::{InternalIdMap, ManyToOneIdMap};
+use crate::compiler::stages::equiv_types::{InternalIdMap, ManyToOneIdMap, MappedArtifact};
 use crate::compiler::constraint_possible_matches as pm;
 use crate::ds::bitset::BitSet;
 use crate::runtime::{ConstraintRuntimeBackend, SegmentedBoundaryShard, SegmentedBoundaryShardBackend};
@@ -104,28 +104,38 @@ pub(crate) fn install(constraint: &mut Constraint, vocab: &Vocab) -> Result<()> 
         constraint.constraint_at_recursive_component_path(&leaf.component_path)
             .ok_or_else(|| fail("static template leaf path is invalid")))
         .collect::<Result<Vec<_>>>()?;
-    if leaves.iter().any(|leaf| leaf.tokenizer.has_any_virtual_runtime()) {
-        return Err(fail("static template boundary needs a finite lexical observation projection for virtual lexers"));
-    }
-    let tokenizer_inputs = leaves.iter().zip(&layout.leaf_terminal_offsets)
-        .map(|(leaf, &offset)| (leaf.tokenizer.as_ref(), offset)).collect::<Vec<_>>();
+    let projected = leaves.iter().any(|leaf| leaf.tokenizer.has_any_virtual_runtime());
+    let views = leaves.iter().map(|leaf| {
+        if leaf.tokenizer.has_any_virtual_runtime() {
+            let view = leaf.dynamic_mask_vocab.mask_projection_tokenizer()
+                .ok_or_else(|| fail("virtual component requires a persisted finite lexical observation projection"))?;
+            if view.has_any_virtual_runtime() { return Err(fail("virtual lexical observation projection is not finite")); }
+            Ok(view)
+        } else { Ok(leaf.tokenizer.as_ref()) }
+    }).collect::<Result<Vec<_>>>()?;
+    let tokenizer_inputs = views.iter().zip(&layout.leaf_terminal_offsets)
+        .map(|(&view, &offset)| (view, offset)).collect::<Vec<_>>();
     let (mut merged, tokenizer_offsets) = Tokenizer::disjoint_union_with_terminal_offsets(&tokenizer_inputs);
     // The lexical union inserts one synthetic root before the intact leaves.
     // That root is useful during compilation but is never a live recursive
     // tokenizer state. Preserve the exact +1 injection rather than treating
     // the compiler union and runtime leaf coordinates as identical.
-    if tokenizer_offsets.iter().zip(&layout.leaf_tokenizer_state_offsets)
+    if !projected && (tokenizer_offsets.iter().zip(&layout.leaf_tokenizer_state_offsets)
         .any(|(&compiled, &runtime)| runtime.checked_add(1) != Some(compiled))
-        || layout.total_tokenizer_states.checked_add(1) != Some(merged.num_states()) {
+        || layout.total_tokenizer_states.checked_add(1) != Some(merged.num_states())) {
         return Err(fail("static lexical observation changed the recursive state coordinate"));
     }
+    let observation = projected.then(|| {
+        let mut leaf_offsets = tokenizer_offsets.clone(); leaf_offsets.push(merged.num_states());
+        crate::runtime::static_observation::RecursiveStaticObservation { leaf_offsets }
+    });
     if merged.terminal_exprs().is_none() {
         if let Some(exprs) = merged_retained_terminal_exprs(&leaves, &layout.leaf_terminal_offsets,
             layout.total_leaf_terminals) {
             merged.restore_terminal_exprs(Some(exprs)).map_err(fail)?;
         }
     }
-    let state_counts = leaves.iter().map(|leaf| leaf.tokenizer.num_states()).collect::<Vec<_>>();
+    let state_counts = views.iter().map(|view| view.num_states()).collect::<Vec<_>>();
     let owners = layout.leaves.iter().map(|leaf| ImmediateComponentId(leaf.top_component)).collect::<Vec<_>>();
     let mut transparent = BitSet::new(layout.total_leaf_terminals as usize);
     for (leaf, &offset) in leaves.iter().zip(&layout.leaf_terminal_offsets) {
@@ -185,8 +195,14 @@ pub(crate) fn install(constraint: &mut Constraint, vocab: &Vocab) -> Result<()> 
     let possible = pm::compute_constraint_possible_matches_for_vocab(&merged, vocab,
         pm::ConstraintPossibleMatchesConfig::EAGER);
     if !possible.complete { return Err(fail("static template boundary has incomplete exclusions")); }
-    let common = complete_possible_match_coordinate(possible.mapped_possible_matches.id_map(),
+    let mut common = complete_possible_match_coordinate(possible.mapped_possible_matches.id_map(),
         merged.num_states(), vocab)?;
+    if projected {
+        // One observation per finite source state: neither A nor PM alone can
+        // justify collapsing states which B may distinguish after a crossing.
+        common.tokenizer_states = ManyToOneIdMap::from_original_to_internal_allowing_unmapped(
+            (0..merged.num_states()).collect(), merged.num_states());
+    }
     let possible_matches = possible.mapped_possible_matches.remap_into_existing_common(&common)
         .into_artifact().into_iter().map(|(terminal, weight)| {
             let runtime_terminal = layout.outer_terminal_count.checked_add(terminal)
@@ -215,17 +231,53 @@ pub(crate) fn install(constraint: &mut Constraint, vocab: &Vocab) -> Result<()> 
         templates.len(), classes.len(), started.elapsed().as_secs_f64() * 1000.0); }
     let mut published = Vec::with_capacity(walks.len());
     for walk in walks {
-        let output = super::boundary_transfer::template_program::compile_classed(
+        let mut output = super::boundary_transfer::template_program::compile_classed(
             &templates, &controls, certificate.as_ref(), &walk.output.dwa, &classes).map_err(fail)?;
+        let mut id_map = walk.output.id_map;
+        if projected {
+            let target = InternalIdMap {
+                tokenizer_states: common.tokenizer_states.clone(),
+                vocab_tokens: id_map.vocab_tokens.clone(),
+                deferred_vocab_singleton_original_ids: id_map.deferred_vocab_singleton_original_ids.clone(),
+            };
+            output.parser_dwa = MappedArtifact::new(output.parser_dwa, id_map)
+                .remap_into_existing_common(&target).into_artifact();
+            id_map = target;
+        }
         let work = WalkBoundaryShardWork { start_component: walk.start_component as u32,
-            terminal_automaton: TerminalAutomaton::Dwa(walk.output.dwa), id_map: walk.output.id_map,
+            terminal_automaton: TerminalAutomaton::Dwa(walk.output.dwa), id_map,
             candidate_tokens: Arc::from(walk.candidate_tokens.into_iter().collect::<Vec<_>>()) };
-        let (shard, _) = super::boundary_transfer::publish_signed_shard(work, output,
+        let (mut shard, _) = super::boundary_transfer::publish_signed_shard(work, output,
             &tokenizer_offsets, &state_counts).map_err(fail)?;
+        if projected {
+            let boundary = Arc::make_mut(&mut shard.boundary);
+            boundary.uses_composed_tsid_coordinate = true;
+            boundary.tokenizer_state_to_tsid.clear();
+        }
         if profile { eprintln!("[glrmask/profile][static_template_boundary] phase=shard_done component={} elapsed_ms={:.3}",
             shard.start_component, started.elapsed().as_secs_f64() * 1000.0); }
         published.push(shard);
     }
+    let physical_tsids = if let Some(observation) = &observation {
+        let mut rows = Vec::with_capacity(layout.total_tokenizer_states as usize);
+        for (index, leaf) in leaves.iter().enumerate() {
+            for local in 0..leaf.tokenizer.num_states() {
+                rows.push(vec![observation.leaf_key(index, leaf, local)
+                    .ok_or_else(|| fail("physical lexer state has no finite observation"))?]);
+            }
+        }
+        rows
+    } else {
+        common.tokenizer_states.original_to_internal.iter().skip(1).map(|&tsid| vec![tsid]).collect()
+    };
+    let root_tsids = physical_tsids.iter().take(constraint.tokenizer.num_states() as usize)
+        .map(|row| row[0]).collect();
+    let inverse_tsids = if projected {
+        (0..merged.num_states()).map(|id| vec![id]).collect()
+    } else {
+        common.tokenizer_states.internal_to_originals_vecs().into_iter()
+            .map(|states| states.into_iter().filter_map(|state| state.checked_sub(1)).collect()).collect()
+    };
     let overlay = constraint.static_dynamic_overlay.as_mut().unwrap();
     for component in &mut overlay.segmented_parser_components { component.boundary = None; }
     let mut shards = Vec::with_capacity(published.len());
@@ -245,13 +297,11 @@ pub(crate) fn install(constraint: &mut Constraint, vocab: &Vocab) -> Result<()> 
     // B keeps its private quotient. The coordinator coordinate is independently
     // exact for correlated A exclusions and for mapping every B output token.
     overlay.recursive_tokenizer_internal_tsids = Default::default();
-    overlay.recursive_tokenizer_internal_tsids.set(Arc::new(common.tokenizer_states.original_to_internal
-        .iter().skip(1).map(|&tsid| vec![tsid]).collect()))
+    overlay.recursive_tokenizer_internal_tsids.set(Arc::new(physical_tsids))
         .map_err(|_| fail("static template TSID coordinate initialized twice"))?;
-    constraint.state_to_internal_tsid = common.tokenizer_states.original_to_internal
-        [1..1 + constraint.tokenizer.num_states() as usize].to_vec();
-    constraint.internal_tsid_to_states = common.tokenizer_states.internal_to_originals_vecs()
-        .into_iter().map(|states| states.into_iter().filter_map(|state| state.checked_sub(1)).collect()).collect();
+    overlay.recursive_static_observation = observation.map(Arc::new);
+    constraint.state_to_internal_tsid = root_tsids;
+    constraint.internal_tsid_to_states = inverse_tsids;
     constraint.deferred_internal_tsid_to_states = Default::default();
     constraint.state_internal_tsid_offsets = vec![u32::MAX];
     constraint.state_internal_tsids.clear();
@@ -271,6 +321,10 @@ pub(crate) fn install(constraint: &mut Constraint, vocab: &Vocab) -> Result<()> 
     constraint.serialized_artifact_cache = None;
     constraint.validate_template_composition_layout().map_err(fail)?;
     constraint.rebuild_runtime_caches();
+    if let Some(observation) = constraint.static_dynamic_overlay.as_ref()
+        .and_then(|overlay| overlay.recursive_static_observation.as_ref()) {
+        observation.validate(constraint).map_err(fail)?;
+    }
     if profile { eprintln!("[glrmask/profile][static_template_boundary] phase=done elapsed_ms={:.3}",
         started.elapsed().as_secs_f64() * 1000.0); }
     Ok(())

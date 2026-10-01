@@ -2510,6 +2510,7 @@ impl Constraint {
         let mut leaf_terminal_offsets = Vec::with_capacity(leaves.len());
         let mut next_tokenizer_state = 0u32;
         let mut next_leaf_terminal = 0u32;
+        let mut has_virtual_residuals = false;
         for leaf in &leaves {
             let constraint = self
                 .constraint_at_recursive_component_path(&leaf.component_path)
@@ -2519,6 +2520,7 @@ impl Constraint {
                         leaf.component_path,
                     )
                 })?;
+            has_virtual_residuals |= constraint.tokenizer.has_virtual_residual_runtime();
             leaf_tokenizer_state_offsets.push(next_tokenizer_state);
             next_tokenizer_state = next_tokenizer_state
                 .checked_add(constraint.tokenizer.num_states())
@@ -2543,6 +2545,7 @@ impl Constraint {
         let layout = Arc::new(RecursiveParserLayout {
             component_offsets,
             leaves,
+            has_virtual_residuals,
             leaf_state_offsets,
             leaf_tokenizer_state_offsets,
             total_tokenizer_states: next_tokenizer_state,
@@ -2702,6 +2705,9 @@ impl Constraint {
         &self,
         tokenizer_state: u32,
     ) -> Option<SmallVec<[u32; 4]>> {
+        if self.static_dynamic_overlay.as_ref().is_some_and(|overlay| overlay.recursive_static_observation.is_some()) {
+            return self.static_exclusion_state(tokenizer_state).map(|key| SmallVec::from_slice(&[key]));
+        }
         if self.uses_compact_segmented_parser_runtime() {
             let layout = self.recursive_parser_layout_ref()?;
             if tokenizer_state < layout.total_tokenizer_states {
@@ -2975,6 +2981,25 @@ impl Constraint {
         let layout = self.recursive_parser_layout().ok().flatten()?;
         let leaf = layout.leaves.get(leaf_index)?;
         self.constraint_at_recursive_component_path(&leaf.component_path)
+    }
+
+    #[inline]
+    pub(crate) fn tokenizer_requires_exact_liveness(&self) -> bool {
+        if self.uses_compact_segmented_parser_runtime() {
+            self.recursive_parser_layout_ref().is_some_and(|layout| layout.has_virtual_residuals)
+        } else { self.tokenizer.has_virtual_residual_runtime() }
+    }
+
+    pub(crate) fn exact_runtime_tokenizer_state_has_future(&self, state: u32) -> Result<bool, String> {
+        let (body, local) = if self.uses_compact_segmented_parser_runtime() {
+            let (leaf, local) = self.recursive_tokenizer_leaf_state(state)
+                .ok_or("exact residual liveness received an unknown scoped tokenizer state")?;
+            (self.recursive_leaf_constraint(leaf).ok_or("missing residual tokenizer leaf")?, local)
+        } else { (self, state) };
+        if local == body.runtime_commit_initial_state() || !body.tokenizer.has_virtual_residual_runtime() {
+            return Ok(true);
+        }
+        body.tokenizer.exact_dynamic_state_has_future(local)
     }
 
     #[inline]
