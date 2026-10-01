@@ -1,0 +1,5 @@
+condition,mode,corpus,lr_wall_ms,template_wall_ms,lr_total_cpu_ms,template_total_cpu_ms,lr_artifact_bytes,template_artifact_bytes
+static-panel20-fresh,static,panel20,1539.0939375,1611.3056645,3552.1235,3632.212,59328384.0,55896504.0
+static-js-fresh,static,js,3921.780771,4014.7449375,8036.1415,8133.218,19248191.0,18893392.0
+o2-panel20-fresh,o2,panel20,551.9336255,649.4999565,1270.114,1491.667,105144622.0,78090192.0
+o2-js-fresh,o2,js,311.2852085,358.8859375,932.3655,1098.9895,6350694.0,5132900.0

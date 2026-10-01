@@ -1,0 +1,26 @@
+{
+  "schema": "glrmask-template-publication-v1",
+  "measured_source_commit": "6b3f5cc5b6473a81a19055319ceca0110d3c7a1b",
+  "root_sha256": "5b9912872ceb3b8516a73a305adc2e34f34cd450cc5d195ccd30c89346e95c34",
+  "native_sha256": "f9f5964d1dfe70d90526e84acf365fb30d965e05cb9a4f969356b2cb48ff28d4",
+  "report": "../template-parser-validation-2026-10-01.md",
+  "report_sha256": "8c68ead2c106ba49002899d758e180e7545d95d14b76915d4c7dfe163863e768",
+  "archive": "template-parser-validation-2026-10-01.zip",
+  "archive_bytes": 81836412,
+  "archive_sha256": "3729da34973b3bf05f801bcc79b672f559ea89e8a9e63b6886e236f6949c46c8",
+  "portable_verifier": "Extract the archive and run python3 verify_evidence.py; no private paths or native compiler required.",
+  "runtime_processes": 256,
+  "load_processes": 504,
+  "exact_mask_comparisons": 321210,
+  "independent_review_manifest_sha256": "a4350ff9d8e91f35f8827b535e7f70453cdaa011cc3668065733e2d7661cfad4",
+  "default_parser_backend": "LR_TABLE",
+  "compiled_component_composition": "not part of this standalone qualification",
+  "csv_files": {
+    "template-parser-2026-10-01-all-runtime-statistics.csv": "35d19dc8dbd5f15fa6e670ef19967de281e330beb74c66f9eda74343d32e8f2b",
+    "template-parser-2026-10-01-build-and-artifact-medians.csv": "c59eb14fba69b99c1d521eb6b0f3dc0f960498d7b66a850ca18797fa43b02dc5",
+    "template-parser-2026-10-01-cold-warm-headlines.csv": "323947393c58f7b3c8f4433fa5a855bfe8000c1bfc429b42d8b55e67ef3d6af4",
+    "template-parser-2026-10-01-including-initial-masks.csv": "c1855903e7f38870c775e8a9239215e8887fd862cbc6311b5c24e2b1001d6460",
+    "template-parser-2026-10-01-per-case-artifact-sizes.csv": "eb9810165434a7c8972356d1fa27c6261e671425c7611f27c22d9b908c8521b4",
+    "template-parser-2026-10-01-per-case-runtime.csv": "06a07284518823efa7d89e85d91e72c94d79896a53a74be572c7e1c6054a684b"
+  }
+}

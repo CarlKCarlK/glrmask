@@ -1,5 +1,7 @@
 # Table-free parser validation — 30 September 2026
 
+> Historical report. The [1 October 2026 validation](template-parser-validation-2026-10-01.md) supersedes these runtime and storage measurements with the later source, an explicit cold/warm comparison, and matched consume/consume setup. The original results and evidence below remain preserved.
+
 **Disposition: validated as an opt-in standalone backend; retain the LR default.**
 
 The table-free implementation has lower warm mean time between masks (TBM) and lower warm TBM P99 than the LR backend in every one of the eight measured scenarios. It also produces smaller artifacts. These results do **not** establish that every mask-only tail, build, or load is faster. Compiled-component composition is outside this release’s supported table-free scope.

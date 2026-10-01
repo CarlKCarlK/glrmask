@@ -187,7 +187,7 @@ format and independent language checks.
 Compiled-component composition is explicitly unsupported for template-backed
 constraints. Such a link raises `ValueError`; it does not fall back to an LR
 table. Ordinary LR-backed composition remains unchanged.
-The [validation report](../docs/template-parser-validation-2026-09-30.md)
+The [validation report](../docs/template-parser-validation-2026-10-01.md)
 includes measured results and the remaining performance and compatibility
 tradeoffs behind the unchanged default.
 

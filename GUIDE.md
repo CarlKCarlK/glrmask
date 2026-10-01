@@ -266,9 +266,9 @@ silently switch backends. Performance and load-time tradeoffs depend on the
 grammar and mode, so template selection is not an automatic speed guarantee.
 See [the template parser contract](docs/template-parser.md) for provider
 examples, exact POP/READ/PUSH semantics, validation, and persistence.
-The [validation report](docs/template-parser-validation-2026-09-30.md) records
+The [validation report](docs/template-parser-validation-2026-10-01.md) records
 measured runtime and storage results, build/load costs, and the reasons the LR
-backend remains the default.
+backend remains the default. The [lossless evidence archive](docs/evidence/template-parser-validation-2026-10-01.zip) includes all cold/warm traces and a portable verifier; [headline measurements](docs/evidence/template-parser-2026-10-01-cold-warm-headlines.csv) are also available separately.
 
 ### End tokens are final-root policy
 
