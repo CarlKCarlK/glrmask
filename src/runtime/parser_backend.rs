@@ -183,6 +183,62 @@ fn compile_domain(template: &CommitTemplateDfas) -> crate::Result<TemplateDomain
     TemplateDomain::compile(template).map_err(crate::Error::Compilation)
 }
 
+type PreparedTerminalView = Option<Arc<crate::runtime::artifact::FastCommitTemplateDfas>>;
+
+fn prepare_terminal_domain_and_view(
+    terminal: usize,
+    template: &Option<Arc<CommitTemplateDfas>>,
+    state_count: u32,
+    prepare_runtime: bool,
+) -> crate::Result<(TemplateDomain, PreparedTerminalView)> {
+    let template = template.as_deref().ok_or_else(|| {
+        crate::Error::Compilation(format!("missing template for terminal {terminal}"))
+    })?;
+    let validated = super::commit::template_prepare::TemplatePreparation::new(template)
+        .map_err(crate::Error::Compilation)?;
+    validated.validate_alphabet(state_count).map_err(crate::Error::Compilation)?;
+    let domain = TemplateDomain::from_validated(&validated).map_err(crate::Error::Compilation)?;
+    let view = prepare_runtime.then(|| Arc::new(
+        crate::runtime::artifact::FastCommitTemplateDfas::from_prepared(&validated)
+    ));
+    Ok((domain, view))
+}
+
+/// Prepare independent immutable terminal programs without changing their
+/// runtime representation. The ordered result collection preserves the same
+/// first error and terminal coordinates as the serial constructor.
+fn prepare_terminal_inventory(
+    templates: &[Option<Arc<CommitTemplateDfas>>],
+    state_count: u32,
+    prepare_runtime: bool,
+    parallel: bool,
+) -> crate::Result<(Vec<TemplateDomain>, crate::runtime::artifact::FastTemplateDfasByTerminal)> {
+    let mut domains = Vec::with_capacity(templates.len());
+    let mut runtime = Vec::with_capacity(if prepare_runtime { templates.len() } else { 0 });
+    if parallel && rayon::current_num_threads() > 1 {
+        use rayon::prelude::*;
+        let results = templates.par_iter().enumerate()
+            .map(|(terminal, template)| {
+                prepare_terminal_domain_and_view(terminal, template, state_count, prepare_runtime)
+            })
+            .collect::<Vec<_>>();
+        for result in results {
+            let (domain, view) = result?;
+            domains.push(domain);
+            if prepare_runtime { runtime.push(view); }
+        }
+    } else {
+        for (terminal, template) in templates.iter().enumerate() {
+            let (domain, view) = prepare_terminal_domain_and_view(
+                terminal, template, state_count, prepare_runtime,
+            )?;
+            domains.push(domain);
+            if prepare_runtime { runtime.push(view); }
+        }
+    }
+    Ok((domains, runtime))
+}
+
 fn matches_gss(domain: &TemplateDomain, stack: &ParserGSS) -> bool {
     if stack.is_empty() { return false; }
     let cursor = match domain.start() {
@@ -237,18 +293,20 @@ impl TemplateParser {
         if templates.len() != terminal_count as usize {
             return Err(crate::Error::Compilation("template parser must provide every terminal relation, including explicit empty relations".into()));
         }
-        let mut domains = Vec::with_capacity(templates.len());
-        let mut runtime = Vec::with_capacity(if prepare_runtime { templates.len() } else { 0 });
-        for (terminal, template) in templates.iter().enumerate() {
-            let template = template.as_deref().ok_or_else(|| crate::Error::Compilation(format!("missing template for terminal {terminal}")))?;
-            let validated = super::commit::template_prepare::TemplatePreparation::new(template)
-                .map_err(crate::Error::Compilation)?;
-            validated.validate_alphabet(state_count).map_err(crate::Error::Compilation)?;
-            domains.push(TemplateDomain::from_validated(&validated).map_err(crate::Error::Compilation)?);
-            if prepare_runtime {
-                runtime.push(Some(Arc::new(crate::runtime::artifact::FastCommitTemplateDfas::from_prepared(&validated))));
-            }
-        }
+        const PARALLEL_PREPARATION_MIN_STATES: usize = 4_096;
+        let large_inventory = templates.len() > 1 && templates.iter()
+            .filter_map(Option::as_deref)
+            .map(|template| template.pop.states.len()
+                .saturating_add(template.read.states.len())
+                .saturating_add(template.push.states.len()))
+            .fold(0usize, usize::saturating_add) >= PARALLEL_PREPARATION_MIN_STATES;
+        let (domains, runtime) = if large_inventory && !crate::compiler::macro_parallelism_disabled() {
+            crate::compiler::pipeline::run_with_compile_thread_pool(|| {
+                prepare_terminal_inventory(templates, state_count, prepare_runtime, true)
+            })?
+        } else {
+            prepare_terminal_inventory(templates, state_count, prepare_runtime, false)?
+        };
         let validated = super::commit::template_prepare::TemplatePreparation::new(&completion_template)
             .map_err(crate::Error::Compilation)?;
         validated.validate_alphabet(state_count).map_err(crate::Error::Compilation)?;
@@ -692,6 +750,76 @@ impl Constraint {
 mod tests {
     use super::*;
     use crate::compiler::glr::accumulator::TerminalsDisallowed;
+
+    #[test]
+    fn concurrent_inventory_preparation_preserves_domains_and_every_runtime_view() {
+        for count in [0u32, 1, 7, 32, 65] {
+            let programs = (0..count).map(|terminal| {
+                Some(compile_terminal_template(terminal, phase_parallel_fixture(terminal)).unwrap())
+            }).collect::<Vec<_>>();
+            for prepare_runtime in [false, true] {
+                let mut reference_domains = Vec::new();
+                let mut reference_views = Vec::new();
+                for template in &programs {
+                    let template = template.as_deref().unwrap();
+                    let validated = super::super::commit::template_prepare::TemplatePreparation::new(template).unwrap();
+                    validated.validate_alphabet(32).unwrap();
+                    reference_domains.push(TemplateDomain::from_validated(&validated).unwrap());
+                    if prepare_runtime {
+                        reference_views.push(Some(Arc::new(
+                            crate::runtime::artifact::FastCommitTemplateDfas::from_prepared(&validated)
+                        )));
+                    }
+                }
+                for threads in [1, 4] {
+                    let pool = rayon::ThreadPoolBuilder::new().num_threads(threads).build().unwrap();
+                    for _ in 0..3 {
+                        let (domains, views) = pool.install(|| {
+                            prepare_terminal_inventory(&programs, 32, prepare_runtime, true)
+                        }).unwrap();
+                        assert_eq!(domains.len(), reference_domains.len());
+                        assert_eq!(format!("{views:?}"), format!("{reference_views:?}"));
+                        for (expected, actual) in reference_domains.iter().zip(&domains) {
+                            assert_eq!(expected.to_bytes().unwrap(), actual.to_bytes().unwrap());
+                            for top in 0..32 {
+                                assert_eq!(expected.classify_top(top), actual.classify_top(top));
+                                for suffix in [vec![top], vec![top, 3], vec![top, 7, 2]] {
+                                    assert_eq!(expected.matches_top_first(suffix.iter().copied()),
+                                               actual.matches_top_first(suffix.iter().copied()));
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn concurrent_inventory_preparation_rejects_invalid_programs_in_terminal_order() {
+        let mut programs = (0..8u32).map(|terminal| {
+            Some(compile_terminal_template(terminal, phase_parallel_fixture(terminal)).unwrap())
+        }).collect::<Vec<_>>();
+        let pool = rayon::ThreadPoolBuilder::new().num_threads(4).build().unwrap();
+        programs[2] = None;
+        programs[6] = None;
+        for _ in 0..4 {
+            let serial = prepare_terminal_inventory(&programs, 32, true, false).unwrap_err().to_string();
+            let parallel = pool.install(|| prepare_terminal_inventory(&programs, 32, true, true))
+                .unwrap_err().to_string();
+            assert_eq!(serial, parallel);
+            assert!(serial.contains("terminal 2"));
+        }
+        programs[2] = Some(compile_terminal_template(2, phase_parallel_fixture(2)).unwrap());
+        programs[6] = Some(compile_terminal_template(6, phase_parallel_fixture(6)).unwrap());
+        let invalid = Arc::make_mut(programs[1].as_mut().unwrap());
+        let unreachable = invalid.pop.add_state();
+        invalid.pop.add_transition(unreachable, 0, unreachable);
+        let serial = prepare_terminal_inventory(&programs, 32, true, false).unwrap_err().to_string();
+        let parallel = pool.install(|| prepare_terminal_inventory(&programs, 32, true, true))
+            .unwrap_err().to_string();
+        assert_eq!(serial, parallel, "even unreachable malformed graph data must be rejected");
+    }
 
     #[test]
     fn staged_parser_preparation_preserves_runtime_finalization_order() {
