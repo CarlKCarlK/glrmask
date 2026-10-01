@@ -505,11 +505,11 @@ impl Constraint {
                 let characterizations = try_characterize_selected_terminals_for_terminal_count(
                     &self.table, terminal_count, &selected,
                 ).map_err(crate::Error::Compilation)?;
-                Templates::from_characterizations(&characterizations)
+                Templates::dfas_from_characterizations(&characterizations)
             } else {
-                Templates::default()
+                std::collections::BTreeMap::new()
             };
-            let mut rebuilt = raw.by_terminal.into_iter();
+            let mut rebuilt = raw.into_iter();
             let mut templates = vec![None; terminal_count as usize];
             for terminal in 0..terminal_count {
                 let input = match retained.get(terminal as usize).and_then(Option::as_ref) {
