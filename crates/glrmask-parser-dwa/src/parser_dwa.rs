@@ -6806,18 +6806,51 @@ fn determinize_with_supports(
     determinize_with_supports_mode(nwa, dense_positive_label_limit, None, None, None)
 }
 
+/// The shared weighted NWA subset kernel, before any parser-state DEFAULT
+/// interpretation. This is used only for construction-time opaque POP labels.
+pub(crate) fn determinize_opaque_stack_symbols(nwa: &NWA, concrete_symbols: u32) -> DWA {
+    determinize_with_supports(nwa, Some(concrete_symbols)).dwa
+}
+
 fn determinize_parser_dwa_with_fallbacks_impl(
     dwa: &DWA,
     possible_by_state: &[PossibleOutgoingIds],
     num_parser_states: u32,
     normalize_singletons: bool,
 ) -> DWA {
+    determinize_parser_dwa_with_fallbacks_and_classes(
+        dwa, possible_by_state, num_parser_states, normalize_singletons, None, usize::MAX,
+    ).expect("ordinary fallback determinization has no optional class resource limit")
+}
+
+/// The same weighted subset kernel, with finite consuming POP classes instead
+/// of pre-expanded NWA rows. Defaults in the RESULT are complete derivatives
+/// for all unmentioned alphabet symbols; every explicit exception overrides
+/// them, including an empty derivative represented by an explicit dead edge.
+pub(crate) fn determinize_parser_dwa_with_pop_classes(
+    dwa: &DWA,
+    classes: &crate::pop_classes::PopLabelClasses,
+    edge_budget: usize,
+) -> Result<DWA, String> {
+    determinize_parser_dwa_with_fallbacks_and_classes(
+        dwa, &[], classes.symbol_count(), true, Some(classes), edge_budget,
+    )
+}
+
+fn determinize_parser_dwa_with_fallbacks_and_classes(
+    dwa: &DWA,
+    possible_by_state: &[PossibleOutgoingIds],
+    num_parser_states: u32,
+    normalize_singletons: bool,
+    pop_classes: Option<&crate::pop_classes::PopLabelClasses>,
+    edge_budget: usize,
+) -> Result<DWA, String> {
     fn subset_key(entries: &[(u32, Weight)]) -> Vec<(u32, usize)> {
         entries.iter().map(|(sid, w)| (*sid, w.ptr_key())).collect()
     }
 
     let dense_label_limit = num_parser_states as usize;
-    let fixed_singleton_ids = normalize_singletons
+    let fixed_singleton_ids = pop_classes.is_none() && normalize_singletons
         && dwa.states().len() >= std::env::var("GLRMASK_FALLBACK_FIXED_SINGLETON_MIN_STATES")
             .ok()
             .and_then(|value| value.trim().parse::<usize>().ok())
@@ -6875,6 +6908,11 @@ fn determinize_parser_dwa_with_fallbacks_impl(
     let mut dense_label_touched: Vec<bool> = vec![false; dense_label_limit];
     let mut default_touched = false;
     let mut dense_default_all_raw_targets: TargetContribs = TargetContribs::new();
+    let mut class_raw_targets = BTreeMap::<i32, TargetContribs>::new();
+    let mut class_dead_state = None;
+    let mut class_edges = 0usize;
+    let mut class_work = 256_000_000usize;
+
     let mut intersection_cache = ScopedWeightOpCache::default();
     let mut key_buf: Vec<(u32, usize)> = Vec::new();
     let mut final_contributions: Vec<Weight> = Vec::new();
@@ -7014,6 +7052,7 @@ fn determinize_parser_dwa_with_fallbacks_impl(
             && path_weight.is_full()
             && let Some(state) = dwa.states().get(*dwa_state_id as usize)
             && !state.transitions.contains_key(&DEFAULT_LABEL)
+            && pop_classes.is_none_or(|classes| !state.transitions.keys().any(|&label| classes.exclusion(label).is_some()))
         {
             // Preserve the already-sorted row allocation and rewrite only its
             // targets/weights. This avoids millions of individual BTreeMap
@@ -7067,6 +7106,13 @@ fn determinize_parser_dwa_with_fallbacks_impl(
             for label in remove {
                 rewritten.remove(&label);
             }
+            if pop_classes.is_some() {
+                class_edges = class_edges.checked_add(rewritten.len()).ok_or("class derivative edge overflow")?;
+                class_work = class_work.checked_sub(rewritten.len()).ok_or("class derivative work budget exceeded")?;
+                if class_edges > edge_budget || result.states().len() > 1_000_000 {
+                    return Err("class derivative representation budget exceeded; no partial predicate returned".into());
+                }
+            }
             result.states_mut()[from_state as usize].transitions = rewritten;
             continue;
         }
@@ -7091,6 +7137,11 @@ fn determinize_parser_dwa_with_fallbacks_impl(
                     detail.nonempty_intersections += 1;
                 }
 
+                if pop_classes.is_some_and(|classes| classes.exclusion(label).is_some()) {
+                    add_target_contribution_profiled(class_raw_targets.entry(label).or_default(),
+                        *target, next_weight, detail.as_mut());
+                    continue;
+                }
                 let target_weights = if label >= 0 && (label as usize) < dense_label_limit {
                     let label_idx = label as usize;
                     if !dense_label_touched[label_idx] {
@@ -7196,23 +7247,60 @@ fn determinize_parser_dwa_with_fallbacks_impl(
                 Some(PossibleOutgoingIds::Empty) | None => {}
             }
         }
+        if let Some(classes) = pop_classes {
+            // Non-exception symbols have the same derivative: all live class
+            // coefficients, and no literal transition. Only touched literals
+            // and class exclusions need an individual row in the output.
+            for (&label, contributions) in &class_raw_targets {
+                extend_target_contribs(&mut default_raw_targets, contributions);
+                for &symbol in classes.exclusion(label).expect("collected class label") {
+                    let index = symbol as usize;
+                    if !dense_label_touched[index] {
+                        dense_label_touched[index] = true;
+                        touched_dense_labels.push(index);
+                    }
+                }
+            }
+            default_touched = !default_raw_targets.is_empty() && touched_dense_labels.len() < dense_label_limit;
+            for &symbol in &touched_dense_labels {
+                for (&label, contributions) in &class_raw_targets {
+                    class_work = class_work.checked_sub(1).ok_or("class derivative work budget exceeded")?;
+                    if classes.matches(label, symbol as u32) {
+                        class_work = class_work.checked_sub(contributions.len()).ok_or("class derivative work budget exceeded")?;
+                        extend_target_contribs(&mut dense_raw_targets[symbol], contributions);
+                    }
+                }
+            }
+            if !default_touched { default_raw_targets.clear(); }
+            class_raw_targets.clear();
+        }
         if let (Some(detail), Some(started_at)) = (detail.as_mut(), scan_started) {
             detail.intersection_scan_ms += elapsed_ms(started_at);
         }
 
         let label_started = detail.as_ref().map(|_| Instant::now());
-        let mut process_label = |label: i32, mut contribs: TargetContribs| {
+        let class_default_present = pop_classes.is_some() && default_touched;
+        let mut process_label = |label: i32, mut contribs: TargetContribs| -> Result<(), String> {
+            if pop_classes.is_some() {
+                class_work = class_work.checked_sub(contribs.len()).ok_or("class derivative work budget exceeded")?;
+                class_edges = class_edges.checked_add(1).ok_or("class derivative edge overflow")?;
+                if class_edges > edge_budget || result.states().len() >= 1_000_000 {
+                    return Err("class derivative representation budget exceeded; no partial predicate returned".into());
+                }
+            }
             if contribs.is_empty() {
-                return;
+                if class_default_present && label != DEFAULT_LABEL {
+                    let dead = *class_dead_state.get_or_insert_with(|| result.add_state());
+                    result.add_transition(from_state, label, dead, Weight::all());
+                }
+                return Ok(());
             }
 
             debug_assert!(contribs.iter().all(|(_, weight)| !weight.is_empty()));
             contribs.sort_unstable_by_key(|(state_id, _)| *state_id);
 
             let edge_weight = Weight::union_all(contribs.iter().map(|(_, weight)| weight));
-            if edge_weight.is_empty() {
-                return;
-            }
+            if edge_weight.is_empty() { return Ok(()); }
 
             let to_state = if let [(only_state, only_weight)] = contribs.as_slice() {
                 if normalize_singletons {
@@ -7288,6 +7376,7 @@ fn determinize_parser_dwa_with_fallbacks_impl(
             };
 
             result.add_transition(from_state, label, to_state, edge_weight);
+            Ok(())
         };
 
         for label_idx in touched_dense_labels.drain(..) {
@@ -7301,14 +7390,20 @@ fn determinize_parser_dwa_with_fallbacks_impl(
             process_label(
                 label_idx as i32,
                 std::mem::take(&mut dense_raw_targets[label_idx]),
-            );
+            )?;
         }
         if default_touched {
             default_touched = false;
-            process_label(DEFAULT_LABEL, std::mem::take(&mut default_raw_targets));
+            process_label(DEFAULT_LABEL, std::mem::take(&mut default_raw_targets))?;
         }
         for (label, contribs) in sparse_raw_targets.drain() {
-            process_label(label, contribs);
+            process_label(label, contribs)?;
+        }
+        if pop_classes.is_some() {
+            let row = &mut result.states_mut()[from_state as usize].transitions;
+            if let Some((target, weight)) = row.get(&DEFAULT_LABEL).cloned() {
+                row.retain(|&label, (to, coefficient)| label == DEFAULT_LABEL || *to != target || *coefficient != weight);
+            }
         }
         if let (Some(detail), Some(started_at)) = (detail.as_mut(), label_started) {
             detail.label_processing_ms += elapsed_ms(started_at);
@@ -7329,7 +7424,7 @@ fn determinize_parser_dwa_with_fallbacks_impl(
         detail.emit("fallback");
     }
 
-    result
+    Ok(result)
 }
 
 fn determinize_parser_dwa_with_fallbacks(

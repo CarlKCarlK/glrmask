@@ -60,10 +60,10 @@ fn accepted(dwa: &DWA, stack: &[u32]) -> u8 {
 fn compiled(graph: &NWA, classes: &PopLabelClasses) -> DWA {
     let mut graph = graph.clone();
     resolve_negative_codes_in_nwa_with_pop_classes(&mut graph, classes).unwrap();
-    let graph = classes.expand_positive_compressed(graph, 1_000_000).unwrap();
-    assert!(graph.states().iter().all(|row| row.transitions.keys().all(|&label|
-        label >= 0 && label < classes.symbol_count() as i32)));
-    normalize_weighted_stack_predicate_for_symbol_count(classes.symbol_count(), &graph)
+    let result = classes.compile_positive(graph, 1_000_000).unwrap();
+    assert!(result.states().iter().all(|row| row.transitions.keys().all(|&label|
+        label == DEFAULT_LABEL || (label >= 0 && label < classes.symbol_count() as i32))));
+    result
 }
 
 fn all_stacks(depth: usize) -> Vec<Vec<u32>> {
@@ -220,5 +220,47 @@ fn symbolic_substitution_preserves_overlapping_class_and_literal_coefficients() 
         let expected = literal(&graph, &classes, &stack);
         assert_eq!(accepted(&direct, &stack), expected);
         assert_eq!(accepted(&compact, &stack), expected);
+    }
+}
+
+#[test]
+fn class_derivatives_keep_empty_exceptions_and_never_lift_consuming_finals() {
+    let mut classes = PopLabelClasses::new(4096).unwrap();
+    let except_zero = classes.intern_complement([0]).unwrap().unwrap();
+    let mut graph = NWA::from_parts(vec![NWAState::default(); 2], vec![0]);
+    graph.add_transition(0, except_zero, 1, weight(3));
+    graph.set_final_weight(1, weight(3));
+    // Two output rows suffice for this 4096-symbol language: one DEFAULT and
+    // a real rejecting exception. There must be no 4095-edge expansion.
+    let result = classes.compile_positive(graph.clone(), 2).unwrap();
+    assert_eq!(result.num_transitions(), 2);
+    assert!(result.states()[result.start_state() as usize].transitions.contains_key(&0));
+    assert!(result.states()[result.start_state() as usize].transitions.contains_key(&DEFAULT_LABEL));
+    assert_eq!(accepted(&result, &[]), 0);
+    assert_eq!(accepted(&result, &[0]), 0);
+    for top in 1..4096 { assert_eq!(accepted(&result, &[top]), 3); }
+    assert!(classes.compile_positive(graph, 1).unwrap_err().contains("budget"));
+}
+
+#[test]
+fn class_derivatives_match_concrete_expansion_over_complete_alphabet_exceptions() {
+    let mut classes = PopLabelClasses::new(3).unwrap();
+    let not_zero = classes.intern_complement([0]).unwrap().unwrap();
+    let not_one = classes.intern_complement([1]).unwrap().unwrap();
+    let not_two = classes.intern_complement([2]).unwrap().unwrap();
+    let mut graph = NWA::from_parts(vec![NWAState::default(); 5], vec![0]);
+    graph.add_transition(0, not_zero, 1, weight(1));
+    graph.add_transition(0, not_one, 2, weight(2));
+    graph.add_transition(0, not_two, 3, weight(3));
+    graph.add_transition(1, 2, 4, weight(1));
+    graph.add_transition(2, 0, 4, weight(2));
+    graph.add_transition(3, 1, 4, weight(3));
+    graph.set_final_weight(4, weight(3));
+    let result = classes.compile_positive(graph.clone(), 64).unwrap();
+    let expanded = classes.expand_positive(graph.clone(), 64).unwrap();
+    let reference = normalize_weighted_stack_predicate_for_symbol_count(3, &expanded);
+    for stack in all_stacks(5) {
+        assert_eq!(accepted(&result, &stack), literal(&graph, &classes, &stack));
+        assert_eq!(accepted(&result, &stack), accepted(&reference, &stack));
     }
 }

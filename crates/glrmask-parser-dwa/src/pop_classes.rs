@@ -46,7 +46,7 @@ impl PopLabelClasses {
         Ok(Some(label))
     }
 
-    fn exclusion(&self, label: i32) -> Option<&[u32]> {
+    pub(crate) fn exclusion(&self, label: i32) -> Option<&[u32]> {
         let index = DEFAULT_LABEL.checked_sub(1)?.checked_sub(label)?;
         self.exclusions.get(usize::try_from(index).ok()?).map(AsRef::as_ref)
     }
@@ -121,6 +121,35 @@ impl PopLabelClasses {
             eprintln!("[glrmask/profile][pop_classes_positive] source_states={source_states} trimmed_states={trimmed_states} symbolic_states={symbolic_states} symbolic_edges={symbolic_edges} expanded_edges={}", expanded.num_transitions());
         }
         Ok(expanded)
+    }
+
+    /// Compile finite class substitution inside the existing weighted subset
+    /// kernel, without expanding every NWA/DWA edge across the stack alphabet.
+    /// The returned DEFAULT rows are exact complete derivatives, not the
+    /// historical LR-domain shortcuts. Preserve explicit empty exceptions;
+    /// ordinary symbol-language minimization must not remove their shadows.
+    pub fn compile_positive(&self, graph: NWA, edge_budget: usize)
+        -> Result<crate::automata::weighted::dwa::DWA, String>
+    {
+        let started = std::time::Instant::now();
+        let graph = self.trim_positive(graph)?;
+        let input_states = graph.states().len();
+        let symbolic = if !graph.states().is_empty() && graph.is_acyclic() {
+            let deterministic = crate::automata::weighted::determinize::determinize(&graph)
+                .map_err(|error| format!("positive POP-class determinization: {error}"))?;
+            crate::automata::weighted::minimize_acyclic::minimize_acyclic_owned(deterministic)
+        } else {
+            crate::parser_dwa::determinize_opaque_stack_symbols(&graph, self.symbols)
+        };
+        if symbolic.num_states() > 1_000_000 || symbolic.num_transitions() > edge_budget {
+            return Err("symbolic POP predicate exceeds its representation budget".into());
+        }
+        let result = crate::parser_dwa::determinize_parser_dwa_with_pop_classes(&symbolic, self, edge_budget)?;
+        if std::env::var_os("GLRMASK_PROFILE_COMPILE_SUMMARY").is_some() {
+            eprintln!("[glrmask/profile][pop_class_derivatives] input_states={input_states} symbolic_states={} symbolic_edges={} result_states={} result_edges={} classes={} elapsed_ms={:.3}",
+                symbolic.num_states(), symbolic.num_transitions(), result.num_states(), result.num_transitions(), self.len(), started.elapsed().as_secs_f64()*1000.0);
+        }
+        Ok(result)
     }
 
     fn trim_positive(&self, graph: NWA) -> Result<NWA, String> {

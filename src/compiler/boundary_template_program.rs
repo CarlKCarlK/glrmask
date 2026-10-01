@@ -157,7 +157,12 @@ fn compile_impl(
     if let Some(classes) = classes {
         glrmask_parser_dwa::__private::resolve_negatives::resolve_negative_codes_in_nwa_with_pop_classes(
             &mut program, classes)?;
-        program = classes.expand_positive_compressed(program, 8_000_000)?;
+        let resolve_ms = start.elapsed().as_secs_f64() * 1000.0;
+        let normalize_started = Instant::now();
+        let parser_dwa = classes.compile_positive(program, 8_000_000)?;
+        return Ok(SignedShardOutput { parser_dwa, templates_ms: 0.0, compose_ms, resolve_ms,
+            normalize_ms: normalize_started.elapsed().as_secs_f64()*1000.0,
+            signed_states, signed_transitions, terms: templates.len().saturating_sub(controls.len()) });
     } else {
         resolve_negative_codes_in_nwa(&mut program, false);
     }
