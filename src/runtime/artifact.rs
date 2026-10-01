@@ -1394,7 +1394,7 @@ pub(crate) enum FastTemplateTransitionRow {
 }
 
 impl FastTemplateTransitionRow {
-    fn from_entries(entries: impl IntoIterator<Item = (i32, u32)>, count: usize) -> Self {
+    pub(crate) fn from_entries(entries: impl IntoIterator<Item = (i32, u32)>, count: usize) -> Self {
         if count > INLINE_TEMPLATE_TRANSITION_LIMIT {
             let mut row = FxHashMap::with_capacity_and_hasher(count, Default::default());
             row.extend(entries);
@@ -1510,6 +1510,7 @@ mod fast_template_row_construction_tests {
 
 #[derive(Debug, Clone, Default)]
 pub(crate) struct FastCommitTemplateDfas {
+    pub(crate) read_shift: Option<Box<super::commit::simple_read_shift::PreparedReadShift>>,
     pub(crate) input_cursor: Option<super::commit::single_cursor::PreparedInputCursor>,
     pub(crate) phase_dag: Option<super::commit::phase_dag::PreparedPhaseDag>,
     pub(crate) push_dag: Option<super::commit::push_dag::PreparedPushDag>,
@@ -1553,6 +1554,7 @@ impl FastCommitTemplateDfas {
             ),
         };
         Self {
+            read_shift: prepared.and_then(|_| super::commit::simple_read_shift::PreparedReadShift::prepare(template)),
             input_cursor,
             phase_dag,
             push_suffixes,

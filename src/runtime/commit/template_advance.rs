@@ -33,8 +33,12 @@ pub(crate) fn advance_stacks_template_dfa(
         .template_dfas_by_terminal
         .get(terminal as usize)?
         .as_ref()?;
-    let output = advance_with_prepared_template(dfa, stack.clone(),
-        constraint.fast_template_dfas_by_terminal.get(terminal as usize).and_then(|t| t.as_deref()));
+    let fast = constraint.fast_template_dfas_by_terminal
+        .get(terminal as usize).and_then(|t| t.as_deref());
+    let output = match fast.and_then(|fast| super::simple_read_shift::apply(dfa, fast, stack)) {
+        Some(output) => output,
+        None => advance_with_prepared_template(dfa, stack.clone(), fast),
+    };
     debug_validate_template_output(dfa, stack, &output, terminal);
     Some(output)
 }
@@ -49,8 +53,12 @@ pub(super) fn advance_stacks_template_dfa_owned(
         .get(terminal as usize)?
         .as_ref()?;
     let input = debug_template_literal_enabled().then(|| stack.clone());
-    let output = advance_with_prepared_template(dfa, stack,
-        constraint.fast_template_dfas_by_terminal.get(terminal as usize).and_then(|t| t.as_deref()));
+    let fast = constraint.fast_template_dfas_by_terminal
+        .get(terminal as usize).and_then(|t| t.as_deref());
+    let output = match fast.and_then(|fast| super::simple_read_shift::apply(dfa, fast, &stack)) {
+        Some(output) => output,
+        None => advance_with_prepared_template(dfa, stack, fast),
+    };
     if let Some(input) = input { debug_validate_template_output(dfa, &input, &output, terminal); }
     Some(output)
 }

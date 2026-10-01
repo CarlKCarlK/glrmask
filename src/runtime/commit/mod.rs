@@ -3,6 +3,7 @@ pub(crate) mod profile;
 mod template_advance;
 pub(crate) mod push_suffixes;
 mod flat_template;
+pub(crate) mod simple_read_shift;
 pub(crate) mod push_dag;
 pub(crate) mod phase_dag;
 pub(crate) mod single_cursor;
