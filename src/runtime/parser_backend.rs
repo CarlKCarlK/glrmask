@@ -27,6 +27,70 @@ use crate::ds::bitset::BitSet;
 use crate::grammar::flat::{DirectRegularAutomaton, TerminalID};
 use super::{CommitTemplateDfas, Constraint};
 
+/// Each terminal's DEFAULT specialization and complete phase-equivalence
+/// check depends only on that terminal's immutable raw DFA. Keep the output
+/// terminal order (including which error is reported) independent of worker
+/// scheduling. Owned inputs are released by their own transformation rather
+/// than retained behind borrowed parallel iterators.
+fn compile_terminal_template(
+    terminal: TerminalID,
+    raw: DFA,
+) -> crate::Result<Arc<CommitTemplateDfas>> {
+    let specialized = specialize_template_dfa_defaults_for_commit_split_input(&raw);
+    let split = try_split_commit_template_dfas(&specialized).ok_or_else(|| {
+        crate::Error::Compilation(format!(
+            "terminal {terminal} template is not acyclic pop/read/push; refusing table fallback"
+        ))
+    })?;
+    Ok(Arc::new(split))
+}
+
+fn compile_terminal_template_rows(
+    raw: BTreeMap<TerminalID, DFA>,
+    terminal_count: u32,
+) -> crate::Result<crate::runtime::artifact::TemplateDfasByTerminal> {
+    // Tiny inventories should not pay a worker handoff or a second collection.
+    // This is a structural work estimate, independent of grammar identities.
+    const PARALLEL_MIN_RAW_STATES: usize = 1_024;
+    let parallel = raw.len() > 1
+        && raw.values().map(|dfa| dfa.states.len()).sum::<usize>() >= PARALLEL_MIN_RAW_STATES
+        && !crate::compiler::macro_parallelism_disabled();
+    if parallel {
+        crate::compiler::pipeline::run_with_compile_thread_pool(|| {
+            compile_terminal_template_rows_with_parallelism(raw, terminal_count, true)
+        })
+    } else {
+        compile_terminal_template_rows_with_parallelism(raw, terminal_count, false)
+    }
+}
+
+fn compile_terminal_template_rows_with_parallelism(
+    raw: BTreeMap<TerminalID, DFA>,
+    terminal_count: u32,
+    parallel: bool,
+) -> crate::Result<crate::runtime::artifact::TemplateDfasByTerminal> {
+    if raw.len() != terminal_count as usize
+        || raw.keys().copied().ne(0..terminal_count)
+    {
+        return Err(crate::Error::Compilation(
+            "terminal template inventory must cover the complete terminal domain".into()
+        ));
+    }
+    if !parallel || rayon::current_num_threads() == 1 {
+        return raw.into_iter()
+            .map(|(terminal, dfa)| compile_terminal_template(terminal, dfa).map(Some))
+            .collect();
+    }
+    use rayon::prelude::*;
+    let inputs = raw.into_iter().collect::<Vec<_>>();
+    // Collect ordered per-terminal Results first: parallel Result collection
+    // can return whichever error a worker happens to encounter first.
+    let results = inputs.into_par_iter()
+        .map(|(terminal, dfa)| compile_terminal_template(terminal, dfa))
+        .collect::<Vec<_>>();
+    results.into_iter().map(|result| result.map(Some)).collect()
+}
+
 /// Compile-time / ordinary-LR storage. None really means no table remains.
 /// Deref is a migration guard, not a template-mode fallback implementation.
 #[derive(Debug, Clone)]
@@ -102,6 +166,17 @@ pub(crate) struct TemplateParser {
     advances: AtomicU64,
     admissions: AtomicU64,
     completions: AtomicU64,
+}
+
+/// Complete immutable parser machinery prepared for the same constraint.
+/// Runtime-only cache finalization may run before installation, but grammar,
+/// parser actions, terminal identities, and skip terminals must not change.
+pub(crate) struct PreparedTemplateParser {
+    source_state_count: u32,
+    source_terminal_count: u32,
+    templates: Vec<Option<Arc<CommitTemplateDfas>>>,
+    runtime: crate::runtime::artifact::FastTemplateDfasByTerminal,
+    parser: TemplateParser,
 }
 
 fn compile_domain(template: &CommitTemplateDfas) -> crate::Result<TemplateDomain> {
@@ -484,6 +559,19 @@ impl Constraint {
 
     fn install_template_parser_impl(&mut self, reuse_compiler_templates: bool) -> crate::Result<()> {
         if self.has_template_parser() { return Ok(()); }
+        let prepared = self.prepare_template_parser_impl(reuse_compiler_templates)?;
+        self.install_prepared_template_parser(prepared)
+    }
+
+    /// Derive the complete table-free parser without changing the active
+    /// backend. The compiler can overlap this work with vocabulary preparation
+    /// while preserving the established runtime-cache finalization order.
+    pub(crate) fn prepare_template_parser(&self) -> crate::Result<Option<PreparedTemplateParser>> {
+        if self.has_template_parser() { return Ok(None); }
+        self.prepare_template_parser_impl(false).map(Some)
+    }
+
+    fn prepare_template_parser_impl(&self, reuse_compiler_templates: bool) -> crate::Result<PreparedTemplateParser> {
         if self.parser_has_controls() || self.uses_compact_segmented_parser_runtime() || !self.late_grammar_slots.is_empty() {
             return Err(crate::Error::Compilation("template-only parser composition/control closure is not implemented; no LR fallback is permitted".into()));
         }
@@ -509,48 +597,75 @@ impl Constraint {
             } else {
                 std::collections::BTreeMap::new()
             };
-            let mut rebuilt = raw.into_iter();
-            let mut templates = vec![None; terminal_count as usize];
-            for terminal in 0..terminal_count {
-                let input = match retained.get(terminal as usize).and_then(Option::as_ref) {
-                    Some(dfa) => std::borrow::Cow::Borrowed(dfa),
-                    None => {
-                        let (rebuilt_terminal, dfa) = rebuilt.next().ok_or_else(||
-                            crate::Error::Compilation(format!(
-                                "missing complete template for terminal {terminal}; refusing table fallback"
-                            )))?;
-                        if rebuilt_terminal != terminal {
-                            return Err(crate::Error::Compilation(format!(
-                                "template inventory mismatch for terminal {terminal}: found {rebuilt_terminal}"
-                            )));
+            let templates = if self.uses_dynamic_runtime() {
+                // Dynamic preparation owns the full raw inventory. Each
+                // terminal can be transformed independently on the compile
+                // pool; complete equivalence checks still run for every row.
+                compile_terminal_template_rows(raw, terminal_count)?
+            } else {
+                let mut rebuilt = raw.into_iter();
+                let mut templates = vec![None; terminal_count as usize];
+                for terminal in 0..terminal_count {
+                    let input = match retained.get(terminal as usize).and_then(Option::as_ref) {
+                        Some(dfa) => std::borrow::Cow::Borrowed(dfa),
+                        None => {
+                            let (rebuilt_terminal, dfa) = rebuilt.next().ok_or_else(||
+                                crate::Error::Compilation(format!(
+                                    "missing complete template for terminal {terminal}; refusing table fallback"
+                                )))?;
+                            if rebuilt_terminal != terminal {
+                                return Err(crate::Error::Compilation(format!(
+                                    "template inventory mismatch for terminal {terminal}: found {rebuilt_terminal}"
+                                )));
+                            }
+                            std::borrow::Cow::Owned(dfa)
                         }
-                        std::borrow::Cow::Owned(dfa)
-                    }
-                };
-                let dfa = specialize_template_dfa_defaults_for_commit_split_input(input.as_ref());
-                let split = try_split_commit_template_dfas(&dfa).ok_or_else(|| crate::Error::Compilation(format!("terminal {terminal} template is not acyclic pop/read/push; refusing table fallback")))?;
-                templates[terminal as usize] = Some(Arc::new(split));
-                // Reconstructed inputs are owned by this iteration, preserving
-                // the original conversion path's prompt release of each raw
-                // DFA rather than retaining the whole rebuilt inventory.
-            }
-            if rebuilt.next().is_some() {
-                return Err(crate::Error::Compilation(
-                    "unexpected extra reconstructed terminal template".into()
-                ));
-            }
+                    };
+                    let dfa = specialize_template_dfa_defaults_for_commit_split_input(input.as_ref());
+                    let split = try_split_commit_template_dfas(&dfa).ok_or_else(|| crate::Error::Compilation(format!("terminal {terminal} template is not acyclic pop/read/push; refusing table fallback")))?;
+                    templates[terminal as usize] = Some(Arc::new(split));
+                    // Reconstructed inputs are owned by this iteration, preserving
+                    // the original conversion path's prompt release of each raw
+                    // DFA rather than retaining the whole rebuilt inventory.
+                }
+                if rebuilt.next().is_some() {
+                    return Err(crate::Error::Compilation(
+                        "unexpected extra reconstructed terminal template".into()
+                    ));
+                }
+                templates
+            };
             let completion = glrmask_parser_dwa::__private::templates::completion::compile_completion_template(&self.table)
                 .map_err(crate::Error::Compilation)?;
             (templates, completion, self.table.num_states)
         };
         let (parser, runtime) = TemplateParser::compile_with_runtime(state_count, terminal_count,
             self.table.skip_terminals.clone(), &templates, completion)?;
-        self.template_dfas_by_terminal = templates;
-        self.fast_template_dfas_by_terminal = runtime;
+        Ok(PreparedTemplateParser {
+            source_state_count: self.table.num_states,
+            source_terminal_count: terminal_count,
+            templates,
+            runtime,
+            parser,
+        })
+    }
+
+    pub(crate) fn install_prepared_template_parser(&mut self, prepared: PreparedTemplateParser) -> crate::Result<()> {
+        if self.has_template_parser() || !self.table.is_present()
+            || self.table.num_states != prepared.source_state_count
+            || self.table.num_terminals != prepared.source_terminal_count
+            || self.table.skip_terminals != prepared.parser.skip_terminals
+        {
+            return Err(crate::Error::Compilation(
+                "prepared template parser no longer matches its source constraint".into()
+            ));
+        }
+        self.template_dfas_by_terminal = prepared.templates;
+        self.fast_template_dfas_by_terminal = prepared.runtime;
         self.serialized_artifact_cache = None;
         self.deferred_table_rules_blob = None;
         self.deferred_table_rules = Default::default();
-        self.template_parser = Some(Arc::new(parser));
+        self.template_parser = Some(Arc::new(prepared.parser));
         // Drop, do not merely clear rows or change an environment flag.
         self.table = ParserTableStorage::absent();
         if !self.uses_dynamic_runtime() {
@@ -577,6 +692,43 @@ impl Constraint {
 mod tests {
     use super::*;
     use crate::compiler::glr::accumulator::TerminalsDisallowed;
+
+    #[test]
+    fn staged_parser_preparation_preserves_runtime_finalization_order() {
+        let vocab = crate::Vocab::new(["a", "b", "(", ")", "ab", "aa", " "]
+            .into_iter().enumerate().map(|(id, value)| (id as u32, value.as_bytes().to_vec())).collect());
+        let grammar = crate::Grammar::glrm(r#"start root; nt root ::= "a" | "(" root ")";"#);
+        let dynamic = crate::DynamicConstraint::compile_with_vocab_partition(grammar, &vocab).unwrap();
+        let ordinary = dynamic.into_constraints().pop().unwrap();
+        let mut reference = ordinary.clone();
+        reference.rebuild_dynamic_runtime_caches();
+        reference.install_template_parser().unwrap();
+        let mut candidate = ordinary;
+        let prepared = candidate.prepare_template_parser().unwrap().unwrap();
+        assert!(!candidate.has_template_parser());
+        assert!(candidate.table.is_present(), "preparation must not switch the active backend");
+        candidate.rebuild_dynamic_runtime_caches();
+        assert!(candidate.table.is_present(), "ordinary runtime finalization must still see the LR backend");
+        candidate.install_prepared_template_parser(prepared).unwrap();
+        assert!(!candidate.table.is_present());
+        assert!(candidate.prepare_template_parser().unwrap().is_none());
+        let restored = Constraint::load(candidate.save()).unwrap();
+        let external = Constraint::load_with_vocab(candidate.save_with_external_vocab().unwrap(), &vocab).unwrap();
+        for constraint in [&candidate, &restored, &external] {
+            assert!(constraint.has_template_parser() && !constraint.table.is_present());
+            for bytes in [b"".as_slice(), b"a", b"(a)", b"((a))", b"b", b" "] {
+                let mut a = reference.start();
+                let mut b = constraint.start();
+                assert_eq!(a.commit_bytes(bytes).is_ok(), b.commit_bytes(bytes).is_ok());
+                assert_eq!(a.is_accepting(), b.is_accepting());
+                let mut left = vec![0; reference.mask_len()];
+                let mut right = vec![0; constraint.mask_len()];
+                a.fill_mask(&mut left);
+                b.fill_mask(&mut right);
+                assert_eq!(left, right, "prefix {bytes:?}");
+            }
+        }
+    }
 
     #[test]
     fn fresh_compiler_template_reuse_matches_reconstructed_programs() {
@@ -635,6 +787,99 @@ mod tests {
             }
         }
         assert!(retained_total > 0, "fixture must exercise compiler template reuse");
+    }
+
+    fn phase_parallel_fixture(seed: u32) -> DFA {
+        use crate::compiler::glr::labels::DEFAULT_LABEL;
+        let mut dfa = DFA::new();
+        let read_pop = dfa.add_state();
+        let read_push = dfa.add_state();
+        let final_state = dfa.add_state();
+        let top = (seed % 7) as i32;
+        dfa.add_transition(0, top, read_pop);
+        dfa.add_transition(read_pop, encode_negative_label(top as u32), read_push);
+        dfa.add_transition(read_push, encode_negative_label(17), final_state);
+        dfa.set_accepting(final_state, true);
+        let mut tail = dfa.add_state();
+        dfa.add_transition(0, DEFAULT_LABEL, tail);
+        for depth in 0..48 {
+            let next = dfa.add_state();
+            dfa.add_transition(tail, ((seed + depth) % 11) as i32, next);
+            tail = next;
+        }
+        dfa.add_transition(tail, encode_negative_label(19), final_state);
+        dfa
+    }
+
+    fn assert_identical_phase_rows(
+        expected: &crate::runtime::artifact::TemplateDfasByTerminal,
+        actual: &crate::runtime::artifact::TemplateDfasByTerminal,
+    ) {
+        assert_eq!(expected.len(), actual.len());
+        for (a, b) in expected.iter().zip(actual) {
+            let (a, b) = (a.as_ref().unwrap(), b.as_ref().unwrap());
+            assert_eq!(a.pop, b.pop);
+            assert_eq!(a.read, b.read);
+            assert_eq!(a.push, b.push);
+            assert_eq!(a.pop_to_read, b.pop_to_read);
+            assert_eq!(a.pop_to_push, b.pop_to_push);
+            assert_eq!(a.read_to_push, b.read_to_push);
+        }
+    }
+
+    #[test]
+    fn parallel_terminal_phases_match_literal_serial_transformations() {
+        for count in [0u32, 1, 7, 32, 65] {
+            let inputs = (0..count).map(|terminal| (terminal, phase_parallel_fixture(terminal)))
+                .collect::<BTreeMap<_, _>>();
+            let reference = inputs.iter().map(|(&terminal, dfa)| {
+                let specialized = specialize_template_dfa_defaults_for_commit_split_input(dfa);
+                Some(Arc::new(try_split_commit_template_dfas(&specialized)
+                    .unwrap_or_else(|| panic!("fixture terminal {terminal} must split"))))
+            }).collect::<Vec<_>>();
+            for threads in [1, 4] {
+                let pool = rayon::ThreadPoolBuilder::new().num_threads(threads).build().unwrap();
+                for _ in 0..3 {
+                    let actual = pool.install(|| {
+                        compile_terminal_template_rows_with_parallelism(inputs.clone(), count, true)
+                    }).unwrap();
+                    assert_identical_phase_rows(&reference, &actual);
+                }
+            }
+            let automatic = compile_terminal_template_rows(inputs, count).unwrap();
+            assert_identical_phase_rows(&reference, &automatic);
+        }
+    }
+
+    #[test]
+    fn parallel_terminal_phases_preserve_first_error_and_inventory_checks() {
+        let mut unsupported = DFA::new();
+        let pushed = unsupported.add_state();
+        let popped_after_push = unsupported.add_state();
+        unsupported.add_transition(0, encode_negative_label(3), pushed);
+        unsupported.add_transition(pushed, 9, popped_after_push);
+        unsupported.set_accepting(popped_after_push, true);
+        let inputs = (0..8u32).map(|terminal| {
+            let dfa = if terminal == 2 || terminal == 6 { unsupported.clone() }
+                else { phase_parallel_fixture(terminal) };
+            (terminal, dfa)
+        }).collect::<BTreeMap<_, _>>();
+        let reference = compile_terminal_template_rows_with_parallelism(inputs.clone(), 8, false)
+            .unwrap_err().to_string();
+        assert!(reference.contains("terminal 2"));
+        let pool = rayon::ThreadPoolBuilder::new().num_threads(4).build().unwrap();
+        for _ in 0..8 {
+            let actual = pool.install(|| {
+                compile_terminal_template_rows_with_parallelism(inputs.clone(), 8, true)
+            }).unwrap_err().to_string();
+            assert_eq!(actual, reference);
+        }
+        for parallel in [false, true] {
+            assert!(compile_terminal_template_rows_with_parallelism(BTreeMap::new(), 1, parallel).is_err());
+            assert!(compile_terminal_template_rows_with_parallelism(
+                BTreeMap::from([(1, phase_parallel_fixture(1))]), 1, parallel,
+            ).is_err());
+        }
     }
 
     fn pop_word(labels: &[i32], accepting: bool) -> CommitTemplateDfas {

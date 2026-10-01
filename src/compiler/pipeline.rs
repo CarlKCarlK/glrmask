@@ -6357,16 +6357,17 @@ fn compile_dynamic_owned_with_vocab_partition_impl(
                         default_table_construction,
                         false,
                     ).and_then(|mut constraint| {
+                        let mut prepared_parsers = Vec::new();
                         if finalization == DynamicPartitionFinalization::Template {
                             // Parser relations depend on the complete core
                             // table, not on the model-token quotient. Derive
                             // them here instead of extending the critical path
                             // after the quotient lane has already completed.
                             for alternative in constraint.constraints_mut() {
-                                alternative.install_template_parser()?;
+                                prepared_parsers.push(alternative.prepare_template_parser()?);
                             }
                         }
-                        Ok(constraint)
+                        Ok((constraint, prepared_parsers))
                     });
                     (constraint, elapsed_ms(started))
                 },
@@ -6392,7 +6393,7 @@ fn compile_dynamic_owned_with_vocab_partition_impl(
                 },
             )
         });
-    let mut constraint = constraint?;
+    let (mut constraint, prepared_parsers) = constraint?;
     let mut quotient = quotient?;
     let quotient_tokens = quotient.canonical_token_count();
     let quotient_ops = quotient.trie.full_walk_ops().len();
@@ -6419,6 +6420,25 @@ fn compile_dynamic_owned_with_vocab_partition_impl(
             if !tiny_save_artifact {
                 constraint.cache_external_vocab_artifact_for_save();
             }
+        }
+    }
+    // Keep ordinary quotient/runtime-cache finalization on its original LR
+    // representation. Only parser construction overlaps the quotient lane;
+    // switching the active backend must not change the finalizer's inputs.
+    if !prepared_parsers.is_empty() {
+        let mut alternatives = constraint.constraints_mut();
+        for prepared in prepared_parsers {
+            let alternative = alternatives.next().ok_or_else(|| crate::Error::Compilation(
+                "dynamic alternative count changed during parser preparation".into()
+            ))?;
+            if let Some(prepared) = prepared {
+                alternative.install_prepared_template_parser(prepared)?;
+            }
+        }
+        if alternatives.next().is_some() {
+            return Err(crate::Error::Compilation(
+                "unexpected dynamic alternative after parser preparation".into()
+            ));
         }
     }
     let rebuild_ms = rebuild_started.map_or(0.0, elapsed_ms);
