@@ -111,6 +111,18 @@ impl Rule {
 }
 
 impl Terminal {
+    /// Whether this terminal's byte language contains epsilon. Exact token
+    /// identities are events, not byte strings, even when their spelling is empty.
+    pub fn is_nullable(&self) -> bool {
+        match self {
+            Self::Literal { bytes, .. } => bytes.is_empty(),
+            Self::Pattern { pattern, utf8, .. } =>
+                crate::automata::lexer::regex::parse_regex(pattern, *utf8).is_nullable(),
+            Self::Expr { expr, .. } => expr.is_nullable(),
+            Self::SpecialToken { .. } => false,
+        }
+    }
+
     /// Return the terminal's numeric ID.
     pub fn id(&self) -> TerminalID {
         match self {
@@ -136,8 +148,12 @@ impl GrammarDef {
     /// Whether the source start nonterminal derives epsilon. The ordinary
     /// compiler later inlines nullable productions and deliberately removes a
     /// root-only empty generation path, but subgrammar composition must retain
-    /// this source-language fact.
+    /// this source-language fact. Before lexical normalization, a terminal can
+    /// itself derive epsilon; treat that exactly like its later optional wrapper.
     pub fn start_is_nullable(&self) -> bool {
+        let nullable_terminals = self.terminals.iter()
+            .filter_map(|terminal| terminal.is_nullable().then_some(terminal.id()))
+            .collect::<std::collections::BTreeSet<_>>();
         if let Some(automaton) = &self.direct_regular_automaton {
             let mut reachable = automaton.start_states.clone();
             let mut cursor = 0usize;
@@ -151,7 +167,9 @@ impl GrammarDef {
                 if node.is_accepting {
                     return true;
                 }
-                for &target in &node.epsilons {
+                for &target in node.epsilons.iter().chain(node.transitions.iter()
+                    .filter(|(terminal, _)| nullable_terminals.contains(*terminal))
+                    .flat_map(|(_, targets)| targets)) {
                     if seen.insert(target) {
                         reachable.push(target);
                     }
@@ -165,7 +183,7 @@ impl GrammarDef {
             for rule in &self.rules {
                 if rule.rhs.iter().all(|symbol| match symbol {
                     Symbol::Nonterminal(nonterminal) => nullable.contains(nonterminal),
-                    Symbol::Terminal(_) => false,
+                    Symbol::Terminal(terminal) => nullable_terminals.contains(terminal),
                 }) {
                     nullable.insert(rule.lhs);
                 }
@@ -204,3 +222,7 @@ impl GrammarDef {
             .find(|terminal_def| terminal_def.id() == terminal)
     }
 }
+
+#[cfg(test)]
+#[path = "flat_nullability_tests.rs"]
+mod nullability_tests;

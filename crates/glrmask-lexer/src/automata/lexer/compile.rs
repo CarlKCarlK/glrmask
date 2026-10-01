@@ -882,6 +882,13 @@ pub fn build_virtual_zero_min_unit_repeat_tokenizer(expressions: &[Expr]) -> Opt
 const VIRTUAL_BINARY_REPEAT_MIN_BOUND: usize = 4_096;
 
 fn virtual_bounded_repeat_spec(expr: &Expr) -> Option<VirtualBoundedRepeatSpec> {
+    virtual_bounded_repeat_spec_with_minimum(expr, VIRTUAL_BINARY_REPEAT_MIN_BOUND)
+}
+
+fn virtual_bounded_repeat_spec_with_minimum(
+    expr: &Expr,
+    minimum_bound: usize,
+) -> Option<VirtualBoundedRepeatSpec> {
     let Expr::Repeat {
         expr: body,
         min,
@@ -890,7 +897,7 @@ fn virtual_bounded_repeat_spec(expr: &Expr) -> Option<VirtualBoundedRepeatSpec> 
     else {
         return None;
     };
-    if *max < VIRTUAL_BINARY_REPEAT_MIN_BOUND || min > max {
+    if *max < minimum_bound || min > max {
         return None;
     }
     // The body is compiled below in order to prove the deterministic,
@@ -910,7 +917,7 @@ fn virtual_bounded_repeat_spec(expr: &Expr) -> Option<VirtualBoundedRepeatSpec> 
 }
 
 fn virtual_zero_min_bounded_repeat_spec(expr: &Expr) -> Option<VirtualBoundedRepeatSpec> {
-    let spec = virtual_bounded_repeat_spec(expr)?;
+    let spec = virtual_bounded_repeat_spec_with_minimum(expr, 0)?;
     (spec.min == 0).then_some(spec)
 }
 
@@ -1113,8 +1120,8 @@ fn factor_same_body_delimited_literal_repeat_suffix_intersection(
     Some(seq_from_parts(parts))
 }
 
-/// Recognize an exact pure intersection whose two large bounded-repeat
-/// coordinates can remain symbolic at runtime. Each body must be deterministic,
+/// Recognize an exact pure intersection of bounded repeats with at least one
+/// large bound. Both coordinates remain symbolic. Each body must be deterministic,
 /// non-nullable and prefix-free; that makes `(completed copies, body state)` a
 /// complete residual coordinate for each side.
 #[doc(hidden)]
@@ -1124,6 +1131,16 @@ pub fn virtual_binary_bounded_repeat_intersection_descriptor(
     let Expr::Intersect { expr, intersect } = unwrap_shared(expr) else {
         return None;
     };
+    // Only one operand needs to be large to justify a symbolic product.
+    // Requiring both to cross the policy threshold unnecessarily sent exact
+    // prefix-free products into the general residual backend, which has no
+    // corresponding finite observation projector for this expression shape.
+    // Small-only products retain the existing materialized path.
+    if large_top_level_bounded_repeat_bound(expr).is_none()
+        && large_top_level_bounded_repeat_bound(intersect).is_none()
+    {
+        return None;
+    }
     let left = virtual_zero_min_bounded_repeat_spec(expr)?;
     let right = virtual_zero_min_bounded_repeat_spec(intersect)?;
     let byte_support = expr_u8set(expr).intersection(&expr_u8set(intersect));
@@ -9612,6 +9629,119 @@ impl ProductComponent {
     }
 }
 
+fn dense_product_lookup_extents(components: &[ProductComponent]) -> Option<[usize; 2]> {
+    let [left, right] = components else { return None; };
+    Some([
+        left.materialized_dfa()?.num_states().checked_add(1)?,
+        right.materialized_dfa()?.num_states().checked_add(1)?,
+    ])
+}
+
+#[cfg(test)]
+mod dense_product_lookup_tests {
+    use super::*;
+
+    #[test]
+    fn product_descriptor_accepts_one_large_operand_without_changing_bounds() {
+        let repeat = |words: &[&[u8]], min, max| Expr::Repeat {
+            expr: Box::new(Expr::Choice(words.iter().map(|word| Expr::U8Seq(word.to_vec())).collect())),
+            min, max: Some(max),
+        };
+        for small in [1, 64, VIRTUAL_BINARY_REPEAT_MIN_BOUND - 1] {
+            let left = repeat(&[b"ab", b"c"], 0, 5000);
+            let right = repeat(&[b"a", b"bc"], 0, small);
+            for (left, right, bounds) in [
+                (left.clone(), right.clone(), (5000, small)),
+                (right, left, (small, 5000)),
+            ] {
+                let descriptor = virtual_binary_bounded_repeat_intersection_descriptor(&Expr::Intersect {
+                    expr: Box::new(left), intersect: Box::new(right),
+                }).expect("one large operand needs the exact symbolic product");
+                assert_eq!((descriptor.left.min, descriptor.right.min), (0, 0));
+                assert_eq!((descriptor.left.max as usize, descriptor.right.max as usize), bounds);
+            }
+        }
+        let left = repeat(&[b"ab", b"c"], 0, 64);
+        let right = repeat(&[b"a", b"bc"], 0, 48);
+        assert!(virtual_binary_bounded_repeat_intersection_descriptor(&Expr::Intersect {
+            expr: Box::new(left), intersect: Box::new(right),
+        }).is_none(), "small-only policy must remain unchanged");
+    }
+
+    #[test]
+    fn mixed_size_product_keeps_its_semantic_eligibility_checks() {
+        let repeat = |words: &[&[u8]], min, max| Expr::Repeat {
+            expr: Box::new(Expr::Choice(words.iter().map(|word| Expr::U8Seq(word.to_vec())).collect())),
+            min, max: Some(max),
+        };
+        let large = repeat(&[b"ab", b"c"], 0, 5000);
+        for other in [
+            repeat(&[b"a", b"aa"], 0, 64), // Not prefix-free.
+            repeat(&[b"", b"a"], 0, 64), // Nullable body.
+            repeat(&[b"a", b"bc"], 2, 64), // Not the zero-minimum product.
+            repeat(&[b"a", b"bc"], 65, 64), // Invalid bounds.
+        ] {
+            assert!(virtual_binary_bounded_repeat_intersection_descriptor(&Expr::Intersect {
+                expr: Box::new(large.clone()), intersect: Box::new(other),
+            }).is_none());
+        }
+    }
+
+    #[test]
+    fn structural_virtual_repeat_pair_preserves_full_residual_language() {
+        let repeat = |alternatives: &[&[u8]], max| Expr::Repeat {
+            expr: Box::new(Expr::Choice(alternatives.iter().map(|s| Expr::U8Seq(s.to_vec())).collect())),
+            min: 0, max: Some(max),
+        };
+        let expression = Expr::Intersect {
+            expr: Box::new(repeat(&[b"ab", b"c"], 64)),
+            intersect: Box::new(repeat(&[b"a", b"bc"], 48)),
+        };
+        let vocab = Vocab::new(vec![(0, b"a".to_vec()), (1, b"b".to_vec()),
+            (2, b"c".to_vec()), (3, b"abc".to_vec()), (4, b"bcq".to_vec())]);
+        let pair = compile_terminal_expression_pair_with_vocabulary_token_quotient(
+            &expression, &expression, &vocab, &VocabularyRepeatHorizonCache::new(), 3, b"abcq")
+            .expect("identical virtual component languages have an exact structural map");
+        let accepts = |regex: &Regex, word: &[u8]| {
+            let mut state = 0;
+            for &byte in word {
+                let Some(next) = regex.step(state, byte) else { return false; }; state = next;
+            }
+            regex.dfa.finalizers(state).contains(0)
+        };
+        // (ab|c)* intersect (a|bc)* = (abc)*, with two copies on
+        // each side for every abc. The right bound limits it to 24 copies.
+        for copies in 0..=25 {
+            let word = b"abc".repeat(copies);
+            for regex in [&pair.full, &pair.synthesized] {
+                assert_eq!(accepts(regex, &word), copies <= 24);
+                for suffix in [b"a".as_slice(), b"ab", b"c", b"q"] {
+                    let mut invalid = word.clone(); invalid.extend(suffix);
+                    assert!(!accepts(regex, &invalid));
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn virtual_residual_coordinates_never_use_body_sized_dense_lookup() {
+        let body = Arc::new(DFA::new(3));
+        let materialized = ProductComponent::Materialized(Arc::clone(&body));
+        assert_eq!(dense_product_lookup_extents(&[materialized.clone(), materialized.clone()]), Some([4, 4]));
+        let repeat = ProductComponent::VirtualBoundedRepeat { base_dfa: body, min: 0, max: 5000 };
+        let sequence = ProductComponent::VirtualFixedSequence {
+            byte_sets: Arc::from(vec![U8Set::from_bytes(b"a"); 7]),
+            suffix_live: Arc::from(vec![true; 8]),
+        };
+        for virtual_component in [repeat, sequence] {
+            assert_eq!(dense_product_lookup_extents(&[materialized.clone(), virtual_component.clone()]), None);
+            assert_eq!(dense_product_lookup_extents(&[virtual_component, materialized.clone()]), None);
+        }
+        assert_eq!(dense_product_lookup_extents(&[]), None);
+        assert_eq!(dense_product_lookup_extents(&[materialized]), None);
+    }
+}
+
 struct ProductBuildTrace {
     components: Vec<ProductComponent>,
     /// Logical product groups represented by each physical product coordinate.
@@ -11522,18 +11652,17 @@ fn prepare_terminal_expression_pair_with_structural_map_inner(
 
     let tuple_map_started_at = profile.then(Instant::now);
     const DENSE_PRODUCT_LOOKUP_MAX_CELLS: usize = 16 * 1024 * 1024;
-    let component_extents = synthesized_trace
-        .components
-        .iter()
-        .map(|component| component.partition_dfa().num_states().saturating_add(1))
-        .collect::<Vec<_>>();
-    let dense_two_component_cells = (component_maps.len() == 2)
-        .then(|| component_extents[0].checked_mul(component_extents[1]))
-        .flatten()
+    // A virtual repeat's partition DFA describes ONE body, not its full
+    // residual coordinate. Product tuples can contain much larger layered
+    // IDs. Only materialized coordinates may index this dense shortcut;
+    // virtual components retain the existing exact sparse tuple lookup.
+    let component_extents = dense_product_lookup_extents(&synthesized_trace.components);
+    let dense_two_component_cells = component_extents
+        .and_then(|[left, right]| left.checked_mul(right))
         .filter(|&cells| cells <= DENSE_PRODUCT_LOOKUP_MAX_CELLS);
 
     let mut full_to_synthesized = if let Some(cells) = dense_two_component_cells {
-        let right_extent = component_extents[1];
+        let right_extent = component_extents.expect("checked materialized pair")[1];
         let mut state_by_key = vec![u32::MAX; cells];
         match &synthesized_trace.state_tuples {
             ProductStateTuples::Generic(tuples) => {

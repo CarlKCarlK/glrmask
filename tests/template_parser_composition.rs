@@ -4,6 +4,67 @@ use glrmask::{BuildOptions, Constraint, Grammar, Optimization, ParserBackend, Vo
 const HOST: &str = r#"glrm 1; start root; extern grammar child; nt root = "x" child "y";"#;
 
 #[test]
+fn nullable_lexical_source_is_preserved_by_every_compiled_child_backend() {
+    let (vocab, tokens) = vocabulary();
+    let sources = [
+        Grammar::from_glrm("start root; t A ::= /a?/; nt root ::= A;"),
+        Grammar::from_glrm("start root; t A ::= /a?/ & /a*/; nt root ::= A;"),
+        // EBNF has no slash-delimited regex syntax; its explicit optional
+        // literal is the independent parser-nullability control case.
+        Grammar::from_ebnf(r#"start ::= "a"?"#),
+        Grammar::from_lark("start: A\nA: /a?/"),
+    ];
+    let words: &[&[u8]] = &[b"xy", b"xay"];
+    for (source_index, source) in sources.iter().enumerate() {
+        for backend in [ParserBackend::LrTable, ParserBackend::TemplateDfa] {
+            for child_mode in [Optimization::FastBuild, Optimization::FastRuntime] {
+                let child = source.compile_with(&vocab, BuildOptions::default()
+                    .optimization(child_mode).parser_backend(backend)).unwrap();
+                let saved_child = Constraint::load(child.save()).unwrap();
+                for child in [&child, &saved_child] {
+                    let bound = Grammar::from_glrm(HOST).compile_unlinked(&vocab).unwrap()
+                        .bind("child", child).unwrap();
+                    for link_mode in [Optimization::FastBuild, Optimization::FastRuntime] {
+                        let linked = bound.link_with(BuildOptions::default()
+                            .optimization(link_mode).parser_backend(backend)).unwrap();
+                        let loaded = Constraint::load(linked.save()).unwrap();
+                        let external = if backend == ParserBackend::TemplateDfa {
+                            Some(Constraint::load_with_vocab(
+                                linked.save_with_external_vocab().unwrap(), &vocab).unwrap())
+                        } else {
+                            // External-vocabulary Constraint envelopes are a
+                            // template-only API. Keep the LR rejection contract
+                            // and compare its fresh/self-contained forms.
+                            assert!(linked.save_with_external_vocab().is_err());
+                            None
+                        };
+                        for c in [&linked, &loaded].into_iter().chain(external.as_ref()) {
+                            for prefix in [b"".as_slice(), b"x", b"xy", b"xa", b"xay"] {
+                                let mut state = c.start(); state.commit_bytes(prefix).unwrap();
+                                assert_eq!(state.is_accepting(), words.contains(&prefix));
+                                let mask = state.mask();
+                                for (id, bytes) in &tokens {
+                                    let mut word = prefix.to_vec(); word.extend(bytes);
+                                    let expected = words.iter().any(|candidate| candidate.starts_with(&word));
+                                    let actual = mask.get(*id as usize / 32)
+                                        .is_some_and(|bits| bits & (1 << (id % 32)) != 0);
+                                    assert_eq!(actual, expected, "source={source_index} backend={backend:?} \
+                                        child={child_mode:?} link={link_mode:?} prefix={prefix:?} token={bytes:?}");
+                                    if actual {
+                                        let mut branch = state.clone(); branch.commit_token(*id).unwrap();
+                                        assert_eq!(branch.is_accepting(), words.contains(&word.as_slice()));
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+#[test]
 fn sparse_regular_precompiled_children_keep_their_one_symbol_return_frame() {
     use glrmask::__private::{ConstraintExt, into_template_parser, parser_backend_report};
     use glrmask_grammar::__private::grammar::flat::{DirectRegularAutomaton, DirectRegularState,

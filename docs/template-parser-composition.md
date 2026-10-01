@@ -49,6 +49,12 @@ final root, not an embedded child's standalone termination policy. Exact grammar
 tokens remain grammar tokens, and parent and child ignore rules retain their
 own scopes.
 
+Body nullability comes from the original source, including the empty string in
+a nullable lexical rule. For example, a child whose only rule references the
+regular expression `a?` may have an empty body when embedded; an extra optional
+grammar wrapper is not required. An exact special-token identity is still an
+event, even when its vocabulary spelling is empty, and never becomes epsilon.
+
 ## Build-time choices
 
 A source-bound grammar, or an unlinked parent with ordinary compiled children,

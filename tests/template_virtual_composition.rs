@@ -292,3 +292,86 @@ fn unsupported_general_virtual_projection_fails_without_changing_dynamic_languag
         }
     }
 }
+
+
+mod product_review {
+    use glrmask::{BuildOptions, Constraint, Grammar, Optimization, ParserBackend, Vocab};
+
+    fn options(mode: Optimization) -> BuildOptions {
+        BuildOptions::default().optimization(mode).parser_backend(ParserBackend::TemplateDfa)
+    }
+
+    // (ab|c)* intersect (a|bc)* is (abc)*. Both repeated bodies consume
+    // two copies per abc, so bounds 5000 and 4000 permit at most 2000 abc.
+    fn viable(word: &[u8]) -> bool {
+        if word.is_empty() { return true; }
+        if word[0] != b'p' { return false; }
+        let body = &word[1..];
+        let (body, finished) = body.strip_suffix(b"q").map_or((body, false), |b| (b, true));
+        body.len() <= 6000 && (!finished || body.len() % 3 == 0)
+            && body.iter().enumerate().all(|(i, byte)| *byte == b"abc"[i % 3])
+    }
+
+    #[test]
+    fn product_intersection_child_has_exact_full_horizon_crossings() -> Result<(), Box<dyn std::error::Error>> {
+        if super::isolated("product_review::product_intersection_child_has_exact_full_horizon_crossings") { return Ok(()); }
+        let mut tokens = (0..128).map(|id| (id, vec![id as u8])).collect::<Vec<_>>();
+        tokens.extend([(300, b"pq".to_vec()), (301, b"pabcq".to_vec()),
+            (302, b"abc".to_vec()), (303, b"bcq".to_vec()), (304, b"cq".to_vec()),
+            (305, format!("{}q", "abc".repeat(20)).into_bytes()),
+            (306, "abc".repeat(20).into_bytes())]);
+        let vocab = Vocab::new(tokens.clone());
+        // Lexical epsilon is lifted to a parser alternative before execution.
+        // Preserve that source nullability in the reusable child's embedding;
+        // requiring A? here would conceal a lost source-language alternative.
+        let source = "start root; t A ::= /(ab|c){0,5000}/ & /(a|bc){0,4000}/; nt root ::= A;";
+        let child = Grammar::from_glrm(source).compile_with(&vocab, options(Optimization::FastBuild))?;
+        let report = glrmask::__private::parser_backend_report(&child);
+        println!("CHILD {report}");
+        assert_eq!(report["virtual_lexer"], true, "review must use an actual virtual lexer");
+        let original = child.save();
+        let parent = Grammar::from_glrm("glrm 1; start root; extern grammar child; nt root = \"p\" child \"q\";")
+            .compile_unlinked(&vocab)?.bind("child", &child)?;
+        let dynamic = parent.link_with(options(Optimization::FastBuild))?;
+        println!("DYNAMIC LINKED");
+        let candidate = parent.link_with(options(Optimization::FastRuntime))?;
+        println!("STATIC {}", glrmask::__private::parser_backend_report(&candidate));
+        assert_eq!(child.save(), original, "link changed reusable child");
+        let saved = candidate.save();
+        let loaded = Constraint::load(&saved)?;
+        assert_eq!(loaded.save(), saved);
+        let external = Constraint::load_with_vocab(candidate.save_with_external_vocab()?, &vocab)?;
+        let mut prefixes = vec![vec![], b"p".to_vec(), b"pq".to_vec(), b"pabcq".to_vec()];
+        for count in [1, 7, 1979, 1980, 1998, 1999, 2000] {
+            let prefix = format!("p{}", "abc".repeat(count)).into_bytes();
+            prefixes.push(prefix.clone());
+            if count < 2000 {
+                for suffix in [b"a".as_slice(), b"ab"] {
+                    let mut p = prefix.clone(); p.extend(suffix); prefixes.push(p);
+                }
+            }
+        }
+        let mut comparisons = 0;
+        for (representation, c) in [("dynamic", &dynamic), ("static", &candidate),
+            ("self-contained", &loaded), ("external-vocabulary", &external)] {
+            for prefix in &prefixes {
+                let mut state = c.start(); state.commit_bytes(prefix)?;
+                assert_eq!(state.is_accepting(), prefix.ends_with(b"q"));
+                let mask = state.mask();
+                for (id, token) in &tokens {
+                    let mut word = prefix.clone(); word.extend(token);
+                    let expected = viable(&word);
+                    let actual = mask.get(*id as usize / 32).is_some_and(|w| w & (1 << (*id % 32)) != 0);
+                    assert_eq!(actual, expected, "representation={representation} prefix_len={} token={token:?}", prefix.len());
+                    if actual {
+                        let mut branch = state.clone(); branch.commit_token(*id)?;
+                        assert_eq!(branch.is_accepting(), word.ends_with(b"q"));
+                    }
+                    comparisons += 1;
+                }
+            }
+        }
+        println!("PASS independent product language checks={comparisons}, all artifact forms and long crossing horizon");
+        Ok(())
+    }
+}

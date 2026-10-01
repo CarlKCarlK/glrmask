@@ -4,7 +4,6 @@ use std::time::Instant;
 use rustc_hash::FxHashSet;
 
 use crate::automata::regex::Expr;
-use crate::automata::lexer::regex::parse_regex;
 use crate::compiler::glr::analysis::{
     eliminate_right_recursion, has_indirect_left_recursion, merge_identical_nonterminals,
     inline_null_productions, normalize_dynamic_glr_grammar, normalize_grammar,
@@ -141,20 +140,11 @@ fn remap_terminal_id(terminal: &Terminal, new_id: TerminalID) -> Terminal {
     }
 }
 
-fn terminal_is_nullable(terminal: &Terminal) -> bool {
-    match terminal {
-        Terminal::Literal { bytes, .. } => bytes.is_empty(),
-        Terminal::Pattern { pattern, utf8, .. } => parse_regex(pattern, *utf8).is_nullable(),
-        Terminal::Expr { expr, .. } => expr.is_nullable(),
-        Terminal::SpecialToken { .. } => false,
-    }
-}
-
 fn nullable_terminals_for_grammar(grammar: &GrammarDef) -> BTreeSet<TerminalID> {
     grammar
         .terminals
         .iter()
-        .filter_map(|terminal| terminal_is_nullable(terminal).then_some(terminal.id()))
+        .filter_map(|terminal| terminal.is_nullable().then_some(terminal.id()))
         .collect()
 }
 

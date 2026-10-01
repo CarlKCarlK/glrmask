@@ -246,3 +246,41 @@ def test_python_projected_virtual_child_preserves_exact_limits_and_reload(mode):
         state = compiled.start()
         with pytest.raises(ValueError):
             state.commit_bytes(b'p"x:' + b"a" * 4999)
+
+
+@pytest.mark.parametrize("backend", [glrmask.ParserBackend.LR_TABLE, glrmask.ParserBackend.TEMPLATE_DFA])
+@pytest.mark.parametrize("mode", [glrmask.Optimization.FAST_RUNTIME, glrmask.Optimization.FAST_BUILD])
+def test_python_nullable_lexical_body_survives_compiled_child_binding(backend, mode):
+    tokens = {0: b"x", 1: b"a", 2: b"y", 3: b"xay", 4: b"xy",
+              5: b"ay", 6: b"aa", 7: b"yx", 8: b""}
+    vocab = glrmask.Vocab.from_id_to_bytes(tokens)
+    child = glrmask.Grammar.from_glrm(
+        'start root; t A ::= /a?/; nt root ::= A;').compile(
+            vocab, optimization=mode, parser_backend=backend)
+    child = glrmask.Constraint.load(child.save())
+    child_bytes = child.save()
+    parent = glrmask.Grammar.from_glrm(
+        'glrm 1; start root; extern grammar C; nt root = "x" C "y";').compile_unlinked(vocab)
+    linked = parent.bind("C", child).link(
+        optimization=mode, parser_backend=backend, end_tokens=[8])
+    assert child.save() == child_bytes
+    forms = (representations(linked, vocab) if backend == glrmask.ParserBackend.TEMPLATE_DFA
+             else [linked, glrmask.Constraint.load(linked.save())])
+    language = [b"xy", b"xay"]
+    for compiled in forms:
+        for prefix in [b"", b"x", b"xa", b"xy", b"xay"]:
+            state = compiled.start()
+            state.commit_bytes(prefix)
+            mask = state.mask()
+            assert state.is_accepting() == (prefix in language)
+            assert bool(mask[8]) == (prefix in language)
+            for token_id, word in tokens.items():
+                if token_id == 8:
+                    continue
+                expected = any(complete.startswith(prefix + word) for complete in language)
+                assert bool(mask[token_id]) == expected, (backend, mode, prefix, word)
+                if expected:
+                    branch = compiled.start()
+                    branch.commit_bytes(prefix)
+                    branch.commit_token(token_id)
+                    assert branch.is_accepting() == (prefix + word in language)
