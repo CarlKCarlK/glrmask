@@ -100,6 +100,15 @@ pub(crate) fn install(constraint: &mut Constraint, vocab: &Vocab) -> Result<()> 
         return Err(fail("static template lexical/parser terminal coordinates disagree"));
     }
     let component_count = constraint.static_dynamic_overlay.as_ref().unwrap().segmented_parser_components.len();
+    let candidate_tokens_by_component = constraint.static_dynamic_overlay.as_ref().unwrap()
+        .segmented_parser_components.iter().map(|component| {
+            crate::compiler::boundary_candidates::persisted_boundary_candidate_ids(
+                &component.constraint,
+                vocab,
+            )
+        }).collect::<std::result::Result<Vec<_>, _>>().map_err(fail)?;
+    let candidate_tokens_by_component = candidate_tokens_by_component.iter()
+        .any(Option::is_some).then_some(candidate_tokens_by_component);
     let leaves = layout.leaves.iter().map(|leaf|
         constraint.constraint_at_recursive_component_path(&leaf.component_path)
             .ok_or_else(|| fail("static template leaf path is invalid")))
@@ -181,7 +190,7 @@ pub(crate) fn install(constraint: &mut Constraint, vocab: &Vocab) -> Result<()> 
         ignore_terminal: None, follow_transparent_ignores: Some(&transparent),
         terminal_offsets: &layout.leaf_terminal_offsets, leaf_to_immediate: Some(&owners),
         tokenizer_offsets: &tokenizer_offsets, component_state_counts: &state_counts,
-        candidate_tokens_by_component: None, retain_parent_non_crossing_paths: certificate.is_none(),
+        candidate_tokens_by_component: candidate_tokens_by_component.as_deref(), retain_parent_non_crossing_paths: certificate.is_none(),
         walk_plans: Some(plans),
     };
     let (walks, _) = super::boundary_walk::build_boundary_shard_walks(&inputs)

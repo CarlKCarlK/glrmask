@@ -5107,12 +5107,10 @@ impl<'a> ConstraintState<'a> {
                         // GLRMASK_STRICT_STATIC_TRAP_DYNAMIC=1 and any firing
                         // DynamicDirect shard panics loudly here instead of
                         // contributing hidden dynamic admissions.
-                        if crate::compiler::boundary_transfer::strict_static_dynamic_trap_enabled()
-                        {
-                            panic!(
-                                "GLRMASK_STRICT_STATIC_TRAP_DYNAMIC: DynamicDirect boundary shard fired on a strict-static path"
-                            );
-                        }
+                        crate::compiler::boundary_transfer::strict_static_trap_dynamic_for_state(
+                            "segmented_dynamic_direct_shard",
+                            self.constraint.uses_dynamic_runtime(),
+                        );
                         let handled = restricted && shard.candidate_tokens.as_deref().is_some_and(|ids| {
                             let prepared = shard.mask_vocabulary.get_or_init(|| {
                                 super::dynamic_mask::PreparedMaskVocabulary::new(self.constraint, ids)
@@ -5160,8 +5158,9 @@ impl<'a> ConstraintState<'a> {
                 // traps loudly under the strict flag; this second trap names
                 // the unified/recursive walker fallback itself so a missed arm
                 // cannot silently contribute exact dynamic admissions.
-                crate::compiler::boundary_transfer::strict_static_trap_dynamic(
+                crate::compiler::boundary_transfer::strict_static_trap_dynamic_for_state(
                     "segmented_boundary_needs_direct_dynamic",
+                    self.constraint.uses_dynamic_runtime(),
                 );
                 if self.constraint.uses_compact_segmented_parser_runtime() {
                     // Use the same shared provider walk as all-dynamic

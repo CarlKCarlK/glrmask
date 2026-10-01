@@ -303,6 +303,22 @@ pub mod __private {
     /// any accidental runtime table access fails loudly. Composed constraints
     /// are converted recursively without retaining packed compiler tables.
     pub fn into_template_parser(mut constraint: Constraint) -> Result<Constraint> {
+        // Internal conversion is also used by composition benchmarks and by
+        // callers that precompile a child before binding it. Preserve the same
+        // component-local boundary certificate as the public compiler does,
+        // before physical table/rule removal makes recomputation impossible.
+        let vocab = constraint.late_bind_vocab.get().cloned().unwrap_or_else(|| {
+            Vocab::new(
+                constraint
+                    .token_bytes_iter()
+                    .map(|(token_id, bytes)| (token_id, bytes.to_vec()))
+                    .collect(),
+            )
+        });
+        crate::compiler::boundary_candidates::persist_boundary_candidate_summary(
+            &mut constraint,
+            &vocab,
+        );
         constraint.install_template_parser()?;
         Ok(constraint)
     }

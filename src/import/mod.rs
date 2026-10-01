@@ -490,7 +490,13 @@ fn compile_bounded_template_from_source(
             compiled.push(component);
         }
         let mut constraint = DynamicConstraint::from_alternatives(compiled);
-        for component in constraint.constraints_mut() { component.install_template_parser()?; }
+        for component in constraint.constraints_mut() {
+            crate::compiler::boundary_candidates::persist_boundary_candidate_summary(
+                component,
+                vocab,
+            );
+            component.install_template_parser()?;
+        }
         Ok(constraint)
     })
 }

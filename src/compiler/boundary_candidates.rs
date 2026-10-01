@@ -1017,6 +1017,92 @@ pub(crate) fn boundary_candidate_ids(
     (ids, stats)
 }
 
+/// Read a candidate certificate that was deliberately persisted while the
+/// component still owned its grammar/table metadata. Template-parser
+/// conversion physically drops that metadata, so a later composition cannot
+/// re-fingerprint/recompute the summary. The component itself is immutable at
+/// that point; vocabulary identity is still checked here before trusting the
+/// persisted original-token set.
+pub(crate) fn persisted_boundary_candidate_ids(
+    constraint: &Constraint,
+    vocab: &crate::Vocab,
+) -> Result<Option<Vec<u32>>, String> {
+    fn public_interface_matches(
+        constraint: &Constraint,
+        fingerprint: &BoundaryCandidateFingerprint,
+    ) -> bool {
+        let composite = constraint
+            .static_dynamic_overlay
+            .as_ref()
+            .is_some_and(|overlay| !overlay.segmented_parser_components.is_empty());
+        let mut interface = blake3::Hasher::new();
+        if composite {
+            interface.update(b"glrmask-boundary-public-interface-v2-composite\0");
+            interface.update(&fingerprint.component_semantics);
+        } else {
+            interface.update(b"glrmask-boundary-public-interface-v2-leaf\0");
+        }
+        for (name, terminal) in &constraint.unbound_grammar_placeholders {
+            interface.update(&(name.len() as u64).to_le_bytes());
+            interface.update(name.as_bytes());
+            interface.update(&terminal.to_le_bytes());
+        }
+        let mut late = constraint
+            .late_grammar_slots
+            .iter()
+            .map(|slot| (slot.name.as_str(), slot.terminal_id))
+            .collect::<Vec<_>>();
+        late.sort_unstable();
+        for (name, terminal) in late {
+            interface.update(&(name.len() as u64).to_le_bytes());
+            interface.update(name.as_bytes());
+            interface.update(&terminal.to_le_bytes());
+        }
+        if !composite {
+            let mut specials = constraint
+                .special_token_terminals
+                .iter()
+                .filter(|special| {
+                    constraint.is_late_grammar_placeholder_terminal(special.terminal_id)
+                        || constraint.token_bytes_for_id(special.token_id).is_none()
+                })
+                .map(|special| (special.terminal_id, special.token_id))
+                .collect::<Vec<_>>();
+            specials.sort_unstable();
+            for (terminal, token) in specials {
+                interface.update(&terminal.to_le_bytes());
+                interface.update(&token.to_le_bytes());
+            }
+        }
+        *interface.finalize().as_bytes() == fingerprint.public_interface
+    }
+
+    if !constraint.token_bytes_match_vocab(vocab) {
+        return Ok(None);
+    }
+    let Some(summary) = constraint.retained_boundary_candidate_summary_for_compilation()? else {
+        return Ok(None);
+    };
+    match summary {
+        BoundaryCandidateSummary::Known { fingerprint, tokens, .. }
+            if fingerprint.algorithm_version == BOUNDARY_CANDIDATE_ALGORITHM_VERSION
+                && fingerprint.vocabulary
+                    == crate::compiler::compile::vocab_content_digest(vocab)
+                && public_interface_matches(constraint, &fingerprint) =>
+        {
+            let ids = tokens.canonical_ids(vocab.iter());
+            if ids.windows(2).any(|pair| pair[0] >= pair[1])
+                || ids.iter().any(|id| !vocab.entries_map().contains_key(id))
+            {
+                return Ok(None);
+            }
+            Ok(Some(ids))
+        }
+        BoundaryCandidateSummary::Unknown { .. } => Ok(None),
+        BoundaryCandidateSummary::Known { .. } => Ok(None),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1427,5 +1513,105 @@ mod preparation_tests {
         reloaded.materialize_composition_link_metadata_for_compilation().unwrap();
         assert!(matches!(reloaded.boundary_candidate_summary.get(),Some(BoundaryCandidateSummary::Unknown{reason:SummaryUnavailable::Disabled})));
         assert!(boundary_candidate_ids(&reloaded,&vocab).0.is_none());
+    }
+
+    #[test]
+    fn persisted_candidates_survive_physical_table_removal_and_reload() {
+        let vocab = crate::Vocab::new(vec![
+            (0, b"a".to_vec()),
+            (1, b"ab".to_vec()),
+            (2, b"ax".to_vec()),
+            (3, b"b".to_vec()),
+            (4, b"ba".to_vec()),
+        ]);
+        for optimization in [crate::Optimization::FastRuntime, crate::Optimization::FastBuild] {
+            let source = crate::Grammar::from_glrm(
+                r#"glrm 1; start document; nt document = "a";"#,
+            )
+            .compile_with(
+                &vocab,
+                crate::BuildOptions::default()
+                    .optimization(optimization)
+                    .parser_backend(crate::ParserBackend::TemplateDfa),
+            )
+            .unwrap();
+            assert!(!source.table.is_present());
+            let expected = persisted_boundary_candidate_ids(&source, &vocab)
+                .unwrap()
+                .expect("public template compilation must persist its boundary certificate");
+            assert!(!expected.is_empty());
+            assert!(expected.len() < vocab.len());
+
+            let loaded = Constraint::load(&source.save()).unwrap();
+            assert!(!loaded.table.is_present());
+            assert!(loaded.boundary_candidate_summary.get().is_none());
+            assert!(loaded.deferred_composition_metadata_blob.is_some());
+            assert_eq!(persisted_boundary_candidate_ids(&loaded, &vocab).unwrap(), Some(expected));
+            assert!(loaded.boundary_candidate_summary.get().is_none(),
+                "read-only proof lookup must not materialize link metadata");
+            assert!(loaded.deferred_composition_metadata_blob.is_some(),
+                "read-only proof lookup must retain deferred compiler metadata");
+        }
+    }
+
+    #[test]
+    fn persisted_candidates_reject_stale_or_malformed_proofs_but_keep_known_empty() {
+        let (mut source, vocab) = fixture();
+        persist_boundary_candidate_summary(&mut source, &vocab);
+        let original = source.boundary_candidate_summary.take().unwrap();
+        let BoundaryCandidateSummary::Known {
+            fingerprint: original_fingerprint,
+            tokens: original_tokens,
+            precision,
+        } = original else {
+            panic!("fixture should produce a known certificate")
+        };
+
+        let install = |constraint: &mut Constraint,
+                       fingerprint: BoundaryCandidateFingerprint,
+                       tokens: OriginalTokenSet| {
+            let _ = constraint.boundary_candidate_summary.take();
+            constraint
+                .boundary_candidate_summary
+                .set(BoundaryCandidateSummary::Known {
+                    fingerprint,
+                    tokens,
+                    precision,
+                })
+                .unwrap();
+        };
+
+        let mut stale_algorithm = original_fingerprint;
+        stale_algorithm.algorithm_version = BOUNDARY_CANDIDATE_ALGORITHM_VERSION.wrapping_sub(1);
+        install(&mut source, stale_algorithm, original_tokens.clone());
+        assert!(persisted_boundary_candidate_ids(&source, &vocab).unwrap().is_none());
+
+        let mut stale_vocab = original_fingerprint;
+        stale_vocab.vocabulary[0] ^= 0x80;
+        install(&mut source, stale_vocab, original_tokens.clone());
+        assert!(persisted_boundary_candidate_ids(&source, &vocab).unwrap().is_none());
+
+        install(&mut source, original_fingerprint, original_tokens.clone());
+        source
+            .unbound_grammar_placeholders
+            .insert("changed-after-proof".to_owned(), 0);
+        assert!(persisted_boundary_candidate_ids(&source, &vocab).unwrap().is_none());
+        source.unbound_grammar_placeholders.remove("changed-after-proof");
+
+        install(
+            &mut source,
+            original_fingerprint,
+            OriginalTokenSet::Sparse(std::sync::Arc::from([u32::MAX])),
+        );
+        assert!(persisted_boundary_candidate_ids(&source, &vocab).unwrap().is_none());
+
+        let empty_vocab = crate::Vocab::new(vec![(0, b"a".to_vec()), (1, b"b".to_vec())]);
+        let mut empty = Constraint::from_glrm_grammar(
+            r#"glrm 1; start document; nt document = "a";"#,
+            &empty_vocab,
+        )
+        .unwrap();
+        persist_boundary_candidate_summary(&mut empty, &empty_vocab);
+        assert_eq!(persisted_boundary_candidate_ids(&empty, &empty_vocab).unwrap(), Some(vec![]));
     }
 }

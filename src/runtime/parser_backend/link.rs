@@ -144,6 +144,10 @@ pub(crate) fn compose(parent: Constraint, children: &[(String, Arc<Constraint>)]
     // ordinary recursive linker's one-class wire compatibility image, while
     // leaving all actual component lexer and parser coordinates unchanged.
     constraint.state_to_internal_tsid = vec![0];
+    let candidate_tokens = components.iter().map(|component| {
+        crate::compiler::boundary_candidates::persisted_boundary_candidate_ids(component, vocab)
+            .map(|ids| ids.map(Arc::<[u32]>::from))
+    }).collect::<std::result::Result<Vec<_>, _>>().map_err(fail)?;
     let mut specials = Vec::new();
     let mut wrappers = Vec::new(); let mut shards = Vec::new();
     for (index, component) in components.into_iter().enumerate() {
@@ -154,7 +158,7 @@ pub(crate) fn compose(parent: Constraint, children: &[(String, Arc<Constraint>)]
         }
         let shard = SegmentedBoundaryShard { start_component: index as u32,
             start_parser_states: crate::ds::bitset::BitSet::new(0), accepts_empty_stack: index == 0,
-            candidate_tokens: None, mask_vocabulary: Default::default(), backend: SegmentedBoundaryShardBackend::DynamicDirect };
+            candidate_tokens: candidate_tokens[index].clone(), mask_vocabulary: Default::default(), backend: SegmentedBoundaryShardBackend::DynamicDirect };
         shards.push(shard.clone());
         wrappers.push(SegmentedParserComponent { constraint: component, boundary: Some(shard),
             tokenizer_state_offset: tokenizer_offsets[index], terminal_offset: terminal_offsets[index],
@@ -171,4 +175,64 @@ pub(crate) fn compose(parent: Constraint, children: &[(String, Arc<Constraint>)]
     constraint.validate_template_composition_layout().map_err(fail)?;
     constraint.rebuild_dynamic_runtime_caches();
     Ok(constraint)
+}
+
+#[cfg(test)]
+mod candidate_tests {
+    use super::*;
+    use crate::{BuildOptions, Grammar, Optimization, ParserBackend};
+
+    #[test]
+    fn direct_table_free_link_carries_persisted_candidate_sets_through_reload() {
+        let vocab = Vocab::new(vec![
+            (0, b"a".to_vec()),
+            (1, b"ab".to_vec()),
+            (2, b"ax".to_vec()),
+            (3, b"x".to_vec()),
+            (4, b"y".to_vec()),
+            (5, b"xay".to_vec()),
+            (6, b"xaby".to_vec()),
+        ]);
+        let child = Grammar::from_glrm(r#"glrm 1; start value; nt value = "a";"#)
+            .compile_with(
+                &vocab,
+                BuildOptions::default().parser_backend(ParserBackend::TemplateDfa),
+            )
+            .unwrap();
+        let expected = crate::compiler::boundary_candidates::persisted_boundary_candidate_ids(
+            &child,
+            &vocab,
+        )
+        .unwrap()
+        .expect("compiled table-free child should retain a candidate certificate");
+        assert!(!expected.is_empty());
+        assert!(expected.len() < vocab.len());
+
+        let parent = Grammar::from_glrm(
+            r#"glrm 1; extern grammar child; start root; nt root = "x" child "y";"#,
+        )
+        .compile_unlinked(&vocab)
+        .unwrap();
+        let linked = parent
+            .bind("child", &child)
+            .unwrap()
+            .link_with(
+                BuildOptions::default()
+                    .optimization(Optimization::FastBuild)
+                    .parser_backend(ParserBackend::TemplateDfa),
+            )
+            .unwrap();
+
+        let check = |constraint: &Constraint| {
+            let overlay = constraint.static_dynamic_overlay.as_ref().unwrap();
+            let boundary = overlay.segmented_parser_components[1]
+                .boundary
+                .as_ref()
+                .unwrap();
+            assert!(matches!(boundary.backend, SegmentedBoundaryShardBackend::DynamicDirect));
+            assert_eq!(boundary.candidate_tokens.as_deref(), Some(expected.as_slice()));
+        };
+        check(&linked);
+        check(&Constraint::load(&linked.save()).unwrap());
+    }
 }

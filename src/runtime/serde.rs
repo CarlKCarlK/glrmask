@@ -1037,9 +1037,13 @@ fn encode_composition_metadata(constraint: &Constraint) -> Vec<u8> {
 }
 
 fn encode_composition_metadata_for_save(constraint: &Constraint) -> Vec<u8> {
-    // Composition is explicitly unsupported by this standalone backend. Do
-    // not retain dead compiler/LR caches in an otherwise table-free artifact.
-    if constraint.has_template_parser() { return Vec::new(); }
+    // A table-free component can now be linked again after save/load. Preserve
+    // its small link-time proof/interface metadata (including the checked
+    // boundary-candidate certificate), while continuing to omit dead LR/parser
+    // compiler caches that template conversion deliberately removed.
+    if constraint.has_template_parser() {
+        return encode_composition_metadata_base_for_save(constraint);
+    }
     let bytes=encode_composition_metadata_base_for_save(constraint);
     if let Some(wire)=crate::compiler::boundary_precomputed_completion::saved_wire(constraint) {
         crate::compiler::boundary_precomputed_completion::wrap_envelope(bytes,wire)
@@ -5925,6 +5929,23 @@ impl Constraint {
         }
         self.composition_link_metadata_materialized = true;
         Ok(())
+    }
+
+    /// Read only the reusable boundary-candidate proof from deferred link
+    /// metadata. Table-free late binding needs this small certificate, but must
+    /// not materialize parser-template/compiler caches merely to discover its
+    /// model-token boundary subset.
+    pub(crate) fn retained_boundary_candidate_summary_for_compilation(
+        &self,
+    ) -> Result<Option<crate::runtime::BoundaryCandidateSummary>, String> {
+        if let Some(summary) = self.boundary_candidate_summary.get() {
+            return Ok(Some(summary.clone()));
+        }
+        let Some(blob) = self.deferred_composition_metadata_blob.as_ref() else {
+            return Ok(None);
+        };
+        let metadata = decode_composition_link_metadata(blob.as_slice())?;
+        restore_boundary_candidate_summary(metadata.boundary_candidate_summary, self).map(Some)
     }
 
     /// Serialize this compiled constraint to a versioned binary artifact.

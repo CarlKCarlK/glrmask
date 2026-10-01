@@ -309,6 +309,15 @@ impl<'a> Grammar<'a> {
         let mut constraint = spec.compile_final(options.optimization_value())?;
         ensure_runnable_constraint(&constraint)?;
         if options.parser_backend == ParserBackend::TemplateDfa {
+            // Preserve the component-only proper-prefix certificate while the
+            // LR/rule metadata still exists. A table-free constraint can be
+            // bound later as a compiled child and must not widen that boundary
+            // query back to the full model vocabulary merely because its table
+            // was intentionally removed.
+            crate::compiler::boundary_candidates::persist_boundary_candidate_summary(
+                &mut constraint,
+                vocab,
+            );
             constraint.install_template_parser_from_compile()?;
         }
         constraint.with_end_tokens(options.end_token_ids())
@@ -2169,10 +2178,16 @@ impl UnlinkedConstraint {
 
     fn materialize_template_components(&self, optimization: Optimization) -> Result<RuntimeConstraint> {
         self.validate_slot_manifest()?;
+        let vocab = constraint_vocab(self.inner.as_ref());
         let mut parent = self.inner.as_ref().clone();
+        if parent.table.is_present() {
+            crate::compiler::boundary_candidates::persist_boundary_candidate_summary(
+                &mut parent,
+                &vocab,
+            );
+        }
         parent.install_template_parser()?;
         if self.bindings.is_empty() { return Ok(parent); }
-        let vocab = constraint_vocab(self.inner.as_ref());
         let children = self.bindings.iter().map(|(name, binding)| {
             let mut child = match binding {
                 ModuleBinding::Module(module) => module.materialize_template_components(optimization)?,
@@ -2180,6 +2195,12 @@ impl UnlinkedConstraint {
                 ModuleBinding::ExactTokens(ids) => compile_exact_token_adapter(&vocab, ids)?,
             };
             child.end_tokens = Arc::from([]);
+            if child.table.is_present() {
+                crate::compiler::boundary_candidates::persist_boundary_candidate_summary(
+                    &mut child,
+                    &vocab,
+                );
+            }
             child.install_template_parser()?;
             Ok((name.clone(), Arc::new(child)))
         }).collect::<Result<Vec<_>>>()?;
