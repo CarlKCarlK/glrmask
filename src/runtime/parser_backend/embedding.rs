@@ -21,6 +21,25 @@ pub(crate) struct TemplateEmbedding {
 }
 
 impl TemplateEmbedding {
+    /// Only for the built-in depth-one regular frontend: its generated EOF
+    /// program has exactly the POP-one return semantics, not just a predicate.
+    /// Retain source nullability even when standalone preparation removed it.
+    pub(crate) fn from_sparse_regular(
+        completion: &Arc<CommitTemplateDfas>,
+        source_nullable: bool,
+        slots: impl IntoIterator<Item = u32>,
+    ) -> Result<Self, String> {
+        let nullable = source_nullable || super::compile_domain(completion)
+            .map_err(|error| error.to_string())?.matches_top_first([0]);
+        let finish = if nullable {
+            Arc::new(super::link_program::compile(&[
+                super::link_program::action_nfa(completion)?,
+                super::link_program::nullable_return(0),
+            ])?)
+        } else { Arc::clone(completion) };
+        Ok(Self { nullable, return_pop: 1, entries: slots.into_iter().collect(), finish })
+    }
+
     pub(crate) fn from_table(table: &GLRTable, nullable: bool, return_pop: u32,
         slots: impl IntoIterator<Item = u32>) -> Result<Self, String> {
         let transfer = characterize_finish_transfer(table, &FinishEndpointPolicy {

@@ -2153,10 +2153,16 @@ impl UnlinkedConstraint {
         self.link_with(BuildOptions::default())
     }
 
-    fn contains_template_component(&self) -> bool {
-        self.inner.has_template_parser() || self.bindings.values().any(|binding| match binding {
-            ModuleBinding::Module(module) => module.contains_template_component(),
-            ModuleBinding::Constraint(constraint) => constraint.has_template_parser(),
+    fn requires_template_linker(&self) -> bool {
+        // Sparse regular frontends also have no LR action/rule inventory.
+        // An explicit template request converts their finite depth-one
+        // programs directly instead of sending them through the LR splicer.
+        let needs_native = |constraint: &RuntimeConstraint| {
+            constraint.has_template_parser() || constraint.uses_sparse_direct_regular_runtime()
+        };
+        needs_native(self.inner.as_ref()) || self.bindings.values().any(|binding| match binding {
+            ModuleBinding::Module(module) => module.requires_template_linker(),
+            ModuleBinding::Constraint(constraint) => needs_native(constraint.as_ref()),
             ModuleBinding::ExactTokens(_) => false,
         })
     }
@@ -2194,7 +2200,7 @@ impl UnlinkedConstraint {
                 kind.name(),
             )));
         }
-        let mut constraint = if options.parser_backend == ParserBackend::TemplateDfa && self.contains_template_component() {
+        let mut constraint = if options.parser_backend == ParserBackend::TemplateDfa && self.requires_template_linker() {
             self.materialize_template_components(options.optimization_value())?
         } else { self.materialize(options.optimization_value())? };
         ensure_runnable_constraint(&constraint)?;

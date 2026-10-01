@@ -9,6 +9,8 @@
 pub(crate) mod wire;
 pub(crate) mod composition;
 pub(crate) mod embedding;
+#[cfg(test)]
+mod sparse_composition_tests;
 pub(crate) mod link;
 pub(crate) mod link_program;
 
@@ -368,7 +370,15 @@ fn sparse_regular_templates(
     automaton: &DirectRegularAutomaton,
     terminal_count: u32,
 ) -> crate::Result<(Vec<Option<Arc<CommitTemplateDfas>>>, CommitTemplateDfas, u32)> {
-    let state_count = u32::try_from(automaton.states.len() + 1).map_err(|_| crate::Error::Compilation("regular stack alphabet too large".into()))?;
+    let invalid = || crate::Error::Compilation("invalid sparse regular automaton coordinate".into());
+    let state_count = automaton.states.len().checked_add(1).and_then(|n| u32::try_from(n).ok())
+        .ok_or_else(|| crate::Error::Compilation("regular stack alphabet too large".into()))?;
+    if automaton.start_states.iter().any(|&state| state as usize >= automaton.states.len())
+        || automaton.states.iter().any(|row| {
+            row.epsilons.iter().any(|&state| state as usize >= automaton.states.len())
+                || row.transitions.iter().any(|(&terminal, targets)| terminal >= terminal_count
+                    || targets.iter().any(|&state| state as usize >= automaton.states.len()))
+        }) { return Err(invalid()); }
     let mut by_terminal = vec![BTreeMap::<u32, Vec<u32>>::new(); terminal_count as usize];
     let mut finished_tops = Vec::new();
     for top in 0..state_count {
@@ -382,7 +392,6 @@ fn sparse_regular_templates(
             seen.set(raw as usize);
             finished |= state.is_accepting;
             for (&terminal, destinations) in &state.transitions {
-                if terminal >= terminal_count { continue; }
                 targets.entry(terminal).or_default().extend(destinations.iter().map(|raw| raw + 1));
             }
             pending.extend(state.epsilons.iter().copied());
@@ -481,10 +490,8 @@ impl Constraint {
             return Err(crate::Error::Compilation("template-only parser composition/control closure is not implemented; no LR fallback is permitted".into()));
         }
         let terminal_count = self.table.num_terminals;
-        if preserve_coordinate && self.uses_sparse_direct_regular_runtime() {
-            return Err(crate::Error::Compilation("cannot replace a composed sparse parser's stack coordinate".into()));
-        }
-        let (templates, completion, state_count) = if !preserve_coordinate && self.uses_sparse_direct_regular_runtime() {
+        let sparse_regular = self.uses_sparse_direct_regular_runtime();
+        let (templates, completion, state_count) = if sparse_regular {
             sparse_regular_templates(self.direct_regular_automaton.as_ref().unwrap(), terminal_count)?
         } else {
             let selected = vec![true; terminal_count as usize];
@@ -501,11 +508,22 @@ impl Constraint {
                 .map_err(crate::Error::Compilation)?;
             (templates, completion, self.table.num_states)
         };
+        if preserve_coordinate && state_count != self.table.num_states {
+            return Err(crate::Error::Compilation("template conversion would change a composed parser's stack coordinate".into()));
+        }
         let mut parser = TemplateParser::compile(state_count, terminal_count, self.table.skip_terminals.clone(), &templates, completion)?;
         // Not every standalone provider/legacy table has the finite canonical
         // embedding contract. Such a parser remains runnable, but linking it
         // returns an explicit error instead of reconstructing a table.
-        if !self.uses_sparse_direct_regular_runtime() {
+        if sparse_regular {
+            // This built-in frontend keeps exactly one symbol per frame and
+            // its generated completion relation POPs that symbol. Unlike an
+            // arbitrary provider's predicate, this is the actual return action.
+            parser.embedding = Some(Arc::new(embedding::TemplateEmbedding::from_sparse_regular(
+                &parser.completion_template, self.table.embedded_start_nullable(),
+                self.late_grammar_slots.iter().map(|slot| slot.terminal_id),
+            ).map_err(crate::Error::Compilation)?));
+        } else {
             parser.embedding = embedding::TemplateEmbedding::from_constraint(self).ok().map(Arc::new);
         }
         self.template_dfas_by_terminal = templates;
@@ -543,7 +561,8 @@ impl Constraint {
                 }
                 report
             }
-            None => serde_json::json!({"backend":"lr-table", "lr_table_present":self.table.is_present()}),
+            None => serde_json::json!({"backend":"lr-table", "lr_table_present":self.table.is_present(),
+                "sparse_regular": self.uses_sparse_direct_regular_runtime()}),
         }
     }
 }

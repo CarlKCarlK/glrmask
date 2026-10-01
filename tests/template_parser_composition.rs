@@ -3,6 +3,111 @@ use glrmask::{BuildOptions, Constraint, Grammar, Optimization, ParserBackend, Vo
 
 const HOST: &str = r#"glrm 1; start root; extern grammar child; nt root = "x" child "y";"#;
 
+#[test]
+fn sparse_regular_precompiled_children_keep_their_one_symbol_return_frame() {
+    use glrmask::__private::{ConstraintExt, into_template_parser, parser_backend_report};
+    use glrmask_grammar::__private::grammar::flat::{DirectRegularAutomaton, DirectRegularState,
+        GrammarDef, Rule, Symbol, Terminal};
+    use std::collections::BTreeMap;
+    // The outer p C q wrapper must have actual crossing model tokens; without
+    // them it correctly needs no B shard at that level. Keep both entering and
+    // leaving crossings, and a whole token crossing both interfaces.
+    let (_, mut tokens) = vocabulary();
+    tokens.extend([(4000, b"px".to_vec()), (4001, b"yq".to_vec()),
+        (4002, b"pxayq".to_vec()), (4003, b"pxyq".to_vec())]);
+    let vocab = Vocab::new(tokens.clone());
+    for nullable in [false, true] {
+        let mut rules = vec![Rule { lhs: 0, rhs: vec![Symbol::Terminal(0)] },
+            Rule { lhs: 0, rhs: vec![Symbol::Terminal(1)] },
+            Rule { lhs: 0, rhs: vec![Symbol::Terminal(0), Symbol::Terminal(1)] }];
+        if nullable { rules.push(Rule { lhs: 0, rhs: vec![] }); }
+        let grammar = GrammarDef { rules, start: 0,
+            terminals: vec![Terminal::Literal { id: 0, bytes: b"a".to_vec() },
+                Terminal::Literal { id: 1, bytes: b"b".to_vec() }],
+            direct_regular_automaton: Some(DirectRegularAutomaton { start_states: vec![0], states: vec![
+                DirectRegularState { is_accepting: nullable,
+                    transitions: BTreeMap::from([(0, vec![1]), (1, vec![2])]), epsilons: vec![] },
+                DirectRegularState { is_accepting: true,
+                    transitions: BTreeMap::from([(1, vec![2])]), epsilons: vec![] },
+                DirectRegularState { is_accepting: true, ..Default::default() },
+            ] }), ..Default::default() };
+        let source = Constraint::compile_grammar_def_json(&serde_json::to_string(&grammar).unwrap(), &vocab).unwrap();
+        assert_eq!(parser_backend_report(&source)["sparse_regular"], true,
+            "this test must exercise the sparse regular frontend, not an ordinary LR row");
+        let words: &[&[u8]] = if nullable { &[b"xy", b"xay", b"xby", b"xaby"] }
+            else { &[b"xay", b"xby", b"xaby"] };
+        // A raw sparse child must select the native template linker as well;
+        // the LR splicer requires augmented rules which this frontend omits.
+        let legacy = Grammar::from_glrm(HOST).compile_unlinked(&vocab).unwrap().bind("child", &source).unwrap();
+        for mode in [Optimization::FastBuild, Optimization::FastRuntime] {
+            let linked = legacy.link_with(BuildOptions::default().optimization(mode)
+                .parser_backend(ParserBackend::TemplateDfa)).unwrap();
+            assert_language(&linked, &tokens, words);
+            assert_language(&Constraint::load(linked.save()).unwrap(), &tokens, words);
+        }
+        let child = into_template_parser(source).unwrap();
+        assert_eq!(parser_backend_report(&child)["finite_embedding"], true);
+        let child = Constraint::load(child.save()).unwrap();
+        let host = Grammar::from_glrm(HOST).compile_unlinked(&vocab).unwrap().bind("child", &child).unwrap();
+        for mode in [Optimization::FastBuild, Optimization::FastRuntime] {
+            let c = host.link_with(BuildOptions::default().optimization(mode)
+                .parser_backend(ParserBackend::TemplateDfa)).unwrap();
+            let loaded = Constraint::load(c.save()).unwrap();
+            let external = Constraint::load_with_vocab(c.save_with_external_vocab().unwrap(), &vocab).unwrap();
+            for c in [&c, &loaded, &external] { assert_language(c, &tokens, words); }
+            let outer = Grammar::from_glrm(r#"glrm 1; start root; extern grammar C; nt root = "p" C "q";"#)
+                .compile_unlinked(&vocab).unwrap().bind("C", &loaded).unwrap()
+                .link_with(BuildOptions::default().optimization(mode).parser_backend(ParserBackend::TemplateDfa)).unwrap();
+            let nested_words = words.iter().map(|word| {
+                let mut out = vec![b'p']; out.extend_from_slice(word); out.push(b'q'); out
+            }).collect::<Vec<_>>();
+            let nested_words = nested_words.iter().map(Vec::as_slice).collect::<Vec<_>>();
+            assert_language(&outer, &tokens, &nested_words);
+            assert_language(&Constraint::load(outer.save()).unwrap(), &tokens, &nested_words);
+            if mode == Optimization::FastRuntime { assert_static_boundaries(&outer); }
+        }
+    }
+}
+
+#[test]
+fn static_composition_with_no_crossing_tokens_needs_no_boundary_shards() {
+    const CHILD: &str = "GLRMASK_TEMPLATE_STATIC_EMPTY_BOUNDARY_TEST";
+    if std::env::var_os(CHILD).is_none() {
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .arg("--exact").arg("static_composition_with_no_crossing_tokens_needs_no_boundary_shards")
+            .arg("--nocapture").arg("--test-threads=1")
+            .env(CHILD, "1").env("GLRMASK_STRICT_STATIC_TRAP_DYNAMIC", "1")
+            .output().unwrap();
+        assert!(output.status.success(), "{}\n{}", String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr));
+        return;
+    }
+    let tokens = b"xaypq".iter().enumerate().map(|(id, byte)| (id as u32, vec![*byte]))
+        .collect::<Vec<_>>();
+    let vocab = Vocab::new(tokens.clone());
+    let options = || BuildOptions::default().optimization(Optimization::FastRuntime)
+        .parser_backend(ParserBackend::TemplateDfa);
+    let leaf = Grammar::from_ebnf(r#"start ::= "a""#).compile_with(&vocab, options()).unwrap();
+    let middle = Grammar::from_glrm(HOST).compile_unlinked(&vocab).unwrap()
+        .bind("child", &leaf).unwrap().link_with(options()).unwrap();
+    let outer = Grammar::from_glrm(r#"glrm 1; start root; extern grammar C; nt root = "p" C "q";"#)
+        .compile_unlinked(&vocab).unwrap().bind("C", &middle).unwrap().link_with(options()).unwrap();
+    fn check_empty_shards(report: &serde_json::Value) {
+        assert_eq!(report["lr_table_present"], false);
+        if let Some(children) = report["component_parsers"].as_array() {
+            assert_eq!(report["static_boundary_shards"], 0, "{report}");
+            assert_eq!(report["dynamic_boundary_shards"], 0, "{report}");
+            assert_eq!(report["packed_lr_compiler_table_present"], false);
+            for child in children { check_empty_shards(child); }
+        }
+    }
+    for c in [&outer, &Constraint::load(outer.save()).unwrap(),
+        &Constraint::load_with_vocab(outer.save_with_external_vocab().unwrap(), &vocab).unwrap()] {
+        check_empty_shards(&glrmask::__private::parser_backend_report(c));
+        assert_language(c, &tokens, &[b"pxayq"]);
+    }
+}
+
 fn assert_static_boundaries(constraint: &Constraint) {
     fn check(report: &serde_json::Value) {
         assert_eq!(report["lr_table_present"], false);

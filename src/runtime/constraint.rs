@@ -12389,7 +12389,11 @@ impl Constraint {
         if self.runtime_direct_regular_l1_is_empty() {
             return false;
         }
-        if let Some(row) = self.table.advance.get(parser_state as usize) {
+        // A sparse regular parser keeps the same depth-one state alphabet
+        // after conversion. Its template-domain support replaces the LR row;
+        // retain the already-compiled L1 weights without touching an absent
+        // table (including during initial-mask preparation after loading).
+        if let Some(row) = self.parser_advance_row(parser_state) {
             let mut found = false;
             for terminal in row.iter_ones() {
                 if let Some(weight) =
