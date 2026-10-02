@@ -911,6 +911,20 @@ impl Constraint {
             Some(parser) => {
                 assert!(!self.table.is_present(), "template-only constraint retained an LR table");
                 let mut report = parser.report();
+                if let Some(summary)=parser.link_grammar.as_ref().and_then(|grammar|grammar.stack_effects.as_ref()) {
+                    let entry_effects=summary.entries.values().map(Vec::len).sum::<usize>();
+                    let pushes=summary.effects.iter().chain(summary.entries.values().flatten()).map(|effect|effect.pushes.len()).sum::<usize>();
+                    let vector_bytes=std::mem::size_of_val(summary)
+                        +summary.effects.capacity()*summary.effects.first().map_or(0,std::mem::size_of_val)
+                        +summary.accepting.capacity()*std::mem::size_of::<u32>()
+                        +summary.entries.values().map(|row|row.capacity()*summary.effects.first().map_or(0,std::mem::size_of_val)).sum::<usize>()
+                        +summary.effects.iter().chain(summary.entries.values().flatten()).map(|effect|effect.pushes.capacity()*std::mem::size_of::<u32>()).sum::<usize>();
+                    report["compiler_effect_metadata"] = serde_json::json!({"states":summary.states,"terminals":summary.terminals,
+                        "effects":summary.effects.len(),"entry_terminals":summary.entries.len(),"entry_effects":entry_effects,
+                        "accepting_states":summary.accepting.len(),"pushed_symbols":pushes,
+                        "serialized_bytes":bincode::serialized_size(summary).ok(),
+                        "owned_vector_bytes_excluding_btree_and_allocator":vector_bytes});
+                }
                 report["sparse_regular"] = self.direct_regular_automaton.is_some().into();
                 report["virtual_lexer"] = self.tokenizer.has_any_virtual_runtime().into();
                 if let Some(overlay) = &self.static_dynamic_overlay {

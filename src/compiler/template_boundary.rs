@@ -186,6 +186,9 @@ pub(crate) fn install(constraint: &mut Constraint, vocab: &Vocab) -> Result<()> 
             merged.restore_terminal_exprs(Some(exprs)).map_err(fail)?;
         }
     }
+    if profile {for (index,leaf) in leaves.iter().enumerate() {
+        eprintln!("[glrmask/profile][compiler_effect_metadata] leaf={index} summary={}",leaf.parser_backend_report()["compiler_effect_metadata"]);
+    }}
     let state_counts = views.iter().map(|view| view.num_states()).collect::<Vec<_>>();
     let owners = layout.leaves.iter().map(|leaf| ImmediateComponentId(leaf.top_component)).collect::<Vec<_>>();
     let mut transparent = BitSet::new(layout.total_leaf_terminals as usize);
@@ -292,28 +295,40 @@ pub(crate) fn install(constraint: &mut Constraint, vocab: &Vocab) -> Result<()> 
         }).collect::<Result<BTreeMap<_, _>>>()?;
     let controls = (composition.control_start..composition.programs.len() as u32).collect::<Vec<_>>();
     let mut selected = controls.iter().copied().collect::<std::collections::BTreeSet<_>>();
+    let mut ending_selected=std::collections::BTreeSet::new();
     for walk in &walks {
         for row in walk.output.dwa.states() {
-            for (terminal, _, weight) in row.transitions.entries() {
+            for (terminal, target, weight) in row.transitions.entries() {
                 if weight.is_empty() { continue; }
                 let terminal = u32::try_from(terminal).map_err(|_| fail("negative lexical terminal"))?;
                 if terminal >= composition.control_start {
                     return Err(fail("lexical boundary terminal lies outside the ordinary inventory"));
                 }
-                selected.insert(terminal);
+                if walk.output.dwa.states()[target as usize].final_weight.as_ref()
+                    .is_some_and(|final_weight|weight.is_subset(final_weight)) {
+                    ending_selected.insert(terminal);
+                } else {
+                    selected.insert(terminal);
+                }
             }
         }
     }
     if profile { eprintln!("[glrmask/profile][static_template_boundary] phase=programs_selected selected={} total={} elapsed_ms={:.3}",
         selected.len(), composition.programs.len(), started.elapsed().as_secs_f64() * 1000.0); }
-    let (templates, classes) = crate::template_parser::static_compile::prepare_scoped_boundary_programs(
+    let (templates, mut classes) = crate::template_parser::static_compile::prepare_scoped_boundary_programs(
         &composition.views, parser.state_count, &selected)?;
-    if profile { eprintln!("[glrmask/profile][static_template_boundary] phase=programs_ready templates={} pop_classes={} elapsed_ms={:.3}",
-        templates.len(), classes.len(), started.elapsed().as_secs_f64() * 1000.0); }
+    let admissions=crate::template_parser::static_compile::prepare_scoped_boundary_admissions(
+        &composition.views,&ending_selected,&mut classes)?;
+    let predecessor=metadata.and_then(|metadata|metadata.stack_effects.as_ref()).filter(|summary|summary.states==parser.state_count)
+        .and_then(|summary|super::boundary_stack_support::from_compiler_effects(summary).ok());
+    let read_context=predecessor.as_ref().and_then(|certificate|certificate.native_context())
+        .filter(|_|std::env::var_os("GLRMASK_PROFILE_BOUNDARY_NO_READ_SUPPORT").is_none());
+    if profile { eprintln!("[glrmask/profile][static_template_boundary] phase=programs_ready templates={} admissions={} pop_classes={} predecessor={} elapsed_ms={:.3}",
+        templates.len(),admissions.len(), classes.len(),read_context.is_some(), started.elapsed().as_secs_f64() * 1000.0); }
     let mut published = Vec::with_capacity(walks.len());
     for walk in walks {
-        let mut output = super::boundary_transfer::template_program::compile_classed(
-            &templates, &controls, certificate.as_ref(), &walk.output.dwa, &classes).map_err(fail)?;
+        let mut output = super::boundary_transfer::template_program::compile_classed_with_admissions(
+            &templates,&admissions,&controls,certificate.as_ref(),&walk.output.dwa,&classes,read_context.as_ref()).map_err(fail)?;
         let mut id_map = walk.output.id_map;
         if projected {
             let target = InternalIdMap {

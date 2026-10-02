@@ -201,6 +201,83 @@ pub fn normalize_finite_template_program_with_pop_classes(
     normalize_finite_template_program_impl(program,alphabet,rows,extended.as_ref(),trim_positive,Some(classes))
 }
 
+/// Exact cyclic control-star mode for the same template instance contract.
+/// Finite control-gap programs use the virtual DAG kernel above. A genuine
+/// control cycle requires the existing weighted cancellation fixed point;
+/// it is never replaced with a chosen finite unfolding depth.
+pub fn normalize_control_star_template_program_with_pop_classes(
+    program:&FiniteTemplateProgram<'_>,classes:&crate::pop_classes::PopLabelClasses,
+    minimize:impl FnOnce(crate::automata::weighted::dwa::DWA)->crate::automata::weighted::dwa::DWA,
+)->Result<(crate::automata::weighted::dwa::DWA,FiniteTemplateProgramProfile),String> {
+    let started=Instant::now();let limits=FiniteCompileLimits::default();
+    let ports=program.port_finals.len();
+    if ports==0 || ports>limits.states || program.starts.iter().any(|&q|q as usize>=ports) {
+        return Err("template program port coordinate exceeds its shared budget".into());
+    }
+    let alphabet=classes.symbol_count().checked_add(classes.len() as u32)
+        .ok_or("template program class coordinate overflow")?;
+    let mut graph=NWA::from_parts(vec![Default::default();ports],program.starts.to_vec());
+    for (q,coefficient) in program.port_finals.iter().enumerate() {
+        if let Some(id)=coefficient {
+            let weight=program.coefficients.get(*id).ok_or("template program final coefficient is missing")?;
+            graph.set_final_weight(q as u32,weight.clone());
+        }
+    }
+    let mut edges=0usize;
+    for instance in program.instances {
+        let source=*program.templates.get(instance.template).ok_or("template program instance template is missing")?;
+        let weight=program.coefficients.get(instance.coefficient).ok_or("template program instance coefficient is missing")?;
+        if instance.continuation as usize>=ports || instance.entries.start>instance.entries.end
+            || instance.entries.end as usize>ports || source.states().is_empty()
+            || source.start_states().iter().any(|&q|q as usize>=source.states().len()) {
+            return Err("invalid template program instance coordinate".into());
+        }
+        let next=graph.states().len().checked_add(source.states().len()).ok_or("template program state overflow")?;
+        if next>limits.states {return Err("template program exceeds its shared state budget".into());}
+        let body_edges=source.states().iter().try_fold(0usize,|count,row| {
+            count.checked_add(row.epsilons.len())?.checked_add(usize::from(row.final_weight.is_some()))?
+                .checked_add(row.transitions.values().map(Vec::len).sum::<usize>())
+        }).ok_or("template program edge overflow")?;
+        let entry_edges=(instance.entries.end-instance.entries.start) as usize;
+        let next_edges=edges.checked_add(body_edges).and_then(|count|
+            entry_edges.checked_mul(source.start_states().len()).and_then(|n|count.checked_add(n)))
+            .ok_or("template program edge overflow")?;
+        if next_edges>limits.edges {return Err("template program exceeds its shared edge budget".into());}
+        let offset=graph.states().len() as u32;
+        for _ in source.states() {graph.add_state();}
+        for (q,row) in source.states().iter().enumerate() {
+            let from=offset+q as u32;
+            for &(target,_) in &row.epsilons {
+                if target as usize>=source.states().len() {return Err("template epsilon leaves its graph".into());}
+                graph.add_epsilon(from,offset+target,weight.clone());
+            }
+            if row.final_weight.is_some() {graph.add_epsilon(from,instance.continuation,weight.clone());}
+            for (&label,branches) in &row.transitions {
+                let mapped=if (classes.symbol_count() as i32..alphabet as i32).contains(&label) {
+                    DEFAULT_LABEL-1-(label-classes.symbol_count() as i32)
+                } else {label};
+                if branches.is_empty() {graph.states_mut()[from as usize].transitions.entry(mapped).or_default();}
+                for &(target,_) in branches {
+                    if target as usize>=source.states().len() {return Err("template transition leaves its graph".into());}
+                    graph.add_transition(from,mapped,offset+target,weight.clone());
+                }
+            }
+        }
+        for port in instance.entries.clone() {for &entry in source.start_states() {
+            graph.add_epsilon(port,offset+entry,Weight::all());
+        }}
+        edges=next_edges;
+    }
+    let mut profile=FiniteTemplateProgramProfile{input_states:graph.states().len(),input_edges:edges,
+        assembly_ms:elapsed_ms(started),..Default::default()};
+    let phase=Instant::now();
+    crate::resolve_negatives::resolve_negative_codes_in_nwa_with_pop_classes(&mut graph,classes)?;
+    profile.resolve_ms=elapsed_ms(phase);profile.positive_states=graph.states().len();profile.positive_edges=graph.num_transitions();
+    let phase=Instant::now();let result=classes.compile_positive_with_minimizer(graph,limits.edges,minimize)?;
+    profile.normalize_ms=elapsed_ms(phase);
+    Ok((result,profile))
+}
+
 fn normalize_finite_template_program_impl(
     program:&FiniteTemplateProgram<'_>,parser_states:u32,rows:usize,
     read_context:Option<&FiniteParserReadSupport>,trim_positive:bool,
@@ -229,7 +306,7 @@ fn normalize_finite_template_program_impl(
                 program,parser_states,&mut interner,limits,classes)?,
             None=>finite_signed_graph::VirtualSignedGraph::build(program,parser_states,&mut interner,limits)?,
         };
-        if !selected_for_state_count(graph.profile.logical_states) { return None; }
+        if classes.is_none() && !selected_for_state_count(graph.profile.logical_states) { return None; }
         let assembly_ms=elapsed_ms(started);
         let phase=Instant::now();
         let filter=crate::optimized_env_flag("GLRMASK_BOUNDARY_CANCELLATION_READ_FILTER");
@@ -252,7 +329,7 @@ fn normalize_finite_template_program_impl(
         (states,edges,order,program.starts.to_vec(),logical_states,elapsed_ms(started),None)
     };
     let topology=if reuse_topology{Some(CheckedNativeTopology::from_order(topology_order)?)}else{None};
-    if !selected_for_state_count(states.len()) { return None; }
+    if classes.is_none() && !selected_for_state_count(states.len()) { return None; }
     let mut profile = FiniteTemplateProgramProfile {
         input_states: logical_states, input_edges: edges,
         assembly_ms, ..Default::default()
@@ -313,7 +390,7 @@ fn normalize_finite_template_program_impl(
     profile.positive_states = states.len();
     profile.positive_edges = states.iter().map(|s| s.epsilons.len()
         + s.transitions.iter().map(|(_, b)| b.len()).sum::<usize>()).sum();
-    if !selected_for_state_count(states.len())
+    if (classes.is_none() && !selected_for_state_count(states.len()))
         || !interner.allow_work(0, states.len(), profile.positive_edges) { return None; }
     if let Ok(mode)=std::env::var("GLRMASK_BOUNDARY_POSITIVE_WEIGHT_SUPPORT"){
         let phase=Instant::now();

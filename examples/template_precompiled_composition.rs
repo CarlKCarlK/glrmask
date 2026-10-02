@@ -201,6 +201,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let started = Instant::now(); let parent = Grammar::from_glrm(&source).compile_unlinked(&vocab)?;
     let parent_compile_ns = started.elapsed().as_nanos();
     eprintln!("PARENT source_compile_ns={parent_compile_ns}");
+    fs::write(output.join("prepared-child-backend.json"),serde_json::to_vec_pretty(&child_report)?)?;
+    let child_artifact=child.save();
+    eprintln!("PREPARED_CHILD_ARTIFACT bytes={}",child_artifact.len());
+    fs::write(output.join("prepared-child-artifact.bin"),child_artifact)?;
+    fs::write(output.join("prepared-parent-artifact.bin"),parent.save())?;
+    eprintln!("PREPARED_METADATA child={}",child_report["compiler_effect_metadata"]);
     // The oracle compiles one fully resolved grammar. It never uses the native
     // component linker under test or historical LR-backed artifacts.
     let started = Instant::now();

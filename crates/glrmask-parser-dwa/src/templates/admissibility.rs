@@ -505,6 +505,45 @@ impl TemplateDomain {
 
     pub fn state_count(&self) -> usize { self.states.len() }
     pub fn edge_count(&self) -> usize { self.edges.len() }
+
+    /// Compile this existing read-only admission DAG into a scoped boundary
+    /// predicate. DEFAULT stays local at every consumed symbol; explicit dead
+    /// exceptions are interned before any subset union. Output phases are
+    /// already existentially eliminated by domain preparation.
+    pub fn scoped_prefix_program(&self,offset:u32,symbols:u32,guard_owner:bool,
+        classes:&mut crate::pop_classes::PopLabelClasses,
+    )->Result<crate::automata::weighted::nwa::NWA,String> {
+        use crate::automata::weighted::nwa::{NWA,NWAState};
+        use crate::ds::weight::Weight;
+        let end=offset.checked_add(symbols).filter(|&end|end<=classes.symbol_count())
+            .ok_or("admission program component range overflow")?;
+        let dead=u32::try_from(self.states.len()).map_err(|_|"admission graph too large")?;
+        let target=|q:u32| if q==REJECT {dead} else {q};
+        let mut states=vec![NWAState::default();self.states.len()+1];
+        for (q,row) in self.states.iter().enumerate() {
+            if row.accepts_prefix {states[q].final_weight=Some(Weight::all());continue;}
+            let edges=&self.edges[row.first_edge..row.first_edge+row.edge_count];
+            for &(label,next) in edges {
+                if label>=symbols {return Err("admission literal outside its component".into());}
+                states[q].transitions.insert((offset+label) as i32,vec![(target(next),Weight::all())]);
+            }
+            if row.default_target!=REJECT {
+                if let Some(label)=classes.intern_scoped_complement(offset..end,
+                    edges.iter().map(|&(label,_)|offset+label))? {
+                    states[q].transitions.insert(label,vec![(target(row.default_target),Weight::all())]);
+                }
+            }
+        }
+        let mut graph=NWA::from_parts(states,vec![target(self.start)]);
+        if guard_owner && self.start()==DomainProbe::Accept {
+            let start=graph.add_state();
+            if let Some(label)=classes.intern_scoped_complement(offset..end,[])? {
+                graph.add_transition(start,label,target(self.start),Weight::all());
+            }
+            graph.set_start_states(vec![start]);
+        }
+        Ok(graph)
+    }
     /// Native heap payload, not serialized wire size or peak allocation.
     pub fn heap_payload_bytes(&self) -> usize {
         std::mem::size_of_val(self.states.as_ref()) + std::mem::size_of_val(self.edges.as_ref())

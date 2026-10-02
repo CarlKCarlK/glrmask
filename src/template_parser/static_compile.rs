@@ -380,6 +380,20 @@ pub(crate) fn prepare_scoped_boundary_programs(
     Ok((result, classes))
 }
 
+pub(crate) fn prepare_scoped_boundary_admissions(
+    programs:&[crate::runtime::parser_backend::scoped_program::ScopedProgram],
+    selected:&BTreeSet<u32>,classes:&mut PopLabelClasses,
+)->Result<BTreeMap<u32,NWA>> {
+    selected.iter().map(|&terminal| {
+        let view=programs.get(terminal as usize).ok_or_else(||
+            Error::Compilation(format!("missing scoped admission relation {terminal}")))?;
+        view.validate_coordinate(classes.symbol_count())?;
+        let graph=view.domain.scoped_prefix_program(view.offset,view.symbols,view.guard_owner,classes)
+            .map_err(Error::Compilation)?;
+        Ok((terminal,graph))
+    }).collect()
+}
+
 #[cfg(test)]
 mod selected_inventory_tests {
     use super::*;
@@ -413,6 +427,39 @@ mod selected_inventory_tests {
         for id in [0, 3] {
             let error = prepare_static_templates_for_terminals(&programs, 4, &BTreeSet::from([id])).unwrap_err();
             assert!(error.to_string().contains("missing selected terminal relation"));
+        }
+    }
+
+    #[test]
+    fn scoped_admission_projection_matches_full_transfer_for_all_stack_words() {
+        use crate::runtime::parser_backend::scoped_program::ScopedProgram;
+        use crate::ds::weight::Weight;
+        let mut pop=DFA::new();for _ in 0..3 {pop.add_state();}
+        pop.set_accepting(2,true);pop.add_transition(0,DEFAULT_LABEL,1);pop.add_transition(0,3,3);
+        pop.add_transition(1,DEFAULT_LABEL,2);pop.add_transition(1,2,3);
+        let mut read=DFA::new();let end=read.add_state();read.set_accepting(end,true);read.add_transition(0,1,end);
+        let mut push=DFA::new();let end=push.add_state();push.set_accepting(end,true);
+        push.add_transition(0,encode_negative_label(0),end);
+        let source=Arc::new(CommitTemplateDfas{pop,read,push,pop_to_read:vec![None,None,Some(0),None],
+            pop_to_push:vec![],read_to_push:vec![None,Some(0)]});
+        for source in [source,self::pop(0),{
+            let mut p=DFA::new();p.set_accepting(0,true);
+            Arc::new(CommitTemplateDfas{pop:p,read:DFA::new(),push:DFA::new(),pop_to_read:vec![],pop_to_push:vec![],read_to_push:vec![]})
+        }] {
+            let mut view=ScopedProgram::prepare(source,4).unwrap().relocated(2).unwrap();
+            view.append_push=Some(7);
+            let mut classes=PopLabelClasses::new(8).unwrap();
+            let raw=action_nfa(&view.source,8,&mut ExpansionBudget::default(),Some(&mut classes),Some(&view)).unwrap();
+            let mut full=boundary_action_program(raw,&mut ExpansionBudget{work:33_554_432,..Default::default()});
+            glrmask_parser_dwa::__private::resolve_negatives::resolve_negative_codes_in_nwa_with_pop_classes(&mut full,&classes).unwrap();
+            let reference=classes.compile_positive(full,10000).unwrap();
+            let checker=view.domain.scoped_prefix_program(view.offset,view.symbols,view.guard_owner,&mut classes).unwrap();
+            assert!(!checker.states().iter().any(|row|row.transitions.keys().any(|&label|label<0)));
+            let candidate=classes.compile_positive(checker,10000).unwrap();
+            let comparison=glrmask_parser_dwa::__private::parser_equivalence::compare_parser_mask_prefix_languages(
+                &reference,&candidate,8,10000).unwrap();
+            assert!(comparison.difference.is_none(),"{:?}",comparison.difference);
+            assert!(candidate.states()[candidate.start_state() as usize].final_weight.as_ref().is_none_or(Weight::is_empty));
         }
     }
 
