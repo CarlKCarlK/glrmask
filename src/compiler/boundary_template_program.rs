@@ -5,6 +5,22 @@
 //! No LR table, parser action row, or grammar production is consulted here.
 use super::*;
 
+fn minimize_symbolic_class_boundary(graph: DWA) -> DWA {
+    if crate::compiler::boundary_env::enabled("GLRMASK_BOUNDARY_FINITE_ATOM_MINIMIZE")
+        && let Some((candidate, profile)) = crate::compiler::boundary_bit_minimize::minimize_finite_final_atoms(
+            &graph, crate::compiler::glr::labels::DEFAULT_LABEL) {
+        if std::env::var_os("GLRMASK_PROFILE_COMPILE_SUMMARY").is_some() {
+            eprintln!("[glrmask/profile][symbolic_class_finite_minimize] selected=true profile={profile:?}");
+        }
+        candidate
+    } else {
+        if std::env::var_os("GLRMASK_PROFILE_COMPILE_SUMMARY").is_some() {
+            eprintln!("[glrmask/profile][symbolic_class_finite_minimize] selected=false");
+        }
+        crate::automata::weighted::minimize_acyclic::minimize_acyclic_owned(graph)
+    }
+}
+
 pub(super) fn assemble(
     templates: &Templates,
     controls: &[u32],
@@ -159,7 +175,23 @@ fn compile_impl(
             &mut program, classes)?;
         let resolve_ms = start.elapsed().as_secs_f64() * 1000.0;
         let normalize_started = Instant::now();
-        let parser_dwa = classes.compile_positive(program, 8_000_000)?;
+        let reference = std::env::var_os("GLRMASK_VALIDATE_BOUNDARY_FINITE_MINIMIZE")
+            .is_some().then(|| program.clone());
+        // Use the same bounded finite-final-mask quotient as the established
+        // boundary normalizer before substituting the opaque POP classes.
+        // Prefix-language equality is preserved by length-preserving class
+        // substitution; an unavailable proof retains the ordinary minimizer.
+        let parser_dwa = classes.compile_positive_with_minimizer(program, 8_000_000, minimize_symbolic_class_boundary)?;
+        if let Some(program) = reference {
+            let reference = classes.compile_positive(program, 8_000_000)?;
+            let comparison = glrmask_parser_dwa::__private::parser_equivalence::compare_parser_mask_prefix_languages(
+                &reference, &parser_dwa, classes.symbol_count(), 500_000)?;
+            if let Some(difference) = comparison.difference {
+                return Err(format!("symbolic class quotient changed concrete prefix mask: {difference:?}"));
+            }
+            eprintln!("[glrmask/validate][symbolic_class_finite_minimize] exact=true pairs={} branches={}",
+                comparison.product_states, comparison.compared_branches);
+        }
         return Ok(SignedShardOutput { parser_dwa, templates_ms: 0.0, compose_ms, resolve_ms,
             normalize_ms: normalize_started.elapsed().as_secs_f64()*1000.0,
             signed_states, signed_transitions, terms: templates.len().saturating_sub(controls.len()) });
@@ -177,4 +209,28 @@ fn compile_impl(
         normalize_ms: start.elapsed().as_secs_f64() * 1000.0,
         signed_states, signed_transitions,
         terms: templates.len().saturating_sub(controls.len()) })
+}
+
+#[cfg(test)]
+mod symbolic_class_tests {
+    use super::*;
+
+    #[test]
+    fn finite_prefix_quotient_preserves_overlapping_scoped_class_masks_for_every_stack_word() {
+        let mut classes = glrmask_parser_dwa::__private::pop_classes::PopLabelClasses::new(7).unwrap();
+        let local = classes.intern_scoped_complement(3..6, [4]).unwrap().unwrap();
+        let mut graph = NWA::from_parts(vec![Default::default(); 3], vec![0]);
+        let a = Weight::from_uniform(0..=0, std::iter::once(0u32).collect());
+        let b = Weight::from_uniform(0..=0, std::iter::once(1u32).collect());
+        graph.add_transition(0, local, 1, a.clone());
+        graph.add_transition(0, 5, 2, b.clone());
+        graph.set_final_weight(1, a); graph.set_final_weight(2, b);
+        let reference = classes.compile_positive(graph.clone(), 1000).unwrap();
+        let candidate = classes.compile_positive_with_minimizer(graph, 1000, minimize_symbolic_class_boundary).unwrap();
+        let comparison = glrmask_parser_dwa::__private::parser_equivalence::compare_parser_mask_prefix_languages(
+            &reference, &candidate, 7, 10000).unwrap();
+        assert!(comparison.difference.is_none(), "{:?}", comparison.difference);
+        assert!(comparison.product_states > 0);
+        assert!(candidate.states()[candidate.start_state() as usize].final_weight.is_none());
+    }
 }

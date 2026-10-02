@@ -167,13 +167,25 @@ impl PopLabelClasses {
     pub fn compile_positive(&self, graph: NWA, edge_budget: usize)
         -> Result<crate::automata::weighted::dwa::DWA, String>
     {
+        self.compile_positive_with_minimizer(graph, edge_budget,
+            crate::automata::weighted::minimize_acyclic::minimize_acyclic_owned)
+    }
+
+    /// Boundary masks observe final coefficients at every consumed prefix.
+    /// A caller may use that established exact quotient while class labels
+    /// are still opaque symbols, before their finite consuming substitution.
+    pub fn compile_positive_with_minimizer(
+        &self, graph: NWA, edge_budget: usize,
+        minimize: impl FnOnce(crate::automata::weighted::dwa::DWA) -> crate::automata::weighted::dwa::DWA,
+    ) -> Result<crate::automata::weighted::dwa::DWA, String>
+    {
         let started = std::time::Instant::now();
         let graph = self.trim_positive(graph)?;
         let input_states = graph.states().len();
         let symbolic = if !graph.states().is_empty() && graph.is_acyclic() {
             let deterministic = crate::automata::weighted::determinize::determinize(&graph)
                 .map_err(|error| format!("positive POP-class determinization: {error}"))?;
-            crate::automata::weighted::minimize_acyclic::minimize_acyclic_owned(deterministic)
+            minimize(deterministic)
         } else {
             crate::parser_dwa::determinize_opaque_stack_symbols(&graph, self.symbols)
         };
