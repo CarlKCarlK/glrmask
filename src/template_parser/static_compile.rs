@@ -301,6 +301,11 @@ fn boundary_action_program(nfa: NFA, budget: &mut ExpansionBudget) -> NWA {
     // A refused representation keeps the complete original phase program.
     let mut candidate_budget = budget.clone();
     if let Ok(dfa) = bounded_determinize(&nfa, &mut candidate_budget) {
+        // Ordinary compiler templates use this same full action-language
+        // minimizer after determinization. Scope complements have already
+        // absorbed every explicit dead shadow, so they remain exact when
+        // the ordinary constructor removes a dead literal branch.
+        let dfa = crate::automata::unweighted_u32::minimize_acyclic::minimize_acyclic(&dfa);
         *budget = candidate_budget;
         let states = dfa.states.into_iter().map(|state| NWAState {
             final_weight: state.is_accepting.then(crate::ds::weight::Weight::all),
