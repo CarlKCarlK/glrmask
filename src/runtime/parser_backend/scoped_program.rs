@@ -179,6 +179,26 @@ mod tests {
     }
 
     #[test]
+    fn live_frontier_with_large_rows_keeps_deeper_scope_and_dead_priority_on_merged_stacks() {
+        let mut source = (*view().source).clone();
+        let dead = 3;
+        // These absent concrete labels must have no effect on the live GSS.
+        for label in 4..2048 { source.pop.states[0].transitions.insert(label, dead); }
+        let scoped = ScopedProgram::prepare(Arc::new(source), 2048).unwrap().relocated(100).unwrap();
+        let annotation = TerminalsDisallowed::new().with_insert(2, 3);
+        for words in [vec![vec![100,101],vec![103,101],vec![5,101]],
+            vec![vec![103,101],vec![5,101]],vec![vec![100,101],vec![100,102]]] {
+            let inputs = words.iter().map(|word| (word.clone(),annotation.clone())).collect::<Vec<_>>();
+            let stack = ParserGSS::from_stacks(&inputs);
+            let accepted = words.iter().any(|word| word == &[100,101]);
+            let expected = if accepted { ParserGSS::from_single_stack(vec![102],annotation.clone()) }
+                else { ParserGSS::empty() };
+            assert_eq!(scoped.admits(&stack), accepted);
+            assert_eq!(scoped.advance(&stack).semantically_eq(&expected,65536),Some(true));
+        }
+    }
+
+    #[test]
     fn static_mask_query_obeys_the_same_deeper_default_scope_and_empty_stack_rule() {
         let view = view();
         let (mut queries, classes) = crate::template_parser::static_compile::prepare_scoped_boundary_programs(

@@ -939,22 +939,21 @@ pub(crate) fn advance_with_template_coordinate(
                     output = output.merge(&gss);
                 }
 
-                for (&label, &target) in &dfa_state.transitions {
-                    if is_negative_label(label) {
-                        panic!(
-                            "commit template pop DFA contains push label {label} at state {state_id}"
-                        );
-                    }
-                    if label != DEFAULT_LABEL && label >= 0 {
-                        let state = global(label as u32);
-                        let branch = gss.isolate(Some(state)).popn(1);
-                        if !branch.is_empty() {
-                            worklist.push((Phase::Pop, target, branch));
-                        }
+                // Match the ordinary interpreter's live-frontier lookup.
+                // Translating sorted concrete tops preserves the original
+                // explicit BTreeMap row order and correlated merge order.
+                let tops = gss.peek_values();
+                let mut explicit_tops = tops.clone();
+                explicit_tops.sort_unstable();
+                for top in explicit_tops {
+                    let Some(symbol) = local(top) else { continue; };
+                    if let Some(&target) = dfa_state.transitions.get(&(symbol as i32)) {
+                        let branch = gss.isolate(Some(top)).popn(1);
+                        if !branch.is_empty() { worklist.push((Phase::Pop, target, branch)); }
                     }
                 }
                 if let Some(&target) = dfa_state.transitions.get(&DEFAULT_LABEL) {
-                    for top in gss.peek_values() {
+                    for top in tops {
                         let Some(symbol) = local(top) else { continue; };
                         if dfa_state.transitions.contains_key(&(symbol as i32)) {
                             continue;
@@ -981,15 +980,13 @@ pub(crate) fn advance_with_template_coordinate(
                     output = output.merge(&gss);
                 }
 
-                for (&label, &target) in &dfa_state.transitions {
-                    if label == DEFAULT_LABEL || is_negative_label(label) {
-                        panic!(
-                            "commit template read DFA contains non-read label {label} at state {state_id}"
-                        );
-                    }
-                    let branch = gss.isolate(Some(global(label as u32)));
-                    if !branch.is_empty() {
-                        worklist.push((Phase::Read, target, branch));
+                let mut tops = gss.peek_values();
+                tops.sort_unstable();
+                for top in tops {
+                    let Some(symbol) = local(top) else { continue; };
+                    if let Some(&target) = dfa_state.transitions.get(&(symbol as i32)) {
+                        let branch = gss.isolate(Some(top));
+                        if !branch.is_empty() { worklist.push((Phase::Read, target, branch)); }
                     }
                 }
 
