@@ -119,6 +119,21 @@ impl ScopedProgram {
     }
 }
 
+impl crate::compiler::template_follow_support::ScopedFollowProgram for ScopedProgram {
+    fn source(&self) -> &CommitTemplateDfas {
+        &self.source
+    }
+    fn offset(&self) -> u32 {
+        self.offset
+    }
+    fn append_push(&self) -> Option<u32> {
+        self.append_push
+    }
+    fn classify_top(&self, top: u32) -> TopAdmission {
+        ScopedProgram::classify_top(self, top)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

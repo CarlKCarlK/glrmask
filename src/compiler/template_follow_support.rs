@@ -114,19 +114,29 @@ pub(crate) fn disallowed(programs: &[Option<Arc<CommitTemplateDfas>>], terminal_
     Ok(rows)
 }
 
+pub(crate) trait ScopedFollowProgram {
+    fn source(&self) -> &CommitTemplateDfas;
+    fn offset(&self) -> u32;
+    fn append_push(&self) -> Option<u32>;
+    fn classify_top(&self, top: u32) -> TopAdmission;
+}
+
 /// The same conservative proof using component-local domains and translated
 /// output tops. No owned relocated terminal graph is constructed.
-pub(crate) fn disallowed_scoped(programs: &[crate::runtime::parser_backend::scoped_program::ScopedProgram],
-    terminal_count: usize, budget: usize) -> Result<Vec<Vec<u32>>, String> {
+pub(crate) fn disallowed_scoped<P: ScopedFollowProgram>(
+    programs: &[P],
+    terminal_count: usize,
+    budget: usize,
+) -> Result<Vec<Vec<u32>>, String> {
     if terminal_count > programs.len() { return Err("invalid ordinary/control split".into()); }
     let mut work = budget; let mut rows = vec![Vec::new(); terminal_count];
     let mut output = Vec::with_capacity(programs.len());
     for view in programs {
-        let mut tops = outputs(&view.source, &mut work)?;
+        let mut tops = outputs(view.source(), &mut work)?;
         if let Tops::Known(values) = &mut tops {
-            *values = values.iter().map(|symbol| symbol + view.offset).collect();
+            *values = values.iter().map(|symbol| symbol + view.offset()).collect();
         }
-        if let Some(symbol) = view.append_push { tops = Tops::Known(BTreeSet::from([symbol])); }
+        if let Some(symbol) = view.append_push() { tops = Tops::Known(BTreeSet::from([symbol])); }
         output.push(tops);
     }
     for first in 0..terminal_count {
