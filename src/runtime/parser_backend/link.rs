@@ -190,10 +190,28 @@ pub(crate) fn compose(mut parent: Constraint, children: &[(String, Arc<Constrain
     // ordinary recursive linker's one-class wire compatibility image, while
     // leaving all actual component lexer and parser coordinates unchanged.
     constraint.state_to_internal_tsid = vec![0];
-    let candidate_tokens = components.iter().map(|component| {
+    let mut candidate_tokens = components.iter().map(|component| {
         crate::compiler::boundary_candidates::persisted_boundary_candidate_ids(component, vocab)
             .map(|ids| ids.map(Arc::<[u32]>::from))
     }).collect::<std::result::Result<Vec<_>, _>>().map_err(fail)?;
+    // DynamicDirect needs the same necessary root-CALL vocabulary proof as
+    // static boundary assembly. Keep its original conservative certificate if
+    // scoped ignores, nullable or nested components make that proof unavailable.
+    if components.iter().all(|component| component.template_parser.as_ref().unwrap().composition.is_none())
+        && links.iter().all(|link| !link.child_start_nullable) {
+        let leaves = components.iter().map(Arc::as_ref).collect::<Vec<_>>();
+        let global_ignores = crate::compiler::constraint_compose::leaf_ignores_are_globally_erasable(&leaves);
+        let no_ignores = leaves.iter().all(|leaf| leaf.ignore_terminal.is_none() && leaf.parser_skip_terminals().is_empty());
+        if (!global_ignores || no_ignores) && let Some(existing) = candidate_tokens[0].as_ref() {
+            let children = leaves.iter().skip(1).copied().collect::<Vec<_>>();
+            let calls = links.iter().filter(|link| link.parent_component == 0)
+                .map(|link| link.slot_terminal).collect::<Vec<_>>();
+            if let Ok(refined) = crate::compiler::boundary_tail::build_root_call_candidates(leaves[0], &children, &calls, vocab) {
+                let ids = existing.iter().copied().filter(|id| refined.candidate_ids.binary_search(id).is_ok()).collect::<Vec<_>>();
+                candidate_tokens[0] = Some(Arc::from(ids));
+            }
+        }
+    }
     let mut specials = Vec::new();
     let mut wrappers = Vec::new(); let mut shards = Vec::new();
     for (index, component) in components.into_iter().enumerate() {
