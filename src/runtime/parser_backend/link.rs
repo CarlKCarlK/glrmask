@@ -221,7 +221,11 @@ pub(crate) fn compose(mut parent: Constraint, children: &[(String, Arc<Constrain
     constraint.sanitize_late_grammar_placeholder_token_domain();
     constraint.validate_template_composition_layout().map_err(fail)?;
     constraint.rebuild_dynamic_runtime_caches();
-    if let Some((ids, widened)) = boundary_tail {
+    // Sparse/data-only components can have an interface-tail proof without
+    // source grammar rules. Its reusable fingerprint is then unavailable;
+    // retain the ordinary conservative candidate query for that component.
+    if constraint.template_parser.as_ref().is_some_and(|parser| parser.link_grammar.is_some())
+        && let Some((ids, widened)) = boundary_tail {
         crate::compiler::boundary_candidates::install_precomputed_boundary_candidate_ids(
             &mut constraint, vocab, &ids, widened,
         ).map_err(fail)?;
