@@ -21,6 +21,49 @@ fn minimize_symbolic_class_boundary(graph: DWA) -> DWA {
     }
 }
 
+// A normalized DEFAULT covers the finite construction alphabet: concrete
+// stack symbols plus opaque class identities. Preserve that exact substitution
+// with an existing finite complement and the missing class identities, rather
+// than allocating one literal edge per concrete symbol. Source row scope and
+// dead guards are unchanged. A descriptor collision retains literal expansion.
+fn restore_finite_pop_defaults(
+    graph:&mut DWA,classes:&glrmask_parser_dwa::__private::pop_classes::PopLabelClasses,
+)->Option<glrmask_parser_dwa::__private::pop_classes::PopLabelClasses> {
+    let concrete=classes.symbol_count();let alphabet=concrete.checked_add(classes.len() as u32)?;
+    let default_label=crate::compiler::glr::labels::DEFAULT_LABEL;
+    let mut published=classes.clone();let mut expanded_edges=0usize;
+    for row in graph.states_mut() {
+        let mut dense=row.transitions.entries().map(|(label,target,weight)|(label,(target,weight.clone())))
+            .collect::<BTreeMap<_,_>>();
+        let default=dense.remove(&default_label).filter(|edge|!edge.1.is_empty());
+        if dense.keys().any(|&label|label<0 || label as u32>=alphabet) {return None;}
+        // Keep the previous hypothetical literal-expansion resource contract.
+        expanded_edges=expanded_edges.checked_add(if default.is_some(){alphabet as usize}else{dense.len()})?;
+        if expanded_edges>4_000_000 {return None;}
+        let restore=|label:i32|if label>=concrete as i32 {default_label-1-(label-concrete as i32)}else{label};
+        let mut mapped=dense.iter().map(|(&label,edge)|(restore(label),edge.clone())).collect::<BTreeMap<_,_>>();
+        if let Some(default)=default {
+            let complement=published.intern_complement(dense.keys().copied()
+                .filter(|&label|label<concrete as i32).map(|label|label as u32)).ok()?;
+            if complement.is_some_and(|label|mapped.contains_key(&label)) {
+                // Two opaque branches can substitute to the same descriptor
+                // with different targets. DWA rows cannot store both branches.
+                for label in 0..alphabet as i32 {dense.entry(label).or_insert_with(||default.clone());}
+                mapped=dense.into_iter().map(|(label,edge)|(restore(label),edge)).collect();
+            } else {
+                if let Some(label)=complement {mapped.insert(label,default.clone());}
+                for index in 0..classes.len() {
+                    if !dense.contains_key(&(concrete as i32+index as i32)) {
+                        mapped.insert(default_label-1-index as i32,default.clone());
+                    }
+                }
+            }
+        }
+        row.transitions=mapped.into_iter().collect();
+    }
+    Some(published)
+}
+
 #[cfg(test)]
 fn compile_compact_classed(
     templates:&BTreeMap<u32,NWA>,admissions:Option<&BTreeMap<u32,NWA>>,controls:&[u32],
@@ -141,25 +184,9 @@ fn compile_shared_classed(
     let (mut symbolic,min_profile)=minimize_native_decoded(&native,&decoder,crate::compiler::glr::labels::DEFAULT_LABEL).or_else(|| {
         if profiling {eprintln!("[glrmask/profile][native_compact_template_program] selected=false stage=decoded_minimization");}None
     })?;
-    // The finite compiler's DEFAULT ranges over its construction alphabet.
-    // Restore that exact finite range before substituting scoped classes.
-    let mut edges=0usize;
-    for row in symbolic.states_mut() {
-        let mut mapped=row.transitions.entries().map(|(label,target,weight)|(label,(target,weight.clone())))
-            .collect::<BTreeMap<_,_>>();
-        if let Some(default)=mapped.remove(&crate::compiler::glr::labels::DEFAULT_LABEL) {
-            if !default.1.is_empty() {for label in 0..alphabet as i32 {mapped.entry(label).or_insert_with(||default.clone());}}
-        }
-        if mapped.keys().any(|&label|label<0 || label as u32>=alphabet) {return None;}
-        edges=edges.checked_add(mapped.len())?;if edges>4_000_000 {return None;}
-        row.transitions=mapped.into_iter().map(|(label,edge)| {
-            let original=if label>=classes.symbol_count() as i32 {
-                crate::compiler::glr::labels::DEFAULT_LABEL-1-(label-classes.symbol_count() as i32)
-            } else {label};(original,edge)
-        }).collect();
-    }
+    let publication_classes=restore_finite_pop_defaults(&mut symbolic,classes)?;
     let phase=Instant::now();
-    let parser_dwa=classes.compile_positive_dwa(symbolic,8_000_000).ok()?;
+    let parser_dwa=publication_classes.compile_positive_dwa(symbolic,8_000_000).ok()?;
     if std::env::var_os("GLRMASK_PROFILE_COMPILE_SUMMARY").is_some() {
         eprintln!("[glrmask/profile][native_compact_template_program] selected=true context={} templates={} instances={} coefficients={} prepare_ms={prepare_ms:.3} class_ms={:.3} total_ms={:.3} native={profile:?} minimize={min_profile:?}",
             context.is_some(),refs.len(),instances.len(),coefficients.len(),phase.elapsed().as_secs_f64()*1000.0,started.elapsed().as_secs_f64()*1000.0);
@@ -335,6 +362,45 @@ mod symbolic_class_tests {
 
     fn token_weight(tokens: &[u32]) -> Weight {
         Weight::from_uniform(0..=0,tokens.iter().copied().collect())
+    }
+
+    #[test]
+    fn finite_default_remapping_matches_full_literal_expansion_and_descriptor_collisions() {
+        use glrmask_parser_dwa::__private::pop_classes::PopLabelClasses;
+        let default=crate::compiler::glr::labels::DEFAULT_LABEL;
+        for collision in [false,true] {
+            let mut classes=PopLabelClasses::new(4).unwrap();
+            let first=if collision {classes.intern_complement([0]).unwrap().unwrap()}
+                else {classes.intern_scoped_complement(1..4,[2]).unwrap().unwrap()};
+            classes.intern_scoped_complement(0..4,[0,1,3]).unwrap().unwrap();
+            let alphabet=classes.symbol_count()+classes.len() as u32;
+            let mut source=DWA::from_parts(vec![Default::default();4],0);
+            source.add_transition(0,0,3,Weight::empty());
+            source.add_transition(0,4,2,token_weight(&[0]));
+            source.add_transition(0,default,1,token_weight(&[1]));
+            source.set_final_weight(1,token_weight(&[1]));
+            source.set_final_weight(2,token_weight(&[0]));
+            source.set_final_weight(3,token_weight(&[0,1]));
+            source.add_transition(1,1,3,Weight::empty());
+            source.add_transition(1,default,0,Weight::all());
+            let mut reference=source.clone();
+            for row in reference.states_mut() {
+                let mut dense=row.transitions.entries().map(|(label,target,w)|(label,(target,w.clone())))
+                    .collect::<BTreeMap<_,_>>();
+                if let Some(edge)=dense.remove(&default) {
+                    for label in 0..alphabet as i32 {dense.entry(label).or_insert_with(||edge.clone());}
+                }
+                row.transitions=dense.into_iter().map(|(label,edge)|
+                    (if label>=4{default-1-(label-4)}else{label},edge)).collect();
+            }
+            let reference=classes.compile_positive_dwa(reference,10000).unwrap();
+            let published=restore_finite_pop_defaults(&mut source,&classes).unwrap();
+            if collision {assert!(source.states()[0].transitions.contains_key(&first));}
+            let candidate=published.compile_positive_dwa(source,10000).unwrap();
+            let comparison=glrmask_parser_dwa::__private::parser_equivalence::compare_parser_mask_prefix_languages(
+                &reference,&candidate,4,10000).unwrap();
+            assert!(comparison.difference.is_none(),"collision={collision}: {:?}",comparison.difference);
+        }
     }
 
     #[test]
