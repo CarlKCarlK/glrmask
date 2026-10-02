@@ -4976,7 +4976,11 @@ mod tests {
             u16::from_le_bytes([saved[8], saved[9]]),
             TEMPLATE_DYNAMIC_CONSTRAINT_VERSION,
         );
-        let loaded = DynamicConstraint::load(&saved).unwrap();
+        // This deliberately unlinked body is not a public closed root.
+        assert!(DynamicConstraint::load(&saved).is_err());
+        assert_eq!(u32::from_le_bytes(saved[18..22].try_into().unwrap()), 1);
+        let mut loaded = DynamicConstraint::from_constraints(vec![Constraint::load_body_artifact(&saved[30..]).unwrap()]);
+        loaded.inner.materialize_composition_link_metadata_for_compilation().unwrap();
         assert_eq!(loaded.inner.late_grammar_slots, constraint.inner.late_grammar_slots);
         assert_eq!(loaded.inner.tokenizer.virtual_runtime_metadata(), metadata);
         assert!(loaded.inner.dynamic_mask_vocab.has_terminal_observation_classes());
@@ -4992,7 +4996,9 @@ mod tests {
             u16::from_le_bytes([transfer[8], transfer[9]]),
             TEMPLATE_DYNAMIC_TRANSFER_VERSION,
         );
-        let transferred = DynamicConstraint::load_with_vocab(&transfer, &vocab).unwrap();
+        assert!(DynamicConstraint::load_with_vocab(&transfer, &vocab).is_err());
+        let mut transferred = DynamicConstraint::from_constraints(vec![Constraint::load_body_artifact_with_vocab(&transfer[30..], &vocab).unwrap()]);
+        transferred.inner.materialize_composition_link_metadata_for_compilation().unwrap();
         assert_eq!(transferred.inner.tokenizer.virtual_runtime_metadata(), metadata);
         assert!(transferred.inner.dynamic_mask_vocab.has_terminal_observation_classes());
         assert_eq!(

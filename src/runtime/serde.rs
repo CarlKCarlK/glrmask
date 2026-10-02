@@ -7021,6 +7021,16 @@ impl Constraint {
         Self::load_body(bytes.into())
     }
 
+    /// Internal embeddable body loader with an exact external vocabulary.
+    /// Public closed-root loading still rejects unresolved slots.
+    pub(crate) fn load_body_artifact_with_vocab<'a>(
+        bytes: impl Into<Cow<'a, [u8]>>, vocab: &crate::Vocab,
+    ) -> crate::Result<Self> {
+        let mut constraint = Self::load_body_with_vocab_policy(bytes.into(), Some(vocab))?;
+        constraint.bind_vocab_exact(vocab).map_err(crate::GlrMaskError::Serialization)?;
+        Ok(constraint)
+    }
+
     /// Load a compiled constraint and bind it to an already-existing exact
     /// model vocabulary.
     ///
@@ -8394,8 +8404,7 @@ impl Constraint {
                 Arc::make_mut(&mut constraint.tokenizer).restore_terminal_exprs(artifact.terminal_exprs)
                     .map_err(crate::GlrMaskError::Serialization)?;
             } else {
-                let compiled_static_residual = !constraint.uses_dynamic_runtime()
-                    && static_virtual_residual_mask.as_ref().is_some_and(|static_mask| {
+                let compiled_static_residual = static_virtual_residual_mask.as_ref().is_some_and(|static_mask| {
                         static_mask.projections().len() == virtual_runtimes.len()
                             && static_mask.projections().iter().all(|projection| !projection.runtime_expr_bytes().is_empty())
                             && virtual_runtimes.iter().all(|entry| entry.kind == crate::automata::lexer::tokenizer::VirtualTokenizerRuntimeKind::ResidualExpr)
@@ -8408,8 +8417,8 @@ impl Constraint {
                     let terminal_exprs = artifact.terminal_exprs.or_else(|| {
                         constraint.retained_terminal_exprs().map(|exprs| exprs.to_vec())
                     });
-                    if constraint.uses_dynamic_runtime() {
-                        Arc::make_mut(&mut constraint.tokenizer).restore_terminal_exprs_with_virtual_runtime_metadata_preserving_residual_coordinates(
+                    if constraint.uses_dynamic_runtime() && static_virtual_residual_mask.is_none() {
+                        Arc::make_mut(&mut constraint.tokenizer).restore_terminal_exprs_with_virtual_runtime_metadata(
                             terminal_exprs, &virtual_runtimes, false,
                         )
                     } else if let Some(static_mask) = static_virtual_residual_mask
