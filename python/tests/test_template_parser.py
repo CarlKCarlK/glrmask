@@ -60,13 +60,13 @@ def words_and_vocab():
     return words, glrmask.Vocab.from_id_to_bytes(dict(enumerate(words)))
 
 
-def depth_after(word, depth=0):
+def depth_after(word, depth=0, ignore_whitespace=True):
     for byte in word:
         if byte == ord("("):
             depth += 1
         elif byte == ord(")") and depth:
             depth -= 1
-        elif byte != ord(" "):
+        elif byte != ord(" ") or not ignore_whitespace:
             return None
     return depth
 
@@ -82,13 +82,14 @@ def representations(constraint, vocab):
 
 
 @pytest.mark.parametrize("mode", [glrmask.Optimization.FAST_RUNTIME, glrmask.Optimization.FAST_BUILD])
-def test_python_builtin_template_backend_is_explicit_and_survives_reload(mode):
+def test_python_builtin_template_backend_is_default_and_survives_reload(mode):
     words, vocab = words_and_vocab()
     grammar = glrmask.Grammar.from_ebnf('start ::= "(" start ")" start | ""')
     reference = grammar.compile(vocab, optimization=mode)
     candidate = grammar.compile(vocab, optimization=mode, parser_backend=glrmask.ParserBackend.TEMPLATE_DFA)
-    assert reference.parser_backend == glrmask.ParserBackend.LR_TABLE
-    for compiled in representations(candidate, vocab):
+    assert reference.parser_backend == glrmask.ParserBackend.TEMPLATE_DFA
+    reference_bytes = reference.save()
+    for compiled in representations(reference, vocab) + representations(candidate, vocab):
         assert compiled.parser_backend == glrmask.ParserBackend.TEMPLATE_DFA
         for prefix in [b"", b"(", b"()", b"(()", b"((()))", b"()("]:
             left, right = reference.start(), compiled.start()
@@ -96,6 +97,20 @@ def test_python_builtin_template_backend_is_explicit_and_survives_reload(mode):
             right.commit_bytes(prefix)
             assert np.array_equal(left.mask(), right.mask())
             assert left.is_accepting() == right.is_accepting()
+            depth = depth_after(prefix, ignore_whitespace=False)
+            # Built-in grammar normalization deliberately removes the root-only
+            # empty generation path; embedded source nullability is retained.
+            # Data-only ParserProgram completion below still accepts empty.
+            assert right.is_accepting() == (bool(prefix) and depth == 0)
+            for token_id, word in enumerate(words):
+                expected = depth_after(word, depth, ignore_whitespace=False)
+                assert bool(right.mask()[token_id]) == (expected is not None), (prefix, word)
+                if expected is not None:
+                    branch = compiled.start()
+                    branch.commit_bytes(prefix)
+                    branch.commit_token(token_id)
+                    assert branch.is_accepting() == (expected == 0)
+    assert reference.save() == reference_bytes
 
 
 @pytest.mark.parametrize("mode", [glrmask.Optimization.FAST_RUNTIME, glrmask.Optimization.FAST_BUILD])
@@ -155,29 +170,37 @@ def test_python_template_validation_is_early_and_does_not_retain_python_callback
         program.compile(vocab, ["(", b")", "[ ]+"])
 
 
-def test_python_compiled_composition_selects_templates_without_changing_the_default():
-    vocab = glrmask.Vocab.from_id_to_bytes({0: b"a"})
+@pytest.mark.parametrize("mode", [glrmask.Optimization.AUTO, glrmask.Optimization.FAST_RUNTIME,
+                                  glrmask.Optimization.FAST_BUILD])
+def test_python_compiled_composition_uses_native_defaults(mode):
+    tokens = {0: b"a", 1: b"aa", 2: b"b"}
+    vocab = glrmask.Vocab.from_id_to_bytes(tokens)
     child = glrmask.Grammar.from_ebnf('start ::= "a"').compile(
-        vocab, parser_backend=glrmask.ParserBackend.TEMPLATE_DFA)
+        vocab, optimization=mode, parser_backend=glrmask.ParserBackend.TEMPLATE_DFA)
     parent = glrmask.Grammar.from_glrm('glrm 1; start root; extern grammar C; nt root = C;').compile_unlinked(vocab)
-    # An unchanged LR default cannot reinterpret a table-free child as LR.
-    bound = parent.bind("C", child)
-    with pytest.raises(ValueError, match="template-parser|table-free"):
-        bound.link()
     assert child.parser_backend == glrmask.ParserBackend.TEMPLATE_DFA
-    ordinary = glrmask.Grammar.from_ebnf('start ::= "a"').compile(vocab)
-    assert ordinary.parser_backend == glrmask.ParserBackend.LR_TABLE
-    linked = parent.bind("C", ordinary).link()
-    assert linked.parser_backend == glrmask.ParserBackend.LR_TABLE
-    assert linked.start().mask()[0]
-    for source in [ordinary, child]:
-        linked = parent.bind("C", source).link(parser_backend=glrmask.ParserBackend.TEMPLATE_DFA)
-        for compiled in representations(linked, vocab):
-            assert compiled.parser_backend == glrmask.ParserBackend.TEMPLATE_DFA
-            state = compiled.start()
-            assert state.mask()[0]
-            state.commit_token(0)
-            assert state.is_accepting()
+    ordinary = glrmask.Grammar.from_ebnf('start ::= "a"').compile(vocab, optimization=mode)
+    assert ordinary.parser_backend == glrmask.ParserBackend.TEMPLATE_DFA
+    for child in [ordinary, child]:
+        for source in representations(child, vocab):
+            child_bytes = source.save()
+            for selection in [{}, {"parser_backend": glrmask.ParserBackend.TEMPLATE_DFA}]:
+                linked = parent.bind("C", source).link(optimization=mode, **selection)
+                assert source.save() == child_bytes
+                for compiled in representations(linked, vocab):
+                    assert compiled.parser_backend == glrmask.ParserBackend.TEMPLATE_DFA
+                    for prefix in [b"", b"a"]:
+                        state = compiled.start()
+                        state.commit_bytes(prefix)
+                        assert state.is_accepting() == (prefix == b"a")
+                        for token_id, word in tokens.items():
+                            expected = b"a".startswith(prefix + word)
+                            assert bool(state.mask()[token_id]) == expected, (prefix, word)
+                            if expected:
+                                branch = compiled.start()
+                                branch.commit_bytes(prefix)
+                                branch.commit_token(token_id)
+                                assert branch.is_accepting() == (prefix + word == b"a")
 
 
 @pytest.mark.parametrize("mode", [glrmask.Optimization.FAST_RUNTIME, glrmask.Optimization.FAST_BUILD])
@@ -209,6 +232,18 @@ def test_python_backend_selection_does_not_accept_untyped_flags():
     for value in ["TEMPLATE_DFA", True, 1, object()]:
         with pytest.raises(TypeError):
             grammar.compile(vocab, parser_backend=value)
+
+
+def test_python_explicit_lr_compile_and_link_requests_panic_loudly():
+    vocab = glrmask.Vocab.from_id_to_bytes({0: b"a"})
+    grammar = glrmask.Grammar.from_ebnf('start ::= "a"')
+    module = grammar.compile_unlinked(vocab)
+    for operation in [lambda: grammar.compile(vocab, parser_backend=glrmask.ParserBackend.LR_TABLE),
+                      lambda: module.link(parser_backend=glrmask.ParserBackend.LR_TABLE)]:
+        with pytest.raises(BaseException, match="LR-BACKED CONSTRAINT REQUEST IS FORBIDDEN") as rejected:
+            operation()
+        # PyO3 exposes Rust panics as a BaseException, not an ordinary ValueError.
+        assert type(rejected.value).__name__ == "PanicException"
 
 
 @pytest.mark.parametrize("mode", [glrmask.Optimization.FAST_RUNTIME, glrmask.Optimization.FAST_BUILD])
@@ -248,39 +283,42 @@ def test_python_projected_virtual_child_preserves_exact_limits_and_reload(mode):
             state.commit_bytes(b'p"x:' + b"a" * 4999)
 
 
-@pytest.mark.parametrize("backend", [glrmask.ParserBackend.LR_TABLE, glrmask.ParserBackend.TEMPLATE_DFA])
+@pytest.mark.parametrize("backend", [None, glrmask.ParserBackend.TEMPLATE_DFA])
 @pytest.mark.parametrize("mode", [glrmask.Optimization.FAST_RUNTIME, glrmask.Optimization.FAST_BUILD])
 def test_python_nullable_lexical_body_survives_compiled_child_binding(backend, mode):
     tokens = {0: b"x", 1: b"a", 2: b"y", 3: b"xay", 4: b"xy",
               5: b"ay", 6: b"aa", 7: b"yx", 8: b""}
     vocab = glrmask.Vocab.from_id_to_bytes(tokens)
+    selection = {} if backend is None else {"parser_backend": backend}
     child = glrmask.Grammar.from_glrm(
         'start root; t A ::= /a?/; nt root ::= A;').compile(
-            vocab, optimization=mode, parser_backend=backend)
-    child = glrmask.Constraint.load(child.save())
-    child_bytes = child.save()
+            vocab, optimization=mode, **selection)
     parent = glrmask.Grammar.from_glrm(
         'glrm 1; start root; extern grammar C; nt root = "x" C "y";').compile_unlinked(vocab)
-    linked = parent.bind("C", child).link(
-        optimization=mode, parser_backend=backend, end_tokens=[8])
-    assert child.save() == child_bytes
-    forms = (representations(linked, vocab) if backend == glrmask.ParserBackend.TEMPLATE_DFA
-             else [linked, glrmask.Constraint.load(linked.save())])
     language = [b"xy", b"xay"]
-    for compiled in forms:
-        for prefix in [b"", b"x", b"xa", b"xy", b"xay"]:
-            state = compiled.start()
-            state.commit_bytes(prefix)
-            mask = state.mask()
-            assert state.is_accepting() == (prefix in language)
-            assert bool(mask[8]) == (prefix in language)
-            for token_id, word in tokens.items():
-                if token_id == 8:
-                    continue
-                expected = any(complete.startswith(prefix + word) for complete in language)
-                assert bool(mask[token_id]) == expected, (backend, mode, prefix, word)
-                if expected:
-                    branch = compiled.start()
-                    branch.commit_bytes(prefix)
-                    branch.commit_token(token_id)
-                    assert branch.is_accepting() == (prefix + word in language)
+    for child in representations(child, vocab):
+        child_bytes = child.save()
+        linked = parent.bind("C", child).link(
+            optimization=mode, end_tokens=[8], **selection)
+        assert child.save() == child_bytes
+        for compiled in representations(linked, vocab):
+            assert compiled.parser_backend == glrmask.ParserBackend.TEMPLATE_DFA
+            for prefix in [b"", b"x", b"xa", b"xy", b"xay"]:
+                state = compiled.start()
+                state.commit_bytes(prefix)
+                mask = state.mask()
+                assert state.is_accepting() == (prefix in language)
+                assert bool(mask[8]) == (prefix in language)
+                for token_id, word in tokens.items():
+                    if token_id == 8:
+                        continue
+                    expected = any(complete.startswith(prefix + word) for complete in language)
+                    assert bool(mask[token_id]) == expected, (backend, mode, prefix, word)
+                    if expected:
+                        branch = compiled.start()
+                        branch.commit_bytes(prefix)
+                        branch.commit_token(token_id)
+                        assert branch.is_accepting() == (prefix + word in language)
+                if prefix in language:
+                    state.commit_token(8)
+                    assert state.is_terminated()

@@ -74,7 +74,7 @@ fn options(
         PyOptimization::FAST_BUILD => glrmask::Optimization::FastBuild,
         PyOptimization::FAST_RUNTIME => glrmask::Optimization::FastRuntime,
     };
-    let backend = parser_backend.as_deref().copied().unwrap_or(PyParserBackend::LR_TABLE);
+    let backend = parser_backend.as_deref().copied().unwrap_or(PyParserBackend::TEMPLATE_DFA);
     glrmask::BuildOptions::default().end_tokens(end_tokens.unwrap_or_default())
         .optimization(mode).parser_backend(backend.into())
 }
