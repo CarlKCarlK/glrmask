@@ -26,12 +26,14 @@ assert state.is_accepting()
 `FAST_RUNTIME` selects static masking. `FAST_BUILD` selects the existing
 vocabulary-partitioned dynamic masking path for built-in template grammars.
 Neither choice retains an LR table in the resulting template constraint.
-Omitting `parser_backend` retains the existing `LR_TABLE` default. Pass the enum,
-not a string, integer or Boolean flag.
+Omitting `parser_backend` selects the native `TEMPLATE_DFA` backend. Explicit
+`LR_TABLE` requests trigger the forbidden-LR panic. Pass the enum, not a string,
+integer or Boolean flag.
 
 `constraint.parser_backend` is read-only and remains valid after loading.
-The built-in compiler may use LR machinery while deriving the templates; this
-differs from the data-only provider below, which never needs an LR grammar.
+The built-in compiler may use temporary LR analysis while deriving templates,
+then discards the table before constructing the constraint. The data-only
+provider below bypasses grammar analysis.
 
 ## Compile a parser definition directly
 
@@ -129,10 +131,9 @@ sufficient. Self-contained and external forms retain the end-token policy.
 
 ## Composition and compatibility
 
-Compiled table-free children and compiled table-free linkage are not yet
-supported. Binding records an immutable attachment; final linking raises
-`ValueError` for unsupported composition rather than quietly attaching a hidden
-LR table. `UnlinkedConstraint.link` accepts the typed `parser_backend` keyword so
-the request can be checked explicitly. Ordinary LR composition is
-unchanged. This compatibility gap is a reason not to switch the global default
-based only on faster single-component averages.
+Compiled native children support direct linking, including nested and nullable
+bodies. Binding records an immutable attachment; final linking shares prepared
+template graphs through scoped views. `UnlinkedConstraint.link` defaults to
+`TEMPLATE_DFA` and accepts that typed backend explicitly. Unsupported native
+composition raises `ValueError`; LR-backed execution is forbidden. Fresh,
+self-contained and exact external-vocabulary artifacts retain these semantics.

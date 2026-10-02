@@ -228,11 +228,11 @@ constraint = host.bind("payload", child).link(
 
 All three modes preserve accepted-language semantics and produce the same public `Constraint` type.
 
-### Optional table-free parser backend
+### Native template parser backend
 
-The parser backend is a separate choice from the build/runtime preference. The
-default remains `LR_TABLE` / `LrTable`. Select the acyclic template backend
-explicitly for a standalone constraint:
+All constraints use the native acyclic template backend, independently of the
+build/runtime preference. Omitting the backend selects `TEMPLATE_DFA` /
+`TemplateDfa`; it can also be stated explicitly:
 
 ```python
 constraint = grammar.compile(
@@ -260,21 +260,22 @@ assert_eq!(constraint.parser_backend(), ParserBackend::TemplateDfa);
 The selected runtime and its artifact contain the template relations, not an
 LR table. Mask generation and token commitment use the existing shared engines;
 parser advancement and admissibility use those relations. Built-in grammar
-compilation can still use LR machinery to derive the program. Data-only
+compilation can use temporary LR analysis to derive the program, then discards
+the table before constructing a `Constraint`. Explicit LR-backed construction,
+loading or runtime access panics. Data-only
 `ParserProgram` providers bypass that frontend and support both static and
 dynamic mask compilation.
 
 Built-in compiled components with finite embedding transfers support nested
 and nullable [template composition](docs/template-parser-composition.md).
-Select `TemplateDfa` explicitly when linking a template-backed child. Unsupported
-requests return errors rather than retaining a hidden table or switching
-backends. Performance and load-time tradeoffs depend on the
+Compiled components link directly through shared immutable template graphs and
+scoped views. Unsupported native requests return errors. Performance and load-time tradeoffs depend on the
 grammar and mode, so template selection is not an automatic speed guarantee.
 See [the template parser contract](docs/template-parser.md) for provider
 examples, exact POP/READ/PUSH semantics, validation, and persistence.
-The [validation report](docs/template-parser-validation-2026-09-30.md) records
-measured runtime and storage results, build/load costs, and the reasons the LR
-backend remains the default.
+The [September 30 validation report](docs/template-parser-validation-2026-09-30.md)
+records historical measurements at its pinned revision. Those measurements do
+not qualify the current native replacement.
 
 ### End tokens are final-root policy
 

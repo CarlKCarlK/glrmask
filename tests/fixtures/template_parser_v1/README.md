@@ -2,7 +2,7 @@
 
 Generated once before TPR2 was introduced, by commit7ecc35bac plus the temporary exporter test recorded in the session notes, using Rust1.95.0 on aarch64-apple-darwin. Grammar and vocabulary match `GRAMMARS[1]` and `vocab()` in `tests/template_parser_artifact.rs`. The exporter was removed after generation to prevent accidentally refreshing old-version fixtures with the current writer.
 
-These are small synthetic grammar artifacts, not user data or production models. Tests must keep reading them with the ordinary LR, self-contained template and external-vocabulary template readers after the compact parser writer changes.
+These are small synthetic grammar artifacts, not user data or production models. Tests retain these bytes and hashes as rejection records: the known LR-backed format must panic before materialization, and obsolete template formats must be rejected explicitly. Current malformed-wire validation uses fresh native artifacts that load successfully before mutation.
 
 SHA256:
 - `static-v30-lr.bin`:08ce2bfc1a17f3edc0d682c8c3b9276f3e7b6693934ee9afe4aafd150e38bcc3

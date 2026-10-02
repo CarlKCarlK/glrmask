@@ -1,10 +1,10 @@
-//! Real selected10 composition qualification using the existing canonical cache.
+//! Native selected10 composition qualification against a grammar-inlined oracle.
 //! Usage: template_precompiled_composition FIXTURE_DIR OUTPUT_DIR static|dynamic JS_GRAMMAR
-//! FIXTURE_DIR contains core.bin, dispatch-literal.bin, vocab_dump.bin, traces.json.
+//! FIXTURE_DIR contains schema-00.json through schema-09.json, vocab_dump.bin, traces.json.
 //! All masks are compared in memory; only measurements and hashes are saved.
 use std::{fs, path::Path, io::{BufWriter, Write}, time::Instant};
 use glrmask::{BuildOptions,Grammar,Optimization,Constraint,ParserBackend,Vocab};
-use glrmask::__private::{into_template_parser,parser_backend_report};
+use glrmask::__private::parser_backend_report;
 use serde::Deserialize;
 
 #[derive(Deserialize)]
@@ -60,7 +60,37 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         assert_eq!(decoded, trace.text.as_bytes(), "canonical trace byte identity");
     }
     eprintln!("LOAD canonical selected10, traces={} positions=11767", traces.len());
-    let dispatch = Constraint::load_with_vocab(fs::read(fixture.join("dispatch-literal.bin"))?, &vocab)?;
+    let options = BuildOptions::default()
+        .optimization(if args[3] == "static" { Optimization::FastRuntime } else { Optimization::FastBuild })
+        .parser_backend(ParserBackend::TemplateDfa);
+    // Prepare the complete native child before starting the link timer. Schema
+    // lowering and child compilation are reported separately, never hidden.
+    let started = Instant::now();
+    let mut dispatch = String::from("start suffix;\n");
+    let mut schemas = Vec::new();
+    for index in 0..10 {
+        dispatch.push_str(&format!("extern grammar ARGS_{index};\n"));
+        let schema = serde_json::from_slice(&fs::read(fixture.join(format!("schema-{index:02}.json")))?)?;
+        let named = glrmask_json_schema::schema_to_named_grammar(&schema)?;
+        let mut factored = glrmask_grammar::__private::grammar::factoring::factor_named_grammar(named);
+        glrmask_json_schema::prepare_named_grammar_for_dump(&mut factored)?;
+        schemas.push((format!("ARGS_{index}"), glrmask_grammar::__private::grammar::glrm::to_glrm(&factored)));
+    }
+    dispatch.push_str("nt suffix ::=\n");
+    for index in 0..10 {
+        if index != 0 { dispatch.push_str("  | "); }
+        dispatch.push_str(&format!("\".tool_{index}(\" ARGS_{index} \")\"\n"));
+    }
+    dispatch.push_str(";\n");
+    let bindings = schemas.iter().map(|(name, source)| (name.as_str(), source.as_str())).collect::<Vec<_>>();
+    let named = glrmask_grammar::__private::grammar::glrm::from_glrm_with_inline_subgrammars(&dispatch, &bindings)?;
+    let child_source = glrmask_grammar::__private::grammar::glrm::to_glrm(&named);
+    fs::write(output.join("child-source.glrm"), &child_source)?;
+    let child = Grammar::from_glrm(&child_source).compile_with(&vocab, options.clone())?;
+    let child_compile_ns = started.elapsed().as_nanos();
+    let child_report = parser_backend_report(&child); assert_table_free(&child_report);
+    fs::write(output.join("child-backend.json"),serde_json::to_vec_pretty(&child_report)?)?;
+    eprintln!("CHILD source_prepare_compile_ns={child_compile_ns}");
     let source_path = Path::new(&args[4]);
     let mut source = fs::read_to_string(source_path)?.replace("\r\n", "\n");
     let needle = "nt member_expression_with_suffixes ::=\n    primary_expression";
@@ -69,17 +99,23 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     source.push_str("\nextern grammar PROGRAMMATIC_TOOL_SUFFIX;\n");
     fs::write(output.join("parent-source.glrm"), &source)?;
     let started = Instant::now(); let parent = Grammar::from_glrm(&source).compile_unlinked(&vocab)?;
-    eprintln!("PARENT source_compile_ns={}", started.elapsed().as_nanos());
-    let reference = parent.bind("PROGRAMMATIC_TOOL_SUFFIX", &dispatch)?.link_with(BuildOptions::default().optimization(if args[3] == "static" { Optimization::FastRuntime } else { Optimization::FastBuild }))?;
-    let started = Instant::now(); let child = into_template_parser(dispatch)?;
-    let conversion_ns = started.elapsed().as_nanos();
-    let child_report = parser_backend_report(&child); assert_table_free(&child_report);
-    fs::write(output.join("child-backend.json"),serde_json::to_vec_pretty(&child_report)?)?;
-    eprintln!("CHILD preconverted_ns={conversion_ns} finite_embedding={}", child_report["finite_embedding"]);
+    let parent_compile_ns = started.elapsed().as_nanos();
+    eprintln!("PARENT source_compile_ns={parent_compile_ns}");
+    // The oracle compiles one fully resolved grammar. It never uses the native
+    // component linker under test or historical LR-backed artifacts.
+    let started = Instant::now();
+    let mut inline_bindings = vec![("PROGRAMMATIC_TOOL_SUFFIX".to_owned(), dispatch)];
+    inline_bindings.extend(schemas.iter().map(|(name, source)| (format!("PROGRAMMATIC_TOOL_SUFFIX::{name}"), source.clone())));
+    let bindings = inline_bindings.iter().map(|(name, source)| (name.as_str(), source.as_str())).collect::<Vec<_>>();
+    let named = glrmask_grammar::__private::grammar::glrm::from_glrm_with_inline_subgrammars(&source, &bindings)?;
+    let inline_source = glrmask_grammar::__private::grammar::glrm::to_glrm(&named);
+    fs::write(output.join("inline-reference-source.glrm"), &inline_source)?;
+    let reference = Grammar::from_glrm(&inline_source).compile_with(&vocab, options.clone())?;
+    let reference_compile_ns = started.elapsed().as_nanos();
+    assert_table_free(&parser_backend_report(&reference));
+    eprintln!("INLINE_REFERENCE source_prepare_compile_ns={reference_compile_ns}");
     let start = Instant::now();
-    let candidate = parent.bind("PROGRAMMATIC_TOOL_SUFFIX", &child)?.link_with(BuildOptions::default()
-        .optimization(if args[3] == "static" { Optimization::FastRuntime } else { Optimization::FastBuild })
-        .parser_backend(ParserBackend::TemplateDfa))?;
+    let candidate = parent.bind("PROGRAMMATIC_TOOL_SUFFIX", &child)?.link_with(options)?;
     let link_ns = start.elapsed().as_nanos(); eprintln!("DIRECT_LINK ns={link_ns}");
     assert_eq!(candidate.parser_backend(), ParserBackend::TemplateDfa);
     let report = parser_backend_report(&candidate); assert_table_free(&report); if args[3] == "static" { assert_static(&report); }
@@ -90,14 +126,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let external = candidate.save_with_external_vocab()?; let external_loaded = Constraint::load_with_vocab(&external, &vocab)?;
     assert_table_free(&parser_backend_report(&external_loaded)); if args[3] == "static" { assert_static(&parser_backend_report(&external_loaded)); }
     let mut csv = BufWriter::new(fs::File::create(output.join("exact-replay.csv"))?);
-    writeln!(csv, "trace,step,token,lr_mask_ns,template_mask_ns,self_load_mask_ns,external_load_mask_ns,hash")?;
+    writeln!(csv, "trace,step,token,inline_mask_ns,template_mask_ns,self_load_mask_ns,external_load_mask_ns,hash")?;
     let mut reference_mask = vec![0; reference.mask_len()]; let mut mask = vec![0; candidate.mask_len()];
     assert_eq!(reference_mask.len(), mask.len()); let mut samples = 0usize;
     for (index, trace) in traces.iter().enumerate() {
         let mut oracle = reference.start(); let mut fresh = candidate.start();
         let mut reloaded = loaded.start(); let mut ext = external_loaded.start();
         for step in 0..=trace.token_ids.len() {
-            let started = Instant::now(); oracle.fill_mask(&mut reference_mask); let lr_ns = started.elapsed().as_nanos();
+            let started = Instant::now(); oracle.fill_mask(&mut reference_mask); let inline_ns = started.elapsed().as_nanos();
             let mut times = [0u128; 3];
             for (representation, state) in [&mut fresh, &mut reloaded, &mut ext].into_iter().enumerate() {
                 let started = Instant::now(); state.fill_mask(&mut mask); times[representation] = started.elapsed().as_nanos();
@@ -109,7 +145,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
             let hash = mask.iter().fold(0xcbf29ce484222325u64, |hash, word| (hash ^ *word as u64).wrapping_mul(0x100000001b3));
             let token = trace.token_ids.get(step).copied();
-            writeln!(csv, "{index},{step},{},{lr_ns},{},{},{},{hash:016x}", token.map(|id| id.to_string()).unwrap_or_default(), times[0], times[1], times[2])?;
+            writeln!(csv, "{index},{step},{},{inline_ns},{},{},{},{hash:016x}", token.map(|id| id.to_string()).unwrap_or_default(), times[0], times[1], times[2])?;
             if let Some(token) = token {
                 assert_ne!(mask[token as usize / 32] & (1 << (token % 32)), 0, "canonical token not admitted");
                 oracle.commit_token(token)?; fresh.commit_token(token)?; reloaded.commit_token(token)?; ext.commit_token(token)?;
@@ -134,7 +170,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     csv.flush()?;
     let result = serde_json::json!({"mode":args[3],"positions":samples,"candidate_representations":3,
         "complete":true,"masks_commits_completion_equal":true,"explicit_eof_checks":traces.len(),"link_ns":link_ns,
-        "conversion_ns":conversion_ns,"save_ns":save_ns,"load_ns":load_ns,
+        "child_compile_ns":child_compile_ns,"parent_compile_ns":parent_compile_ns,
+        "reference_compile_ns":reference_compile_ns,"reference":"independent grammar-inlined native compiler",
+        "save_ns":save_ns,"load_ns":load_ns,
         "self_bytes":saved.len(),"external_bytes":external.len(),
         "timing_note":"Correctness-run observations, not an isolated performance qualification"});
     fs::write(output.join("summary.json"), serde_json::to_vec_pretty(&result)?)?;

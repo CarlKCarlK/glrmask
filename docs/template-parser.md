@@ -21,14 +21,13 @@ assert_eq!(constraint.parser_backend(), ParserBackend::TemplateDfa);
 `FastBuild` uses the existing vocabulary-partitioned dynamic engine (O2), after
 normalizing the grammar so each terminal advance has a finite acyclic action
 relation. The normalization is exact; it does not truncate recursive action
-paths. This differs from ordinary LR `FastBuild`, whose grammar preparation may
-permit an unbounded reduction closure.
+paths.
 
-The built-in grammar compiler can use LR machinery to derive the action
-relations. The resulting constraint, its mask and commit runtime, and its saved
-artifact do **not** retain the LR table. The option is per constraint, not a
-process-wide flag. An unsupported composition request returns an error instead
-of quietly keeping an LR fallback. The default backend remains `LrTable`.
+The built-in grammar compiler may derive action relations using temporary LR
+analysis. It discards those tables before constructing a `Constraint`. Native
+`TemplateDfa` is the default and the only permitted runtime backend; explicit
+LR-backed construction, loading or runtime access panics. An unsupported native
+composition request returns an error.
 
 The older experimental `GLRMASK_ENABLE_TEMPLATE_DFA_ADVANCE` environment switch
 is not this storage guarantee. Use `BuildOptions::parser_backend` and inspect
@@ -210,9 +209,11 @@ vocabulary, or with a different mapping, fails. End-token policy uses
 `BuildOptions::end_tokens` for built-in grammars. Both forms retain the policy
 through save/load.
 
-Template artifacts are versioned and validated separately from legacy LR
-artifacts; existing LR artifacts remain readable. Component composition is
-explicitly deferred and must not be implemented by retaining a hidden table.
+Current native artifacts use self-contained envelope33 or external-vocabulary
+envelope34 and parser section `TPR6` (wrapped by `TPX1` for an external binding).
+Obsolete pre-release formats are rejected explicitly; known LR artifacts panic
+rather than materializing a table. Compiled components link directly with
+shared template graphs and scoped views; see [composition](template-parser-composition.md).
 
 
 ## Large finite output languages

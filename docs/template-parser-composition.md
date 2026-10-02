@@ -57,10 +57,10 @@ event, even when its vocabulary spelling is empty, and never becomes epsilon.
 
 ## Build-time choices
 
-A source-bound grammar, or an unlinked parent with ordinary compiled children,
-can use the existing composition compiler and then discard its LR tables.
-Using LR machinery to construct templates is distinct from retaining an LR
-runtime or reconstructing one from a table-free artifact.
+Source-bound grammars use the common lexical/query compiler. Temporary LR
+analysis may derive their templates, but all tables are discarded before
+constructing a `Constraint`. Compiled children link through immutable prepared
+graphs and scoped views without reconstructing or retaining execution tables.
 
 An already table-free child takes the direct template linker. `FastBuild` and
 `Auto` use dynamic boundary traversal. `FastRuntime` compiles the boundary token
@@ -103,7 +103,8 @@ Static template and weighted-automaton construction have representation and
 work limits. A successful dynamic build does not imply that a static build will
 fit those limits. A static build error never silently changes the request to
 dynamic masking. These limits are not a whole-process memory or elapsed-time
-guarantee. The default parser backend remains `LrTable`.
+guarantee. The native `TemplateDfa` backend is the default; explicit LR-backed
+construction, loading and runtime access are forbidden.
 
 ## Persistence and embedding
 
@@ -113,8 +114,8 @@ completion relations. Completion is an input predicate; it does not specify
 how an arbitrary parser should remove a child frame. The built-in compiler
 derives that embedding contract before discarding its LR construction data.
 
-Embedding-capable programs use the TPR4 parser section. Older supported program
-sections remain readable for execution. An artifact without an embedding
+Embedding-capable programs use the `TPR6` parser section in current envelope33
+or34. Obsolete pre-release program sections are rejected. An artifact without an embedding
 contract cannot acquire one merely by being loaded. Invalid indices, cycles,
 alphabet labels, control inventories, and embedding fields are rejected.
 
@@ -123,8 +124,8 @@ with the full token horizon and fingerprints of both the finite graph and the
 exact-state mapping. Loading reconstructs this vocabulary-dependent lexer
 metadata and checks the fingerprints, leaf offsets, dimensions, and physical
 images before accepting the saved boundary. It does not rebuild the parser.
-Existing non-projected artifact variants remain readable. The unpublished
-horizon-less experimental projected variant must be rebuilt.
+Only current native artifact variants are accepted. Obsolete projected and
+non-projected variants must be rebuilt.
 
 `save_with_external_vocab()` omits the separately supplied model vocabulary and
 requires `Constraint::load_with_vocab()` with the exact original binding. Both
@@ -148,7 +149,11 @@ cargo run --release --features internal-api --example template_precompiled_compo
   FIXTURE_DIR NEW_OUTPUT_DIR static PATH_TO_JS_GRAMMAR
 ```
 
-The fixture contains `dispatch-literal.bin`, `vocab_dump.bin`, and `traces.json`.
+The fixture contains `schema-00.json` through `schema-09.json` in canonical
+selected10 order, `vocab_dump.bin`, and `traces.json`. The example prepares a
+native child and unlinked parent, and compares direct linking with a separately
+compiled grammar-inlined native reference. It reports child preparation, parent
+compilation, reference compilation and precompiled linking separately.
 The example checks vocabulary and trace dimensions, all 11,767 recorded mask
 positions, token commits, and three explicit grammar-EOF completions. It refuses
 to overwrite an output directory. Its `summary.json` is written only after the
