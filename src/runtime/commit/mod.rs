@@ -9673,59 +9673,21 @@ mod tests {
         // but the theorem does not depend on their distinctness.
         let end_states = vec![initial, non_initial, non_initial];
 
-        let admitted = batched_end_state_admitted_terminals(
-            &constraint,
-            gss,
-            &end_states,
-        )
-        .expect("multiple non-initial tokenizer states should batch");
+        let admitted = batched_end_state_admitted_terminals(&constraint, gss, &end_states);
+        assert!(admitted.is_none(), "native relations decline the LR batching shortcut");
         for &end_state in &end_states {
-            assert_eq!(
-                end_state_may_advance_with_batch(
-                    &constraint,
-                    gss,
-                    end_state,
-                    Some(&admitted),
-                ),
-                end_state_may_advance(&constraint, gss, end_state),
-                "batched admission differs for tokenizer state {end_state}",
-            );
+            assert_eq!(end_state_may_advance_with_batch(&constraint, gss, end_state, admitted.as_ref()),
+                end_state_may_advance(&constraint, gss, end_state));
         }
-
         let mut cache = SmallVec::<[ParserAdmissionCacheEntry; 8]>::new();
-        let index = cached_batched_end_state_admission(
-            &constraint,
-            gss,
-            &end_states,
-            &mut cache,
-        )
-        .expect("multiple non-initial tokenizer states should populate cache");
-        for &end_state in &end_states {
-            assert_eq!(
-                end_state_may_advance_from_cache_entry(
-                    &constraint,
-                    end_state,
-                    &cache[index],
-                ),
-                end_state_may_advance(&constraint, gss, end_state),
-                "cached admission differs for tokenizer state {end_state}",
-            );
+        for _ in 0..2 {
+            assert!(cached_batched_end_state_admission(&constraint,gss,&end_states,&mut cache).is_none());
+            assert!(cache.is_empty(), "declined batching must leave the cache unchanged");
         }
-
-        // Repeating the identical query must be a pure cache hit and retain the
-        // exact pointwise facts.
-        let tested = cache[index].tested.clone();
-        let admitted_before = cache[index].admitted.clone();
-        let repeat = cached_batched_end_state_admission(
-            &constraint,
-            gss,
-            &end_states,
-            &mut cache,
-        )
-        .unwrap();
-        assert_eq!(repeat, index);
-        assert_eq!(cache[index].tested, tested);
-        assert_eq!(cache[index].admitted, admitted_before);
+        for (token, _) in constraint.token_bytes_iter() {
+            let admitted = state.mask()[token as usize / 32] & (1 << (token % 32)) != 0;
+            assert_eq!(state.clone().commit_token(token).is_ok(), admitted, "token={token}");
+        }
     }
 
     #[test]
@@ -10316,6 +10278,14 @@ mod tests {
             AdmissionPolicy::ExactSimulation,
         );
 
+        // Own compiler reference data directly; never restore a table in the
+        // native Constraint whose commits and admission are under test.
+        let grammar = constraint.template_parser.as_ref().unwrap().link_grammar.as_ref().unwrap();
+        let table = crate::compiler::glr::table::GLRTable::build_with_default_construction(
+            &grammar.analyze(constraint.terminal_display_names.clone()),
+            crate::compiler::glr::table::GlrTableConstruction::ExperimentalCoreMerged,
+        );
+
         let mut states = vec![constraint.start()];
         let mut after_a = constraint.start();
         after_a.commit_token(0).unwrap();
@@ -10324,7 +10294,7 @@ mod tests {
         for state in states {
             for gss in state.state.values() {
                 for terminal in 0..constraint.parser_terminal_count() {
-                    let legacy = if stack_may_advance_on(&constraint.table, gss, terminal) {
+                    let legacy = if stack_may_advance_on(&table, gss, terminal) {
                         let advanced = advance_parser_stacks(&constraint, gss, terminal);
                         (!advanced.is_empty()).then_some(advanced)
                     } else {
@@ -10821,21 +10791,15 @@ nt start ::= item item? item?;
         }
         assert_eq!(state.len(), INLINE_PARSER_STATE_CAPACITY + 1);
 
-        let mut original = Vec::with_capacity(LINEAR_STACK_RESERVE);
-        let mut work = Vec::with_capacity(LINEAR_STACK_RESERVE);
-        let mut tokenizer_scratch = tokenizer_scan::ReusableTokenizerExecScratch::default();
-        let mut frontier = FlatFrontierScratch::default();
-        let result = try_commit_flat_frontier_in_place(
-            &constraint,
-            &mut state,
-            b"a",
-            &mut original,
-            &mut work,
-            &mut tokenizer_scratch,
-            &mut frontier,
-        );
-        assert!(matches!(result, Some(Ok(()))));
-        assert!(!state.is_empty());
+        let mut actual = start.clone();
+        actual.state = state;
+        actual.commit_bytes(b"a").unwrap();
+        let mut expected = start;
+        expected.commit_bytes(b"a").unwrap();
+        assert_eq!(canonical_commit_state(&actual.state), canonical_commit_state(&expected.state));
+        assert_eq!(actual.mask(), expected.mask());
+        assert_eq!(actual.is_accepting(), expected.is_accepting());
+        assert!(actual.is_accepting());
     }
 
     #[test]

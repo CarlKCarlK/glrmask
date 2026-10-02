@@ -676,7 +676,7 @@ mod epsilon_reset_boundary_tests {
                 }
             }
         }
-        assert!(total_proved > 0, "fixture must execute a proved epsilon-only reset");
+        assert_eq!(total_proved, 0, "native relations use the exact walk and decline the LR epsilon-only proof");
     }
 }
 
@@ -762,14 +762,14 @@ mod closed_admission_support_tests {
                             for modulus in [1, 2, 3] {
                                 let mut old_seen = Vec::new();
                                 let old = constraint.compact_segmented_parser_may_advance_on_any_matching(
-                                    gss, base..base+child.table.num_terminals,
+                                    gss, base..base+child.parser_terminal_count(),
                                     |t| { old_seen.push(t); t%modulus==0 },
                                 );
                                 let mut new_seen = Vec::new();
                                 let prepared = constraint.prepare_scoped_admission_support(gss, leaf)
                                     .expect("bounded fixture support");
-                                let mut candidates = BitSet::new((base + child.table.num_terminals) as usize);
-                                for t in base..base+child.table.num_terminals { candidates.set(t as usize); }
+                                let mut candidates = BitSet::new((base + child.parser_terminal_count()) as usize);
+                                for t in base..base+child.parser_terminal_count() { candidates.set(t as usize); }
                                 let new = Some(prepared.matches(&candidates,
                                     |t| { new_seen.push(t); t%modulus==0 }));
                                 assert_eq!(old,new);

@@ -193,3 +193,27 @@ pub(crate) mod core_programs {
         TemplateDfasByTerminal::deserialize(deserializer)
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn current_parser_section_rejects_duplicate_core_program_inventory() {
+        let vocab = crate::Vocab::new(vec![(0, b"a".to_vec())]);
+        let original = Constraint::from_glrm_grammar("start root; nt root ::= \"a\";", &vocab).unwrap();
+        let wire = encode(original.template_parser.as_ref().unwrap(), &original.template_dfas_by_terminal);
+        let mut duplicate = original.clone();
+        let error = decode(&wire).unwrap().install(&mut duplicate).unwrap_err();
+        assert!(error.contains("duplicate core parser programs"), "{error}");
+        assert!(!duplicate.table.is_present());
+
+        let mut section_owned = original.clone();
+        section_owned.template_dfas_by_terminal.clear();
+        decode(&wire).unwrap().install(&mut section_owned).unwrap();
+        assert_eq!(section_owned.start().mask(), original.start().mask());
+        let mut state = section_owned.start();
+        state.commit_token(0).unwrap();
+        assert!(state.is_accepting());
+    }
+}

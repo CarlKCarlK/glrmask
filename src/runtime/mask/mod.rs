@@ -2255,19 +2255,7 @@ mod tests {
         poisoned.tokenizer = root.tokenizer.clone();
         poisoned.tokenizer_fast_transitions = root.tokenizer_fast_transitions.clone();
         poisoned.tokenizer_has_epsilon_transitions = root.tokenizer_has_epsilon_transitions;
-        poisoned.table.action.clear();
-        poisoned.table.goto.clear();
-        poisoned.table.advance.clear();
-        poisoned.table.unconditional_advance.clear();
-        poisoned.table.rules.clear();
-        poisoned.table.forwarded_shifts.clear();
-        poisoned.table.control_terminals.clear();
-        poisoned.table.skip_terminals.clear();
-        poisoned.table.guarded_shift_index.clear();
-        poisoned.table.direct_regular_wide_frontiers.clear();
-        poisoned.table.num_states = 0;
-        poisoned.table.num_terminals = 0;
-        poisoned.table.num_rules = 0;
+        assert!(!poisoned.table.is_present(), "native root must retain no LR table");
 
         let mut actual = poisoned.start();
         let mut expected = monolithic.start();

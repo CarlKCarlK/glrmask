@@ -11880,8 +11880,7 @@ nt start ::= A B | A;
             (4, b"ba".to_vec()),
             (5, b"bb".to_vec()),
         ]);
-        // Only the parser table is used from this ordinary constraint. The
-        // dynamic constraint below substitutes a deliberately retained
+        // The dynamic constraint below substitutes a deliberately retained
         // epsilon-NFA tokenizer with the same two terminal IDs.
         let parser_source = Constraint::from_glrm_grammar(
             r#"
@@ -11896,8 +11895,17 @@ nt start ::= A | B | A A | A B | B A | B B;
         let tokenizer =
             crate::automata::lexer::tokenizer::arbitrary_epsilon_l1_test_tokenizer();
         assert!(tokenizer.has_epsilon_transitions());
+        // Temporary compiler analysis is allowed; from_parts derives native
+        // relations and drops this table before constructing the Constraint.
+        let grammar = parser_source.template_parser.as_ref().unwrap().link_grammar.as_ref().unwrap();
+        let mut table = crate::compiler::glr::table::GLRTable::build_with_default_construction(
+            &grammar.analyze(parser_source.terminal_display_names.clone()),
+            crate::compiler::glr::table::GlrTableConstruction::ExperimentalCoreMerged,
+        );
+        table.set_embedded_start_nullable(grammar.root_nullable);
+        table.set_embedded_end_token_ids(&grammar.embedded_end_token_ids);
         let mut dynamic = DynamicConstraint::from_parts(
-            parser_source.table.clone_lr(),
+            table,
             parser_source.terminal_display_names.clone(),
             tokenizer,
             None,

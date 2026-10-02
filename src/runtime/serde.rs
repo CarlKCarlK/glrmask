@@ -7068,33 +7068,11 @@ impl Constraint {
             Some(supplied_vocab.ok_or_else(|| crate::Error::Serialization(
                 "this table-free artifact requires the exact external vocabulary".into()))?)
         } else { None };
-        if !matches!(
-            version,
-            LEGACY_CONSTRAINT_VERSION
-                | PREVIOUS_COMPRESSED_CONSTRAINT_VERSION
-                | PREVIOUS_EXPRLESS_CONSTRAINT_VERSION
-                | PREVIOUS_TERMINAL_EXPRS_CONSTRAINT_VERSION
-                | PREVIOUS_DOMAIN_LABELS_CONSTRAINT_VERSION
-                | PREVIOUS_UNCOMPRESSED_CONSTRAINT_VERSION
-                | PREVIOUS_SECTIONED_CONSTRAINT_VERSION
-                | PREVIOUS_PACKED_RUNTIME_CONSTRAINT_VERSION
-                | PREVIOUS_FAST_RUNTIME_CONSTRAINT_VERSION
-                | PREVIOUS_VOCAB_SECTION_CONSTRAINT_VERSION
-                | PREVIOUS_EXTERNAL_RUNTIME_CONSTRAINT_VERSION
-                | PREVIOUS_SERIALIZATION_CURRENT_CONSTRAINT_VERSION
-                | PREVIOUS_COMBINED_CONSTRAINT_VERSION
-                | PREVIOUS_SEGMENTED_MATERIALIZATION_CONSTRAINT_VERSION
-                | PREVIOUS_BOUNDARY_SHARDLESS_CONSTRAINT_VERSION
-                | PREVIOUS_BOUNDARY_SHARDED_CONSTRAINT_VERSION
-                | PREVIOUS_RECURSIVE_PARSER_CONSTRAINT_VERSION
-                | PREVIOUS_STATIC_RESIDUAL_CONSTRAINT_VERSION
-                | PREVIOUS_STATIC_PROJECTION_CONSTRAINT_VERSION
-                | PREVIOUS_BOUNDARY_SUMMARYLESS_CONSTRAINT_VERSION
-                | CONSTRAINT_VERSION
-                | TEMPLATE_CONSTRAINT_VERSION
-            | EXTERNAL_TEMPLATE_CONSTRAINT_VERSION
-        ) {
-            let decompress_started = profile.then(std::time::Instant::now);
+        // Native-only pre-release persistence has no compatibility contract
+        // with historical LR or earlier template envelopes.
+        assert_ne!(version, CONSTRAINT_VERSION,
+            "LR-BACKED CONSTRAINT ARTIFACT LOADING IS FORBIDDEN: only native template artifacts may be loaded");
+        if !matches!(version, TEMPLATE_CONSTRAINT_VERSION | EXTERNAL_TEMPLATE_CONSTRAINT_VERSION) {
             return Err(crate::GlrMaskError::Serialization(format!(
                 "unsupported constraint artifact version {version}"
             )));
@@ -8609,8 +8587,6 @@ impl Constraint {
 mod tests {
     use super::*;
     use crate::Vocab;
-    use crate::automata::unweighted_u32::dfa::DFA as UnweightedDfa;
-    use crate::runtime::CommitTemplateDfas;
     use std::sync::Arc;
 
     #[test]
@@ -9128,8 +9104,9 @@ mod tests {
         let loaded = Constraint::load(&saved).unwrap();
         assert_eq!(loaded.start().mask(), constraint.start().mask());
 
-        let raw = bincode::serialize(&SerializedConstraint(&constraint)).unwrap();
-        assert!(Constraint::load(&raw)
+        // Raw native section bytes lack the required versioned envelope.
+        let raw = &saved[CONSTRAINT_HEADER_LEN..];
+        assert!(Constraint::load(raw)
             .unwrap_err()
             .to_string()
             .contains("header"));
@@ -9158,6 +9135,11 @@ mod tests {
             .unwrap_err()
             .to_string()
             .contains("unsupported"));
+
+        let mut lr_envelope = constraint.save();
+        lr_envelope[8..10].copy_from_slice(&CONSTRAINT_VERSION.to_le_bytes());
+        assert!(std::panic::catch_unwind(|| Constraint::load(&lr_envelope)).is_err(),
+            "a request to load the known LR artifact format must panic loudly");
     }
 
     #[test]
@@ -9374,32 +9356,33 @@ mod tests {
 
     #[test]
     fn current_constraint_artifact_preserves_static_dynamic_overlay() {
-        let mut constraint = tiny_constraint();
-        constraint.static_dynamic_overlay = Some(crate::runtime::artifact::StaticDynamicOverlayMetadata {
-            terminal_offsets: vec![0, 3, 7],
-            tokenizer_state_offsets: vec![1, 11, 29],
-            repair_terminals: vec![false, true, false, true],
-            non_parent_only_parser_states: vec![true, false, true],
-            ..Default::default()
-        });
-
+        let vocab = Vocab::new(vec![(0,b"a".to_vec()),(1,b"b".to_vec()),(2,b"ab".to_vec())]);
+        let parent = Constraint::compile(crate::Grammar::glrm(
+            "glrm 1; start root; extern grammar child; nt root = \"a\" child;"), &vocab).unwrap();
+        let child = Constraint::from_glrm_grammar("start root; nt root ::= \"b\";", &vocab).unwrap();
+        let constraint = parent.bind_grammar_dynamic_boundary("child", &child).unwrap();
         let loaded = Constraint::load(&constraint.save()).unwrap();
-        let overlay = loaded
-            .static_dynamic_overlay
-            .as_ref()
-            .expect("current artifact should preserve composition overlay metadata");
-        assert_eq!(overlay.terminal_offsets, vec![0, 3, 7]);
-        assert_eq!(overlay.tokenizer_state_offsets, vec![1, 11, 29]);
-        assert_eq!(overlay.repair_terminals, vec![false, true, false, true]);
-        assert_eq!(
-            overlay.non_parent_only_parser_states,
-            vec![true, false, true],
-        );
-        assert!(overlay.segmented_parser_components.is_empty());
-        assert!(overlay.segmented_component_union_root_dispatch.is_empty());
-        assert!(overlay.segmented_boundary_parser.is_none());
-        assert!(overlay.segmented_boundary_terminal_trie.is_none());
-        assert_eq!(loaded.start().mask(), constraint.start().mask());
+        let expected = constraint.static_dynamic_overlay.as_ref().unwrap();
+        let actual = loaded.static_dynamic_overlay.as_ref().unwrap();
+        assert_eq!(actual.terminal_offsets, expected.terminal_offsets);
+        assert_eq!(actual.tokenizer_state_offsets, expected.tokenizer_state_offsets);
+        assert_eq!(actual.repair_terminals, expected.repair_terminals);
+        assert_eq!(actual.non_parent_only_parser_states, expected.non_parent_only_parser_states);
+        assert_eq!(actual.segmented_parser_components.len(), 2);
+        assert_eq!(actual.segmented_parser_links.len(), 1);
+        assert!(actual.segmented_component_union_root_dispatch.is_empty());
+        for tokens in [vec![0,1],vec![2]] {
+            let mut reference = constraint.start();
+            let mut restored = loaded.start();
+            for token in tokens {
+                assert_eq!(reference.mask(), restored.mask());
+                reference.commit_token(token).unwrap();
+                restored.commit_token(token).unwrap();
+            }
+            assert_eq!(reference.mask(), restored.mask());
+            assert!(restored.is_accepting());
+            assert_eq!(reference.is_accepting(), restored.is_accepting());
+        }
     }
 
     #[test]
@@ -9689,32 +9672,11 @@ mod tests {
     }
 
     #[test]
-    fn v29_artifact_without_composition_metadata_loads_legacy_unknown_summary() {
-        let mut constraint = tiny_constraint();
-        constraint.composition_reset_tokens_by_terminal.clear();
-        constraint.unbound_grammar_placeholders.clear();
-        constraint.composition_parser_templates_by_terminal.clear();
-        constraint
-            .composition_parser_characterizations_by_terminal
-            .clear();
-        constraint.composition_grammar_summary = None;
-        constraint.boundary_trigger = crate::runtime::BoundaryTrigger::None;
-        let mut saved = constraint.save();
-        let (_, _, _, _, _, _, _, _, _, _, composition) =
-            v30_sections(&saved[CONSTRAINT_HEADER_LEN..]).unwrap();
-        assert!(composition.is_empty(), "legacy-empty fixture must have no CMS section");
+    fn v29_artifact_without_composition_metadata_is_rejected() {
+        let mut saved = tiny_constraint().save();
         saved[8..10].copy_from_slice(&PREVIOUS_BOUNDARY_SUMMARYLESS_CONSTRAINT_VERSION.to_le_bytes());
-        saved[CONSTRAINT_HEADER_LEN..CONSTRAINT_HEADER_LEN + 4]
-            .copy_from_slice(&V29_SECTION_MAGIC);
-
-        let loaded = Constraint::load(&saved).unwrap();
-        assert!(matches!(
-            loaded.boundary_candidate_summary.get(),
-            Some(crate::runtime::BoundaryCandidateSummary::Unknown {
-                reason: crate::runtime::SummaryUnavailable::LegacyArtifact
-            })
-        ));
-        assert_eq!(loaded.save(), saved, "unchanged v29 artifact must resave byte-for-byte");
+        let error = Constraint::load(&saved).unwrap_err().to_string();
+        assert!(error.contains("unsupported"), "{error}");
     }
 
     #[test]
@@ -9723,7 +9685,7 @@ mod tests {
         constraint.ensure_composition_reset_tokens_by_terminal();
         assert_eq!(
             constraint.composition_reset_tokens_by_terminal.len(),
-            constraint.table.num_terminals as usize,
+            constraint.parser_terminal_count() as usize,
         );
         assert!(constraint
             .composition_reset_tokens_by_terminal
@@ -9738,7 +9700,16 @@ mod tests {
             .materialize_composition_metadata_for_compilation()
             .unwrap();
         assert_eq!(loaded.composition_reset_tokens_by_terminal, expected);
-        assert_eq!(loaded.start().mask(), constraint.start().mask());
+        let mut actual = loaded.start();
+        let mut expected = constraint.start();
+        for token in [0, 1] {
+            assert_eq!(actual.mask(), expected.mask());
+            actual.commit_token(token).unwrap();
+            expected.commit_token(token).unwrap();
+        }
+        assert_eq!(actual.mask(), expected.mask());
+        assert!(actual.is_accepting());
+        assert_eq!(actual.is_accepting(), expected.is_accepting());
     }
 
     #[test]
@@ -9765,7 +9736,7 @@ mod tests {
         let constraint = tiny_constraint();
         assert_eq!(
             constraint.composition_parser_templates_by_terminal.len(),
-            constraint.table.num_terminals as usize,
+            constraint.parser_terminal_count() as usize,
         );
         assert!(constraint
             .composition_parser_templates_by_terminal
@@ -9782,7 +9753,16 @@ mod tests {
             loaded.composition_parser_templates_by_terminal,
             constraint.composition_parser_templates_by_terminal,
         );
-        assert_eq!(loaded.start().mask(), constraint.start().mask());
+        let mut actual = loaded.start();
+        let mut expected = constraint.start();
+        for token in [0, 1] {
+            assert_eq!(actual.mask(), expected.mask());
+            actual.commit_token(token).unwrap();
+            expected.commit_token(token).unwrap();
+        }
+        assert_eq!(actual.mask(), expected.mask());
+        assert!(actual.is_accepting());
+        assert_eq!(actual.is_accepting(), expected.is_accepting());
     }
 
     #[test]
@@ -9792,7 +9772,7 @@ mod tests {
             constraint
                 .composition_parser_characterizations_by_terminal
                 .len(),
-            constraint.table.num_terminals as usize,
+            constraint.parser_terminal_count() as usize,
         );
         assert!(constraint
             .composition_parser_characterizations_by_terminal
@@ -9811,7 +9791,16 @@ mod tests {
             loaded.composition_parser_characterizations_by_terminal,
             constraint.composition_parser_characterizations_by_terminal,
         );
-        assert_eq!(loaded.start().mask(), constraint.start().mask());
+        let mut actual = loaded.start();
+        let mut expected = constraint.start();
+        for token in [0, 1] {
+            assert_eq!(actual.mask(), expected.mask());
+            actual.commit_token(token).unwrap();
+            expected.commit_token(token).unwrap();
+        }
+        assert_eq!(actual.mask(), expected.mask());
+        assert!(actual.is_accepting());
+        assert_eq!(actual.is_accepting(), expected.is_accepting());
     }
 
     #[test]
@@ -9908,25 +9897,18 @@ mod tests {
     #[test]
     fn constraint_envelope_rejects_invalid_compressed_payloads() {
         let constraint = tiny_constraint();
-        let raw = bincode::serialize(&SerializedConstraint(&constraint)).unwrap();
+        let raw = bincode::serialize(&ConstraintCompositionLinkMetadataRef {
+            composition_reset_tokens_by_terminal: &constraint.composition_reset_tokens_by_terminal,
+            unbound_grammar_placeholders: &constraint.unbound_grammar_placeholders,
+            composition_grammar_summary: &constraint.composition_grammar_summary,
+            boundary_trigger: boundary_trigger_wire_ref(&constraint.boundary_trigger),
+            boundary_candidate_summary: boundary_candidate_summary_wire(&constraint),
+        }).unwrap();
         let compressed = zstd::bulk::compress(&raw, CONSTRAINT_COMPRESSION_LEVEL).unwrap();
-
-        let mut wrong_raw_len = Vec::with_capacity(8 + compressed.len());
-        wrong_raw_len.extend_from_slice(&((raw.len() + 1) as u64).to_le_bytes());
-        wrong_raw_len.extend_from_slice(&compressed);
-        assert!(Constraint::load(&envelope(
-            PREVIOUS_DOMAIN_LABELS_CONSTRAINT_VERSION,
-            &wrong_raw_len,
-        ))
-            .unwrap_err()
-            .to_string()
-            .contains("uncompressed"));
-
-        assert!(Constraint::load(&envelope(
-            PREVIOUS_DOMAIN_LABELS_CONSTRAINT_VERSION,
-            &[0; 8],
-        ))
-        .is_err());
+        let invalid_length = assemble_composition_metadata_split(raw.len()+1, &compressed, true, 0, &[], false);
+        assert!(decode_composition_link_metadata(&invalid_length).is_err());
+        let invalid_compression = assemble_composition_metadata_split(raw.len(), &[0; 8], true, 0, &[], false);
+        assert!(decode_composition_link_metadata(&invalid_compression).is_err());
     }
 
     #[test]
@@ -9951,20 +9933,20 @@ mod tests {
 
     #[test]
     fn constraint_roundtrip_preserves_commit_template_dfas() {
-        let mut constraint = tiny_constraint();
-        let mut pop = UnweightedDfa::new();
-        let accepted = pop.add_state();
-        pop.add_transition(pop.start_state, 7, accepted);
-        pop.set_accepting(accepted, true);
-        let template = CommitTemplateDfas {
-            pop,
-            read: UnweightedDfa::default(),
-            push: UnweightedDfa::default(),
-            pop_to_read: vec![None; 2],
-            pop_to_push: vec![None; 2],
-            read_to_push: Vec::new(),
-        };
-        constraint.template_dfas_by_terminal = vec![None, Some(Arc::new(template.clone()))];
+        use crate::template_parser::{ParserProgram, ParserDefinition, StackTemplate, StackLabel,
+            LexerDefinition, TerminalPattern, TemplateBuildOptions};
+        // Construct the relation at the native provider boundary, so its
+        // admission certificates agree with the serialized template graphs.
+        let program = ParserProgram::new(ParserDefinition {
+            stack_symbol_count: 8,
+            terminals: vec![StackTemplate::reject(), StackTemplate::rewrite([StackLabel::Symbol(7)], [])],
+            completion: StackTemplate::reject(),
+        }).unwrap();
+        let constraint = program.compile_with(&LexerDefinition::new(vec![
+            TerminalPattern::Literal(b"a".to_vec()), TerminalPattern::Literal(b"b".to_vec()),
+        ]), &Vocab::new(vec![(0,b"a".to_vec()),(1,b"b".to_vec())]), TemplateBuildOptions::default()).unwrap();
+        let template = constraint.template_dfas_by_terminal[1].as_deref().unwrap();
+        let accepted = *template.pop.states[template.pop.start_state as usize].transitions.get(&7).unwrap();
 
         let loaded = Constraint::load(&constraint.save()).expect("template artifact should load");
         let loaded_template = loaded.template_dfas_by_terminal[1]

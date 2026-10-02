@@ -14511,7 +14511,8 @@ mod dense_internal_token_mask_tests {
             },
         ];
 
-        assert!(loaded.direct_regular_wide_frontier_for_gss(&gss).is_some());
+        assert!(loaded.direct_regular_wide_frontier_for_gss(&gss).is_none(),
+            "native relations decline LR frontier memoization without materializing vocabulary");
         assert!(
             loaded.lazy_dynamic_mask_vocab.get().is_none(),
             "wide-frontier memoization must not materialize the dynamic vocab",

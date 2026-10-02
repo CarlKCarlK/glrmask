@@ -3893,13 +3893,15 @@ mod tests {
         }));
 
         let loaded_dynamic = DynamicConstraint::load(&dynamic_constraint.save()).unwrap();
-        assert!(loaded_dynamic.clone_constraints().iter().all(|constraint| {
+        assert!(loaded_dynamic.clone_constraints().iter_mut().all(|constraint| {
+            constraint.materialize_composition_link_metadata_for_compilation().unwrap();
             matches!(constraint.boundary_trigger, crate::runtime::BoundaryTrigger::Exact(_))
         }));
 
         let transfer = dynamic_constraint.clone().into_saved();
         let loaded_transfer = DynamicConstraint::load_with_vocab(&transfer, &vocab).unwrap();
-        assert!(loaded_transfer.clone_constraints().iter().all(|constraint| {
+        assert!(loaded_transfer.clone_constraints().iter_mut().all(|constraint| {
+            constraint.materialize_composition_link_metadata_for_compilation().unwrap();
             matches!(constraint.boundary_trigger, crate::runtime::BoundaryTrigger::Exact(_))
         }));
     }
@@ -4195,8 +4197,9 @@ mod tests {
             (11, b"aa".to_vec()),
             (12, b"a\"".to_vec()),
         ]);
+        let schema = r#"{"type":"string","format":"uri","minLength":1,"maxLength":5000}"#;
         let child = RuntimeConstraint::from_json_schema(
-            r#"{"type":"string","format":"uri","minLength":1,"maxLength":5000}"#,
+            schema,
             &vocab,
         )
         .unwrap();
@@ -4209,26 +4212,40 @@ mod tests {
             &vocab,
         )
         .unwrap();
-        // A virtual-residual child cannot take a static shard: requesting
-        // static must decline loudly, never silently succeed as dynamic.
-        assert!(
-            parent.bind_grammar("payload", &child).is_err(),
-            "static bind of a virtual-residual child must decline loudly",
-        );
+        let static_bound = parent.bind_grammar("payload", &child).unwrap();
+        assert!(static_bound.static_dynamic_overlay.as_ref().unwrap()
+            .segmented_boundary_shards.iter().all(|shard| !matches!(
+                shard.backend, crate::runtime::SegmentedBoundaryShardBackend::DynamicDirect)));
+        let static_loaded = RuntimeConstraint::load(&static_bound.save()).unwrap();
         let bound = parent
             .bind_grammar_dynamic_boundary("payload", child)
             .unwrap();
         let loaded = RuntimeConstraint::load(&bound.save()).unwrap();
+        let child_source = crate::dump_json_schema_grammar_glrm(schema).unwrap();
+        let named = crate::grammar::glrm::from_glrm_with_inline_subgrammars(
+            "glrm 1; start document; extern grammar payload; nt document = \"X\" payload \"!\";",
+            &[("payload", child_source.as_str())],
+        ).unwrap();
+        let inline = crate::import::compile_from_named_grammar(named, &vocab,
+            "virtual_uri_inline_reference", crate::compiler::glr::table::GlrTableConstruction::ExperimentalCoreMerged,
+            &[]).unwrap();
 
         let token_allowed = |mask: &[u32], token: u32| {
             mask[token as usize / 32] & (1u32 << (token % 32)) != 0
         };
-        for constraint in [&bound, &loaded] {
+        for constraint in [&static_bound, &static_loaded, &bound, &loaded] {
             let mut state = constraint.start();
+            let mut reference = inline.start();
+            assert_eq!(state.mask(), reference.mask());
             assert!(token_allowed(&state.mask(), 9));
             state.commit_token(9).unwrap();
+            reference.commit_token(9).unwrap();
+            assert_eq!(state.mask(), reference.mask());
             assert!(token_allowed(&state.mask(), 10));
             state.commit_token(10).unwrap();
+            reference.commit_token(10).unwrap();
+            assert_eq!(state.mask(), reference.mask());
+            assert_eq!(state.is_accepting(), reference.is_accepting());
             assert!(state.is_accepting());
 
             let mut exact = constraint.start();
