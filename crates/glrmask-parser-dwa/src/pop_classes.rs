@@ -159,6 +159,33 @@ impl PopLabelClasses {
         Ok(expanded)
     }
 
+    /// Publish an already deterministic positive class predicate directly.
+    /// Its opaque labels and weights are already normalized by the shared
+    /// template compiler; repeating weighted NWA subset construction changes
+    /// storage only and can multiply equivalent conditional rows.
+    pub fn compile_positive_dwa(
+        &self, symbolic: crate::automata::weighted::dwa::DWA, edge_budget: usize,
+    ) -> Result<crate::automata::weighted::dwa::DWA, String> {
+        let started=std::time::Instant::now();
+        let count=symbolic.states().len();
+        if count==0 || count>1_000_000 || symbolic.start_state() as usize>=count
+            || symbolic.num_transitions()>edge_budget {
+            return Err("positive class DWA exceeds its coordinate or representation budget".into());
+        }
+        for row in symbolic.states() {for (label,target,_) in row.transitions.entries() {
+            if label<0 || !((label as u32)<self.symbols || self.exclusion(label).is_some())
+                || target as usize>=count {
+                return Err("positive class DWA contains an invalid consuming transition".into());
+            }
+        }}
+        let result=crate::parser_dwa::determinize_parser_dwa_with_pop_classes(&symbolic,self,edge_budget)?;
+        if std::env::var_os("GLRMASK_PROFILE_COMPILE_SUMMARY").is_some() {
+            eprintln!("[glrmask/profile][pop_class_direct_publication] input_states={count} input_edges={} result_states={} result_edges={} classes={} elapsed_ms={:.3}",
+                symbolic.num_transitions(),result.num_states(),result.num_transitions(),self.len(),started.elapsed().as_secs_f64()*1000.0);
+        }
+        Ok(result)
+    }
+
     /// Compile finite class substitution inside the existing weighted subset
     /// kernel, without expanding every NWA/DWA edge across the stack alphabet.
     /// The returned DEFAULT rows are exact complete derivatives, not the

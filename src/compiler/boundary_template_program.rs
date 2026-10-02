@@ -159,7 +159,7 @@ fn compile_shared_classed(
         }).collect();
     }
     let phase=Instant::now();
-    let parser_dwa=classes.compile_positive_with_minimizer(symbolic.to_nwa(),8_000_000,minimize_symbolic_class_boundary).ok()?;
+    let parser_dwa=classes.compile_positive_dwa(symbolic,8_000_000).ok()?;
     if std::env::var_os("GLRMASK_PROFILE_COMPILE_SUMMARY").is_some() {
         eprintln!("[glrmask/profile][native_compact_template_program] selected=true context={} templates={} instances={} coefficients={} prepare_ms={prepare_ms:.3} class_ms={:.3} total_ms={:.3} native={profile:?} minimize={min_profile:?}",
             context.is_some(),refs.len(),instances.len(),coefficients.len(),phase.elapsed().as_secs_f64()*1000.0,started.elapsed().as_secs_f64()*1000.0);

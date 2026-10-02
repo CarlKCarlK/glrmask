@@ -308,3 +308,40 @@ fn class_derivatives_match_concrete_expansion_over_complete_alphabet_exceptions(
         assert_eq!(accepted(&result, &stack), accepted(&reference, &stack));
     }
 }
+
+#[test]
+fn direct_dwa_publication_matches_literal_class_paths_with_overlap_dead_guards_and_cycles() {
+    // Symbol 3 is foreign to every local class, but valid in the global stack alphabet.
+    let mut classes=PopLabelClasses::new(4).unwrap();
+    let first=classes.intern_scoped_complement(1..3,[2]).unwrap().unwrap();
+    let overlap=classes.intern_scoped_complement(0..3,[0]).unwrap().unwrap();
+    let deep=classes.intern_scoped_complement(1..3,[1]).unwrap().unwrap();
+    let mut source=DWA::from_parts(vec![Default::default();4],0);
+    source.add_transition(0,first,1,weight(3));
+    source.add_transition(0,overlap,2,weight(2));
+    source.add_transition(0,2,3,Weight::empty());
+    source.set_final_weight(1,weight(1));
+    source.add_transition(1,2,0,weight(3));
+    source.add_transition(2,deep,3,weight(2));source.set_final_weight(3,weight(2));
+    let raw=source.to_nwa();
+    let result=classes.compile_positive_dwa(source,10000).unwrap();
+    for stack in all_stacks(5).into_iter().chain([vec![3],vec![3,1],vec![3,2],vec![0,2]]) {
+        assert_eq!(accepted(&result,&stack),literal(&raw,&classes,&stack),"stack={stack:?}");
+    }
+    let reference=classes.compile_positive(raw,10000).unwrap();
+    let comparison=crate::parser_equivalence::compare_parser_mask_prefix_languages(&reference,&result,4,10000).unwrap();
+    assert!(comparison.difference.is_none(),"{:?}",comparison.difference);
+}
+
+#[test]
+fn direct_dwa_publication_rejects_negative_push_unknown_labels_and_budget_refusal() {
+    let classes=PopLabelClasses::new(3).unwrap();
+    for label in [encode_negative_label(0),DEFAULT_LABEL,7] {
+        let mut source=DWA::from_parts(vec![Default::default();2],0);
+        source.add_transition(0,label,1,weight(3));source.set_final_weight(1,weight(3));
+        assert!(classes.compile_positive_dwa(source,10000).is_err());
+    }
+    let mut source=DWA::from_parts(vec![Default::default();2],0);
+    source.add_transition(0,1,1,weight(3));source.set_final_weight(1,weight(3));
+    assert!(classes.compile_positive_dwa(source,0).is_err());
+}
