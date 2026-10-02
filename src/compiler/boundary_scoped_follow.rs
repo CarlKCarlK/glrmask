@@ -73,6 +73,36 @@ pub fn scoped_follow_relation(
     Some(result)
 }
 
+/// Shared scoped-ignore rejection proof for every composition backend.
+/// Preserve the existing ignore-incident projection and exact delta check.
+pub(crate) fn optimized_scoped_follow_relation(grammar: &AnalyzedGrammar,
+    counts: &[usize], labels: &[Vec<u32>]) -> Option<BTreeMap<u32, BitSet>> {
+    let reference = || {
+        let mut relation = scoped_follow_relation(grammar, counts, labels);
+        if let Some(relation) = relation.as_mut() {
+            let ignored = labels.iter().flatten().copied().collect::<std::collections::BTreeSet<_>>();
+            for (&previous, blocked) in relation.iter_mut() {
+                if !ignored.contains(&previous) {
+                    for next in 0..grammar.num_terminals {
+                        if !ignored.contains(&next) { blocked.clear(next as usize); }
+                    }
+                }
+            }
+            relation.retain(|_, blocked| !blocked.is_zero());
+        }
+        relation
+    };
+    let candidate = crate::compiler::boundary_env::enabled("GLRMASK_BOUNDARY_SCOPED_FOLLOW_DELTA")
+        .then(|| super::boundary_scoped_follow_delta::scoped_ignore_follow_relation(grammar, counts, labels)).flatten();
+    if let Some(candidate) = candidate {
+        if std::env::var_os("GLRMASK_VALIDATE_BOUNDARY_SCOPED_FOLLOW_DELTA").is_some() {
+            assert_eq!(Some(&candidate), reference().as_ref(),
+                "ignore-delta differs from unchanged padded grammar relation");
+        }
+        Some(candidate)
+    } else { reference() }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

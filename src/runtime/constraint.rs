@@ -105,6 +105,73 @@ impl ParserComponentTableSource for RecursiveSegmentedParserTables<'_> {
     }
 }
 
+/// Slow recursive oracle: inspect immutable component relations directly,
+/// without prepared shift shortcuts or control-admission certificates.
+struct RecursiveTemplateReference<'a> {
+    parser: &'a super::parser_backend::TemplateParser,
+    composition: &'a super::parser_backend::composition::TemplateComposition,
+}
+
+impl RecursiveTemplateReference<'_> {
+    fn advance_view(
+        view: &super::parser_backend::scoped_program::ScopedProgram,
+        stack: &ParserGSS,
+    ) -> ParserGSS {
+        let input = if view.guard_owner {
+            let mut input = ParserGSS::empty();
+            for top in stack.peek_values() {
+                if view.local(top).is_some() {
+                    input = input.merge(&stack.isolate(Some(top)));
+                }
+            }
+            input
+        } else {
+            stack.clone()
+        };
+        let output = super::commit::template_advance::advance_with_template_coordinate(
+            &view.source, input, Some((view.offset, view.symbols)),
+        );
+        match view.append_push {
+            Some(symbol) => output.push(symbol),
+            None => output,
+        }
+    }
+}
+
+impl crate::compiler::glr::parser::ParserActionProvider for RecursiveTemplateReference<'_> {
+    type Symbol = u32;
+
+    fn action(&self, _: u32, _: u32) -> Option<crate::compiler::glr::parser::ProvidedAction<'_>> {
+        unreachable!("native recursive reference cannot inspect LR actions")
+    }
+    fn scope_state(&self, _: u32, _: u32) -> Option<u32> {
+        unreachable!("native recursive reference already uses scoped symbols")
+    }
+    fn goto_target(&self, _: u32, _: u32, _: u32) -> Option<(u32, bool)> {
+        unreachable!("native recursive reference cannot inspect LR gotos")
+    }
+    fn state_count_hint(&self) -> usize { self.parser.state_count as usize }
+    fn control_symbols(&self, _: u32, out: &mut SmallVec<[u32; 4]>) {
+        // Enumerate every explicit crossing; the exact interpreter decides
+        // feasibility, independently of the production top certificates.
+        out.extend((self.composition.control_start..self.composition.views.len() as u32)
+            .map(|index| self.parser.terminal_count + index));
+    }
+    fn advance_relation(&self, stack: &ParserGSS, terminal: u32) -> Option<ParserGSS> {
+        let view = if terminal < self.parser.terminal_count {
+            self.composition.outer_views.get(terminal as usize)
+        } else if terminal != crate::compiler::glr::analysis::EOF {
+            self.composition.views.get((terminal - self.parser.terminal_count) as usize)
+        } else { None };
+        Some(view.map_or_else(ParserGSS::empty, |view| Self::advance_view(view, stack)))
+    }
+    fn relation_finished(&self, stack: &ParserGSS, terminal: u32) -> Option<bool> {
+        Some(terminal == crate::compiler::glr::analysis::EOF
+            && self.composition.completion_view.as_ref()
+                .is_some_and(|view| !Self::advance_view(view, stack).is_empty()))
+    }
+}
+
 #[derive(Default)]
 struct DirectSparseWeightBufCaches {
     eligible: DirectSparseWeightTokenSetCache,
@@ -1186,46 +1253,28 @@ impl Constraint {
     /// deliberately separate from ordinary constraint compilation. The trigger
     /// uses raw local tokenizer-state IDs and original model-token IDs rather
     /// than the component's whole-token TSID/token quotient. Recursive
-    /// coordinators build it from private compiler-materialized table/tokenizer
-    /// views; those flattened views are never reattached to live runtime state.
+    /// coordinators build a temporary lexical union and query their immutable
+    /// scoped template relations. No parser table is reconstructed.
     pub fn build_exact_boundary_trigger(&mut self) -> Result<(), String> {
         if matches!(self.boundary_trigger, crate::runtime::BoundaryTrigger::Exact(_)) {
             return Ok(());
         }
 
-        // Recursive coordinators deliberately keep only leaf-native runtime
-        // parser/tokenizer views. Exact-trigger construction is compiler work:
-        // it is still defined over the exact flattened component coordinate,
-        // so materialize those compiler-only views in a private clone rather
-        // than reattaching them to the live constraint. The resulting trigger
-        // remains an optional accelerator; recursive outer runtimes decline its
-        // materialized parser coordinate and fall back to exact scoped commits.
-        let dwa = if self.uses_compact_segmented_parser_runtime() {
-            let mut compiler_view = self.clone();
-            compiler_view.prepare_recursive_compiler_table_for_composition()?;
-            compiler_view.prepare_recursive_compiler_tokenizer_for_composition()?;
-            compiler_view.build_boundary_token_trigger()?;
-            let candidates = compiler_view
-                .boundary_trigger
-                .token_summary()
-                .map(|tokens| tokens.to_vec())
-                .unwrap_or_default();
-            crate::compiler::constraint_compose::build_exact_component_boundary_trigger(
-                &compiler_view,
-                &candidates,
-            )?
+        // The trigger is an optional query artifact. Components retain their
+        // own lexer and template coordinates throughout its construction.
+        self.build_boundary_token_trigger()?;
+        let candidates = if self.uses_compact_segmented_parser_runtime() {
+            // The coordinator retains its root lexer, so its leaf-only token
+            // trigger cannot certify the whole recursive interface. A checked
+            // component summary may prune; otherwise widen conservatively.
+            crate::compiler::boundary_candidates::persisted_boundary_candidate_ids(self,
+                self.late_bind_vocab.get().ok_or("exact recursive trigger requires its vocabulary")?)?
+                .unwrap_or_else(|| self.token_bytes_iter().filter(|(_, bytes)| bytes.len() >= 2)
+                    .map(|(id, _)| id).collect())
         } else {
-            self.build_boundary_token_trigger()?;
-            let candidates = self
-                .boundary_trigger
-                .token_summary()
-                .map(|tokens| tokens.to_vec())
-                .unwrap_or_default();
-            crate::compiler::constraint_compose::build_exact_component_boundary_trigger(
-                self,
-                &candidates,
-            )?
+            self.boundary_trigger.token_summary().map(|tokens| tokens.to_vec()).unwrap_or_default()
         };
+        let dwa = crate::compiler::constraint_compose::build_exact_component_boundary_trigger(self, &candidates)?;
         let Some(dwa) = dwa else {
             return Err(
                 "exact boundary trigger construction could not characterize the component parser"
@@ -1346,6 +1395,10 @@ impl Constraint {
     /// artifacts may retain their canonical bincode payload and decode it only
     /// when a later composition actually needs grammar structure.
     pub(crate) fn retained_table_rules(&self) -> Result<&[crate::grammar::flat::Rule], String> {
+        if let Some(parser) = &self.template_parser {
+            return parser.link_grammar.as_ref().map(|grammar| grammar.rules.as_ref())
+                .ok_or_else(|| "template parser has no source grammar metadata".to_owned());
+        }
         if self.deferred_table_rules_blob.is_none() {
             return Ok(&self.table.rules);
         }
@@ -1381,6 +1434,10 @@ impl Constraint {
     /// materialized compiler-oracle table; ordinary constraints use that table
     /// directly as before.
     pub(crate) fn composition_start_nullable(&self) -> Result<bool, String> {
+        if let Some(parser) = &self.template_parser {
+            return parser.embedding.as_ref().map(|embedding| embedding.nullable)
+                .ok_or_else(|| "template parser has no embedding nullability".to_owned());
+        }
         if self.uses_compact_segmented_parser_runtime() {
             if let Some(summary) = self.composition_grammar_summary.as_ref() {
                 return Ok(summary.root_nullable);
@@ -1888,6 +1945,10 @@ impl Constraint {
     /// invariant from the first/root leaf instead of the materialized composed
     /// table; ordinary constraints keep the historical direct derivation.
     pub(crate) fn composition_child_return_pop(&self) -> Result<u32, String> {
+        if let Some(parser) = &self.template_parser {
+            return parser.embedding.as_ref().map(|embedding| embedding.return_pop)
+                .ok_or_else(|| "native parser lacks a finite return convention".to_owned());
+        }
         if !self.uses_compact_segmented_parser_runtime() {
             return subgrammar_child_return_pop(&self.table, self.retained_table_rules()?);
         }
@@ -1902,6 +1963,44 @@ impl Constraint {
             .constraint_at_recursive_component_path(&root_leaf.component_path)
             .ok_or_else(|| "recursive composition root leaf does not resolve".to_owned())?;
         subgrammar_child_return_pop(&root.table, root.retained_table_rules()?)
+    }
+
+    pub(crate) fn embedded_end_token_ids(&self) -> Vec<u32> {
+        self.template_parser.as_ref().and_then(|parser| parser.link_grammar.as_ref())
+            .map(|grammar| grammar.embedded_end_token_ids.clone())
+            .expect("native parser is missing composition grammar metadata")
+    }
+
+    pub(crate) fn set_composition_end_token_ids(&mut self, ids: &[u32]) {
+        if let Some(parser) = self.template_parser.as_mut().and_then(Arc::get_mut)
+            && let Some(grammar) = parser.link_grammar.as_mut() {
+            Arc::make_mut(grammar).embedded_end_token_ids = ids.to_vec();
+        }
+    }
+
+    /// Preserve source nullability after compiler-only normalization. This
+    /// updates interface metadata and the finite nullable return relation;
+    /// it never reconstructs or materializes an LR table.
+    pub(crate) fn set_composition_start_nullable(&mut self, nullable: bool) {
+        let parser = self.template_parser.as_mut()
+            .and_then(Arc::get_mut).expect("source nullability must be set before sharing the native parser");
+        if let Some(grammar) = parser.link_grammar.as_mut() {
+            Arc::make_mut(grammar).root_nullable = nullable;
+        }
+        if let Some(embedding) = parser.embedding.as_mut() {
+            let embedding = Arc::make_mut(embedding);
+            if nullable && !embedding.nullable {
+                embedding.finish = Arc::new(crate::runtime::parser_backend::link_program::compile(&[
+                    crate::runtime::parser_backend::link_program::action_nfa(&embedding.finish)
+                        .expect("validated finite finish relation"),
+                    crate::runtime::parser_backend::link_program::nullable_return(0),
+                ]).expect("nullable return must remain finite"));
+                embedding.finish_view = crate::runtime::parser_backend::scoped_program::ScopedProgram::prepare(
+                    Arc::clone(&embedding.finish), embedding.finish_view.symbols)
+                    .expect("nullable FINISH must remain within its component");
+            }
+            embedding.nullable = nullable;
+        }
     }
 
     /// Finite tokenizer coordinate used by Static composition/link analysis.
@@ -3223,6 +3322,13 @@ impl Constraint {
         let Some(layout) = self.recursive_parser_layout()? else {
             return Ok(None);
         };
+        if let Some(parser) = &self.template_parser {
+            let composition = parser.composition.as_deref()
+                .ok_or("native recursive parser has no scoped relations")?;
+            return Ok(Some(close_provider_control_stacks(
+                &RecursiveTemplateReference { parser, composition }, stack,
+            )));
+        }
         let tables = RecursiveSegmentedParserTables {
             root: self,
             layout: &layout,
@@ -3253,6 +3359,14 @@ impl Constraint {
         let Some(layout) = self.recursive_parser_layout()? else {
             return Ok(None);
         };
+        if let Some(parser) = &self.template_parser {
+            let composition = parser.composition.as_deref()
+                .ok_or("native recursive parser has no scoped relations")?;
+            let provider = RecursiveTemplateReference { parser, composition };
+            return Ok(Some(advance_provider_control_closed_stacks(
+                &provider, stack, global_terminal,
+            )));
+        }
         let tables = RecursiveSegmentedParserTables {
             root: self,
             layout: &layout,
@@ -3286,6 +3400,14 @@ impl Constraint {
         let Some(layout) = self.recursive_parser_layout()? else {
             return Ok(None);
         };
+        if let Some(parser) = &self.template_parser {
+            let composition = parser.composition.as_deref()
+                .ok_or("native recursive parser has no scoped relations")?;
+            return Ok(Some(stacks_finished_with_provider(
+                &RecursiveTemplateReference { parser, composition }, stack,
+                crate::compiler::glr::analysis::EOF,
+            )));
+        }
         let tables = RecursiveSegmentedParserTables {
             root: self,
             layout: &layout,

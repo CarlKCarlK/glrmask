@@ -50,6 +50,15 @@ fn bitset_sole_live_terminal(matched: &BitSet, futures: &BitSet) -> Option<Termi
     only
 }
 
+// Parser admission rows may carry one additional EOF bit. Lexer futures
+// contain only ordinary terminals and have zero padding, so intersect their
+// shared words directly; EOF can never become a lexical witness.
+#[inline(always)]
+fn lexer_parser_rows_intersect(parser: &BitSet, lexer: &BitSet) -> bool {
+    debug_assert!(parser.len() == lexer.len() || parser.len() == lexer.len() + 1);
+    parser.words().iter().zip(lexer.words()).any(|(a, b)| a & b != 0)
+}
+
 trait FullWalkTransitionTable {
     type Cell: Copy;
 
@@ -122,7 +131,7 @@ trait FullWalkTransitionTable {
 
     #[inline(always)]
     fn future_intersects(&self, tokenizer: &Tokenizer, state: u32, terminals: &BitSet) -> bool {
-        !terminals.is_disjoint(tokenizer.possible_future_terminals(state))
+        lexer_parser_rows_intersect(terminals, tokenizer.possible_future_terminals(state))
     }
 
     /// Return the sole matched/future terminal at this exact walk coordinate.
@@ -913,13 +922,13 @@ impl FullWalkTransitionTable for FullWalkLazyUnion<'_> {
     #[inline(always)]
     fn future_intersects(&self, tokenizer: &Tokenizer, state: u32, terminals: &BitSet) -> bool {
         if state < self.base_state_count {
-            return !terminals.is_disjoint(tokenizer.possible_future_terminals(state));
+            return lexer_parser_rows_intersect(terminals, tokenizer.possible_future_terminals(state));
         }
         if !self.ensure_virtual_metadata(state) {
             return false;
         }
         let cache = unsafe { &*self.cache.get() };
-        !terminals.is_disjoint(&cache.metadata[self.extension_index(state)]
+        lexer_parser_rows_intersect(terminals, &cache.metadata[self.extension_index(state)]
             .as_ref().expect("virtual subset metadata missing").futures)
     }
 
@@ -1209,9 +1218,9 @@ impl FullWalkTransitionTable for FullWalkSubset16<'_> {
     #[inline(always)]
     fn future_intersects(&self, tokenizer: &Tokenizer, state: u32, terminals: &BitSet) -> bool {
         if state < self.base_state_count {
-            !terminals.is_disjoint(tokenizer.possible_future_terminals(state))
+            lexer_parser_rows_intersect(terminals, tokenizer.possible_future_terminals(state))
         } else {
-            !terminals.is_disjoint(&self.futures[self.extension_index(state)])
+            lexer_parser_rows_intersect(terminals, &self.futures[self.extension_index(state)])
         }
     }
 
@@ -1316,9 +1325,9 @@ impl FullWalkTransitionTable for FullWalkCachedSubset16<'_> {
     #[inline(always)]
     fn future_intersects(&self, tokenizer: &Tokenizer, state: u32, terminals: &BitSet) -> bool {
         if state < self.extension.base_state_count {
-            !terminals.is_disjoint(tokenizer.possible_future_terminals(state))
+            lexer_parser_rows_intersect(terminals, tokenizer.possible_future_terminals(state))
         } else {
-            !terminals.is_disjoint(&self.extension.futures[self.extension_index(state)])
+            lexer_parser_rows_intersect(terminals, &self.extension.futures[self.extension_index(state)])
         }
     }
 

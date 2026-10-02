@@ -1589,6 +1589,36 @@ pub(crate) fn build_boundary_shard_walks(
         })
 }
 
+pub(crate) fn build_boundary_shard_walks_with_support(
+    inputs: &BoundaryShardLinkInputs,
+    adjacency: Option<&BTreeMap<u32, BitSet>>,
+    prepared_first: Option<&[Option<super::boundary_precomputed_completion::PreparedSourceSpan>]>,
+) -> Option<(Vec<BuiltBoundaryShardWalk>, BoundaryShardLinkProfile)> {
+    map_boundary_shard_walks_with(inputs, &|shard| Ok(shard), adjacency, prepared_first)
+        .expect("identity boundary-walk consumer cannot fail")
+        .map(|(built, profile)| (built.into_iter().map(|(_, shard)| shard).collect(), profile))
+}
+
+pub(crate) fn apply_scoped_adjacency(shard: &mut BuiltBoundaryShardWalk,
+    relation: &BTreeMap<u32, BitSet>, terminal_count: u32) {
+    let started = Instant::now();
+    let product = if crate::compiler::boundary_env::enabled("GLRMASK_BOUNDARY_FOLLOW_ROW_QUOTIENT") {
+        tdwa::l2p::apply_boundary_follow_constraints
+    } else { tdwa::l2p::apply_explicit_follow_constraints };
+    let filtered = minimize_acyclic_owned(product(&shard.output.dwa, relation,
+        terminal_count as usize, None).dwa);
+    let candidates = boundary_accepted_tokens(&filtered, &shard.output.id_map);
+    // Retain the old nonempty-only publication contract until emptiness is
+    // independently certified by parser construction.
+    if !candidates.is_empty() {
+        shard.output.dwa = filtered;
+        shard.candidate_tokens = candidates;
+    }
+    shard.output.profile.all_input_tokens_accepted = false;
+    shard.output.profile.walk_ms += started.elapsed().as_secs_f64() * 1000.0;
+    shard.output.profile.lexical_accepted_tokens = shard.candidate_tokens.len();
+}
+
 /// Inputs for a production static boundary link over one composition.
 pub(crate) struct WalkStaticLinkInputs<'a> {
     pub parent: &'a Constraint,
@@ -1721,7 +1751,7 @@ fn validate_overlay_terminal_layout(
                 component.terminal_offset,
             ));
         }
-        let domain = component.constraint.table.num_terminals;
+        let domain = component.constraint.parser_terminal_count();
         if end.checked_sub(start) != Some(domain) {
             return Err(format!(
                 "nested link overlay component {index} interval size {} differs from its terminal domain {domain}",
@@ -1749,7 +1779,7 @@ fn map_overlay_slot_terminal(
             if global != slot {
                 continue;
             }
-            if local >= component.constraint.table.num_terminals {
+            if local >= component.constraint.parser_terminal_count() {
                 return Err(format!(
                     "nested link terminal alias maps slot {slot} outside component {index} domain",
                 ));
@@ -1773,7 +1803,7 @@ fn map_overlay_slot_terminal(
     let local = slot.checked_sub(start).ok_or_else(|| {
         format!("nested link slot terminal {slot} underflows component {owner} offset {start}")
     })?;
-    if local >= components[owner].constraint.table.num_terminals {
+    if local >= components[owner].constraint.parser_terminal_count() {
         return Err(format!(
             "nested link slot terminal {slot} lies outside component {owner} terminal domain",
         ));
@@ -1818,10 +1848,10 @@ fn resolve_expansion_slot(
             let leaf = leaves.get(sub.first).ok_or_else(|| {
                 format!("nested link leaf index {} is out of range", sub.first)
             })?;
-            if slot >= leaf.table.num_terminals {
+            if slot >= leaf.parser_terminal_count() {
                 return Err(format!(
                     "nested link slot terminal {slot} lies outside leaf table domain {}",
-                    leaf.table.num_terminals,
+                    leaf.parser_terminal_count(),
                 ));
             }
             Ok((sub.first, slot))
@@ -1896,7 +1926,7 @@ fn expand_recorded_subtree_leaves<'a>(
     if overlay.segmented_parser_components.is_empty() {
         return Err("nested link subtree has no segmented components".to_string());
     }
-    validate_overlay_terminal_layout(overlay, constraint.table.num_terminals)?;
+    validate_overlay_terminal_layout(overlay, constraint.parser_terminal_count())?;
     let first = recorder.leaves.len();
     let mut subs = Vec::with_capacity(overlay.segmented_parser_components.len());
     for component in &overlay.segmented_parser_components {
@@ -1917,7 +1947,7 @@ fn expand_recorded_subtree_leaves<'a>(
     let visit = recorder.visits.len();
     recorder.visits.push(ExpansionVisit {
         overlay,
-        node_terminals: constraint.table.num_terminals,
+        node_terminals: constraint.parser_terminal_count(),
         subs,
     });
     for link in &overlay.segmented_parser_links {
@@ -2061,7 +2091,7 @@ pub(crate) fn expand_nested_link_leaves<'a>(
     for leaf in &leaves {
         leaf_terminal_offsets.push(total);
         total = total
-            .checked_add(leaf.table.num_terminals)
+            .checked_add(leaf.parser_terminal_count())
             .ok_or_else(|| "nested link terminal domain overflow".to_string())?;
     }
     let mut top_terminal_offsets = Vec::with_capacity(children.len() + 1);
@@ -2070,7 +2100,7 @@ pub(crate) fn expand_nested_link_leaves<'a>(
         let start = leaf_terminal_offsets[range[0]];
         let size: u32 = range
             .iter()
-            .map(|&leaf| leaves[leaf].table.num_terminals)
+            .map(|&leaf| leaves[leaf].parser_terminal_count())
             .try_fold(0u32, |acc, size| {
                 acc.checked_add(size)
                     .ok_or_else(|| "nested link block size overflow".to_string())
@@ -2536,35 +2566,7 @@ pub(crate) fn build_walk_static_boundary_link(
             component.ignore_terminal.into_iter().chain(component.table.skip_terminals.iter().copied())
                 .map(|terminal| terminal + composed.terminal_offsets[owner]).collect::<BTreeSet<_>>().into_iter().collect::<Vec<_>>()
         }).collect::<Vec<_>>();
-        let reference_relation = || {
-            let mut relation = crate::compiler::boundary_scoped_follow::scoped_follow_relation(&grammar,&counts,&labels);
-            // Preserve the exact pre-existing ignore-incident projection.
-            if let Some(relation) = relation.as_mut() {
-                let ignored=labels.iter().flatten().copied().collect::<BTreeSet<_>>();
-                for (&previous,blocked) in relation.iter_mut() {
-                    if !ignored.contains(&previous) {
-                        for next in 0..grammar.num_terminals {
-                            if !ignored.contains(&next) { blocked.clear(next as usize); }
-                        }
-                    }
-                }
-                relation.retain(|_,blocked|!blocked.is_zero());
-            }
-            relation
-        };
-        let use_delta=crate::compiler::boundary_env::enabled("GLRMASK_BOUNDARY_SCOPED_FOLLOW_DELTA");
-        let candidate=use_delta.then(|| super::boundary_scoped_follow_delta::scoped_ignore_follow_relation(&grammar,&counts,&labels)).flatten();
-        let delta_selected=candidate.is_some();
-        let relation=if let Some(candidate)=candidate {
-            if std::env::var_os("GLRMASK_VALIDATE_BOUNDARY_SCOPED_FOLLOW_DELTA").is_some() {
-                assert_eq!(Some(&candidate),reference_relation().as_ref(),"ignore-delta differs from unchanged padded grammar relation");
-                eprintln!("[glrmask/validate][boundary_scoped_follow_delta] exact=true");
-            }
-            Some(candidate)
-        } else { reference_relation() };
-        if use_delta && compose_profile_enabled() {
-            eprintln!("[glrmask/profile][boundary_scoped_follow_delta] selected={delta_selected}");
-        }
+        let relation = super::boundary_scoped_follow::optimized_scoped_follow_relation(&grammar, &counts, &labels);
         if compose_profile_enabled() {
             eprintln!("[glrmask/profile][boundary_scoped_adjacency_setup] selected={} ms={:.3}",relation.is_some(),started.elapsed().as_secs_f64()*1000.0);
         }
@@ -2586,31 +2588,9 @@ pub(crate) fn build_walk_static_boundary_link(
         let adjacency_reference = (scoped_adjacent.is_some()
             && std::env::var_os("GLRMASK_VALIDATE_BOUNDARY_SCOPED_ADJACENCY").is_some()).then(|| shard.output.dwa.clone());
         if let Some(relation) = &scoped_adjacent {
-            let started = Instant::now();
-            let before_states = shard.output.dwa.num_states();
-            let before_tokens = shard.candidate_tokens.len();
-            let product = if crate::compiler::boundary_env::enabled("GLRMASK_BOUNDARY_FOLLOW_ROW_QUOTIENT"){
-                tdwa::l2p::apply_boundary_follow_constraints
-            }else{tdwa::l2p::apply_explicit_follow_constraints};
-            let filtered = product(&shard.output.dwa,relation,grammar.num_terminals as usize,None).dwa;
-            let filtered = minimize_acyclic_owned(filtered);
-            let candidates = boundary_accepted_tokens(&filtered,&shard.output.id_map);
-            // Keep the empty-case reference until its parser emptiness proof is
-            // explicitly checked; never silently erase an unsupported shard.
-            if !candidates.is_empty() {
-                shard.output.dwa = filtered;
-                shard.candidate_tokens = candidates;
-            }
-            let elapsed = started.elapsed().as_secs_f64()*1000.0;
-            // A new follow product has a new language; do not reuse the
-            // preceding query's coverage certificate after this mutation.
-            shard.output.profile.all_input_tokens_accepted = false;
-            shard.output.profile.walk_ms += elapsed;
-            shard.output.profile.lexical_accepted_tokens = shard.candidate_tokens.len();
-            if compose_profile_enabled() {
-                eprintln!("[glrmask/profile][boundary_scoped_adjacency] component={start_component} states_before={before_states} states_after={} tokens_before={before_tokens} tokens_after={} ms={elapsed:.3}",shard.output.dwa.num_states(),shard.candidate_tokens.len());
-            }
+            apply_scoped_adjacency(&mut shard, relation, grammar.num_terminals);
         }
+
         let candidates = shard.candidate_tokens.iter().copied().collect::<Vec<_>>();
         if !effective.contains(start_component) {
             return Ok(ProcessedShard {
@@ -3725,13 +3705,71 @@ fn build_walk_static_boundary_link_nested(
 
 #[cfg(test)]
 mod tests {
+    // Compiler probes construct temporary tables from pure source metadata;
+    // these tables never enter a Constraint or its native runtime.
+    fn compiler_table_fixture(constraint: &Constraint) -> GLRTable {
+        let grammar = constraint.template_parser.as_ref().unwrap().link_grammar.as_ref().unwrap();
+        let mut table = GLRTable::build_with_default_construction(
+            &grammar.analyze(constraint.terminal_display_names.clone()),
+            crate::compiler::glr::table::GlrTableConstruction::ExperimentalCoreMerged,
+        );
+        table.set_embedded_start_nullable(grammar.root_nullable);
+        table.set_embedded_end_token_ids(&grammar.embedded_end_token_ids);
+        table
+    }
+
+    fn fixture_ignores_are_globally_erasable(
+        parent: &Constraint, children: &[CompiledSubgrammarInput<'_>],
+    ) -> bool {
+        let components = std::iter::once(parent)
+            .chain(children.iter().map(|child| child.constraint)).collect::<Vec<_>>();
+        if components.iter().any(|component| {
+            let grammar = component.template_parser.as_ref().unwrap().link_grammar.as_ref().unwrap();
+            grammar.scoped_ignores.iter().flatten()
+                .any(|terminal| Some(*terminal) != component.ignore_terminal)
+        }) { return false; }
+        let expression = |component: &Constraint| component.ignore_terminal.and_then(|terminal|
+            component.retained_terminal_exprs().and_then(|exprs| exprs.get(terminal as usize)).cloned());
+        match parent.ignore_terminal {
+            None => components.iter().all(|component| component.ignore_terminal.is_none()),
+            Some(_) => expression(parent).is_some_and(|expected|
+                components.iter().all(|component| expression(component).as_ref() == Some(&expected))),
+        }
+    }
+
+    fn compiler_provider_table_fixture(
+        parent: &Constraint, children: &[CompiledSubgrammarInput<'_>],
+        terminal_offsets: &[u32], num_terminals: u32, global_ignores: bool,
+    ) -> Result<GLRTable, String> {
+        let tables = std::iter::once(parent).chain(children.iter().map(|child| child.constraint))
+            .map(compiler_table_fixture).collect::<Vec<_>>();
+        let ignores = std::iter::once(parent).chain(children.iter().map(|child| child.constraint))
+            .map(|component| (!global_ignores).then_some(component.ignore_terminal).flatten()).collect();
+        let source = LinkComponentTables { tables: tables.iter().collect(), ignores };
+        let links = build_segmented_parser_links(children)?;
+        let provider = DisjointComponentActionProvider::new(&source, &links)?;
+        let terminal_symbols = (0..num_terminals).map(|global| {
+            let owner = terminal_offsets.iter().rposition(|&offset| offset <= global)
+                .expect("fixture terminal owner");
+            let mut symbols = SmallVec::<[ScopedParserSymbol; 4]>::new();
+            symbols.push(ScopedParserSymbol::Terminal {
+                component: owner as u32, terminal: global - terminal_offsets[owner],
+            });
+            symbols
+        }).collect::<Vec<_>>();
+        let table = materialize_control_eliminated_scoped_provider_table(&provider, &terminal_symbols)?;
+        assert_eq!(table.num_terminals, num_terminals);
+        assert!(table.control_terminals.is_empty());
+        Ok(table)
+    }
+
     use super::*;
     use crate::automata::weighted_u32::terminal_automaton::TerminalAutomaton;
     use crate::compiler::constraint_compose::{
         CompiledSubgrammarInput, SegmentedBoundaryBackend,
-        component_ignores_are_globally_erasable, compose_constraints_owned_parent_segmented,
+        compose_constraints_owned_parent_segmented,
         eliminate_composed_runtime_controls, install_published_static_boundary_shards,
-        load_vocab, merged_ignore_terminals, merged_retained_terminal_exprs,
+        load_vocab, merged_retained_terminal_exprs,
         merged_terminal_display_names, publish_walk_boundary_shard_work, WalkBoundaryShardWork,
     };
     use crate::compiler::glr::analysis::AnalyzedGrammar;
@@ -3803,21 +3841,24 @@ mod tests {
         parent: &Constraint,
         children: &[CompiledSubgrammarInput<'_>],
     ) -> LowLevelComposed {
-        let global_ignores = component_ignores_are_globally_erasable(parent, children);
+        let global_ignores = fixture_ignores_are_globally_erasable(parent, children);
+        let parent_table = compiler_table_fixture(parent);
+        let child_tables = children.iter().map(|child| compiler_table_fixture(child.constraint))
+            .collect::<Vec<_>>();
         let table_inputs: Vec<SubgrammarTableInput> = children
-            .iter()
-            .map(|child| SubgrammarTableInput {
+            .iter().zip(&child_tables)
+            .map(|(child, table)| SubgrammarTableInput {
                 placeholder_terminal: child.placeholder_terminal,
                 additional_placeholder_terminals: &[],
-                table: &child.constraint.table,
+                table,
                 ignore_terminal: (!global_ignores)
                     .then_some(child.constraint.ignore_terminal)
                     .flatten(),
-                start_nullable: child.constraint.table.embedded_start_nullable(),
+                start_nullable: table.embedded_start_nullable(),
             })
             .collect();
         let mut composed = compose_subgrammar_tables(
-            &parent.table,
+            &parent_table,
             (!global_ignores).then_some(parent.ignore_terminal).flatten(),
             &table_inputs,
         )
@@ -3845,12 +3886,7 @@ mod tests {
                 merged.restore_terminal_exprs(Some(exprs)).expect("restore merged exprs");
             }
         }
-        let ignores = merged_ignore_terminals(
-            parent,
-            children,
-            &composed.terminal_offsets,
-            global_ignores,
-        );
+        let ignore_canonical = global_ignores.then_some(parent.ignore_terminal).flatten();
         assert_eq!(
             tokenizer_offsets[0], 1,
             "merged state 0 must be the fresh reset fan-out"
@@ -3860,7 +3896,7 @@ mod tests {
             tokenizer: merged,
             tokenizer_offsets,
             terminal_names,
-            ignore_canonical: ignores.canonical,
+            ignore_canonical,
         }
     }
 
@@ -3907,7 +3943,8 @@ mod tests {
             &vocab,
         )
         .unwrap();
-        let grammar = analyzed_grammar(&constraint.table, &constraint.terminal_display_names);
+        let grammar = constraint.template_parser.as_ref().unwrap().link_grammar.as_ref().unwrap()
+            .analyze(constraint.terminal_display_names.clone());
         let disallowed = compute_disallowed_follows(&grammar);
         let a = terminal_id(&constraint, "A");
         let b = terminal_id(&constraint, "B");
@@ -4230,16 +4267,11 @@ mod tests {
             Arc::make_mut(&mut component.tokenizer).restore_terminal_exprs(Some(exprs))
                 .expect("restore component terminal exprs");
         }
-        let inline_rules = component.table.rules.len();
         let retained = component.retained_table_rules().expect("decode retained rules").len();
-        if inline_rules != retained {
-            component.table.rules =
-                component.retained_table_rules().expect("decode retained rules").to_vec();
-        }
         component
             .materialize_composition_metadata_for_compilation()
             .expect("materialize composition metadata");
-        eprintln!("BOUNDARY_WALK restore {label} inline_rules={inline_rules} retained_rules={retained}");
+        eprintln!("BOUNDARY_WALK restore {label} retained_rules={retained}");
     }
 
     struct Selected10Outer {
@@ -5404,7 +5436,7 @@ mod tests {
             .collect();
         let retain_parent_non_crossing_paths = inputs
             .iter()
-            .any(|child| child.constraint.table.embedded_start_nullable());
+            .any(|child| child.constraint.composition_start_nullable().expect("child nullability"));
         let (built, profile) = build_boundary_shard_walks(&BoundaryShardLinkInputs {
             merged_tokenizer: &composed.tokenizer,
             vocab,
@@ -5438,7 +5470,7 @@ mod tests {
             build_fragment_library, build_signed_link_context, compile_signed_shard_parser,
             publish_signed_shard,
         };
-        let global_ignores = component_ignores_are_globally_erasable(parent, &inputs);
+        let global_ignores = fixture_ignores_are_globally_erasable(parent, &inputs);
         let unbound_set: std::collections::BTreeSet<TerminalID> =
             unbound_link_slot_terminals(parent, &inputs, &composed.table.terminal_offsets)
                 .expect("unbound slots")
@@ -5765,7 +5797,7 @@ mod tests {
             candidate_tokens_by_component: None,
             retain_parent_non_crossing_paths: inputs
                 .iter()
-                .any(|child| child.constraint.table.embedded_start_nullable()),
+                .any(|child| child.constraint.composition_start_nullable().expect("child nullability")),
             walk_plans: None,
         })
         .expect("walk shards");
@@ -5778,9 +5810,9 @@ mod tests {
         );
         let (splice_table, _) =
             prepare_spliced_boundary_table("divergent", &composed, &[]);
-        let global_ignores = component_ignores_are_globally_erasable(&parent, &inputs);
+        let global_ignores = fixture_ignores_are_globally_erasable(&parent, &inputs);
         let provider_table = Arc::new(
-            link_provider_boundary_table(
+            compiler_provider_table_fixture(
                 &parent,
                 &inputs,
                 &composed.table.terminal_offsets,
@@ -5877,9 +5909,9 @@ mod tests {
             additional_placeholder_terminals: &[],
             constraint: &fixture.dispatch,
         }];
-        let global_ignores = component_ignores_are_globally_erasable(&fixture.core, &children);
+        let global_ignores = fixture_ignores_are_globally_erasable(&fixture.core, &children);
         let started = Instant::now();
-        let result = link_provider_boundary_table(
+        let result = compiler_provider_table_fixture(
             &fixture.core,
             &children,
             &fixture.composed.table.terminal_offsets,
@@ -5928,18 +5960,20 @@ mod tests {
         };
         use crate::compiler::stages::templates::characterize::characterize_selected_terminals_for_terminal_count;
 
+        let core_table = compiler_table_fixture(&fixture.core);
+        let dispatch_table = compiler_table_fixture(&fixture.dispatch);
         assert_eq!(links.len(), 1, "outer link has one child link");
         let link = &links[0];
         let parent_injection = StateInjection { offset: 0 };
         let child_injection = StateInjection {
-            offset: fixture.core.table.num_states,
+            offset: core_table.num_states,
         };
         // Ordinary local transfer for core terminal 3 (the row-918 terminal).
-        let mut selected = vec![false; fixture.core.table.num_terminals as usize];
+        let mut selected = vec![false; core_table.num_terminals as usize];
         selected[3] = true;
         let characterized = characterize_selected_terminals_for_terminal_count(
-            &fixture.core.table,
-            fixture.core.table.num_terminals,
+            &core_table,
+            core_table.num_terminals,
             &selected,
         );
         let local_t3 = characterized.get(&3).expect("core terminal 3 characterizes");
@@ -5962,13 +5996,13 @@ mod tests {
             "core terminal-3 local transfer must be finite",
         );
         // Slot Entry: validate the provider-supported shape, then instantiate.
-        validate_slot_entry_shape(&fixture.core.table, link.slot_terminal)
+        validate_slot_entry_shape(&core_table, link.slot_terminal)
             .expect("outer slot supports static Entry");
-        let mut slot_selected = vec![false; fixture.core.table.num_terminals as usize];
+        let mut slot_selected = vec![false; core_table.num_terminals as usize];
         slot_selected[link.slot_terminal as usize] = true;
         let slot_characterized = characterize_selected_terminals_for_terminal_count(
-            &fixture.core.table,
-            fixture.core.table.num_terminals,
+            &core_table,
+            core_table.num_terminals,
             &slot_selected,
         );
         let local_slot = slot_characterized
@@ -6003,7 +6037,7 @@ mod tests {
         );
         // Finish export for the dispatch child under this link's policy.
         let (finish, has_local_eof_effects) =
-            instantiate_finish(&fixture.dispatch.table, link, &child_injection)
+            instantiate_finish(&dispatch_table, link, &child_injection)
                 .expect("dispatch finish transfer");
         eprintln!(
             "BOUNDARY_TRANSFER finish return_pop={} nullable={} escapes={} reduces={} nt_escapes={} nt_rereduces={} read={} push={} cycle={:?} kinds={:?} local_eof={has_local_eof_effects}",
@@ -6201,59 +6235,69 @@ mod tests {
     /// Divergent called-frame fixture through the PRODUCTION static link
     /// (milestones E/G/H at fixture scale).
     ///
-    /// Nullable bound children are OUTSIDE the signed-transfer static
-    /// linker's supported class (bounded flat closure certificate): silent
-    /// Entry/Return episodes have no uniform bound, so the link declines
-    /// loudly here instead of under-admitting. This pins that decline.
+    /// Nullable bound children use the native exact control closure. Exercise
+    /// every reachable prefix, including fused tokens and both nullable and
+    /// nonnullable completion, against the independent inline grammar.
     #[test]
-    fn nullable_static_link_declines_loudly() {
+    fn nullable_static_link_matches_dynamic_and_inline_after_reload() {
         let vocab = Vocab::new(vec![
-            (0, b"L".to_vec()),
-            (1, b"a".to_vec()),
-            (2, b"x".to_vec()),
+            (0, b"L".to_vec()), (1, b"a".to_vec()), (2, b"x".to_vec()),
+            (3, b"La".to_vec()), (4, b"ax".to_vec()), (5, b"Lx".to_vec()),
+            (6, b"Lax".to_vec()),
         ]);
-        let parent = Constraint::from_glrm_grammar(
-            r#"
-                start document;
-                t SUB ::= @token(999);
-                nt document ::= "L" SUB "x";
-            "#,
-            &vocab,
-        )
-        .unwrap();
-        let child = Constraint::from_glrm_grammar(
-            r#"
-                start child;
-                nt item ::= "a";
-                nt child ::= item?;
-            "#,
-            &vocab,
-        )
-        .unwrap();
-        assert!(
-            child.table.embedded_start_nullable(),
-            "pin fixture must stay effectively nullable",
-        );
+        let parent = Constraint::from_glrm_grammar(r#"
+            start document; t SUB ::= @token(999);
+            nt document ::= "L" SUB "x";
+        "#, &vocab).unwrap();
+        let child = Constraint::from_glrm_grammar(r#"
+            start child; nt item ::= "a"; nt child ::= item?;
+        "#, &vocab).unwrap();
+        assert!(child.composition_start_nullable().unwrap());
         let inputs = [CompiledSubgrammarInput {
             placeholder_terminal: terminal_id(&parent, "SUB"),
-            additional_placeholder_terminals: &[],
-            constraint: &child,
+            additional_placeholder_terminals: &[], constraint: &child,
         }];
-        let composed = low_level_compose(&parent, &inputs);
-        let error = match build_walk_static_boundary_link(&WalkStaticLinkInputs {
-            parent: &parent,
-            children: &inputs,
-            vocab: &vocab,
-            static_components: None,
-            expected_terminal_offsets: &composed.table.terminal_offsets,
-        }) {
-            Err(error) => error,
-            Ok(_) => panic!("nullable static links must decline loudly (general C* is future work)"),
-        };
-        assert!(
-            error.contains("nullable"),
-            "decline must name nullability, got: {error}",
-        );
+        let dynamic = compose_constraints_owned_parent_segmented(
+            parent.clone(), &inputs, &vocab, SegmentedBoundaryBackend::Dynamic,
+        ).unwrap().constraint;
+        let static_link = compose_constraints_owned_parent_segmented(
+            parent, &inputs, &vocab, SegmentedBoundaryBackend::StaticParserDwa,
+        ).unwrap().constraint;
+        let inline = Constraint::from_glrm_grammar(r#"
+            start document; nt document ::= "L" "a"? "x";
+        "#, &vocab).unwrap();
+        let reloaded = Constraint::load(&static_link.save()).unwrap();
+        let mut prefixes = vec![Vec::<u32>::new()];
+        while let Some(prefix) = prefixes.pop() {
+            let mut expected = inline.start();
+            let mut actual = static_link.start();
+            let mut direct = dynamic.start();
+            let mut loaded = reloaded.start();
+            for &token in &prefix {
+                expected.commit_token(token).unwrap();
+                actual.commit_token(token).unwrap();
+                direct.commit_token(token).unwrap();
+                loaded.commit_token(token).unwrap();
+            }
+            let mask = expected.mask();
+            assert_eq!(actual.mask(), mask, "static prefix {prefix:?}");
+            assert_eq!(direct.mask(), mask, "dynamic prefix {prefix:?}");
+            assert_eq!(loaded.mask(), mask, "loaded prefix {prefix:?}");
+            assert_eq!(actual.is_accepting(), expected.is_accepting());
+            assert_eq!(direct.is_accepting(), expected.is_accepting());
+            assert_eq!(loaded.is_accepting(), expected.is_accepting());
+            let bytes = prefix.iter().flat_map(|&token| vocab.get(token).unwrap().iter().copied())
+                .collect::<Vec<_>>();
+            assert_eq!(expected.is_accepting(), bytes == b"Lx" || bytes == b"Lax");
+            if prefix.len() >= 3 { continue; }
+            for token in 0..7u32 {
+                if mask.get(token as usize / 32)
+                    .is_some_and(|word| word & (1 << (token % 32)) != 0)
+                {
+                    let mut next = prefix.clone(); next.push(token); prefixes.push(next);
+                }
+            }
+        }
     }
 
     /// Divergent called-frame fixture through the PRODUCTION static link
@@ -6482,31 +6526,33 @@ mod tests {
             additional_placeholder_terminals: &[],
             constraint: &child,
         }];
-        let composed = low_level_compose(&parent, &inputs);
-        let link_output = {
+        let linked = {
             let _env_lock = crate::TEST_ENV_LOCK.lock().unwrap();
             let _strict = EnvVarGuard::set(
                 "GLRMASK_L2P_FIRST_BYTE_VOCAB_FACTOR_STRICT_REFERENCE",
                 "boundary_shard",
             );
-            build_walk_static_boundary_link(&WalkStaticLinkInputs {
-                parent: &parent,
-                children: &inputs,
-                vocab: &vocab,
-                static_components: None,
-                expected_terminal_offsets: &composed.table.terminal_offsets,
-            })
-            .expect("shard-scoped strict link on the divergent fixture")
+            compose_constraints_owned_parent_segmented(
+                parent, &inputs, &vocab, SegmentedBoundaryBackend::StaticParserDwa,
+            ).expect("native shard-scoped strict link on the divergent fixture").constraint
         };
-        assert!(
-            !link_output.all_dynamic,
-            "fixture link must be static, not all-dynamic",
-        );
-        assert_eq!(
-            link_output.published_shards.len(),
-            1,
-            "only the child shard crosses here",
-        );
+        let overlay = linked.static_dynamic_overlay.as_ref().expect("native static overlay");
+        assert!(!overlay.segmented_boundary_shards.is_empty(), "crossing shards must be installed");
+        assert!(overlay.segmented_boundary_shards.iter().all(|shard|
+            matches!(&shard.backend, crate::runtime::SegmentedBoundaryShardBackend::StaticParser(_))));
+        let inline = Constraint::from_glrm_grammar(r#"
+            start document; nt document ::= "L" "a" "x" | "R" "a" "y";
+        "#, &vocab).unwrap();
+        for path in [vec![], vec![2], vec![3], vec![2, 4], vec![3, 4], vec![2, 0], vec![3, 1]] {
+            let mut expected = inline.start();
+            let mut actual = linked.start();
+            for token in path.iter().copied() {
+                assert_eq!(actual.mask(), expected.mask(), "before {token} in {path:?}");
+                assert_eq!(actual.commit_token(token).is_ok(), expected.commit_token(token).is_ok());
+            }
+            assert_eq!(actual.mask(), expected.mask(), "prefix {path:?}");
+            assert_eq!(actual.is_accepting(), expected.is_accepting(), "EOF prefix {path:?}");
+        }
     }
 
     /// Nested depth-2 end-to-end fixture through the nested signed-transfer
@@ -6691,11 +6737,11 @@ mod tests {
         )
         .unwrap();
         assert!(
-            !mid.table.embedded_start_nullable(),
+            !mid.composition_start_nullable().expect("mid nullability"),
             "nested fixture mid must stay effectively nonnullable",
         );
         assert!(
-            !grandchild.table.embedded_start_nullable(),
+            !grandchild.composition_start_nullable().expect("child nullability"),
             "nested fixture grandchild must stay effectively nonnullable",
         );
         assert!(parent.ignore_terminal.is_none());
@@ -6794,9 +6840,12 @@ mod tests {
             vec![vec![0], vec![1, 0], vec![1, 1]],
             "nested runtime leaf order must be parent, mid, grandchild",
         );
-        let n_p = parent.table.num_terminals;
-        let n_m = mid.table.num_terminals;
-        let n_g = grandchild.table.num_terminals;
+        let parent_table = compiler_table_fixture(&parent);
+        let mid_table = compiler_table_fixture(&mid);
+        let grandchild_table = compiler_table_fixture(&grandchild);
+        let n_p = parent_table.num_terminals;
+        let n_m = mid_table.num_terminals;
+        let n_g = grandchild_table.num_terminals;
         let outer_overlay = outer_dyn.static_dynamic_overlay.as_ref().expect("overlay");
         assert_eq!(outer_overlay.segmented_parser_components.len(), 2);
         let mid_overlay = mid_dyn.static_dynamic_overlay.as_ref().expect("inner overlay");
@@ -6836,13 +6885,13 @@ mod tests {
         // Recursive machine splice (layout-only, never parser behavior):
         // inner splice first, then the inner composed table as one child.
         let mut splice1 = crate::compiler::glr::table::compose_subgrammar_tables_with_rules(
-            &mid.table,
+            &mid_table,
             mid.retained_table_rules().expect("mid rules"),
             None,
             &[SubgrammarTableInput {
                 placeholder_terminal: sub2_m,
                 additional_placeholder_terminals: &[],
-                table: &grandchild.table,
+                table: &grandchild_table,
                 ignore_terminal: None,
                 start_nullable: false,
             }],
@@ -6851,7 +6900,7 @@ mod tests {
         .expect("inner splice");
         eliminate_composed_runtime_controls(&mut splice1).expect("inner eliminate");
         let mut splice2 = crate::compiler::glr::table::compose_subgrammar_tables_with_rules(
-            &parent.table,
+            &parent_table,
             parent.retained_table_rules().expect("parent rules"),
             None,
             &[SubgrammarTableInput {
@@ -7055,10 +7104,10 @@ mod tests {
             additional_placeholder_terminals: &[],
             constraint: &mid_dyn,
         }];
-        let global_ignores = component_ignores_are_globally_erasable(&parent, &example_children);
+        let global_ignores = fixture_ignores_are_globally_erasable(&parent, &example_children);
         let signed_context =
             crate::compiler::boundary_transfer::build_signed_link_context_from_parts(
-                vec![&parent.table, &mid.table, &grandchild.table],
+                vec![&parent_table, &mid_table, &grandchild_table],
                 vec![None, None, None],
                 links,
                 &leaf_offsets,

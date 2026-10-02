@@ -349,7 +349,7 @@ fn byte_terminal_summary(
             tail_to_event: ByteLanguage::epsilon(),
         };
     }
-    if constraint.table.control_terminals.contains(&terminal) {
+    if constraint.parser_is_control_terminal(terminal) {
         return BytePhaseSummary {
             historical_productive: true,
             normal: ByteLanguage::epsilon(),
@@ -479,7 +479,7 @@ fn summarize_rules_module_r1(
     // Local Skip/IGNORE is modeled conservatively at module exits. This keeps
     // real ignore-before-public-event/root-return witnesses while avoiding any
     // assumption about a future parent's reset domain.
-    let mut ignore_ids = constraint.table.skip_terminals.clone();
+    let mut ignore_ids = constraint.parser_skip_terminals().clone();
     if let Some(ignore) = constraint.ignore_terminal {
         ignore_ids.insert(ignore);
     }
@@ -739,7 +739,7 @@ fn nonempty_entry_prefix_cover(expr: &Expr) -> Option<Vec<Vec<u8>>> {
 /// included even when local policy would disallow them at this entry: extra
 /// candidates are safe, whereas forgetting an inherited/global ignore is not.
 fn component_entry_prefix_cover(constraint: &Constraint) -> Option<Vec<Vec<u8>>> {
-    if constraint.table.embedded_start_nullable() {
+    if constraint.composition_start_nullable().ok()? {
         return None;
     }
     let rules = constraint.retained_table_rules().ok()?;
@@ -797,7 +797,7 @@ fn component_entry_prefix_cover(constraint: &Constraint) -> Option<Vec<Vec<u8>>>
         // coordinates. It does not constrain a future child's first bytes.
         // Special/control terminals likewise must not be treated as lexemes.
         if outward.contains(&terminal)
-            || constraint.table.control_terminals.contains(&terminal)
+            || constraint.parser_is_control_terminal(terminal)
             || constraint.special_token_terminals.iter()
                 .any(|special| special.terminal_id == terminal)
         {
@@ -818,7 +818,7 @@ fn component_entry_prefix_cover(constraint: &Constraint) -> Option<Vec<Vec<u8>>>
         if !seen.insert(component as *const Constraint as usize) {
             continue;
         }
-        for terminal in component.table.skip_terminals.iter().copied()
+        for terminal in component.parser_skip_terminals().iter().copied()
             .chain(component.ignore_terminal)
         {
             prefixes.extend(nonempty_entry_prefix_cover(
@@ -1232,7 +1232,7 @@ fn terminal_summary2(
             tail_to_event: eps,
         };
     }
-    if constraint.table.control_terminals.contains(&terminal) {
+    if constraint.parser_is_control_terminal(terminal) {
         let eps = Tail2Language::epsilon();
         return PhaseSummary2 {
             historical_productive: true,
@@ -1378,7 +1378,7 @@ pub(crate) fn build_composition_boundary_tail_r2(
     // grammar-symbol concatenation, so decline rather than risk forgetting an
     // ignore byte between the historical cut and the interface. Composition
     // automatically falls back to the sound and faster r=1 summary.
-    if parent.ignore_terminal.is_some() || !parent.table.skip_terminals.is_empty() {
+    if parent.ignore_terminal.is_some() || !parent.parser_skip_terminals().is_empty() {
         return Err("r2 interface-tail summary declines parent skip/ignore; use r1".to_owned());
     }
     let started = Instant::now();

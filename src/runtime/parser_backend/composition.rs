@@ -11,10 +11,11 @@ use crate::compiler::glr::analysis::EOF;
 use crate::compiler::glr::parser::{ParserActionProvider, ParserGSS, ProvidedAction};
 use crate::compiler::glr::table::GLRTable;
 use crate::runtime::artifact::TemplateDfasByTerminal;
-use crate::runtime::commit::template_advance::advance_prepared_relation;
-use crate::runtime::FastCommitTemplateDfas;
+use super::scoped_program::ScopedProgram;
 use super::{Constraint, ParserTableStorage, TemplateParser,
-    TemplateDomain, TopAdmission, matches_gss};
+    TemplateDomain, TopAdmission};
+#[cfg(test)]
+use super::matches_gss;
 
 /// The first `control_start` programs are exact leaf-local terminal aliases.
 /// The remainder are zero-width controls. IDs are relative to the outer
@@ -23,10 +24,10 @@ use super::{Constraint, ParserTableStorage, TemplateParser,
 pub(crate) struct TemplateComposition {
     pub(crate) programs: TemplateDfasByTerminal,
     pub(crate) control_start: u32,
-    outer_programs: TemplateDfasByTerminal,
-    outer_fast: Vec<Arc<FastCommitTemplateDfas>>,
-    domains: Vec<TemplateDomain>,
-    fast: Vec<Arc<FastCommitTemplateDfas>>,
+    pub(crate) views: Vec<ScopedProgram>,
+    pub(crate) outer_views: Vec<ScopedProgram>,
+    pub(crate) completion_view: Option<ScopedProgram>,
+    domains: Vec<Arc<TemplateDomain>>,
     controls_by_top: Vec<SmallVec<[u32; 4]>>,
 }
 
@@ -45,27 +46,36 @@ impl TemplateComposition {
         {
             return Err(crate::Error::Compilation("composition control certificates exceed the resource budget".into()));
         }
-        let mut outer_fast = Vec::with_capacity(outer_programs.len());
-        for program in outer_programs {
-            let program = program.as_deref().ok_or_else(|| crate::Error::Compilation(
-                "missing outer composition program".into()))?;
-            outer_fast.push(Arc::new(FastCommitTemplateDfas::from_template(program)));
+        let prepare = |programs: &TemplateDfasByTerminal| programs.iter().map(|program| {
+            let mut view = ScopedProgram::prepare(Arc::clone(program.as_ref().ok_or_else(||
+                crate::Error::Compilation("missing composition program".into()))?), state_count)?;
+            view.guard_owner = false;
+            Ok(view)
+        }).collect::<crate::Result<Vec<_>>>();
+        Self::from_views(state_count, control_start, prepare(outer_programs)?, prepare(&programs)?, None)
+    }
+
+    pub(crate) fn from_views(state_count: u32, control_start: u32,
+        outer_views: Vec<ScopedProgram>, views: Vec<ScopedProgram>,
+        completion_view: Option<ScopedProgram>) -> crate::Result<Self> {
+        if control_start as usize > views.len() {
+            return Err(crate::Error::Compilation("invalid composition control offset".into()));
         }
-        let mut domains = Vec::with_capacity(programs.len());
-        let mut fast = Vec::with_capacity(programs.len());
-        for (index, program) in programs.iter().enumerate() {
-            let program = program.as_deref().ok_or_else(|| crate::Error::Compilation(
-                format!("missing scoped composition program {index}")))?;
-            domains.push(super::compile_domain(program)?);
-            fast.push(Arc::new(FastCommitTemplateDfas::from_template(program)));
+        if state_count as u64 * ((views.len() - control_start as usize) as u64 * 4 + 24)
+            > 256 * 1024 * 1024 {
+            return Err(crate::Error::Compilation("composition control certificates exceed resource budget".into()));
+        }
+        for view in views.iter().chain(&outer_views).chain(completion_view.iter()) {
+            view.validate_coordinate(state_count)?;
         }
         let controls_by_top = (0..state_count).map(|top| {
-            domains.iter().enumerate().skip(control_start as usize)
-                .filter_map(|(index, domain)| (domain.classify_top(top) != TopAdmission::Never)
+            views.iter().enumerate().skip(control_start as usize)
+                .filter_map(|(index, view)| (view.classify_top(top) != TopAdmission::Never)
                     .then_some(index as u32)).collect()
         }).collect();
-        Ok(Self { programs, control_start, outer_programs: outer_programs.clone(),
-            outer_fast, domains, fast, controls_by_top })
+        let programs = views.iter().map(|view| Some(Arc::clone(&view.source))).collect();
+        let domains = views.iter().map(|view| Arc::clone(&view.domain)).collect();
+        Ok(Self { programs, control_start, views, outer_views, completion_view, domains, controls_by_top })
     }
 
     pub(crate) fn has_controls(&self) -> bool {
@@ -73,35 +83,32 @@ impl TemplateComposition {
     }
 
     pub(crate) fn admits(&self, stack: &ParserGSS, index: u32) -> bool {
-        self.domains.get(index as usize).is_some_and(|domain| {
-            // The domain certificate quantifies every possible lower suffix.
-            // An exclusive concrete top can answer without traversing the GSS.
-            // Ambiguous frontiers and suffix-dependent rows use the exact
-            // existing domain interpreter, with no additional retained cache.
+        self.views.get(index as usize).is_some_and(|view| {
             if let Some(top) = stack.single_exclusive_top_value() {
-                match domain.classify_top(top) {
+                match view.classify_top(top) {
                     TopAdmission::Always => return true,
                     TopAdmission::Never => return false,
                     TopAdmission::DependsOnSuffix => {}
                 }
             }
-            matches_gss(domain, stack)
+            view.admits(stack)
         })
     }
 
+    pub(crate) fn admits_outer(&self, stack: &ParserGSS, terminal: u32) -> Option<bool> {
+        if terminal == EOF { self.completion_view.as_ref().map(|view| view.admits(stack)) }
+        else { self.outer_views.get(terminal as usize).map(|view| view.admits(stack)) }
+    }
+
     fn advance(&self, stack: &ParserGSS, index: u32) -> ParserGSS {
-        let Some(template) = self.programs.get(index as usize).and_then(Option::as_deref) else {
-            return ParserGSS::empty();
-        };
-        advance_prepared_relation(template, stack,
-            self.fast.get(index as usize).map(Arc::as_ref))
+        self.views.get(index as usize).map_or_else(ParserGSS::empty, |view| view.advance(stack))
     }
 
     pub(crate) fn report(&self) -> serde_json::Value {
         serde_json::json!({
             "scoped_terminal_relations": self.control_start,
             "control_relations": self.programs.len() - self.control_start as usize,
-            "extra_domain_states": self.domains.iter().map(TemplateDomain::state_count).sum::<usize>(),
+            "extra_domain_states": self.domains.iter().map(|domain| domain.state_count()).sum::<usize>(),
         })
     }
 }
@@ -134,10 +141,7 @@ impl ParserActionProvider for TemplateCompositionProvider<'_> {
     fn advance_relation(&self, stack: &ParserGSS, terminal: u32) -> Option<ParserGSS> {
         self.parser.record_advance();
         Some(if terminal < self.parser.terminal_count {
-            let template = self.composition.outer_programs[terminal as usize].as_deref()
-                .expect("validated outer composition template");
-            advance_prepared_relation(template, stack,
-                self.composition.outer_fast.get(terminal as usize).map(Arc::as_ref))
+            self.composition.outer_views[terminal as usize].advance(stack)
         } else if terminal != EOF {
             self.composition.advance(stack, terminal - self.parser.terminal_count)
         } else {

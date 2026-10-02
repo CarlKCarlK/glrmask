@@ -1,7 +1,7 @@
 //! Parser-independent runtime seam for finite acyclic stack transducers.
 //!
-//! The built-in frontend may use LR construction to produce this data. Once
-//! installed, however, the LR table is physically absent. Accidental accesses
+//! The built-in frontend may use temporary LR compiler analysis to produce
+//! this data before any Constraint exists. Accidental Constraint table accesses
 //! through an unported helper panic instead of silently taking a table fallback.
 //! Tokenizer execution, GSS ownership, delayed exclusions and mask generation
 //! remain in their existing shared implementations.
@@ -13,6 +13,8 @@ pub(crate) mod embedding;
 mod sparse_composition_tests;
 pub(crate) mod link;
 pub(crate) mod link_program;
+pub(crate) mod link_grammar;
+pub(crate) mod scoped_program;
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::ops::{ControlFlow, Deref, DerefMut};
@@ -112,19 +114,22 @@ impl ParserTableStorage {
     }
 }
 impl From<GLRTable> for ParserTableStorage {
-    fn from(table: GLRTable) -> Self { Self(Some(table)) }
+    #[track_caller]
+    fn from(_table: GLRTable) -> Self {
+        panic!("LR-BACKED CONSTRAINT MATERIALIZATION IS FORBIDDEN: derive templates from compiler parts before constructing or loading a Constraint")
+    }
 }
 impl Deref for ParserTableStorage {
     type Target = GLRTable;
     #[track_caller]
     fn deref(&self) -> &GLRTable {
-        self.0.as_ref().expect("LR TABLE ACCESS IN TEMPLATE-ONLY MODE: route this operation through the parser backend")
+        panic!("LR CONSTRAINT RUNTIME ACCESS IS FORBIDDEN: route this operation through native parser programs")
     }
 }
 impl DerefMut for ParserTableStorage {
     #[track_caller]
     fn deref_mut(&mut self) -> &mut GLRTable {
-        self.0.as_mut().expect("LR TABLE MUTATION IN TEMPLATE-ONLY MODE")
+        panic!("LR CONSTRAINT TABLE MUTATION IS FORBIDDEN")
     }
 }
 
@@ -163,8 +168,9 @@ pub(crate) struct TemplateParser {
     pub(crate) completion_template: Arc<CommitTemplateDfas>,
     pub(crate) composition: Option<Arc<composition::TemplateComposition>>,
     pub(crate) embedding: Option<Arc<embedding::TemplateEmbedding>>,
-    domains: Vec<TemplateDomain>,
-    completion: TemplateDomain,
+    pub(crate) link_grammar: Option<Arc<link_grammar::LinkGrammar>>,
+    domains: Vec<Arc<TemplateDomain>>,
+    completion: Arc<TemplateDomain>,
     /// Possible is an upper bound over every lower stack suffix; unconditional
     /// is an exact certificate independent of the lower suffix. Both are
     /// derived from input-domain automata, not copied from LR rows.
@@ -182,9 +188,116 @@ pub(crate) struct TemplateParser {
 pub(crate) struct PreparedTemplateParser {
     source_state_count: u32,
     source_terminal_count: u32,
-    templates: Vec<Option<Arc<CommitTemplateDfas>>>,
-    runtime: crate::runtime::artifact::FastTemplateDfasByTerminal,
-    parser: TemplateParser,
+    pub(crate) templates: Vec<Option<Arc<CommitTemplateDfas>>>,
+    pub(crate) runtime: crate::runtime::artifact::FastTemplateDfasByTerminal,
+    pub(crate) parser: TemplateParser,
+}
+
+impl PreparedTemplateParser {
+    /// Derive executable templates from construction-only compiler parts.
+    /// No Constraint exists while this temporary table is inspected.
+    pub(crate) fn from_compiler_parts(
+        table: &GLRTable,
+        direct_regular: Option<&DirectRegularAutomaton>,
+        retained_templates: &[Option<DFA>],
+        ignore: Option<u32>,
+        dynamic: bool,
+        preserve_coordinate: bool,
+    ) -> crate::Result<Self> {
+        let terminal_count = table.num_terminals;
+        let sparse_regular = direct_regular.is_some() && table.num_rules == 0 && table.action.is_empty();
+        let (templates, completion, state_count) = if sparse_regular {
+            sparse_regular_templates(direct_regular.unwrap(), terminal_count)?
+        } else {
+            let retained = if !dynamic
+                && retained_templates.len() == terminal_count as usize
+            {
+                retained_templates
+            } else {
+                &[]
+            };
+            let selected = (0..terminal_count as usize)
+                .map(|terminal| retained.get(terminal).is_none_or(Option::is_none))
+                .collect::<Vec<_>>();
+            let raw = if selected.iter().any(|&missing| missing) {
+                let characterizations = try_characterize_selected_terminals_for_terminal_count(
+                    &table, terminal_count, &selected,
+                ).map_err(crate::Error::Compilation)?;
+                Templates::dfas_from_characterizations(&characterizations)
+            } else {
+                std::collections::BTreeMap::new()
+            };
+            let templates = if dynamic {
+                // Dynamic preparation owns the full raw inventory. Each
+                // terminal can be transformed independently on the compile
+                // pool; complete equivalence checks still run for every row.
+                compile_terminal_template_rows(raw, terminal_count)?
+            } else {
+                let mut rebuilt = raw.into_iter();
+                let mut templates = vec![None; terminal_count as usize];
+                for terminal in 0..terminal_count {
+                    let input = match retained.get(terminal as usize).and_then(Option::as_ref) {
+                        Some(dfa) => std::borrow::Cow::Borrowed(dfa),
+                        None => {
+                            let (rebuilt_terminal, dfa) = rebuilt.next().ok_or_else(||
+                                crate::Error::Compilation(format!(
+                                    "missing complete template for terminal {terminal}; refusing table fallback"
+                                )))?;
+                            if rebuilt_terminal != terminal {
+                                return Err(crate::Error::Compilation(format!(
+                                    "template inventory mismatch for terminal {terminal}: found {rebuilt_terminal}"
+                                )));
+                            }
+                            std::borrow::Cow::Owned(dfa)
+                        }
+                    };
+                    let dfa = specialize_template_dfa_defaults_for_commit_split_input(input.as_ref());
+                    let split = try_split_commit_template_dfas(&dfa).ok_or_else(|| crate::Error::Compilation(format!("terminal {terminal} template is not acyclic pop/read/push; refusing table fallback")))?;
+                    templates[terminal as usize] = Some(Arc::new(split));
+                    // Reconstructed inputs are owned by this iteration, preserving
+                    // the original conversion path's prompt release of each raw
+                    // DFA rather than retaining the whole rebuilt inventory.
+                }
+                if rebuilt.next().is_some() {
+                    return Err(crate::Error::Compilation(
+                        "unexpected extra reconstructed terminal template".into()
+                    ));
+                }
+                templates
+            };
+            let completion = glrmask_parser_dwa::__private::templates::completion::compile_completion_template(&table)
+                .map_err(crate::Error::Compilation)?;
+            (templates, completion, table.num_states)
+        };
+        if preserve_coordinate && state_count != table.num_states {
+            return Err(crate::Error::Compilation("template conversion would change a composed parser's stack coordinate".into()));
+        }
+        let (mut parser, runtime) = TemplateParser::compile_with_runtime(
+            state_count, terminal_count, table.skip_terminals.clone(), &templates, completion,
+        )?;
+        // Not every standalone provider/legacy table has the finite canonical
+        // embedding contract. Such a parser remains runnable, but linking it
+        // returns an explicit error instead of reconstructing a table.
+        if sparse_regular {
+            // This built-in frontend keeps exactly one symbol per frame and
+            // its generated completion relation POPs that symbol. Unlike an
+            // arbitrary provider's predicate, this is the actual return action.
+            parser.embedding = Some(Arc::new(embedding::TemplateEmbedding::from_sparse_regular(
+                &parser.completion_template, parser.state_count, table.embedded_start_nullable(),
+                0..terminal_count,
+            ).map_err(crate::Error::Compilation)?));
+        } else {
+            parser.embedding = crate::compiler::glr::table::subgrammar_child_return_pop(table, &table.rules).ok().and_then(|return_pop| embedding::TemplateEmbedding::from_table(table, table.embedded_start_nullable(), return_pop, (0..terminal_count).filter(|&terminal| crate::compiler::boundary_transfer::validate_slot_entry_shape(table, terminal).is_ok())).ok()).map(Arc::new);
+        }
+        parser.link_grammar = link_grammar::LinkGrammar::from_compiler_table(table, ignore).map_err(crate::Error::Compilation)?;
+        Ok(PreparedTemplateParser {
+            source_state_count: table.num_states,
+            source_terminal_count: terminal_count,
+            templates,
+            runtime,
+            parser,
+        })
+    }
 }
 
 fn compile_domain(template: &CommitTemplateDfas) -> crate::Result<TemplateDomain> {
@@ -198,7 +311,7 @@ fn prepare_terminal_domain_and_view(
     template: &Option<Arc<CommitTemplateDfas>>,
     state_count: u32,
     prepare_runtime: bool,
-) -> crate::Result<(TemplateDomain, PreparedTerminalView)> {
+) -> crate::Result<(Arc<TemplateDomain>, PreparedTerminalView)> {
     let template = template.as_deref().ok_or_else(|| {
         crate::Error::Compilation(format!("missing template for terminal {terminal}"))
     })?;
@@ -209,7 +322,7 @@ fn prepare_terminal_domain_and_view(
     let view = prepare_runtime.then(|| Arc::new(
         crate::runtime::artifact::FastCommitTemplateDfas::from_prepared(&validated)
     ));
-    Ok((domain, view))
+    Ok((Arc::new(domain), view))
 }
 
 /// Prepare independent immutable terminal programs without changing their
@@ -220,7 +333,7 @@ fn prepare_terminal_inventory(
     state_count: u32,
     prepare_runtime: bool,
     parallel: bool,
-) -> crate::Result<(Vec<TemplateDomain>, crate::runtime::artifact::FastTemplateDfasByTerminal)> {
+) -> crate::Result<(Vec<Arc<TemplateDomain>>, crate::runtime::artifact::FastTemplateDfasByTerminal)> {
     let mut domains = Vec::with_capacity(templates.len());
     let mut runtime = Vec::with_capacity(if prepare_runtime { templates.len() } else { 0 });
     if parallel && rayon::current_num_threads() > 1 {
@@ -318,15 +431,42 @@ impl TemplateParser {
         let validated = super::commit::template_prepare::TemplatePreparation::new(&completion_template)
             .map_err(crate::Error::Compilation)?;
         validated.validate_alphabet(state_count).map_err(crate::Error::Compilation)?;
-        let completion = TemplateDomain::from_validated(&validated).map_err(crate::Error::Compilation)?;
+        let completion = Arc::new(TemplateDomain::from_validated(&validated).map_err(crate::Error::Compilation)?);
         let (possible, unconditional) = top_certificate_rows(state_count, &domains, &completion);
         let profile = std::env::var_os("GLRMASK_PROFILE_TEMPLATE_BACKEND").is_some();
         Ok((Self { state_count, terminal_count, skip_terminals,
-            completion_template: Arc::new(completion_template), composition: None, embedding: None,
+            completion_template: Arc::new(completion_template), composition: None, embedding: None, link_grammar: None,
             domains, completion,
             possible, unconditional, profile,
             advances: AtomicU64::new(0), admissions: AtomicU64::new(0), completions: AtomicU64::new(0),
         }, runtime))
+    }
+
+    pub(crate) fn from_composition(state_count: u32, terminal_count: u32,
+        composition: composition::TemplateComposition) -> crate::Result<Self> {
+        if composition.outer_views.len() != terminal_count as usize {
+            return Err(crate::Error::Compilation("outer scoped inventory count mismatch".into()));
+        }
+        let completion = composition.completion_view.as_ref().ok_or_else(||
+            crate::Error::Compilation("missing scoped completion view".into()))?;
+        let mut possible = vec![BitSet::new(terminal_count as usize + 1); state_count as usize];
+        let mut unconditional = possible.clone();
+        for (terminal, view) in composition.outer_views.iter().chain(std::iter::once(completion)).enumerate() {
+            for local in 0..view.symbols {
+                let top = view.offset + local;
+                match view.classify_top(top) {
+                    TopAdmission::Never => {},
+                    TopAdmission::Always => { possible[top as usize].set(terminal); unconditional[top as usize].set(terminal); },
+                    TopAdmission::DependsOnSuffix => possible[top as usize].set(terminal),
+                }
+            }
+        }
+        Ok(Self { state_count, terminal_count, skip_terminals: BTreeSet::new(),
+            completion_template: Arc::clone(&completion.source), completion: Arc::clone(&completion.domain),
+            domains: composition.outer_views.iter().map(|view| Arc::clone(&view.domain)).collect(),
+            composition: Some(Arc::new(composition)), embedding: None, link_grammar: None,
+            possible, unconditional, profile: std::env::var_os("GLRMASK_PROFILE_TEMPLATE_BACKEND").is_some(),
+            advances: AtomicU64::new(0), admissions: AtomicU64::new(0), completions: AtomicU64::new(0) })
     }
 
     #[inline]
@@ -348,6 +488,8 @@ impl TemplateParser {
 
     fn admits_control_closed(&self, stack: &ParserGSS, terminal: TerminalID) -> bool {
         if self.profile { self.admissions.fetch_add(1, Ordering::Relaxed); }
+        if let Some(admitted) = self.composition.as_ref().and_then(|composition|
+            composition.admits_outer(stack, terminal)) { return admitted; }
         if terminal != EOF && terminal >= self.terminal_count {
             return self.composition.as_ref().is_some_and(|composition|
                 composition.admits(stack, terminal - self.terminal_count));
@@ -492,9 +634,9 @@ impl TemplateParser {
         serde_json::json!({
             "backend":"acyclic-template-dfa", "lr_table_present":false,
             "terminal_count":self.terminal_count, "stack_symbol_count":self.state_count,
-            "domain_states":self.domains.iter().map(TemplateDomain::state_count).sum::<usize>(),
-            "domain_edges":self.domains.iter().map(TemplateDomain::edge_count).sum::<usize>(),
-            "domain_heap_payload_bytes":self.domains.iter().map(TemplateDomain::heap_payload_bytes).sum::<usize>(),
+            "domain_states":self.domains.iter().map(|domain| domain.state_count()).sum::<usize>(),
+            "domain_edges":self.domains.iter().map(|domain| domain.edge_count()).sum::<usize>(),
+            "domain_heap_payload_bytes":self.domains.iter().map(|domain| domain.heap_payload_bytes()).sum::<usize>(),
             "completion_domain_states":self.completion.state_count(),
             "composition":self.composition.as_ref().map(|composition| composition.report()),
             "finite_embedding":self.embedding.is_some(),
@@ -512,8 +654,8 @@ impl TemplateParser {
 /// begin with its bitsets and patch the explicit certificate exceptions.
 fn top_certificate_rows(
     state_count: u32,
-    domains: &[TemplateDomain],
-    completion: &TemplateDomain,
+    domains: &[Arc<TemplateDomain>],
+    completion: &Arc<TemplateDomain>,
 ) -> (Vec<BitSet>, Vec<BitSet>) {
     let mut default_possible = BitSet::new(domains.len() + 1);
     let mut default_unconditional = BitSet::new(domains.len() + 1);
@@ -629,6 +771,15 @@ impl Constraint {
     pub(crate) fn parser_skip_terminals(&self) -> &BTreeSet<TerminalID> {
         self.template_parser.as_ref().map_or_else(|| &self.table.skip_terminals, |parser| &parser.skip_terminals)
     }
+    pub(crate) fn parser_is_control_terminal(&self, terminal: TerminalID) -> bool {
+        self.template_parser.as_ref().map_or_else(|| self.table.control_terminals.contains(&terminal),
+            |parser| parser.link_grammar.as_ref().is_some_and(|grammar| grammar.control_terminals.contains(&terminal)))
+    }
+    pub(crate) fn parser_control_terminals(&self) -> BTreeSet<u32> {
+        self.template_parser.as_ref().map_or_else(|| self.table.control_terminals.clone(),
+            |parser| parser.link_grammar.as_ref().map_or_else(BTreeSet::new,
+                |grammar| grammar.control_terminals.clone()))
+    }
     #[inline]
     pub(crate) fn parser_admission_policy(&self) -> AdmissionPolicy {
         if self.has_template_parser() { AdmissionPolicy::ExactSimulation } else { self.table.admission_policy }
@@ -717,98 +868,10 @@ impl Constraint {
         if self.parser_has_controls() || self.uses_compact_segmented_parser_runtime() {
             return Err(crate::Error::Compilation("template-only parser composition/control closure is not implemented; no LR fallback is permitted".into()));
         }
-        let terminal_count = self.table.num_terminals;
-        let sparse_regular = self.uses_sparse_direct_regular_runtime();
-        let (templates, completion, state_count) = if sparse_regular {
-            sparse_regular_templates(self.direct_regular_automaton.as_ref().unwrap(), terminal_count)?
-        } else {
-            let retained = if reuse_compiler_templates && !self.uses_dynamic_runtime()
-                && self.composition_parser_templates_by_terminal.len() == terminal_count as usize
-            {
-                self.composition_parser_templates_by_terminal.as_slice()
-            } else {
-                &[]
-            };
-            let selected = (0..terminal_count as usize)
-                .map(|terminal| retained.get(terminal).is_none_or(Option::is_none))
-                .collect::<Vec<_>>();
-            let raw = if selected.iter().any(|&missing| missing) {
-                let characterizations = try_characterize_selected_terminals_for_terminal_count(
-                    &self.table, terminal_count, &selected,
-                ).map_err(crate::Error::Compilation)?;
-                Templates::dfas_from_characterizations(&characterizations)
-            } else {
-                std::collections::BTreeMap::new()
-            };
-            let templates = if self.uses_dynamic_runtime() {
-                // Dynamic preparation owns the full raw inventory. Each
-                // terminal can be transformed independently on the compile
-                // pool; complete equivalence checks still run for every row.
-                compile_terminal_template_rows(raw, terminal_count)?
-            } else {
-                let mut rebuilt = raw.into_iter();
-                let mut templates = vec![None; terminal_count as usize];
-                for terminal in 0..terminal_count {
-                    let input = match retained.get(terminal as usize).and_then(Option::as_ref) {
-                        Some(dfa) => std::borrow::Cow::Borrowed(dfa),
-                        None => {
-                            let (rebuilt_terminal, dfa) = rebuilt.next().ok_or_else(||
-                                crate::Error::Compilation(format!(
-                                    "missing complete template for terminal {terminal}; refusing table fallback"
-                                )))?;
-                            if rebuilt_terminal != terminal {
-                                return Err(crate::Error::Compilation(format!(
-                                    "template inventory mismatch for terminal {terminal}: found {rebuilt_terminal}"
-                                )));
-                            }
-                            std::borrow::Cow::Owned(dfa)
-                        }
-                    };
-                    let dfa = specialize_template_dfa_defaults_for_commit_split_input(input.as_ref());
-                    let split = try_split_commit_template_dfas(&dfa).ok_or_else(|| crate::Error::Compilation(format!("terminal {terminal} template is not acyclic pop/read/push; refusing table fallback")))?;
-                    templates[terminal as usize] = Some(Arc::new(split));
-                    // Reconstructed inputs are owned by this iteration, preserving
-                    // the original conversion path's prompt release of each raw
-                    // DFA rather than retaining the whole rebuilt inventory.
-                }
-                if rebuilt.next().is_some() {
-                    return Err(crate::Error::Compilation(
-                        "unexpected extra reconstructed terminal template".into()
-                    ));
-                }
-                templates
-            };
-            let completion = glrmask_parser_dwa::__private::templates::completion::compile_completion_template(&self.table)
-                .map_err(crate::Error::Compilation)?;
-            (templates, completion, self.table.num_states)
-        };
-        if preserve_coordinate && state_count != self.table.num_states {
-            return Err(crate::Error::Compilation("template conversion would change a composed parser's stack coordinate".into()));
-        }
-        let (mut parser, runtime) = TemplateParser::compile_with_runtime(
-            state_count, terminal_count, self.table.skip_terminals.clone(), &templates, completion,
-        )?;
-        // Not every standalone provider/legacy table has the finite canonical
-        // embedding contract. Such a parser remains runnable, but linking it
-        // returns an explicit error instead of reconstructing a table.
-        if sparse_regular {
-            // This built-in frontend keeps exactly one symbol per frame and
-            // its generated completion relation POPs that symbol. Unlike an
-            // arbitrary provider's predicate, this is the actual return action.
-            parser.embedding = Some(Arc::new(embedding::TemplateEmbedding::from_sparse_regular(
-                &parser.completion_template, self.table.embedded_start_nullable(),
-                self.late_grammar_slots.iter().map(|slot| slot.terminal_id),
-            ).map_err(crate::Error::Compilation)?));
-        } else {
-            parser.embedding = embedding::TemplateEmbedding::from_constraint(self).ok().map(Arc::new);
-        }
-        Ok(PreparedTemplateParser {
-            source_state_count: self.table.num_states,
-            source_terminal_count: terminal_count,
-            templates,
-            runtime,
-            parser,
-        })
+        PreparedTemplateParser::from_compiler_parts(&self.table,
+            self.direct_regular_automaton.as_ref(),
+            if reuse_compiler_templates { &self.composition_parser_templates_by_terminal } else { &[] },
+            self.ignore_terminal, self.uses_dynamic_runtime(), preserve_coordinate)
     }
 
     pub(crate) fn install_prepared_template_parser(&mut self, prepared: PreparedTemplateParser) -> crate::Result<()> {
@@ -843,6 +906,7 @@ impl Constraint {
             Some(parser) => {
                 assert!(!self.table.is_present(), "template-only constraint retained an LR table");
                 let mut report = parser.report();
+                report["sparse_regular"] = self.direct_regular_automaton.is_some().into();
                 report["virtual_lexer"] = self.tokenizer.has_any_virtual_runtime().into();
                 if let Some(overlay) = &self.static_dynamic_overlay {
                     report["finite_observation_leaves"] = overlay.recursive_static_observation.as_ref()
@@ -954,14 +1018,16 @@ mod tests {
         reference.rebuild_dynamic_runtime_caches();
         reference.install_template_parser().unwrap();
         let mut candidate = ordinary;
-        let prepared = candidate.prepare_template_parser().unwrap().unwrap();
-        assert!(!candidate.has_template_parser());
-        assert!(candidate.table.is_present(), "preparation must not switch the active backend");
-        candidate.rebuild_dynamic_runtime_caches();
-        assert!(candidate.table.is_present(), "ordinary runtime finalization must still see the LR backend");
-        candidate.install_prepared_template_parser(prepared).unwrap();
-        assert!(!candidate.table.is_present());
+        // Compiler preparation completes before the Constraint exists.
+        // Rebuilding runtime caches must preserve the shared native programs.
+        assert!(candidate.has_template_parser() && !candidate.table.is_present());
         assert!(candidate.prepare_template_parser().unwrap().is_none());
+        let programs = candidate.template_dfas_by_terminal.clone();
+        candidate.rebuild_dynamic_runtime_caches();
+        assert!(!candidate.table.is_present());
+        for (before, after) in programs.iter().zip(&candidate.template_dfas_by_terminal) {
+            assert!(Arc::ptr_eq(before.as_ref().unwrap(), after.as_ref().unwrap()));
+        }
         let restored = Constraint::load(candidate.save()).unwrap();
         let external = Constraint::load_with_vocab(candidate.save_with_external_vocab().unwrap(), &vocab).unwrap();
         for constraint in [&candidate, &restored, &external] {
@@ -1169,10 +1235,10 @@ mod tests {
                         t
                     },
                 };
-                domains.push(compile_domain(&t).unwrap());
+                domains.push(Arc::new(compile_domain(&t).unwrap()));
             }
             for completion in [pop_word(&[0], true), pop_word(&[], true), pop_word(&[], false)] {
-                let completion = compile_domain(&completion).unwrap();
+                let completion = Arc::new(compile_domain(&completion).unwrap());
                 for state_count in [0, 1, 4, 64, 71, 129] {
                     let (possible, unconditional) = top_certificate_rows(state_count, &domains, &completion);
                     assert_eq!(possible.len(), state_count as usize);

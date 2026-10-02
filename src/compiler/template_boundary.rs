@@ -100,19 +100,35 @@ pub(crate) fn install(constraint: &mut Constraint, vocab: &Vocab) -> Result<()> 
         return Err(fail("static template lexical/parser terminal coordinates disagree"));
     }
     let component_count = constraint.static_dynamic_overlay.as_ref().unwrap().segmented_parser_components.len();
-    let candidate_tokens_by_component = constraint.static_dynamic_overlay.as_ref().unwrap()
+    let mut candidate_tokens_by_component = constraint.static_dynamic_overlay.as_ref().unwrap()
         .segmented_parser_components.iter().map(|component| {
             crate::compiler::boundary_candidates::persisted_boundary_candidate_ids(
                 &component.constraint,
                 vocab,
             )
         }).collect::<std::result::Result<Vec<_>, _>>().map_err(fail)?;
-    let candidate_tokens_by_component = candidate_tokens_by_component.iter()
-        .any(Option::is_some).then_some(candidate_tokens_by_component);
     let leaves = layout.leaves.iter().map(|leaf|
         constraint.constraint_at_recursive_component_path(&leaf.component_path)
             .ok_or_else(|| fail("static template leaf path is invalid")))
         .collect::<Result<Vec<_>>>()?;
+    let global_ignores = super::constraint_compose::leaf_ignores_are_globally_erasable(&leaves);
+    let no_ignores = leaves.iter().all(|leaf| leaf.ignore_terminal.is_none()
+        && leaf.parser_skip_terminals().is_empty());
+    if (!global_ignores || no_ignores) && certificate.is_some() {
+        let components = &constraint.static_dynamic_overlay.as_ref().unwrap().segmented_parser_components;
+        let parent = components[0].constraint.as_ref();
+        let children = components.iter().skip(1).map(|component| component.constraint.as_ref()).collect::<Vec<_>>();
+        let calls = constraint.static_dynamic_overlay.as_ref().unwrap().segmented_parser_links.iter()
+            .filter(|link| link.parent_component == 0).map(|link| link.slot_terminal).collect::<Vec<_>>();
+        if let Some(existing) = candidate_tokens_by_component[0].as_mut()
+            && let Ok(refined) = super::boundary_tail::build_root_call_candidates(parent, &children, &calls, vocab) {
+            let before = existing.len();
+            existing.retain(|id| refined.candidate_ids.binary_search(id).is_ok());
+            if profile { eprintln!("[glrmask/profile][boundary_root_call_candidates] reusable={before} filtered={}", existing.len()); }
+        }
+    }
+    let candidate_tokens_by_component = candidate_tokens_by_component.iter()
+        .any(Option::is_some).then_some(candidate_tokens_by_component);
     let projected = leaves.iter().any(|leaf| leaf.tokenizer.has_any_virtual_runtime());
     let observation = projected.then(|| crate::runtime::static_observation::RecursiveStaticObservation::prepare(
         &leaves, vocab.max_token_byte_len())).transpose().map_err(fail)?;
@@ -167,22 +183,40 @@ pub(crate) fn install(constraint: &mut Constraint, vocab: &Vocab) -> Result<()> 
                 // its caller's lexical scope. A cannot recognize the unresolved
                 // placeholder, so B must keep these same-owner paths as well.
                 // The exact control-star program below still decides viability.
-                retain_non_crossing_paths: certificate.is_none() });
+                // RETURN followed by another CALL to the same component can
+                // cross its interface without consuming a caller lexeme.
+                // Equal lexical owners therefore do not prove that a child
+                // token stayed within one invocation. Keep those candidates;
+                // the exact scoped control-star program decides viability.
+                retain_non_crossing_paths: component != 0 || certificate.is_none() });
         }
     }
-    let context = crate::template_parser::static_compile::lexical_context(layout.total_leaf_terminals);
+    let metadata = parser.link_grammar.as_deref()
+        .filter(|grammar| grammar.terminal_count == layout.total_leaf_terminals);
+    let context = metadata.map_or_else(|| crate::template_parser::static_compile::lexical_context(
+        layout.total_leaf_terminals), |grammar| grammar.analyze(constraint.terminal_display_names.clone()));
     let follow_started = std::time::Instant::now();
-    let proof_rows = super::template_follow_support::disallowed(&composition.programs,
-        layout.total_leaf_terminals as usize, 32_000_000).map_err(fail)?;
-    let mut follows = BTreeMap::new();
-    let mut excluded_pairs = 0usize;
-    for (terminal, exclusions) in proof_rows.into_iter().enumerate() {
-        if exclusions.is_empty() { continue; }
-        excluded_pairs += exclusions.len();
-        let mut row = BitSet::new(layout.total_leaf_terminals as usize);
-        for excluded in exclusions { row.set(excluded as usize); }
-        follows.insert(terminal as u32, row);
-    }
+    let follows = if metadata.is_some() {
+        super::pipeline::compute_disallowed_follows(&context)
+    } else {
+        let proof_rows = super::template_follow_support::disallowed_scoped(&composition.views,
+            layout.total_leaf_terminals as usize, 32_000_000).map_err(fail)?;
+        proof_rows.into_iter().enumerate().filter_map(|(terminal, exclusions)| {
+            if exclusions.is_empty() { return None; }
+            let mut row = BitSet::new(layout.total_leaf_terminals as usize);
+            for excluded in exclusions { row.set(excluded as usize); }
+            Some((terminal as u32, row))
+        }).collect::<BTreeMap<_, _>>()
+    };
+    let excluded_pairs = follows.values().map(BitSet::count_ones).sum::<usize>();
+    let scoped_adjacent = if !global_ignores
+        && super::boundary_env::enabled("GLRMASK_BOUNDARY_SCOPED_ADJACENCY") {
+        metadata.and_then(|grammar| super::boundary_scoped_follow::optimized_scoped_follow_relation(
+            &context, &grammar.component_nonterminals, &grammar.scoped_ignores))
+    } else { None };
+    let prepared_first = (!projected).then(|| leaves.iter().enumerate().map(|(index, leaf)|
+        super::boundary_precomputed_completion::PreparedSourceSpan::for_component(leaf,
+            tokenizer_offsets[index], layout.leaf_terminal_offsets[index])).collect::<Vec<_>>());
     if profile { eprintln!("[glrmask/profile][static_template_boundary] phase=follow_support rows={} excluded_pairs={} elapsed_ms={:.3}",
         follows.len(), excluded_pairs, follow_started.elapsed().as_secs_f64() * 1000.0); }
     let inputs = BoundaryShardLinkInputs {
@@ -193,8 +227,16 @@ pub(crate) fn install(constraint: &mut Constraint, vocab: &Vocab) -> Result<()> 
         candidate_tokens_by_component: candidate_tokens_by_component.as_deref(), retain_parent_non_crossing_paths: certificate.is_none(),
         walk_plans: Some(plans),
     };
-    let (walks, _) = super::boundary_walk::build_boundary_shard_walks(&inputs)
+    let early_adjacency = super::boundary_env::enabled("GLRMASK_BOUNDARY_SCOPED_ADJACENCY_EARLY")
+        .then_some(scoped_adjacent.as_ref()).flatten();
+    let (mut walks, _) = super::boundary_walk::build_boundary_shard_walks_with_support(&inputs,
+        early_adjacency, prepared_first.as_deref())
         .ok_or_else(|| fail("static template boundary lexical walk could not certify its scope"))?;
+    if let Some(relation) = &scoped_adjacent {
+        for walk in &mut walks {
+            super::boundary_walk::apply_scoped_adjacency(walk, relation, layout.total_leaf_terminals);
+        }
+    }
     if profile { eprintln!("[glrmask/profile][static_template_boundary] phase=lexical_done shards={} elapsed_ms={:.3}",
         walks.len(), started.elapsed().as_secs_f64() * 1000.0); }
     // A remembers a delayed lexical decision using exact leaf terminal IDs.
@@ -234,8 +276,8 @@ pub(crate) fn install(constraint: &mut Constraint, vocab: &Vocab) -> Result<()> 
     }
     if profile { eprintln!("[glrmask/profile][static_template_boundary] phase=programs_selected selected={} total={} elapsed_ms={:.3}",
         selected.len(), composition.programs.len(), started.elapsed().as_secs_f64() * 1000.0); }
-    let (templates, classes) = crate::template_parser::static_compile::prepare_classed_boundary_programs(
-        &composition.programs, parser.state_count, &selected)?;
+    let (templates, classes) = crate::template_parser::static_compile::prepare_scoped_boundary_programs(
+        &composition.views, parser.state_count, &selected)?;
     if profile { eprintln!("[glrmask/profile][static_template_boundary] phase=programs_ready templates={} pop_classes={} elapsed_ms={:.3}",
         templates.len(), classes.len(), started.elapsed().as_secs_f64() * 1000.0); }
     let mut published = Vec::with_capacity(walks.len());

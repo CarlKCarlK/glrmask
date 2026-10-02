@@ -25,6 +25,10 @@ pub(crate) struct PreparedReadShift {
 }
 
 impl PreparedReadShift {
+    pub(crate) fn symbol_for_top(&self, top: u32) -> Option<u32> {
+        self.by_top.get(i32::try_from(top).ok()?)
+    }
+
     pub(crate) fn prepare(template: &CommitTemplateDfas) -> Option<Box<Self>> {
         let pop_id = template.pop.start_state as usize;
         let pop = template.pop.states.get(pop_id)?;

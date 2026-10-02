@@ -121,7 +121,7 @@ fn every_compact_graph_phase_and_link_rejects_out_of_bounds_fields() {
             let original = fixture(optimization, external);
             let parser = &original[parser_range(&original)];
             let header = if external { 36 } else { 0 };
-            assert_eq!(&parser[header..header + 4], b"TPR2");
+            assert_eq!(&parser[header..header + 4], b"TPR6");
             let mut offset = header + 4;
             let (alphabet, _) = read_var(parser, &mut offset);
             let (terminals, _) = read_var(parser, &mut offset);
@@ -186,7 +186,9 @@ fn every_compact_graph_phase_and_link_rejects_out_of_bounds_fields() {
                     }
                 }
             }
-            assert_eq!(offset, parser.len());
+            // This public-program fixture has no recursive composition,
+            // embedding relation, or compiler grammar metadata.
+            assert_eq!(&parser[offset..], &[0, 0, 0]);
             assert!(phases_with_edges.into_iter().all(|present| present));
             assert!(links_checked > 0 && mutations.len() > 40);
             for (range, value, label) in mutations {

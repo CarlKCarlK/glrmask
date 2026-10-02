@@ -50,6 +50,15 @@ fn rename(program: &CommitTemplateDfas, offset: u32) -> CommitTemplateDfas {
         row.transitions = row.transitions.iter().map(|(&label, &target)|
             (if label == DEFAULT_LABEL { label } else { label + offset as i32 }, target)).collect();
     }}
+    // The independent oracle explicitly restricts each DEFAULT to this
+    // component; the production implementation checks its sidecar at runtime.
+    for row in &mut p.pop.states {
+        if let Some(target) = row.transitions.remove(&DEFAULT_LABEL) {
+            for symbol in offset..offset + 3 {
+                row.transitions.entry(symbol as i32).or_insert(target);
+            }
+        }
+    }
     for row in &mut p.push.states {
         row.transitions = row.transitions.iter().map(|(&label, &target)|
             (encode_negative_label(negative_to_positive_label(label) as u32 + offset), target)).collect();

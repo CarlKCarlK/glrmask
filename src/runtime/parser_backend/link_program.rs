@@ -3,7 +3,9 @@
 //! symbol: explicit dead edges continue to shadow it during determinization.
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use crate::automata::unweighted_u32::{dfa::DFA, nfa::NFA};
-use crate::compiler::glr::labels::{DEFAULT_LABEL, encode_negative_label, negative_to_positive_label};
+use crate::compiler::glr::labels::{DEFAULT_LABEL, encode_negative_label};
+#[cfg(test)]
+use crate::compiler::glr::labels::negative_to_positive_label;
 use super::CommitTemplateDfas;
 use glrmask_parser_dwa::__private::templates::compile_dfa::{
     recombine_split_commit_template_language, try_split_commit_template_dfas,
@@ -90,10 +92,11 @@ pub(crate) fn action_nfa(template: &CommitTemplateDfas) -> Result<NFA, String> {
     Ok(nfa)
 }
 
-/// Inject concrete stack labels and restrict the *initial* top to its owner.
-/// Later DEFAULT pops remain unrestricted, exactly like the existing provider.
+/// Test-only materialized oracle for the immutable scoped view. DEFAULT
+/// belongs to the component at every POP, with explicit dead edges retained.
 /// A zero-input branch gains a read-and-restore of the initial owner top; a
 /// consuming branch uses that same first pop directly. No stack is enumerated.
+#[cfg(test)]
 pub(crate) fn scoped(template: &CommitTemplateDfas, offset: u32, count: u32) -> Result<NFA, String> {
     let end = offset.checked_add(count).filter(|&end| end < DEFAULT_LABEL as u32)
         .ok_or("template link stack alphabet overflow")?;
@@ -103,7 +106,16 @@ pub(crate) fn scoped(template: &CommitTemplateDfas, offset: u32, count: u32) -> 
     for state in &mut nfa.states {
         let mut transitions = BTreeMap::new();
         for (&label, targets) in &state.transitions {
-            let label = if label == DEFAULT_LABEL { label } else {
+            if label == DEFAULT_LABEL {
+                spend(&mut work, count as usize)?;
+                for local in 0..count {
+                    if !state.transitions.contains_key(&(local as i32)) {
+                        transitions.insert((offset + local) as i32, targets.clone());
+                    }
+                }
+                continue;
+            }
+            let label = {
                 let local = if label < 0 { negative_to_positive_label(label) as u32 } else { label as u32 };
                 if local >= count { return Err("template link label lies outside component alphabet".into()); }
                 let global = offset + local;
@@ -150,47 +162,12 @@ pub(crate) fn scoped(template: &CommitTemplateDfas, offset: u32, count: u32) -> 
     Ok(nfa)
 }
 
-/// Relocate the original phase DAG when its exact input domain already
-/// enforces first-top ownership. All concrete labels are checked, including
-/// unreachable rows, so every out-of-alphabet top has the same DEFAULT
-/// behavior. One such representative therefore proves the owner restriction.
-/// Input-free and genuinely default-topped relations keep the generic guard.
-pub(crate) fn scoped_template(
-    program: &CommitTemplateDfas, offset: u32, count: u32,
-) -> Result<CommitTemplateDfas, String> {
-    offset.checked_add(count).filter(|&end| end < DEFAULT_LABEL as u32)
-        .ok_or("template link stack alphabet overflow")?;
-    let domain = super::compile_domain(program).map_err(|error| error.to_string())?;
-    for graph in [&program.pop, &program.read, &program.push] {
-        for row in &graph.states {
-            for &label in row.transitions.keys() {
-                if label == DEFAULT_LABEL { continue; }
-                let local = if label < 0 { negative_to_positive_label(label) as u32 } else { label as u32 };
-                if local >= count { return Err("template link label lies outside component alphabet".into()); }
-            }
-        }
-    }
-    use glrmask_parser_dwa::__private::templates::admissibility::DomainProbe;
-    let ownership_proved = match domain.start() {
-        DomainProbe::Reject => true,
-        DomainProbe::Accept => false,
-        DomainProbe::NeedMore(cursor) => matches!(domain.step(cursor, count), DomainProbe::Reject),
-    };
-    if !ownership_proved { return compile(&[scoped(program, offset, count)?]); }
-    let mut relocated = program.clone();
-    for graph in [&mut relocated.pop, &mut relocated.read, &mut relocated.push] {
-        for row in &mut graph.states {
-            row.transitions = row.transitions.iter().map(|(&label, &target)| {
-                let label = if label == DEFAULT_LABEL { label } else {
-                    let local = if label < 0 { negative_to_positive_label(label) as u32 } else { label as u32 };
-                    let global = offset + local;
-                    if label < 0 { encode_negative_label(global) } else { global as i32 }
-                };
-                (label, target)
-            }).collect();
-        }
-    }
-    Ok(relocated)
+/// Literal materialization exists only in the independent test oracle.
+/// The production linker retains immutable component graphs and sidecars.
+#[cfg(test)]
+pub(crate) fn scoped_template(program: &CommitTemplateDfas, offset: u32, count: u32)
+    -> Result<CommitTemplateDfas, String> {
+    compile(&[scoped(program, offset, count)?])
 }
 
 pub(crate) fn append_push(nfa: &mut NFA, symbol: u32) {
@@ -254,6 +231,11 @@ mod oracle_tests {
             for state in &mut graph.states {
                 state.transitions = state.transitions.iter().map(|(&label, &target)|
                     (if label == DEFAULT_LABEL { label } else { label + offset as i32 }, target)).collect();
+            }
+        }
+        for state in &mut result.pop.states {
+            if let Some(target) = state.transitions.remove(&DEFAULT_LABEL) {
+                for top in offset..offset + 3 { state.transitions.entry(top as i32).or_insert(target); }
             }
         }
         for state in &mut result.push.states {
@@ -403,16 +385,19 @@ mod tests {
     }
 
     #[test]
-    fn certified_owner_relocation_preserves_phase_graph_and_foreign_suffix_pops() {
-        let source = rewrite(&[1, DEFAULT_LABEL], &[2]);
-        let scoped = scoped_template(&source, 10, 3).unwrap();
-        assert_eq!(scoped.pop.states.len(), source.pop.states.len());
-        assert_eq!(scoped.read.states.len(), source.read.states.len());
-        assert_eq!(scoped.push.states.len(), source.push.states.len());
-        assert_eq!(outputs(&scoped, &[99, 11]), BTreeSet::from([vec![12]]));
-        assert_eq!(outputs(&scoped, &[77, 99, 11]), BTreeSet::from([vec![77, 12]]));
-        assert!(outputs(&scoped, &[11, 99]).is_empty());
-        assert!(outputs(&scoped, &[]).is_empty());
+    fn scoped_view_preserves_phase_graphs_and_rejects_foreign_suffix_pops() {
+        let source = std::sync::Arc::new(rewrite(&[1, DEFAULT_LABEL], &[2]));
+        let before = bincode::serialize(source.as_ref()).unwrap();
+        let view = super::super::scoped_program::ScopedProgram::prepare(source.clone(), 3).unwrap()
+            .relocated(10).unwrap();
+        assert!(std::sync::Arc::ptr_eq(&source, &view.source));
+        assert_eq!(before, bincode::serialize(view.source.as_ref()).unwrap());
+        for (word, expected) in [(vec![99, 11], BTreeSet::new()),
+            (vec![77, 99, 11], BTreeSet::new()), (vec![77, 10, 11], BTreeSet::from([vec![77, 12]]))] {
+            let input = ParserGSS::from_single_stack(word, TerminalsDisallowed::new());
+            let actual = view.advance(&input).to_stacks(128).unwrap().into_iter().map(|(word, _)| word).collect();
+            assert_eq!(expected, actual);
+        }
         assert!(scoped_template(&rewrite(&[3], &[]), 0, 3).is_err());
     }
 
@@ -454,11 +439,12 @@ mod tests {
     }
 
     #[test]
-    fn deeper_default_pops_keep_the_existing_provider_semantics() {
+    fn deeper_default_pops_require_the_same_component_scope() {
         let source = rewrite(&[DEFAULT_LABEL, DEFAULT_LABEL], &[]);
         let result = compile(&[scoped(&source, 10, 3).unwrap()]).unwrap();
-        assert_eq!(outputs(&result, &[99, 11]), BTreeSet::from([vec![]]));
-        assert_eq!(outputs(&result, &[88, 99, 11]), BTreeSet::from([vec![88]]));
+        assert!(outputs(&result, &[99, 11]).is_empty());
+        assert!(outputs(&result, &[88, 99, 11]).is_empty());
+        assert_eq!(outputs(&result, &[88, 10, 11]), BTreeSet::from([vec![88]]));
         assert!(outputs(&result, &[99, 9]).is_empty());
         assert!(outputs(&result, &[11]).is_empty());
     }

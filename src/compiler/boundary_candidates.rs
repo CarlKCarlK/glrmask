@@ -565,10 +565,10 @@ fn fingerprint(
             &bincode::serialize(exprs).map_err(|_| SummaryUnavailable::MalformedMetadata)?,
         );
         semantics.update(&constraint.ignore_terminal.unwrap_or(u32::MAX).to_le_bytes());
-        for terminal in &constraint.table.skip_terminals {
+        for terminal in constraint.parser_skip_terminals() {
             semantics.update(&terminal.to_le_bytes());
         }
-        for terminal in &constraint.table.control_terminals {
+        for terminal in &constraint.parser_control_terminals() {
             semantics.update(&terminal.to_le_bytes());
         }
         let mut semantic_specials = constraint
@@ -780,7 +780,7 @@ fn compute_summary(
             Ok(_) => {}
         }
     }
-    let mut local_skip_terminals = constraint.table.skip_terminals.clone();
+    let mut local_skip_terminals = constraint.parser_skip_terminals().clone();
     if let Some(ignore) = constraint.ignore_terminal {
         local_skip_terminals.insert(ignore);
     }
@@ -788,7 +788,7 @@ fn compute_summary(
         rules,
         outward_terminals(constraint),
         local_skip_terminals,
-        constraint.table.control_terminals.clone(),
+        constraint.parser_control_terminals(),
     ) {
         Ok(grammar) => grammar,
         Err(reason) => return (BoundaryCandidateSummary::Unknown { reason }, stats),
@@ -1109,7 +1109,7 @@ mod tests {
 
     fn assert_indexed_initial_seed_matches_bruteforce(constraint: &Constraint) {
         let rules = constraint.retained_table_rules().unwrap();
-        let mut local_skip_terminals = constraint.table.skip_terminals.clone();
+        let mut local_skip_terminals = constraint.parser_skip_terminals().clone();
         if let Some(ignore) = constraint.ignore_terminal {
             local_skip_terminals.insert(ignore);
         }
@@ -1117,7 +1117,7 @@ mod tests {
             rules,
             outward_terminals(constraint),
             local_skip_terminals,
-            constraint.table.control_terminals.clone(),
+            constraint.parser_control_terminals(),
         )
         .unwrap();
         let reset_states = constraint

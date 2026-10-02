@@ -11,8 +11,6 @@ use super::{CommitTemplateDfas, Constraint, ParserTableStorage, TemplateParser};
 use crate::automata::unweighted_u32::dfa::DFA;
 use crate::compiler::glr::labels::{DEFAULT_LABEL, negative_to_positive_label};
 
-const MAGIC: &[u8; 4] = b"TPR1";
-const NONE: u32 = u32::MAX;
 // The row certificates are derived, not trusted wire data. Reject forged
 // dimensions before allocating their Cartesian product. This is a load-time
 // resource limit, not a relaxation of any accepted template's semantics.
@@ -24,8 +22,16 @@ pub(crate) struct ParserSeed {
     skip_terminals: BTreeSet<u32>,
     completion: CommitTemplateDfas,
     programs: Option<TemplateDfasByTerminal>,
-    composition: Option<(u32, TemplateDfasByTerminal)>,
+    composition: Option<CompositionSeed>,
     embedding: Option<super::embedding::TemplateEmbedding>,
+    link_grammar: Option<Arc<super::link_grammar::LinkGrammar>>,
+}
+
+pub(super) struct CompositionSeed {
+    control_start: u32,
+    outer: Vec<super::scoped_program::ScopedProgram>,
+    scoped: Vec<super::scoped_program::ScopedProgram>,
+    completion: super::scoped_program::ScopedProgram,
 }
 
 pub(crate) fn encode(parser: &TemplateParser, templates: &TemplateDfasByTerminal) -> Vec<u8> {
@@ -35,6 +41,7 @@ pub(crate) fn encode(parser: &TemplateParser, templates: &TemplateDfasByTerminal
         assert_eq!(decoded.state_count, parser.state_count);
         assert_eq!(decoded.terminal_count, parser.terminal_count);
         assert_eq!(decoded.skip_terminals, parser.skip_terminals);
+        assert_eq!(decoded.link_grammar, parser.link_grammar);
         assert!(bincode::serialize(decoded.programs.as_ref().unwrap()).unwrap() == bincode::serialize(templates).unwrap(),
             "compact template wire changed raw graph numbering, edges, or links");
         assert!(bincode::serialize(&decoded.completion).unwrap() == bincode::serialize(&*parser.completion_template).unwrap(),
@@ -74,43 +81,7 @@ impl Input<'_> {
         self.offset = end;
         Ok(bytes.try_into().expect("checked fixed-width field"))
     }
-    fn u32(&mut self) -> Result<u32, String> { Ok(u32::from_le_bytes(self.take()?)) }
-    fn bounded_count(&mut self, minimum_item_bytes: usize) -> Result<usize, String> {
-        let count = self.u32()? as usize;
-        if count > self.bytes.len().saturating_sub(self.offset) / minimum_item_bytes {
-            return Err("template parser count exceeds remaining section".into());
-        }
-        Ok(count)
-    }
-    fn dfa(&mut self) -> Result<DFA, String> {
-        let start = self.u32()?;
-        let count = self.bounded_count(5)?;
-        let mut dfa = DFA::default();
-        dfa.start_state = start;
-        for _ in 0..count {
-            let flag = self.take::<1>()?[0];
-            if flag > 1 { return Err("invalid template acceptance flag".into()); }
-            let edges = self.bounded_count(8)?;
-            let id = dfa.add_state();
-            dfa.states[id as usize].is_accepting = flag == 1;
-            let mut previous = None;
-            for _ in 0..edges {
-                let label = i32::from_le_bytes(self.take()?);
-                let target = self.u32()?;
-                if previous.is_some_and(|old| old >= label) {
-                    return Err("template edges are not strictly ordered".into());
-                }
-                if target as usize >= count { return Err("template edge targets a missing state".into()); }
-                previous = Some(label);
-                dfa.states[id as usize].transitions.insert(label, target);
-            }
-        }
-        Ok(dfa)
-    }
-    fn links(&mut self) -> Result<Vec<Option<u32>>, String> {
-        let count = self.bounded_count(4)?;
-        (0..count).map(|_| self.u32().map(|value| (value != NONE).then_some(value))).collect()
-    }
+
 }
 
 fn validate_dimensions(state_count: u32, terminal_count: u32) -> Result<(), String> {
@@ -126,34 +97,7 @@ fn validate_dimensions(state_count: u32, terminal_count: u32) -> Result<(), Stri
 }
 
 pub(crate) fn decode(bytes: &[u8]) -> Result<ParserSeed, String> {
-    if bytes.starts_with(b"TPR2") || bytes.starts_with(b"TPR3") || bytes.starts_with(b"TPR4") { return compact::decode(bytes); }
-    let mut input = Input { bytes, offset: 0 };
-    if &input.take::<4>()? != MAGIC { return Err("invalid template parser section tag".into()); }
-    let state_count = input.u32()?;
-    let terminal_count = input.u32()?;
-    validate_dimensions(state_count, terminal_count)?;
-    let count = input.bounded_count(4)?;
-    if count > terminal_count as usize { return Err("too many template skip terminals".into()); }
-    let mut skip_terminals = BTreeSet::new();
-    let mut previous = None;
-    for _ in 0..count {
-        let terminal = input.u32()?;
-        if terminal >= terminal_count || previous.is_some_and(|old| old >= terminal) {
-            return Err("invalid or unordered template skip terminals".into());
-        }
-        skip_terminals.insert(terminal);
-        previous = Some(terminal);
-    }
-    let pop = input.dfa()?;
-    let read = input.dfa()?;
-    let push = input.dfa()?;
-    let completion = CommitTemplateDfas { pop, read, push,
-        pop_to_read: input.links()?, pop_to_push: input.links()?, read_to_push: input.links()?,
-    };
-    if input.offset != bytes.len() { return Err("trailing bytes in template parser section".into()); }
-    validate_alphabet(&completion, state_count)?;
-    super::compile_domain(&completion).map_err(|error| error.to_string())?;
-    Ok(ParserSeed { state_count, terminal_count, skip_terminals, completion, programs: None, composition: None, embedding: None })
+    compact::decode(bytes)
 }
 
 fn validate_alphabet(template: &CommitTemplateDfas, state_count: u32) -> Result<(), String> {
@@ -190,22 +134,32 @@ impl ParserSeed {
         // before any derived caches or public runtime state can be published.
         // Core graph/alphabet validation and runtime-view preparation share the
         // standalone backend's complete validated preparation path.
-        let (mut parser, runtime) = TemplateParser::compile_with_runtime(
+        let (mut parser, runtime) = if let Some(composition) = self.composition {
+            // Descriptors are authoritative aliases into the source dictionary.
+            // Drop redundant raw outer records after validation rather than
+            // retaining a second graph allocation for a reused component.
+            constraint.template_dfas_by_terminal = composition.outer.iter()
+                .map(|view| Some(Arc::clone(&view.source))).collect();
+            let composition = super::composition::TemplateComposition::from_views(
+                self.state_count, composition.control_start, composition.outer,
+                composition.scoped, Some(composition.completion)).map_err(|error| error.to_string())?;
+            (TemplateParser::from_composition(self.state_count, self.terminal_count, composition)
+                .map_err(|error| error.to_string())?, Vec::new())
+        } else { TemplateParser::compile_with_runtime(
             self.state_count, self.terminal_count, self.skip_terminals,
             &constraint.template_dfas_by_terminal, self.completion,
-        ).map_err(|error| error.to_string())?;
-        if let Some((control_start, programs)) = self.composition {
-            for template in &programs {
-                validate_alphabet(template.as_deref().ok_or("missing scoped template")?, self.state_count)?;
-            }
-            parser.composition = Some(Arc::new(super::composition::TemplateComposition::compile(
-                self.state_count, control_start, &constraint.template_dfas_by_terminal, programs,
-            ).map_err(|error| error.to_string())?));
-        }
+        ).map_err(|error| error.to_string())? };
         if let Some(embedding) = self.embedding {
             validate_alphabet(&embedding.finish, self.state_count)?;
             super::compile_domain(&embedding.finish).map_err(|error| error.to_string())?;
             parser.embedding = Some(Arc::new(embedding));
+        }
+        if let Some(grammar) = self.link_grammar {
+            grammar.validate()?;
+            if grammar.terminal_count != self.terminal_count {
+                return Err("template grammar terminal coordinate disagrees with parser".into());
+            }
+            parser.link_grammar = Some(grammar);
         }
         constraint.template_parser = Some(Arc::new(parser));
         constraint.table = ParserTableStorage::absent();

@@ -12,20 +12,29 @@ use glrmask_parser_dwa::__private::templates::characterize::{
 use glrmask_parser_dwa::__private::templates::compile_dfa::{Templates,
     specialize_template_dfa_defaults_for_commit_split_input, try_split_commit_template_dfas};
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub(crate) struct TemplateEmbedding {
     pub(crate) nullable: bool,
     pub(crate) return_pop: u32,
     pub(crate) entries: BTreeSet<u32>,
     pub(crate) finish: Arc<CommitTemplateDfas>,
+    pub(crate) finish_view: super::scoped_program::ScopedProgram,
 }
 
 impl TemplateEmbedding {
+    pub(crate) fn new(nullable: bool, return_pop: u32, entries: BTreeSet<u32>,
+        finish: Arc<CommitTemplateDfas>, symbols: u32) -> Result<Self, String> {
+        let finish_view = super::scoped_program::ScopedProgram::prepare(Arc::clone(&finish), symbols)
+            .map_err(|error| error.to_string())?;
+        Ok(Self { nullable, return_pop, entries, finish, finish_view })
+    }
+
     /// Only for the built-in depth-one regular frontend: its generated EOF
     /// program has exactly the POP-one return semantics, not just a predicate.
     /// Retain source nullability even when standalone preparation removed it.
     pub(crate) fn from_sparse_regular(
         completion: &Arc<CommitTemplateDfas>,
+        symbols: u32,
         source_nullable: bool,
         slots: impl IntoIterator<Item = u32>,
     ) -> Result<Self, String> {
@@ -37,7 +46,7 @@ impl TemplateEmbedding {
                 super::link_program::nullable_return(0),
             ])?)
         } else { Arc::clone(completion) };
-        Ok(Self { nullable, return_pop: 1, entries: slots.into_iter().collect(), finish })
+        Self::new(nullable, 1, slots.into_iter().collect(), finish, symbols)
     }
 
     pub(crate) fn from_table(table: &GLRTable, nullable: bool, return_pop: u32,
@@ -58,7 +67,7 @@ impl TemplateEmbedding {
             crate::compiler::boundary_transfer::validate_slot_entry_shape(table, terminal)?;
             entries.insert(terminal);
         }
-        Ok(Self { nullable, return_pop, entries, finish: Arc::new(finish) })
+        Self::new(nullable, return_pop, entries, Arc::new(finish), table.num_states)
     }
 
     pub(crate) fn from_constraint(constraint: &Constraint) -> Result<Self, String> {

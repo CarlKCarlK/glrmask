@@ -7253,7 +7253,7 @@ fn determinize_parser_dwa_with_fallbacks_and_classes(
             // and class exclusions need an individual row in the output.
             for (&label, contributions) in &class_raw_targets {
                 extend_target_contribs(&mut default_raw_targets, contributions);
-                for &symbol in classes.exclusion(label).expect("collected class label") {
+                for symbol in classes.excluded_symbols(label) {
                     let index = symbol as usize;
                     if !dense_label_touched[index] {
                         dense_label_touched[index] = true;

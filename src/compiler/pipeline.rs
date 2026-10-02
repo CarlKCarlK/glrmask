@@ -6078,6 +6078,11 @@ fn compile_prepared_with_profile_and_table_construction(
         if !crate::automata::lexer::tokenizer::artifact_serde::compact_large_runtime(&mut tokenizer) {
             crate::automata::lexer::tokenizer::artifact_serde::compact_large_fast_runtime(&mut tokenizer);
         }
+        let prepared_parser = crate::runtime::parser_backend::PreparedTemplateParser::from_compiler_parts(
+            &table, analyzed_grammar.direct_regular_automaton.as_ref(), &composition_parser_templates_by_terminal,
+            prepared_grammar.ignore_terminal, false, true,
+        ).expect("source compiler must produce a finite template parser before Constraint materialization");
+        drop(table);
         let mut constraint = Constraint {
             end_tokens: std::sync::Arc::from([]),
             runtime_backend: crate::runtime::ConstraintRuntimeBackend::Static,
@@ -6099,7 +6104,7 @@ fn compile_prepared_with_profile_and_table_construction(
             direct_regular_dynamic_hot_frontiers: Vec::new(),
             direct_regular_parser_state_acceptance: Vec::new(),
             direct_regular_automaton: analyzed_grammar.direct_regular_automaton.clone(),
-            table: table.into(),
+            table: crate::runtime::parser_backend::ParserTableStorage::absent(),
             terminal_display_names: analyzed_grammar.terminal_display_names.clone(),
             tokenizer: tokenizer.into(),
             boundary_completion_index: None,
@@ -6144,9 +6149,9 @@ fn compile_prepared_with_profile_and_table_construction(
             deferred_original_token_to_internal: std::sync::OnceLock::new(),
             internal_token_to_tokens: internal_ids.vocab_tokens.internal_to_originals_vecs(),
             deferred_internal_token_to_tokens: std::sync::OnceLock::new(),
-            template_dfas_by_terminal,
-            fast_template_dfas_by_terminal: Vec::new(),
-            template_parser: None,
+            template_dfas_by_terminal: prepared_parser.templates,
+            fast_template_dfas_by_terminal: prepared_parser.runtime,
+            template_parser: Some(Arc::new(prepared_parser.parser)),
             token_bytes,
             packed_token_bytes,
             internal_token_bytes,
@@ -6250,9 +6255,7 @@ fn compile_prepared_with_profile_and_table_construction(
 pub(crate) fn compile_prepared(prepared_grammar: GrammarDef, vocab: &Vocab) -> Constraint {
     let start_nullable = prepared_grammar.start_is_nullable();
     let mut constraint = compile_prepared_with_profile(prepared_grammar, vocab).0;
-    constraint
-        .table
-        .set_embedded_start_nullable(start_nullable);
+    constraint.set_composition_start_nullable(start_nullable);
     constraint
 }
 
@@ -6416,7 +6419,7 @@ fn compile_dynamic_owned_with_vocab_partition_impl(
         if finalization == DynamicPartitionFinalization::Lr {
             let tiny_save_artifact = constraint.inner.dynamic_mask_vocab.canonical_token_count() <= 8
                 && constraint.inner.tokenizer.num_states() <= 64
-                && constraint.inner.table.num_states <= 32;
+                && constraint.inner.parser_symbol_count() <= 32;
             if !tiny_save_artifact {
                 constraint.cache_external_vocab_artifact_for_save();
             }
@@ -6705,10 +6708,7 @@ fn compile_dynamic_owned_early_overlap(
         if finalize_runtime {
             constraint.inner.rebuild_dynamic_runtime_caches();
         }
-        constraint
-            .inner
-            .table
-            .set_embedded_start_nullable(start_nullable);
+        constraint.inner.set_composition_start_nullable(start_nullable);
         constraint.set_composition_grammar(prepared_grammar);
         if finalize_runtime {
             constraint.cache_external_vocab_artifact_for_save();
@@ -7031,10 +7031,7 @@ fn compile_dynamic_owned_impl(
         if finalize_runtime {
             constraint.inner.rebuild_dynamic_runtime_caches();
         }
-        constraint
-            .inner
-            .table
-            .set_embedded_start_nullable(start_nullable);
+        constraint.inner.set_composition_start_nullable(start_nullable);
         constraint.set_composition_grammar(prepared_grammar);
         if finalize_runtime {
             constraint.cache_external_vocab_artifact_for_save();
@@ -7066,9 +7063,7 @@ pub(crate) fn compile_owned_with_table_construction(
     if compile_profile_summary_enabled() || compile_top_profile_enabled() {
         let (mut constraint, profile) =
             compile_owned_profiled_with_table_construction(grammar, vocab, default_table_construction);
-        constraint
-            .table
-            .set_embedded_start_nullable(start_nullable);
+        constraint.set_composition_start_nullable(start_nullable);
         emit_compile_profile_summary(None, None, &profile);
         return constraint;
     }
@@ -7076,9 +7071,7 @@ pub(crate) fn compile_owned_with_table_construction(
     let prepared_grammar = prepare_grammar(grammar);
     let mut constraint =
         compile_prepared_with_table_construction(prepared_grammar, vocab, default_table_construction);
-    constraint
-        .table
-        .set_embedded_start_nullable(start_nullable);
+    constraint.set_composition_start_nullable(start_nullable);
     constraint
 }
 
@@ -7111,7 +7104,7 @@ pub(crate) fn compile_owned_with_table_construction_and_protected_shift_terminal
         None,
         Some(Arc::new(protected_shift_terminals)),
     );
-    constraint.table.set_embedded_start_nullable(start_nullable);
+    constraint.set_composition_start_nullable(start_nullable);
     if compile_profile_summary_enabled() || compile_top_profile_enabled() {
         emit_compile_profile_summary(None, None, &profile);
     }
@@ -7132,9 +7125,7 @@ pub(crate) fn compile_prepared_with_table_construction(
         None,
     )
     .0;
-    constraint
-        .table
-        .set_embedded_start_nullable(start_nullable);
+    constraint.set_composition_start_nullable(start_nullable);
     constraint
 }
 
@@ -7154,9 +7145,7 @@ pub(crate) fn compile_owned_with_lexer_adaptive(
         None,
     )
     .0;
-    constraint
-        .table
-        .set_embedded_start_nullable(start_nullable);
+    constraint.set_composition_start_nullable(start_nullable);
     constraint
 }
 
@@ -7189,9 +7178,7 @@ pub(crate) fn compile_owned_profiled_with_table_construction(
         None,
         None,
     );
-    constraint
-        .table
-        .set_embedded_start_nullable(start_nullable);
+    constraint.set_composition_start_nullable(start_nullable);
     profile.prepare_ms = prepare_ms;
     profile.total_ms = elapsed_ms(total_started_at);
     (constraint, profile)

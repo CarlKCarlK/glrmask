@@ -66,6 +66,28 @@ fn compiled(graph: &NWA, classes: &PopLabelClasses) -> DWA {
     result
 }
 
+#[test]
+fn scoped_defaults_reject_foreign_cancellation_and_preserve_dead_exclusions() {
+    let mut classes = PopLabelClasses::new(108).unwrap();
+    let local = classes.intern_scoped_complement(100..104, [103]).unwrap().unwrap();
+    for symbol in [5, 100, 103, 105] {
+        let mut graph = NWA::new(1, 2);
+        let start = graph.add_state(); let pop = graph.add_state(); let end = graph.add_state();
+        graph.set_start_states(vec![start]); graph.set_final_weight(end, weight(3));
+        graph.add_transition(start, encode_negative_label(symbol), pop, weight(3));
+        graph.add_transition(pop, local, end, weight(3));
+        let predicate = compiled(&graph, &classes);
+        assert_eq!(accepted(&predicate, &[]), if symbol == 100 { 3 } else { 0 });
+        for word in [vec![], vec![101], vec![5, 101], vec![103, 101]] {
+            assert_eq!(accepted(&predicate, &word), literal(&graph, &classes, &word));
+        }
+    }
+    assert!(!classes.matches(local, 5));
+    assert!(!classes.matches(local, 103));
+    assert!(classes.matches(local, 102));
+    assert_eq!(classes.exclusions[0].as_ref(), &[103], "foreign ranges remain symbolic");
+}
+
 fn all_stacks(depth: usize) -> Vec<Vec<u32>> {
     let mut all = vec![vec![]]; let mut layer = vec![vec![]];
     for _ in 0..depth {

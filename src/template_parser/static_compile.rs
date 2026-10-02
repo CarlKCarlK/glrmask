@@ -22,6 +22,7 @@ use crate::runtime::ConstraintRuntimeBackend;
 use glrmask_parser_dwa::__private::resolve_negatives::resolve_negative_codes_in_nwa;
 use glrmask_parser_dwa::__private::pop_classes::PopLabelClasses;
 use crate::automata::weighted::nwa::{NWA, NWAState};
+use crate::compiler::glr::labels::negative_to_positive_label;
 use rustc_hash::FxHashMap;
 use std::collections::VecDeque;
 
@@ -63,7 +64,7 @@ fn concrete_action_nfa(
     symbols: u32,
     budget: &mut ExpansionBudget,
 ) -> Result<NFA> {
-    action_nfa(split, symbols, budget, None)
+    action_nfa(split, symbols, budget, None, None)
 }
 
 fn action_nfa(
@@ -71,7 +72,10 @@ fn action_nfa(
     symbols: u32,
     budget: &mut ExpansionBudget,
     mut classes: Option<&mut PopLabelClasses>,
+    scope: Option<&crate::runtime::parser_backend::scoped_program::ScopedProgram>,
 ) -> Result<NFA> {
+    let global = |local: u32| scope.map_or(local, |view| view.offset + local);
+    let domain = scope.map_or(0..symbols, |view| view.offset..view.offset + view.symbols);
     let read_offset = split.pop.states.len();
     let push_offset = read_offset + split.read.states.len();
     let fixed = push_offset + split.push.states.len();
@@ -86,17 +90,20 @@ fn action_nfa(
                 // Even a concrete edge into a dead state shadows DEFAULT.
                 if let Some(classes) = classes.as_deref_mut() {
                     budget.charge(0, 0, 0, state.transitions.len())?;
-                    if let Some(label) = classes.intern_complement(state.transitions.keys()
-                        .copied().filter(|&label| label != DEFAULT_LABEL).map(|label| label as u32))
+                    if let Some(label) = classes.intern_scoped_complement(domain.clone(), state.transitions.keys()
+                        .copied().filter(|&label| label != DEFAULT_LABEL).map(|label| global(label as u32)))
                         .map_err(Error::Compilation)?
                     {
                         budget.charge(0, 1, 0, 0)?;
+                        // The class already records a global component range;
+                        // its symbolic code is not a local stack symbol.
                         nfa.add_transition(id as u32, label, target);
                     }
                 } else {
-                    for symbol in 0..symbols {
+                    for local in 0..domain.end - domain.start {
+                        let symbol = global(local);
                         budget.charge(0, 0, 0, 1)?;
-                        if !state.transitions.contains_key(&(symbol as i32)) {
+                        if !state.transitions.contains_key(&(local as i32)) {
                             budget.charge(0, 1, 0, 0)?;
                             nfa.add_transition(id as u32, symbol as i32, target);
                         }
@@ -104,7 +111,7 @@ fn action_nfa(
                 }
             } else {
                 budget.charge(0, 1, 0, 1)?;
-                nfa.add_transition(id as u32, label, target);
+                nfa.add_transition(id as u32, global(label as u32) as i32, target);
             }
         }
         for (links, offset) in [
@@ -123,10 +130,10 @@ fn action_nfa(
         for (&label, &target) in &state.transitions {
             budget.charge(1, 2, 0, 1)?;
             let restore = nfa.add_state();
-            nfa.add_transition(from, label, restore);
+            nfa.add_transition(from, global(label as u32) as i32, restore);
             nfa.add_transition(
                 restore,
-                encode_negative_label(label as u32),
+                encode_negative_label(global(label as u32)),
                 read_offset as u32 + target,
             );
         }
@@ -140,7 +147,32 @@ fn action_nfa(
         nfa.states[from as usize].is_accepting = state.is_accepting;
         for (&label, &target) in &state.transitions {
             budget.charge(0, 1, 0, 1)?;
-            nfa.add_transition(from, label, push_offset as u32 + target);
+            nfa.add_transition(from, encode_negative_label(global(negative_to_positive_label(label) as u32)), push_offset as u32 + target);
+        }
+    }
+    if let Some(view) = scope {
+        if let Some(symbol) = view.append_push {
+            budget.charge(1, 0, 0, 1)?;
+            let end = nfa.add_state(); nfa.set_accepting(end);
+            for id in 0..end {
+                if nfa.states[id as usize].is_accepting {
+                    budget.charge(0, 1, 0, 1)?;
+                    nfa.states[id as usize].is_accepting = false;
+                    nfa.add_transition(id, encode_negative_label(symbol), end);
+                }
+            }
+        }
+        // Consuming paths are already guarded by their local READ/POP labels.
+        // An input-free success additionally requires a concrete owner top.
+        if view.guard_owner && view.domain.start() == glrmask_parser_dwa::__private::templates::admissibility::DomainProbe::Accept {
+            budget.charge(view.symbols as usize + 1, view.symbols as usize * 2, 0, view.symbols as usize)?;
+            let starts = std::mem::take(&mut nfa.start_states);
+            let entry = nfa.add_state(); nfa.start_states.push(entry);
+            for top in view.offset..view.offset + view.symbols {
+                let restore = nfa.add_state();
+                nfa.add_transition(entry, top as i32, restore);
+                for &start in &starts { nfa.add_transition(restore, encode_negative_label(top), start); }
+            }
         }
     }
     Ok(nfa)
@@ -292,8 +324,31 @@ pub(crate) fn prepare_classed_boundary_programs(
     for &terminal in selected {
         let split = programs.get(terminal as usize).and_then(Option::as_deref)
             .ok_or_else(|| Error::Compilation(format!("missing selected terminal relation {terminal}")))?;
-        let nfa = action_nfa(split, symbol_count, &mut budget, Some(&mut classes))
+        let nfa = action_nfa(split, symbol_count, &mut budget, Some(&mut classes), None)
             .map_err(|error| Error::Compilation(format!("terminal {terminal}: {error}")))?;
+        let states = nfa.states.into_iter().map(|state| NWAState {
+            final_weight: state.is_accepting.then(crate::ds::weight::Weight::all),
+            transitions: state.transitions.into_iter().map(|(label, targets)|
+                (label, targets.into_iter().map(|target| (target, crate::ds::weight::Weight::all())).collect())).collect(),
+            epsilons: state.epsilons.into_iter().map(|target| (target, crate::ds::weight::Weight::all())).collect(),
+        }).collect();
+        result.insert(terminal, NWA::from_parts(states, nfa.start_states));
+    }
+    Ok((result, classes))
+}
+
+pub(crate) fn prepare_scoped_boundary_programs(
+    programs: &[crate::runtime::parser_backend::scoped_program::ScopedProgram], symbol_count: u32,
+    selected: &BTreeSet<u32>,
+) -> Result<(BTreeMap<u32, NWA>, PopLabelClasses)> {
+    let mut budget = ExpansionBudget::default();
+    let mut classes = PopLabelClasses::new(symbol_count).map_err(Error::Compilation)?;
+    let mut result = BTreeMap::new();
+    for &terminal in selected {
+        let view = programs.get(terminal as usize).ok_or_else(||
+            Error::Compilation(format!("missing scoped relation {terminal}")))?;
+        view.validate_coordinate(symbol_count)?;
+        let nfa = action_nfa(&view.source, symbol_count, &mut budget, Some(&mut classes), Some(view))?;
         let states = nfa.states.into_iter().map(|state| NWAState {
             final_weight: state.is_accepting.then(crate::ds::weight::Weight::all),
             transitions: state.transitions.into_iter().map(|(label, targets)|

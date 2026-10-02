@@ -897,6 +897,20 @@ pub(crate) fn advance_with_prepared_template(template: &CommitTemplateDfas, stac
 
 #[cfg(test)]
 fn advance_with_template_reference(template: &CommitTemplateDfas, stack: ParserGSS) -> ParserGSS {
+    advance_with_template_coordinate(template, stack, None)
+}
+
+/// The exact phase interpreter over a borrowed immutable program. A scoped
+/// coordinate translates only inspected/written symbols; caller frames retain
+/// their original values and annotations. DEFAULT is local at every POP.
+pub(crate) fn advance_with_template_coordinate(
+    template: &CommitTemplateDfas, stack: ParserGSS, scope: Option<(u32, u32)>,
+) -> ParserGSS {
+    let global = |local: u32| scope.map_or(local, |(offset, _)| offset + local);
+    let local = |top: u32| match scope {
+        Some((offset, count)) => top.checked_sub(offset).filter(|&symbol| symbol < count),
+        None => Some(top),
+    };
 
     let mut output = ParserGSS::empty();
     let mut worklist = vec![(Phase::Pop, template.pop.start_state, stack)];
@@ -932,7 +946,7 @@ fn advance_with_template_reference(template: &CommitTemplateDfas, stack: ParserG
                         );
                     }
                     if label != DEFAULT_LABEL && label >= 0 {
-                        let state = label as u32;
+                        let state = global(label as u32);
                         let branch = gss.isolate(Some(state)).popn(1);
                         if !branch.is_empty() {
                             worklist.push((Phase::Pop, target, branch));
@@ -941,7 +955,8 @@ fn advance_with_template_reference(template: &CommitTemplateDfas, stack: ParserG
                 }
                 if let Some(&target) = dfa_state.transitions.get(&DEFAULT_LABEL) {
                     for top in gss.peek_values() {
-                        if dfa_state.transitions.contains_key(&(top as i32)) {
+                        let Some(symbol) = local(top) else { continue; };
+                        if dfa_state.transitions.contains_key(&(symbol as i32)) {
                             continue;
                         }
                         let branch = gss.isolate(Some(top)).popn(1);
@@ -972,7 +987,7 @@ fn advance_with_template_reference(template: &CommitTemplateDfas, stack: ParserG
                             "commit template read DFA contains non-read label {label} at state {state_id}"
                         );
                     }
-                    let branch = gss.isolate(Some(label as u32));
+                    let branch = gss.isolate(Some(global(label as u32)));
                     if !branch.is_empty() {
                         worklist.push((Phase::Read, target, branch));
                     }
@@ -999,7 +1014,7 @@ fn advance_with_template_reference(template: &CommitTemplateDfas, stack: ParserG
                     worklist.push((
                         Phase::Push,
                         target,
-                        gss.push(negative_to_positive_label(label) as u32),
+                        gss.push(global(negative_to_positive_label(label) as u32)),
                     ));
                 }
             }

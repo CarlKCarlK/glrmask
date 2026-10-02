@@ -14,13 +14,14 @@ use crate::ds::weight::Weight;
 pub struct PopLabelClasses {
     symbols: u32,
     exclusions: Vec<Arc<[u32]>>,
-    interned: BTreeMap<Vec<u32>, i32>,
+    domains: Vec<std::ops::Range<u32>>,
+    interned: BTreeMap<(u32, u32, Vec<u32>), i32>,
 }
 
 impl PopLabelClasses {
     pub fn new(symbols: u32) -> Result<Self, String> {
         if symbols >= DEFAULT_LABEL as u32 { return Err("POP alphabet collides with reserved labels".into()); }
-        Ok(Self { symbols, exclusions: Vec::new(), interned: BTreeMap::new() })
+        Ok(Self { symbols, exclusions: Vec::new(), domains: Vec::new(), interned: BTreeMap::new() })
     }
 
     pub fn symbol_count(&self) -> u32 { self.symbols }
@@ -30,19 +31,31 @@ impl PopLabelClasses {
     pub fn intern_complement(&mut self, explicit: impl IntoIterator<Item = u32>)
         -> Result<Option<i32>, String>
     {
+        self.intern_scoped_complement(0..self.symbols, explicit)
+    }
+
+    /// DEFAULT over one component range. Foreign symbols are outside this
+    /// class rather than copied into a per-row exclusion list.
+    pub fn intern_scoped_complement(&mut self, domain: std::ops::Range<u32>,
+        explicit: impl IntoIterator<Item = u32>) -> Result<Option<i32>, String> {
+        if domain.start > domain.end || domain.end > self.symbols {
+            return Err("POP class domain outside parser alphabet".into());
+        }
         let mut values = explicit.into_iter().collect::<Vec<_>>();
         values.sort_unstable(); values.dedup();
-        if values.last().is_some_and(|&v| v >= self.symbols) {
-            return Err("POP complement excludes an out-of-alphabet symbol".into());
+        if values.iter().any(|v| !domain.contains(v)) {
+            return Err("POP complement excludes an out-of-domain symbol".into());
         }
-        if values.len() == self.symbols as usize { return Ok(None); }
-        if let Some(&label) = self.interned.get(&values) { return Ok(Some(label)); }
+        if values.len() == (domain.end - domain.start) as usize { return Ok(None); }
+        let key = (domain.start, domain.end, values.clone());
+        if let Some(&label) = self.interned.get(&key) { return Ok(Some(label)); }
         let index = i32::try_from(self.exclusions.len()).map_err(|_| "too many POP classes")?;
         let label = DEFAULT_LABEL.checked_sub(1).and_then(|v| v.checked_sub(index))
             .filter(|&label| label >= self.symbols as i32)
             .ok_or("POP classes collide with the concrete alphabet")?;
         self.exclusions.push(Arc::from(values.clone()));
-        self.interned.insert(values, label);
+        self.domains.push(domain);
+        self.interned.insert(key, label);
         Ok(Some(label))
     }
 
@@ -54,8 +67,21 @@ impl PopLabelClasses {
     fn first_label(&self) -> i32 { DEFAULT_LABEL - self.exclusions.len() as i32 }
 
     pub fn matches(&self, label: i32, symbol: u32) -> bool {
-        symbol < self.symbols && self.exclusion(label)
+        self.domain(label).is_some_and(|domain| domain.contains(&symbol)) && self.exclusion(label)
             .is_some_and(|excluded| excluded.binary_search(&symbol).is_err())
+    }
+
+    fn domain(&self, label: i32) -> Option<&std::ops::Range<u32>> {
+        let index = DEFAULT_LABEL.checked_sub(1)?.checked_sub(label)?;
+        self.domains.get(usize::try_from(index).ok()?)
+    }
+
+    /// Only final concrete parser-DWA normalization expands domain exceptions.
+    /// Cancellation and query assembly retain the symbolic range above.
+    pub(crate) fn excluded_symbols(&self, label: i32) -> impl Iterator<Item = u32> + '_ {
+        let domain = self.domain(label).expect("known POP class");
+        (0..domain.start).chain(self.exclusion(label).unwrap().iter().copied())
+            .chain(domain.end..self.symbols)
     }
 
     pub(crate) fn matching_targets<'a>(&'a self, row: &'a NWAState, symbol: u32)
@@ -224,7 +250,7 @@ impl PopLabelClasses {
             row.epsilons = source.epsilons.clone();
             for (&label, retained) in &source.transitions {
                 let labels: Box<dyn Iterator<Item = i32> + '_> = if let Some(excluded) = self.exclusion(label) {
-                    Box::new((0..self.symbols).filter(|symbol| excluded.binary_search(symbol).is_err()).map(|s| s as i32))
+                    Box::new(self.domain(label).unwrap().clone().filter(|symbol| excluded.binary_search(symbol).is_err()).map(|s| s as i32))
                 } else { Box::new(std::iter::once(label)) };
                 for label in labels {
                     edges = edges.checked_add(retained.len()).ok_or("POP expansion edge overflow")?;

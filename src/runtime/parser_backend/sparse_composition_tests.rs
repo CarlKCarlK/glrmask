@@ -25,7 +25,8 @@ fn fixture(nullable: bool, vocab: &Vocab) -> Constraint {
         }), ..Default::default()
     };
     let child = crate::compile_grammar_def_json(&serde_json::to_string(&grammar).unwrap(), vocab).unwrap();
-    assert!(child.uses_sparse_direct_regular_runtime(), "fixture must exercise the sparse frontend");
+    assert!(child.direct_regular_automaton.is_some() && child.has_template_parser()
+        && !child.table.is_present(), "fixture must exercise the native sparse frontend");
     child
 }
 

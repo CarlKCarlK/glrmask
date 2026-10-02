@@ -16,7 +16,7 @@ fn nullable_lexical_source_is_preserved_by_every_compiled_child_backend() {
     ];
     let words: &[&[u8]] = &[b"xy", b"xay"];
     for (source_index, source) in sources.iter().enumerate() {
-        for backend in [ParserBackend::LrTable, ParserBackend::TemplateDfa] {
+        for backend in [ParserBackend::TemplateDfa] {
             for child_mode in [Optimization::FastBuild, Optimization::FastRuntime] {
                 let child = source.compile_with(&vocab, BuildOptions::default()
                     .optimization(child_mode).parser_backend(backend)).unwrap();
@@ -489,7 +489,7 @@ fn compiled_child_composition_uses_templates_for_advance_and_masks() {
         let loaded = Constraint::load(&saved).unwrap();
         assert_language(&loaded, &tokens, &[b"xay", b"xby", b"xaby"]);
         assert_eq!(saved, loaded.save());
-        assert_eq!(child.parser_backend(), ParserBackend::LrTable, "link must not mutate a shared child");
+        assert_eq!(child.parser_backend(), ParserBackend::TemplateDfa, "link must not mutate a shared child");
     }
 }
 

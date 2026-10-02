@@ -3478,6 +3478,18 @@ pub(crate) fn eof_terminal() -> TerminalID {
 
 #[cfg(test)]
 mod tests {
+    // Compiler analysis fixtures own these tables directly. They never enter
+    // a Constraint or participate in its native runtime.
+    fn compiler_table_fixture(constraint: &crate::runtime::Constraint) -> GLRTable {
+        let grammar = constraint.template_parser.as_ref().unwrap().link_grammar.as_ref().unwrap();
+        let mut table = GLRTable::build_with_default_construction(
+            &grammar.analyze(constraint.terminal_display_names.clone()),
+            crate::compiler::glr::table::GlrTableConstruction::ExperimentalCoreMerged,
+        );
+        table.set_embedded_start_nullable(grammar.root_nullable);
+        table.set_embedded_end_token_ids(&grammar.embedded_end_token_ids);
+        table
+    }
 
     #[test]
     fn retained_template_relocation_matches_fresh_characterization() {
@@ -4115,9 +4127,12 @@ mod tests {
         .unwrap();
         let sub_p = terminal_id(&parent, "SUB");
         let sub2_m = terminal_id(&mid, "SUB2");
-        let n_p = parent.table.num_terminals;
-        let n_m = mid.table.num_terminals;
-        let n_g = grandchild.table.num_terminals;
+        let parent_table = compiler_table_fixture(&parent);
+        let mid_table = compiler_table_fixture(&mid);
+        let grandchild_table = compiler_table_fixture(&grandchild);
+        let n_p = parent_table.num_terminals;
+        let n_m = mid_table.num_terminals;
+        let n_g = grandchild_table.num_terminals;
         let leaf_offsets = vec![0, n_p, n_p + n_m];
         let num_terminals = n_p + n_m + n_g;
         // Local id of grandchild "g" (display names quote the literal).
@@ -4143,7 +4158,7 @@ mod tests {
         ];
         let mut context =
             build_signed_link_context_from_parts(
-                vec![&parent.table, &mid.table, &grandchild.table],
+                vec![&parent_table, &mid_table, &grandchild_table],
                 vec![None, None, None],
                 links.clone(),
                 &leaf_offsets,
@@ -4218,6 +4233,8 @@ mod tests {
     fn two_component_ignore_context<'a>(
         parent: &'a Constraint,
         child: &'a Constraint,
+        parent_table: &'a GLRTable,
+        child_table: &'a GLRTable,
         global: bool,
     ) -> (SignedLinkContext<'a>, TerminalID) {
         let sub_p = parent
@@ -4225,9 +4242,9 @@ mod tests {
             .iter()
             .position(|candidate| candidate == "SUB")
             .expect("parent SUB terminal") as TerminalID;
-        let parent_terminals = parent.table.num_terminals;
+        let parent_terminals = parent_table.num_terminals;
         let terminal_offsets = vec![0, parent_terminals];
-        let num_terminals = parent_terminals + child.table.num_terminals;
+        let num_terminals = parent_terminals + child_table.num_terminals;
         let links = vec![ScopedSubgrammarLink {
             parent_component: 0,
             slot_terminal: sub_p,
@@ -4237,7 +4254,7 @@ mod tests {
             child_start_nullable: false,
         }];
         let context = build_signed_link_context_from_parts(
-            vec![&parent.table, &child.table],
+            vec![parent_table, child_table],
             vec![parent.ignore_terminal, child.ignore_terminal],
             links,
             &terminal_offsets,
@@ -4288,7 +4305,10 @@ mod tests {
     #[test]
     fn global_ignore_identity_spans_parent_and_child_scopes() {
         let (parent, child) = ignore_test_constraints();
-        let (context, child_ignore) = two_component_ignore_context(&parent, &child, true);
+        let parent_table = compiler_table_fixture(&parent);
+        let child_table = compiler_table_fixture(&child);
+        let (context, child_ignore) = two_component_ignore_context(
+            &parent, &child, &parent_table, &child_table, true);
         assert!(context.global_ignores);
         let mut cache = None;
         let transfer =
@@ -4306,7 +4326,7 @@ mod tests {
             "global ignore identity must apply inside the parent scope",
         );
         assert!(
-            !apply_characterization(&transfer, &[parent.table.num_states - 1]).is_empty(),
+            !apply_characterization(&transfer, &[parent_table.num_states - 1]).is_empty(),
             "global ignore identity must apply across the whole parent interval",
         );
     }
@@ -4316,7 +4336,10 @@ mod tests {
     #[test]
     fn scoped_child_ignore_identity_does_not_apply_in_parent() {
         let (parent, child) = ignore_test_constraints();
-        let (context, child_ignore) = two_component_ignore_context(&parent, &child, false);
+        let parent_table = compiler_table_fixture(&parent);
+        let child_table = compiler_table_fixture(&child);
+        let (context, child_ignore) = two_component_ignore_context(
+            &parent, &child, &parent_table, &child_table, false);
         assert!(!context.global_ignores);
         let mut cache = None;
         let transfer =

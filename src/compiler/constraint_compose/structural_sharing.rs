@@ -982,8 +982,8 @@ fn structural_state_classes(
 /// table-level contextual quotient subsequently proves that the caller can be
 /// recovered exactly from the predecessor state before accepting a merge.
 fn component_structural_state_groups(
-    parent: &Constraint,
-    children: &[CompiledSubgrammarInput<'_>],
+    parent: &crate::compiler::glr::table::GLRTable,
+    children: &[&crate::compiler::glr::table::GLRTable],
     composed: &ComposedTable,
     terminal_classes: &[u32],
     nonterminal_classes: &[u32],
@@ -992,19 +992,19 @@ fn component_structural_state_groups(
         return Vec::new();
     }
 
-    let parent_nonterminals = parent.table.nonterminal_display_names.len() as u32;
+    let parent_nonterminals = parent.nonterminal_display_names.len() as u32;
     let mut child_nonterminal_offsets = Vec::with_capacity(children.len());
     let mut next_nonterminal = parent_nonterminals;
     for child in children {
         child_nonterminal_offsets.push(next_nonterminal);
-        next_nonterminal += child.constraint.table.nonterminal_display_names.len() as u32;
+        next_nonterminal += child.nonterminal_display_names.len() as u32;
     }
 
     let mut virtual_state_offsets = Vec::with_capacity(children.len());
     let mut next_virtual_state = 0u32;
     for child in children {
         virtual_state_offsets.push(next_virtual_state);
-        next_virtual_state += child.constraint.table.num_states;
+        next_virtual_state += child.num_states;
     }
     let virtual_state_count = next_virtual_state as usize;
     if virtual_state_count == 0 {
@@ -1016,7 +1016,7 @@ fn component_structural_state_groups(
         .enumerate()
         .map(|(component_index, child)| {
             let nonterminal_offset = child_nonterminal_offsets[component_index];
-            (0..child.constraint.table.nonterminal_display_names.len())
+            (0..child.nonterminal_display_names.len())
                 .map(|nonterminal| {
                     nonterminal_classes
                         .get(nonterminal_offset as usize + nonterminal)
@@ -1031,7 +1031,7 @@ fn component_structural_state_groups(
     // starts from different components to be compared with one another.
     let mut classes = vec![0u32; virtual_state_count];
     for (component_index, child) in children.iter().enumerate() {
-        if child.constraint.table.num_states != 0 {
+        if child.num_states != 0 {
             classes[virtual_state_offsets[component_index] as usize] = 1;
         }
     }
@@ -1041,7 +1041,7 @@ fn component_structural_state_groups(
             .par_iter()
             .enumerate()
             .map(|(component_index, child)| {
-                let table = &child.constraint.table;
+                let table = *child;
                 let state_offset = virtual_state_offsets[component_index];
                 let terminal_offset = composed.terminal_offsets[component_index + 1];
                 let local_state_classes = &classes[state_offset as usize
@@ -1141,7 +1141,7 @@ fn component_structural_state_groups(
     let mut members = vec![Vec::<(usize, u32)>::new(); class_count];
     for (component_index, child) in children.iter().enumerate() {
         let state_offset = virtual_state_offsets[component_index];
-        for local_state in 0..child.constraint.table.num_states {
+        for local_state in 0..child.num_states {
             members[classes[(state_offset + local_state) as usize] as usize]
                 .push((component_index, local_state));
         }
@@ -1192,6 +1192,18 @@ pub(super) fn contextually_share_composed_states(
     composed: &mut ComposedTable,
     parent: &Constraint,
     children: &[CompiledSubgrammarInput<'_>],
+    terminal_classes: &[u32],
+    nonterminal_classes: &[u32],
+) -> (usize, usize) {
+    let child_tables = children.iter().map(|input| &*input.constraint.table).collect::<Vec<_>>();
+    contextually_share_composed_tables(composed, &parent.table, &child_tables,
+        terminal_classes, nonterminal_classes)
+}
+
+pub(super) fn contextually_share_composed_tables(
+    composed: &mut ComposedTable,
+    parent: &crate::compiler::glr::table::GLRTable,
+    children: &[&crate::compiler::glr::table::GLRTable],
     terminal_classes: &[u32],
     nonterminal_classes: &[u32],
 ) -> (usize, usize) {

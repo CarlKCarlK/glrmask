@@ -3588,7 +3588,7 @@ pub(crate) fn runtime_dynamic_vocab_for_partition(
                 .expect("partition class consumed twice");
             originals.append(&mut duplicate_group);
         }
-        if index - group_start > 1 {
+        if index - group_start > 1 || !originals.windows(2).all(|pair| pair[0] <= pair[1]) {
             // The grouped O2 partition keeps every class sorted by original
             // token ID.  Merging byte-identical canonical representatives can
             // concatenate multiple such classes, so restore that ordering only

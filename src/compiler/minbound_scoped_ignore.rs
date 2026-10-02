@@ -257,8 +257,8 @@ fn mb_scoped_ignore_mapping_trace(
     child: &Constraint,
     composed_static: &Constraint,
 ) {
-    eprintln!("[map-trace {label}] parent_terminals={}", parent.table.num_terminals);
-    eprintln!("[map-trace {label}] child_terminals={}", child.table.num_terminals);
+    eprintln!("[map-trace {label}] parent_terminals={}", parent.parser_terminal_count());
+    eprintln!("[map-trace {label}] child_terminals={}", child.parser_terminal_count());
     for (index, name) in parent.terminal_display_names.iter().enumerate() {
         eprintln!("[map-trace {label}] parent local terminal {index} -> composed {index} name={name:?}");
     }

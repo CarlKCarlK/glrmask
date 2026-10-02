@@ -113,3 +113,44 @@ pub(crate) fn disallowed(programs: &[Option<Arc<CommitTemplateDfas>>], terminal_
     }
     Ok(rows)
 }
+
+/// The same conservative proof using component-local domains and translated
+/// output tops. No owned relocated terminal graph is constructed.
+pub(crate) fn disallowed_scoped(programs: &[crate::runtime::parser_backend::scoped_program::ScopedProgram],
+    terminal_count: usize, budget: usize) -> Result<Vec<Vec<u32>>, String> {
+    if terminal_count > programs.len() { return Err("invalid ordinary/control split".into()); }
+    let mut work = budget; let mut rows = vec![Vec::new(); terminal_count];
+    let mut output = Vec::with_capacity(programs.len());
+    for view in programs {
+        let mut tops = outputs(&view.source, &mut work)?;
+        if let Tops::Known(values) = &mut tops {
+            *values = values.iter().map(|symbol| symbol + view.offset).collect();
+        }
+        if let Some(symbol) = view.append_push { tops = Tops::Known(BTreeSet::from([symbol])); }
+        output.push(tops);
+    }
+    for first in 0..terminal_count {
+        let mut tops = output[first].clone();
+        loop {
+            let Tops::Known(values) = &mut tops else { break; };
+            let before = values.len();
+            for control in terminal_count..programs.len() {
+                if !spend(&mut work, values.len() + 1) { tops = Tops::Any; break; }
+                if !values.iter().any(|&top| programs[control].classify_top(top) != TopAdmission::Never) { continue; }
+                match &output[control] {
+                    Tops::Any => { tops = Tops::Any; break; },
+                    Tops::Known(additions) => values.extend(additions),
+                }
+            }
+            if matches!(&tops, Tops::Known(values) if values.len() == before) { break; }
+        }
+        let Tops::Known(values) = tops else { continue; };
+        for second in 0..terminal_count {
+            if !spend(&mut work, values.len() + 1) { return Ok(rows); }
+            if !values.iter().any(|&top| programs[second].classify_top(top) != TopAdmission::Never) {
+                rows[first].push(second as u32);
+            }
+        }
+    }
+    Ok(rows)
+}

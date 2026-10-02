@@ -1,7 +1,7 @@
-//! Link already table-free components by relocating their exact programs.
+//! Link table-free components through shared programs and offset descriptors.
 //! Lexer execution, vocabulary walking and CALL/RETURN closure stay in the
 //! common recursive runtime. No LR action/goto representation is constructed.
-use std::{collections::{BTreeMap, BTreeSet}, sync::Arc};
+use std::{collections::BTreeSet, sync::Arc};
 use crate::{Error, Result, Vocab};
 use crate::automata::lexer::Lexer;
 use crate::automata::unweighted_u32::dfa::DFA;
@@ -9,7 +9,7 @@ use crate::compiler::glr::{accumulator::TerminalsDisallowed, parser::ParserGSS};
 use crate::runtime::{CommitTemplateDfas, Constraint, SegmentedBoundaryShard,
     SegmentedBoundaryShardBackend, SegmentedParserComponent, SegmentedParserLink,
     SpecialTokenTerminal, StaticDynamicOverlayMetadata};
-use super::{TemplateParser, composition::TemplateComposition, embedding::TemplateEmbedding, link_program};
+use super::{TemplateParser, composition::TemplateComposition, scoped_program::ScopedProgram, embedding::TemplateEmbedding, link_program};
 
 fn fail(message: impl Into<String>) -> Error { Error::Compilation(message.into()) }
 
@@ -17,18 +17,6 @@ fn identity() -> CommitTemplateDfas {
     let mut pop = DFA::new(); pop.set_accepting(0, true);
     CommitTemplateDfas { pop, read: DFA::new(), push: DFA::new(),
         pop_to_read: vec![], pop_to_push: vec![], read_to_push: vec![] }
-}
-
-// These shared bounded transformations preserve per-row DEFAULT priority,
-// including explicit dead edges, before returning to the ordinary executor.
-fn scope(program: &CommitTemplateDfas, alphabet: u32, offset: u32) -> Result<CommitTemplateDfas> {
-    link_program::scoped_template(program, offset, alphabet).map_err(fail)
-}
-
-fn append_child_start(program: &CommitTemplateDfas, child_start: u32) -> Result<CommitTemplateDfas> {
-    let mut nfa = link_program::action_nfa(program).map_err(fail)?;
-    link_program::append_push(&mut nfa, child_start);
-    link_program::compile(&[nfa]).map_err(fail)
 }
 
 fn with_nullable_return(program: &CommitTemplateDfas) -> Result<CommitTemplateDfas> {
@@ -39,12 +27,20 @@ fn with_nullable_return(program: &CommitTemplateDfas) -> Result<CommitTemplateDf
 /// Caller has chosen a dynamic boundary explicitly, or Auto. All supplied
 /// components are already compiled; this function never calls a grammar/LR
 /// compiler, including for previously saved components.
-pub(crate) fn compose(parent: Constraint, children: &[(String, Arc<Constraint>)], vocab: &Vocab) -> Result<Constraint> {
+pub(crate) fn compose(mut parent: Constraint, children: &[(String, Arc<Constraint>)], vocab: &Vocab) -> Result<Constraint> {
+    parent.materialize_composition_link_metadata_for_compilation().map_err(fail)?;
+    // Internal callers can register slots after ordinary source compilation.
+    // Remove their non-vocabulary sentinels before retaining the component:
+    // its output domain and its cached token fragments must agree.
+    if parent.sanitize_late_grammar_placeholder_token_domain() {
+        parent.rebuild_runtime_caches();
+    }
     let parent_parser = parent.template_parser.as_ref().ok_or_else(|| fail("parent is not table-free"))?;
     let parent_embedding = parent_parser.embedding.as_ref()
         .ok_or_else(|| fail("parent artifact lacks a finite embedding relation"))?.clone();
     let mut components = vec![Arc::new(parent)];
     let mut slots = Vec::<Vec<u32>>::new();
+    let mut binding_names = Vec::new();
     for (name, child) in children {
         let matching = components[0].late_grammar_slots.iter().filter(|slot| slot.name == *name)
             .map(|slot| slot.terminal_id).collect::<Vec<_>>();
@@ -54,13 +50,14 @@ pub(crate) fn compose(parent: Constraint, children: &[(String, Arc<Constraint>)]
                 return Err(fail(format!("slot {name:?} has no validated template CALL relation")));
             }
         }
-        components.push(Arc::clone(child)); slots.push(matching);
+        let mut child = Arc::clone(child);
+        if child.deferred_composition_metadata_blob.is_some() && !child.composition_link_metadata_materialized {
+            Arc::make_mut(&mut child).materialize_composition_link_metadata_for_compilation().map_err(fail)?;
+        }
+        components.push(child); slots.push(matching); binding_names.push(name.clone());
     }
     if components.len() == 1 { return Ok((*components.remove(0)).clone()); }
     let bound_slots = slots.iter().flatten().copied().collect::<BTreeSet<_>>();
-    if components[0].late_grammar_slots.iter().any(|slot| !bound_slots.contains(&slot.terminal_id))
-        || components.iter().skip(1).any(|child| !child.late_grammar_slots.is_empty())
-    { return Err(fail("template composition requires all external slots to be bound")); }
     let mut state_offsets = Vec::new(); let mut terminal_offsets = Vec::new();
     let mut tokenizer_offsets = Vec::new(); let mut names = Vec::new();
     let mut state_count = 0u32; let mut terminal_count = 0u32; let mut tokenizer_count = 0u32;
@@ -84,30 +81,30 @@ pub(crate) fn compose(parent: Constraint, children: &[(String, Arc<Constraint>)]
     if state_count as u64 * (terminal_count as u64 + 1) > 16_000_000 {
         return Err(fail("linked template certificates exceed 16 million symbol/terminal pairs"));
     }
-    let mut outer = Vec::new(); let mut exact = Vec::new(); let mut controls = Vec::new();
-    let mut cache = BTreeMap::<(usize, u32, u32), Arc<CommitTemplateDfas>>::new();
+    let mut outer = Vec::new(); let mut outer_views = Vec::new();
+    let mut exact_views = Vec::new(); let mut control_views = Vec::new();
     for (index, component) in components.iter().enumerate() {
         let parser = component.template_parser.as_ref().unwrap(); let offset = state_offsets[index];
-        let mut relocate = |program: &Arc<CommitTemplateDfas>| -> Result<Arc<CommitTemplateDfas>> {
-            let key = (Arc::as_ptr(program) as usize, parser.state_count, offset);
-            if let Some(program) = cache.get(&key) { return Ok(Arc::clone(program)); }
-            let result = Arc::new(scope(program, parser.state_count, offset)?);
-            cache.insert(key, Arc::clone(&result)); Ok(result)
-        };
-        for (terminal, program) in component.template_dfas_by_terminal.iter().enumerate() {
-            let program = program.as_ref().ok_or_else(|| fail("missing component terminal program"))?;
-            let local = if parser.composition.is_none() && (component.ignore_terminal == Some(terminal as u32)
-                || parser.skip_terminals.contains(&(terminal as u32))) {
-                Arc::new(scope(&identity(), parser.state_count, offset)?)
-            } else { relocate(program)? };
-            outer.push(Some(Arc::clone(&local)));
-            if parser.composition.is_none() { exact.push(Some(local)); }
+        let ignore_view = if parser.composition.is_none()
+            && (component.ignore_terminal.is_some() || !parser.skip_terminals.is_empty()) {
+            Some(ScopedProgram::prepare(Arc::new(identity()), parser.state_count)?)
+        } else { None };
+        for terminal in 0..component.template_dfas_by_terminal.len() {
+            let view = if let Some(composition) = &parser.composition {
+                composition.outer_views[terminal].relocated(offset)?
+            } else if component.ignore_terminal == Some(terminal as u32)
+                || parser.skip_terminals.contains(&(terminal as u32)) {
+                ignore_view.as_ref().unwrap().relocated(offset)?
+            } else { ScopedProgram::terminal(component, terminal).relocated(offset)? };
+            outer.push(Some(Arc::clone(&view.source)));
+            if parser.composition.is_none() { exact_views.push(view.clone()); }
+            outer_views.push(view);
         }
         if let Some(composition) = &parser.composition {
-            for (terminal, program) in composition.programs.iter().enumerate() {
-                let program = relocate(program.as_ref().ok_or_else(|| fail("missing nested scoped program"))?)?;
-                if terminal < composition.control_start as usize { exact.push(Some(program)); }
-                else { controls.push(Some(program)); }
+            for (terminal, view) in composition.views.iter().enumerate() {
+                let view = view.relocated(offset)?;
+                if terminal < composition.control_start as usize { exact_views.push(view); }
+                else { control_views.push(view); }
             }
         }
     }
@@ -117,29 +114,65 @@ pub(crate) fn compose(parent: Constraint, children: &[(String, Arc<Constraint>)]
         let child_parser = components[component].template_parser.as_ref().unwrap();
         let embedding = child_parser.embedding.as_ref().unwrap();
         for &slot in slots {
-            controls.push(Some(Arc::new(append_child_start(outer[slot as usize].as_ref().unwrap(), state_offsets[component])?)));
+            let mut call = outer_views[slot as usize].clone();
+            call.append_push = Some(state_offsets[component]);
+            control_views.push(call);
             links.push(SegmentedParserLink { parent_component: 0, slot_terminal: slot,
                 child_component: component as u32, child_start: 0, return_pop: embedding.return_pop,
                 child_start_nullable: embedding.nullable });
         }
-        controls.push(Some(Arc::new(scope(&embedding.finish, child_parser.state_count, state_offsets[component])?)));
+        control_views.push(embedding.finish_view.relocated(state_offsets[component])?);
     }
-    let control_start = u32::try_from(exact.len()).map_err(|_| fail("too many scoped terminals"))?;
-    exact.extend(controls);
-    let completion = scope(&components[0].template_parser.as_ref().unwrap().completion_template,
-        components[0].parser_symbol_count(), 0)?;
-    let mut parser = TemplateParser::compile(state_count, terminal_count, BTreeSet::new(), &outer, completion)?;
-    parser.composition = Some(Arc::new(TemplateComposition::compile(state_count, control_start, &outer, exact)?));
+    let mut remaining_slots = components[0].late_grammar_slots.iter()
+        .filter(|slot| !bound_slots.contains(&slot.terminal_id)).cloned().collect::<Vec<_>>();
+    for (component, child) in components.iter().enumerate().skip(1) {
+        for slot in &child.late_grammar_slots {
+            let mut slot = slot.clone();
+            slot.terminal_id += terminal_offsets[component];
+            slot.name = format!("{}.{}", binding_names[component - 1], slot.name);
+            remaining_slots.push(slot);
+        }
+    }
+    let control_start = u32::try_from(exact_views.len()).map_err(|_| fail("too many scoped terminals"))?;
+    exact_views.extend(control_views);
+    let parent_parser = components[0].template_parser.as_ref().unwrap();
+    let completion = if let Some(composition) = &parent_parser.composition {
+        composition.completion_view.as_ref().expect("native scoped completion").clone()
+    } else { ScopedProgram { source: Arc::clone(&parent_parser.completion_template),
+        domain: Arc::clone(&parent_parser.completion), fast: None, offset: 0,
+        symbols: parent_parser.state_count, guard_owner: true, append_push: None } };
+    let mut parser = TemplateParser::from_composition(state_count, terminal_count,
+        TemplateComposition::from_views(state_count, control_start, outer_views, exact_views, Some(completion))?)?;
     let initial = ParserGSS::from_single_stack(vec![0], TerminalsDisallowed::new());
     let nullable = parent_embedding.nullable || parser.finished(&initial);
-    let finish = if nullable && !parent_embedding.nullable {
-        Arc::new(with_nullable_return(&parent_embedding.finish)?)
-    } else { Arc::clone(&parent_embedding.finish) };
-    parser.embedding = Some(Arc::new(TemplateEmbedding { nullable, return_pop: parent_embedding.return_pop,
-        entries: BTreeSet::new(), finish }));
+    // Internal compiled composition can designate a validated entry as a
+    // slot in a later binding. Preserve those proofs even when it has not
+    // acquired a public slot name yet.
+    let mut remaining_entries = parent_embedding.entries.iter().copied()
+        .filter(|terminal| !bound_slots.contains(terminal)).collect::<BTreeSet<_>>();
+    for (component, child) in components.iter().enumerate().skip(1) {
+        remaining_entries.extend(child.template_parser.as_ref().unwrap().embedding.as_ref().unwrap()
+            .entries.iter().map(|&terminal| terminal_offsets[component] + terminal));
+    }
+    let mut embedding = (*parent_embedding).clone();
+    embedding.entries = remaining_entries.clone();
+    if nullable && !parent_embedding.nullable {
+        embedding = TemplateEmbedding::new(nullable, parent_embedding.return_pop,
+            remaining_entries,
+            Arc::new(with_nullable_return(&parent_embedding.finish)?), parent_embedding.finish_view.symbols)
+            .map_err(fail)?;
+    }
+    parser.embedding = Some(Arc::new(embedding));
+    parser.link_grammar = super::link_grammar::LinkGrammar::compose(&components, &terminal_offsets, &slots)
+        .map_err(fail)?;
+    if let Some(grammar) = parser.link_grammar.as_mut() {
+        Arc::make_mut(grammar).root_nullable = nullable;
+    }
     let dynamic_vocab = crate::compiler::constraint_possible_matches::runtime_dynamic_vocab_for_vocab(vocab);
     let mut constraint = crate::dynamic_constraint::DynamicConstraint::from_template_runtime_parts_unfinalized(
         (*components[0].tokenizer).clone(), names, None, outer, Arc::new(parser), vocab, dynamic_vocab);
+    constraint.late_grammar_slots = remaining_slots;
+    constraint.end_tokens = Arc::clone(&components[0].end_tokens);
     // DynamicDirect never consumes a coordinator TSID quotient. Preserve the
     // ordinary recursive linker's one-class wire compatibility image, while
     // leaving all actual component lexer and parser coordinates unchanged.
@@ -172,6 +205,7 @@ pub(crate) fn compose(parent: Constraint, children: &[(String, Arc<Constraint>)]
         segmented_parser_links: links, segmented_mask_authoritative: true,
         segmented_boundary_shards: shards, ..Default::default()
     });
+    constraint.sanitize_late_grammar_placeholder_token_domain();
     constraint.validate_template_composition_layout().map_err(fail)?;
     constraint.rebuild_dynamic_runtime_caches();
     Ok(constraint)

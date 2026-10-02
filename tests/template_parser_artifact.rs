@@ -59,7 +59,7 @@ fn static_template_artifacts_roundtrip_without_lr_storage() {
     for source in GRAMMARS {
         let reference=Constraint::compile(Grammar::glrm(source),&v).unwrap();
         let lr_bytes=reference.save();
-        assert_eq!(u16::from_le_bytes(lr_bytes[8..10].try_into().unwrap()),30);
+        assert_eq!(u16::from_le_bytes(lr_bytes[8..10].try_into().unwrap()),31);
         compare_static(&reference,&Constraint::load(lr_bytes).unwrap());
         let template=into_template_parser(reference.clone()).unwrap();
         let bytes=template.save();
@@ -168,7 +168,7 @@ fn external_template_artifacts_omit_vocab_require_exact_binding_and_roundtrip() 
     assert_eq!(token_section_len,0,"model-token bytes must really be absent");
     let parser = &body[parser_range(body)];
     assert_eq!(&parser[..4],b"TPX1");
-    assert_eq!(&parser[36..40],b"TPR4");
+    assert_eq!(&parser[36..40],b"TPR6");
     let loaded = <DynamicConstraint as DynamicConstraintExt>::load_with_vocab(&external, &v).unwrap();
     compare_dynamic(&reference, &loaded);
     assert_eq!(loaded.save_with_external_vocab(), external,"external re-save must use same-mode backing bytes");
@@ -210,29 +210,15 @@ fn malformed_external_template_binding_is_rejected() {
 }
 
 #[test]
-fn legacy_lr_and_template_artifacts_remain_readable() {
-    let v=vocab();
-    let lr=Constraint::compile(Grammar::glrm(GRAMMARS[1]),&v).unwrap();
-    for bytes in [
-        include_bytes!("fixtures/template_parser_v1/static-v30-lr.bin").as_slice(),
-        include_bytes!("fixtures/template_parser_v1/static-v31-tpr1.bin").as_slice(),
-    ] {
-        let restored=Constraint::load(bytes).unwrap();
-        compare_static(&lr,&restored);
-        assert_eq!(restored.save(),bytes,"old unchanged backing must re-save verbatim");
-    }
-    let o2=DynamicConstraint::compile_with_vocab_partition(Grammar::glrm(GRAMMARS[1]),&v).unwrap();
-    let old=include_bytes!("fixtures/template_parser_v1/o2-v21-tpr1.bin");
-    let restored=DynamicConstraint::load(old).unwrap();
-    compare_dynamic(&o2,&restored);
-    assert_eq!(restored.save(),old);
-    let old=include_bytes!("fixtures/template_parser_v1/o2-transfer-v14-tpx1.bin");
-    let restored=<DynamicConstraint as DynamicConstraintExt>::load_with_vocab(old,&v).unwrap();
-    compare_dynamic(&o2,&restored);
-    assert_eq!(restored.save_with_external_vocab(),old);
-    for report in dynamic_parser_backend_report(&restored).as_array().unwrap() {
-        assert_eq!(report["lr_table_present"],false);
-    }
+fn obsolete_lr_and_template_artifacts_are_rejected() {
+    let v = vocab();
+    let lr = include_bytes!("fixtures/template_parser_v1/static-v30-lr.bin");
+    let rejected = std::panic::catch_unwind(|| Constraint::load(lr));
+    assert!(rejected.is_err(), "LR-backed artifact materialization must panic loudly");
+    assert!(Constraint::load(include_bytes!("fixtures/template_parser_v1/static-v31-tpr1.bin")).is_err());
+    assert!(DynamicConstraint::load(include_bytes!("fixtures/template_parser_v1/o2-v21-tpr1.bin")).is_err());
+    assert!(<DynamicConstraint as DynamicConstraintExt>::load_with_vocab(
+        include_bytes!("fixtures/template_parser_v1/o2-transfer-v14-tpx1.bin"), &v).is_err());
 }
 
 fn compact_fixture()->Vec<u8> {
@@ -258,7 +244,7 @@ fn mutate_range(bytes:&[u8],range:std::ops::Range<usize>,value:&[u8])->Vec<u8> {
 #[test]
 fn compact_template_programs_reject_noncanonical_counts_truncation_and_duplicate_core() {
     let original=compact_fixture();let parser=&original[parser_range(&original)];
-    assert_eq!(&parser[..4],b"TPR4");
+    assert_eq!(&parser[..4],b"TPR6");
     let mut cursor=4;let alphabet=read_var(parser,&mut cursor);let first_end=cursor;
     for bad in [vec![128,0],vec![255,255,255,255,31],vec![128;6]] {
         let bad=mutate_range(parser,4..first_end,&bad);
@@ -350,15 +336,19 @@ fn malformed_embedding_flags_slots_and_finish_graphs_are_rejected() {
         for _ in 0..3 { let count = read_var(bytes, cursor); for _ in 0..count { read_var(bytes, cursor); } }
     }
     let original = compact_fixture(); let parser = &original[parser_range(&original)];
-    assert_eq!(&parser[..4], b"TPR4");
+    assert_eq!(&parser[..4], b"TPR6");
     let mut cursor = 4; let alphabet = read_var(parser, &mut cursor); let terminals = read_var(parser, &mut cursor);
     let skips = read_var(parser, &mut cursor); for _ in 0..skips { read_var(parser, &mut cursor); }
     for _ in 0..=terminals { skip_program(parser, &mut cursor); }
     let composed = cursor; assert_eq!(read_var(parser, &mut cursor), 0);
+    let embedding = cursor; assert_eq!(read_var(parser, &mut cursor), 1);
     let nullable = cursor; read_var(parser, &mut cursor);
     let return_pop = cursor; read_var(parser, &mut cursor);
-    let count_start = cursor; assert_eq!(read_var(parser, &mut cursor), 0); let finish_start = cursor;
-    for (position, value) in [(composed, 2), (nullable, 2), (return_pop, 0), (return_pop, 3)] {
+    let count_start = cursor; let slots = read_var(parser, &mut cursor);
+    for _ in 0..slots { read_var(parser, &mut cursor); }
+    let finish_start = cursor;
+    let finish_alphabet = cursor; read_var(parser, &mut cursor);
+    for (position, value) in [(composed, 2), (embedding, 2), (nullable, 2), (return_pop, 0), (return_pop, 3), (finish_alphabet, 0), (finish_alphabet, alphabet + 1)] {
         let mut end = position; read_var(parser, &mut end);
         let bad = mutate_range(parser, position..end, &var_bytes(value));
         assert!(Constraint::load(replace_parser(&original, &bad)).is_err(), "accepted malformed embedding field {position}");

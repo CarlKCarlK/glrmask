@@ -35,8 +35,8 @@ pub enum Optimization {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 #[non_exhaustive]
 pub enum ParserBackend {
-    #[default]
     LrTable,
+    #[default]
     TemplateDfa,
 }
 
@@ -63,6 +63,8 @@ impl BuildOptions {
     }
 
     pub fn parser_backend(mut self, backend: ParserBackend) -> Self {
+        assert!(backend != ParserBackend::LrTable,
+            "LR-BACKED CONSTRAINT REQUEST IS FORBIDDEN: only native template Constraints may be materialized");
         self.parser_backend = backend; self
     }
 
@@ -298,6 +300,9 @@ impl<'a> Grammar<'a> {
                 ensure_runnable_constraint(&constraint)?;
                 return constraint.with_end_tokens(options.end_token_ids());
             }
+        }
+        if !self.bindings.is_empty() {
+            return self.compile_unlinked(vocab)?.link_with(options);
         }
         let mut spec = ConstraintSpec::builder(self.clone(), vocab)?.build()?;
         spec.automatic_boundary_selection = true;
@@ -1357,7 +1362,7 @@ impl GrammarBinding<'_> {
                         }
                     }
                     let module = grammar.compile_unlinked(vocab)?;
-                    Ok(CompiledChild::StaticOwned(module.materialize(Optimization::Auto)?))
+                    Ok(CompiledChild::StaticOwned(module.materialize_template_components(Optimization::Auto)?))
                 }
                 ChildCompileMode::Dynamic => {
                     let spec = ConstraintSpec::builder(grammar.clone(), vocab)?.build()?;
@@ -1399,7 +1404,7 @@ impl GrammarBinding<'_> {
                         )));
                     }
                     let module = grammar.compile_unlinked(vocab)?;
-                    Ok(CompiledChild::StaticOwned(module.materialize(Optimization::Auto)?))
+                    Ok(CompiledChild::StaticOwned(module.materialize_template_components(Optimization::Auto)?))
                 }
                 ChildCompileMode::Dynamic => {
                     let spec = ConstraintSpec::builder(grammar, vocab)?.build()?;
@@ -1426,15 +1431,11 @@ impl GrammarBinding<'_> {
     }
 }
 
-/// Composition has not yet been lowered to parser-independent relations.
-/// Reject before querying LR-only nullable/link metadata, including when the
-/// parent chose the ordinary LR backend but a child is table-free.
+/// Every compiled component must already own its native parser; linking
+/// cannot materialize an LR-backed Constraint as an intermediate.
 fn require_composable_parser(constraint: &RuntimeConstraint) -> Result<()> {
-    if constraint.has_template_parser() {
-        return Err(Error::Compilation(
-            "template-parser component composition is not implemented; no LR fallback is permitted".into(),
-        ));
-    }
+    assert!(constraint.has_template_parser() && !constraint.table.is_present(),
+        "LR-BACKED CONSTRAINT COMPOSITION IS FORBIDDEN");
     Ok(())
 }
 
@@ -1524,6 +1525,13 @@ fn compose_named_children(
     vocab: &Vocab,
     boundary_backend: SegmentedBoundaryBackend,
 ) -> Result<RuntimeConstraint> {
+    if parent.has_template_parser() {
+        let mut linked = crate::runtime::parser_backend::link::compose(parent, children, vocab)?;
+        if matches!(boundary_backend, SegmentedBoundaryBackend::StaticParserDwa) {
+            crate::compiler::template_boundary::install(&mut linked, vocab)?;
+        }
+        return Ok(linked);
+    }
     let bound_names = children
         .iter()
         .map(|(name, _)| name.as_str())
@@ -2180,7 +2188,7 @@ impl UnlinkedConstraint {
         self.validate_slot_manifest()?;
         let vocab = constraint_vocab(self.inner.as_ref());
         let mut parent = self.inner.as_ref().clone();
-        if parent.table.is_present() {
+        if parent.has_template_parser() {
             crate::compiler::boundary_candidates::persist_boundary_candidate_summary(
                 &mut parent,
                 &vocab,
@@ -2195,7 +2203,7 @@ impl UnlinkedConstraint {
                 ModuleBinding::ExactTokens(ids) => compile_exact_token_adapter(&vocab, ids)?,
             };
             child.end_tokens = Arc::from([]);
-            if child.table.is_present() {
+            if child.has_template_parser() {
                 crate::compiler::boundary_candidates::persist_boundary_candidate_summary(
                     &mut child,
                     &vocab,
@@ -3157,39 +3165,26 @@ mod tests {
     }
 
     fn assert_recursive_compiler_views_detached(constraint: &RuntimeConstraint) {
+        assert!(constraint.has_template_parser());
+        assert!(!constraint.table.is_present(), "native parser retained an LR table");
         if !constraint.uses_compact_segmented_parser_runtime() {
             return;
         }
-        assert_eq!(
-            constraint.table.num_states, 0,
-            "recursive coordinator retained a flattened LR state machine",
-        );
-        assert!(constraint.table.action.is_empty() && constraint.table.goto.is_empty());
         let overlay = constraint.static_dynamic_overlay.as_ref().unwrap();
         assert!(
-            overlay.recursive_compiler_table.get().is_some(),
-            "recursive coordinator lost its lazy compiler table",
+            constraint.template_parser.as_ref().unwrap().link_grammar.is_some(),
+            "recursive coordinator lost its pure composition grammar metadata",
         );
         for component in &overlay.segmented_parser_components {
             assert_recursive_compiler_views_detached(&component.constraint);
         }
     }
 
-    fn poison_materialized_outer_table(constraint: &mut RuntimeConstraint) {
+    fn assert_no_materialized_outer_table(constraint: &mut RuntimeConstraint) {
         constraint.recursive_parser_layout().unwrap().unwrap();
-        constraint.table.action.clear();
-        constraint.table.goto.clear();
-        constraint.table.advance.clear();
-        constraint.table.unconditional_advance.clear();
-        constraint.table.rules.clear();
-        constraint.table.forwarded_shifts.clear();
-        constraint.table.control_terminals.clear();
-        constraint.table.skip_terminals.clear();
-        constraint.table.guarded_shift_index.clear();
-        constraint.table.direct_regular_wide_frontiers.clear();
-        constraint.table.num_states = 0;
-        constraint.table.num_terminals = 0;
-        constraint.table.num_rules = 0;
+        // Native constraints have no table to poison, including at leaves.
+        // Keep exercising the cloned/loaded instance after proving absence.
+        assert_recursive_compiler_views_detached(constraint);
     }
 
     fn assert_static_boundary(constraint: &RuntimeConstraint) {
@@ -3697,13 +3692,9 @@ mod tests {
             .bind_grammar_dynamic_boundary("leaf", leaf)
             .unwrap();
         assert_recursive_compiler_views_detached(&inner);
-        let mut compiler_view = inner.clone();
-        compiler_view
-            .prepare_recursive_compiler_table_for_composition()
-            .unwrap();
         assert!(
-            !compiler_view.table.control_terminals.is_empty(),
-            "fixture must exercise Exact construction over compiler-materialized linker controls",
+            inner.parser_has_controls(),
+            "fixture must exercise Exact construction over explicit native linker controls",
         );
         inner.build_exact_boundary_trigger().unwrap();
         assert_recursive_compiler_views_detached(&inner);
@@ -4026,7 +4017,7 @@ mod tests {
                 root.tokenizer_has_epsilon_transitions;
         }
         let mut no_outer_table = loaded.clone();
-        poison_materialized_outer_table(&mut no_outer_table);
+        assert_no_materialized_outer_table(&mut no_outer_table);
         for constraint in [
             &bound,
             &loaded,
@@ -4171,7 +4162,7 @@ mod tests {
 
         let loaded = RuntimeConstraint::load(&bound.save()).unwrap();
         let mut no_outer_table = loaded.clone();
-        poison_materialized_outer_table(&mut no_outer_table);
+        assert_no_materialized_outer_table(&mut no_outer_table);
         for constraint in [&bound, &loaded, &no_outer_table] {
             let mut state = constraint.start();
             state.commit_token(0).unwrap();
@@ -4360,7 +4351,7 @@ mod tests {
         )
         .unwrap();
         let mut no_outer_table = loaded.clone();
-        poison_materialized_outer_table(&mut no_outer_table);
+        assert_no_materialized_outer_table(&mut no_outer_table);
         fn compare_reachable_prefix_tree(
             actual_constraint: &RuntimeConstraint,
             expected_constraint: &RuntimeConstraint,
@@ -4441,9 +4432,9 @@ mod tests {
             &vocab,
         )
         .unwrap();
-        assert!(middle_parent.table.embedded_start_nullable());
+        assert!(middle_parent.composition_start_nullable().unwrap());
         let middle = middle_parent.bind_grammar("leaf", leaf).unwrap();
-        assert!(middle.table.embedded_start_nullable());
+        assert!(middle.composition_start_nullable().unwrap());
         assert!(middle.uses_compact_segmented_parser_runtime());
 
         let outer_parent = RuntimeConstraint::compile(
@@ -4465,7 +4456,7 @@ mod tests {
         )
         .unwrap();
         let mut no_outer_table = loaded.clone();
-        poison_materialized_outer_table(&mut no_outer_table);
+        assert_no_materialized_outer_table(&mut no_outer_table);
 
         for constraint in [&bound, &loaded, &no_outer_table] {
             for tokens in [&[3][..], &[4][..], &[0, 2][..], &[0, 5][..], &[0, 1, 2][..]] {
@@ -4496,7 +4487,7 @@ mod tests {
             &vocab,
         )
         .unwrap();
-        let leaf_states = leaf.table.num_states;
+        let leaf_states = leaf.parser_symbol_count();
         let leaf_tokenizer_states = leaf.tokenizer.num_states();
         let leaf_tokenizer_reset = leaf.runtime_commit_initial_state();
         let middle_parent = RuntimeConstraint::compile(
@@ -4506,7 +4497,7 @@ mod tests {
             &vocab,
         )
         .unwrap();
-        let middle_parent_states = middle_parent.table.num_states;
+        let middle_parent_states = middle_parent.parser_symbol_count();
         let middle_parent_tokenizer_states = middle_parent.tokenizer.num_states();
         let middle_parent_tokenizer_reset = middle_parent.runtime_commit_initial_state();
         let middle = middle_parent
@@ -4519,7 +4510,7 @@ mod tests {
             &vocab,
         )
         .unwrap();
-        let outer_parent_states = outer_parent.table.num_states;
+        let outer_parent_states = outer_parent.parser_symbol_count();
         let outer_parent_tokenizer_states = outer_parent.tokenizer.num_states();
         let outer_parent_tokenizer_reset = outer_parent.runtime_commit_initial_state();
         let bound = outer_parent
@@ -4908,11 +4899,7 @@ mod tests {
             half.tokenizer.num_states() < half_layout.total_tokenizer_states,
             "test fixture must actually contain more than one tokenizer leaf",
         );
-        assert_eq!(
-            half.table.num_states, 0,
-            "recursive coordinator must not retain a flattened LR state machine",
-        );
-        assert!(half.table.action.is_empty() && half.table.goto.is_empty());
+        assert_recursive_compiler_views_detached(&half);
         assert!(half_overlay
             .segmented_parser_components
             .iter()
@@ -4930,11 +4917,7 @@ mod tests {
             "loaded recursive coordinator must not reconstruct the outer union tokenizer eagerly",
         );
         assert!(loaded_half.tokenizer.num_states() < loaded_half_layout.total_tokenizer_states);
-        assert_eq!(
-            loaded_half.table.num_states, 0,
-            "loaded recursive coordinator must keep the flattened parser table lazy",
-        );
-        assert!(loaded_half.table.action.is_empty() && loaded_half.table.goto.is_empty());
+        assert_recursive_compiler_views_detached(&loaded_half);
         assert!(loaded_half_overlay
             .segmented_parser_components
             .iter()
@@ -4961,7 +4944,7 @@ mod tests {
             .close_compact_segmented_parser(&loaded_start)
             .unwrap();
         assert!(fresh_closed.semantically_eq(&loaded_closed, 4096).unwrap());
-        for terminal in 0..fresh_full.table.num_terminals {
+        for terminal in 0..fresh_full.parser_terminal_count() {
             let fresh_advanced = fresh_full
                 .advance_compact_segmented_parser(&fresh_closed, terminal)
                 .unwrap();
@@ -5019,11 +5002,11 @@ mod tests {
             &vocab,
         )
         .unwrap();
-        assert!(!middle_parent.table.embedded_start_nullable());
+        assert!(!middle_parent.composition_start_nullable().unwrap());
         let middle = middle_parent
             .bind_grammar_dynamic_boundary("leaf", &leaf)
             .unwrap();
-        assert!(middle.table.embedded_start_nullable());
+        assert!(middle.composition_start_nullable().unwrap());
         let outer_parent = RuntimeConstraint::compile(
             Grammar::glrm(
                 "glrm 1; start document; extern grammar middle; t X = \"X\"; t BANG = \"!\"; nt document = X middle BANG;",
@@ -5370,7 +5353,9 @@ mod tests {
         let retained = parent.inner.late_bind_vocab.get().expect("retain supplied vocabulary");
         assert!(Arc::ptr_eq(&retained.entries_arc(), &vocab.entries_arc()));
 
-        let loaded = DynamicConstraint::load(&parent.save()).unwrap();
+        let loaded = DynamicConstraint::from_constraints(vec![
+            RuntimeConstraint::load_body_artifact(parent.inner.save()).unwrap(),
+        ]);
         assert!(loaded.inner.late_bind_vocab.get().is_none());
         let first = loaded.bind_grammar_dynamic_boundary("child", &child).unwrap();
         let first_backing = loaded.inner.late_bind_vocab.get()
@@ -5380,7 +5365,9 @@ mod tests {
             &first_backing, &loaded.inner.late_bind_vocab.get().unwrap().entries_arc(),
         ));
         assert_eq!(first.start().mask(), second.start().mask());
-        let reloaded = DynamicConstraint::load(&loaded.save()).unwrap();
+        let reloaded = DynamicConstraint::from_constraints(vec![
+            RuntimeConstraint::load_body_artifact(loaded.inner.save()).unwrap(),
+        ]);
         assert!(reloaded.inner.late_bind_vocab.get().is_none(), "cache stays off wire");
         let rebound = reloaded.bind_grammar_dynamic_boundary("child", &child).unwrap();
         assert_eq!(first.start().mask(), rebound.start().mask());

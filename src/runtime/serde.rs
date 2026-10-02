@@ -54,12 +54,11 @@ const PREVIOUS_STATIC_RESIDUAL_CONSTRAINT_VERSION: u16 = 27;
 const PREVIOUS_STATIC_PROJECTION_CONSTRAINT_VERSION: u16 = 28;
 const PREVIOUS_BOUNDARY_SUMMARYLESS_CONSTRAINT_VERSION: u16 = 29;
 const CONSTRAINT_VERSION: u16 = 30;
-// V31 retains S30 framing but replaces the LR section with a TPR1 acyclic
-// parser program. Ordinary LR artifacts deliberately continue writing V30.
-const TEMPLATE_CONSTRAINT_VERSION: u16 = 31;
-// V32 is the exact same template-only body bound to an external vocabulary.
-// Token bytes are omitted; TPX1 stores their content identity before TPR1 data.
-const EXTERNAL_TEMPLATE_CONSTRAINT_VERSION: u16 = 32;
+// V33 retains S30 section framing with TPR6 parser views and exact dynamic
+// proof metadata in R33. Earlier pre-release template formats are unsupported.
+const TEMPLATE_CONSTRAINT_VERSION: u16 = 33;
+// V34 is the same native body bound to an external vocabulary (TPX1).
+const EXTERNAL_TEMPLATE_CONSTRAINT_VERSION: u16 = 34;
 const CONSTRAINT_HEADER_LEN: usize = CONSTRAINT_MAGIC.len() + 2 + 8;
 const COMPRESSED_PAYLOAD_HEADER_LEN: usize = 8;
 const CONSTRAINT_COMPRESSION_LEVEL: i32 = 1;
@@ -93,7 +92,7 @@ const V29_SECTION_MAGIC: [u8; 4] = *b"S29\0";
 const V29_SECTION_HEADER_LEN: usize = V29_SECTION_MAGIC.len() + 11 * 8;
 const V30_SECTION_MAGIC: [u8; 4] = *b"S30\0";
 const V30_SECTION_HEADER_LEN: usize = V30_SECTION_MAGIC.len() + 11 * 8;
-const CURRENT_RUNTIME_MAGIC: [u8; 4] = *b"R29\0";
+const CURRENT_RUNTIME_MAGIC: [u8; 4] = *b"R33\0";
 const CURRENT_RUNTIME_HEADER_LEN: usize = CURRENT_RUNTIME_MAGIC.len() + 2 * 8;
 const PREVIOUS_STATIC_RESIDUAL_MASK_MAGIC: [u8; 4] = *b"SRM2";
 const STATIC_RESIDUAL_MASK_MAGIC: [u8; 4] = *b"SRM3";
@@ -1037,13 +1036,8 @@ fn encode_composition_metadata(constraint: &Constraint) -> Vec<u8> {
 }
 
 fn encode_composition_metadata_for_save(constraint: &Constraint) -> Vec<u8> {
-    // A table-free component can now be linked again after save/load. Preserve
-    // its small link-time proof/interface metadata (including the checked
-    // boundary-candidate certificate), while continuing to omit dead LR/parser
-    // compiler caches that template conversion deliberately removed.
-    if constraint.has_template_parser() {
-        return encode_composition_metadata_base_for_save(constraint);
-    }
+    // Preserve component-only proof metadata, including a certified FIRST/cut
+    // index, independently of the native parser's executable source inventory.
     let bytes=encode_composition_metadata_base_for_save(constraint);
     if let Some(wire)=crate::compiler::boundary_precomputed_completion::saved_wire(constraint) {
         crate::compiler::boundary_precomputed_completion::wrap_envelope(bytes,wire)
@@ -3160,6 +3154,7 @@ fn decode_current_runtime_wire(
 
 #[derive(Serialize)]
 struct ConstraintArtifactCurrentRuntimeRef<'a> {
+    template_dynamic_proofs: Option<crate::dynamic_constraint::TemplateDynamicProofs>,
     terminal_live_states: &'a [Vec<u32>],
     segmented_runtime: Option<SegmentedRuntimeArtifactV27Ref<'a>>,
     dynamic_mask_vocab: Option<crate::runtime::artifact::DynamicMaskVocabArtifact>,
@@ -3182,6 +3177,7 @@ struct ConstraintArtifactV28Runtime {
 
 #[derive(Deserialize)]
 struct ConstraintArtifactCurrentRuntime {
+    template_dynamic_proofs: Option<crate::dynamic_constraint::TemplateDynamicProofs>,
     terminal_live_states: Vec<Vec<u32>>,
     segmented_runtime: Option<SegmentedRuntimeArtifactV27>,
     dynamic_mask_vocab: Option<crate::runtime::artifact::DynamicMaskVocabArtifact>,
@@ -3245,6 +3241,7 @@ struct ConstraintArtifactV20Runtime {
 }
 
 struct DecodedConstraintRuntime {
+    template_dynamic_proofs: Option<crate::dynamic_constraint::TemplateDynamicProofs>,
     terminal_live_states: Vec<Vec<u32>>,
     segmented_runtime_v20: Option<SegmentedRuntimeArtifactV20>,
     segmented_runtime_v22: Option<SegmentedRuntimeArtifactV22>,
@@ -6437,15 +6434,14 @@ impl Constraint {
                         || {
                             let started = profile.then(std::time::Instant::now);
                             let packed_dwa_dense_masks = &self.packed_dwa_token_dense_masks;
-                            let static_virtual_residual_wire = if self.uses_dynamic_runtime() {
-                                Vec::new()
-                            } else {
+                            let static_virtual_residual_wire = {
                                 self.dynamic_mask_vocab
                                     .virtual_residual_mask_projection_parts()
                                     .map(|(mask_tokenizer, projections)| encode_static_virtual_residual_mask_wire(&self.tokenizer, mask_tokenizer, projections))
                                     .unwrap_or_default()
                             };
                             let metadata = ConstraintArtifactCurrentRuntimeRef {
+                                template_dynamic_proofs: self.has_template_parser().then(|| crate::dynamic_constraint::TemplateDynamicProofs::from_constraint(self)),
                                 terminal_live_states: &self.terminal_live_states,
                                 segmented_runtime: segmented_runtime_artifact_ref(self),
                                 dynamic_mask_vocab: self.uses_dynamic_runtime().then(|| {
@@ -7548,6 +7544,7 @@ impl Constraint {
                                                 ))
                                             };
                                             Ok(DecodedConstraintRuntime {
+                                                template_dynamic_proofs: runtime.template_dynamic_proofs,
                                                 terminal_live_states: runtime.terminal_live_states,
                                                 segmented_runtime_v20: None,
                                                 segmented_runtime_v22: None,
@@ -7583,6 +7580,7 @@ impl Constraint {
                                                 ))
                                             };
                                             Ok(DecodedConstraintRuntime {
+                                                template_dynamic_proofs: None,
                                                 terminal_live_states: runtime.terminal_live_states,
                                                 segmented_runtime_v20: None,
                                                 segmented_runtime_v22: None,
@@ -7623,6 +7621,7 @@ impl Constraint {
                                                 ))
                                             };
                                             Ok(DecodedConstraintRuntime {
+                                                template_dynamic_proofs: None,
                                                 terminal_live_states: runtime.terminal_live_states,
                                                 segmented_runtime_v20: None,
                                                 segmented_runtime_v22: None,
@@ -7660,6 +7659,7 @@ impl Constraint {
                                                 ))
                                             };
                                             Ok(DecodedConstraintRuntime {
+                                                template_dynamic_proofs: None,
                                                 terminal_live_states: runtime.terminal_live_states,
                                                 segmented_runtime_v20: None,
                                                 segmented_runtime_v22: None,
@@ -7697,6 +7697,7 @@ impl Constraint {
                                                 ))
                                             };
                                             Ok(DecodedConstraintRuntime {
+                                                template_dynamic_proofs: None,
                                                 terminal_live_states: runtime.terminal_live_states,
                                                 segmented_runtime_v20: None,
                                                 segmented_runtime_v22: None,
@@ -7734,6 +7735,7 @@ impl Constraint {
                                                 ))
                                             };
                                             Ok(DecodedConstraintRuntime {
+                                                template_dynamic_proofs: None,
                                                 terminal_live_states: runtime.terminal_live_states,
                                                 segmented_runtime_v20: None,
                                                 segmented_runtime_v22: runtime.segmented_runtime,
@@ -7771,6 +7773,7 @@ impl Constraint {
                                                 ))
                                             };
                                             Ok(DecodedConstraintRuntime {
+                                                template_dynamic_proofs: None,
                                                 terminal_live_states: runtime.terminal_live_states,
                                                 segmented_runtime_v20: runtime.segmented_runtime,
                                                 segmented_runtime_v22: None,
@@ -7788,6 +7791,7 @@ impl Constraint {
                                             runtime_section,
                                         )
                                         .map(|runtime| DecodedConstraintRuntime {
+                                                template_dynamic_proofs: None,
                                             terminal_live_states: runtime.terminal_live_states,
                                             segmented_runtime_v20: runtime.segmented_runtime,
                                             segmented_runtime_v22: None,
@@ -7804,6 +7808,7 @@ impl Constraint {
                                             runtime_section,
                                         )
                                         .map(|runtime| DecodedConstraintRuntime {
+                                                template_dynamic_proofs: None,
                                             terminal_live_states: runtime.terminal_live_states,
                                             segmented_runtime_v20: None,
                                             segmented_runtime_v22: None,
@@ -8337,7 +8342,9 @@ impl Constraint {
             }
             let mut virtual_runtimes = Vec::new();
             let mut static_virtual_residual_mask = None;
+            let mut template_dynamic_proofs = None;
             if let Some(runtime) = runtime {
+                template_dynamic_proofs = runtime.template_dynamic_proofs;
                 virtual_runtimes = runtime.virtual_runtimes;
                 static_virtual_residual_mask = runtime.static_virtual_residual_mask;
                 constraint.terminal_live_states = runtime.terminal_live_states;
@@ -8402,7 +8409,7 @@ impl Constraint {
                         constraint.retained_terminal_exprs().map(|exprs| exprs.to_vec())
                     });
                     if constraint.uses_dynamic_runtime() {
-                        Arc::make_mut(&mut constraint.tokenizer).restore_terminal_exprs_with_virtual_runtime_metadata(
+                        Arc::make_mut(&mut constraint.tokenizer).restore_terminal_exprs_with_virtual_runtime_metadata_preserving_residual_coordinates(
                             terminal_exprs, &virtual_runtimes, false,
                         )
                     } else if let Some(static_mask) = static_virtual_residual_mask
@@ -8427,6 +8434,9 @@ impl Constraint {
             }
             if let Some(static_mask) = static_virtual_residual_mask {
                 static_mask.restore_projections(&mut constraint)?;
+            }
+            if let Some(proofs) = template_dynamic_proofs {
+                proofs.restore(&mut constraint)?;
             }
             let restore_exprs_ms = restore_exprs_started
                 .map_or(0.0, |started| started.elapsed().as_secs_f64() * 1000.0);

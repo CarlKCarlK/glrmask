@@ -244,7 +244,7 @@ fn compile_from_source(
                 default_table_construction,
             )
         })?;
-        constraint.table.set_embedded_end_token_ids(end_token_ids);
+        constraint.set_composition_end_token_ids(end_token_ids);
         emit_compile_profile_summary(Some(source_kind), Some(import_ms), &profile);
         emit_import_phase_end("compile_from_source", compile_from_source_started_at);
         return Ok(constraint);
@@ -254,7 +254,7 @@ fn compile_from_source(
     let mut constraint = crate::error::catch_internal_invariant(|| {
         compile_owned_with_table_construction(grammar, vocab, default_table_construction)
     })?;
-    constraint.table.set_embedded_end_token_ids(end_token_ids);
+    constraint.set_composition_end_token_ids(end_token_ids);
     emit_import_phase_end("compile_from_source", compile_from_source_started_at);
     Ok(constraint)
 }
@@ -280,7 +280,7 @@ pub(crate) fn compile_from_named_grammar(
                 default_table_construction,
             )
         })?;
-        constraint.table.set_embedded_end_token_ids(end_token_ids);
+        constraint.set_composition_end_token_ids(end_token_ids);
         emit_compile_profile_summary(Some(source_kind), Some(import_ms), &profile);
         return Ok(constraint);
     }
@@ -288,7 +288,7 @@ pub(crate) fn compile_from_named_grammar(
     let mut constraint = crate::error::catch_internal_invariant(|| {
         compile_owned_with_table_construction(grammar, vocab, default_table_construction)
     })?;
-    constraint.table.set_embedded_end_token_ids(end_token_ids);
+    constraint.set_composition_end_token_ids(end_token_ids);
     Ok(constraint)
 }
 
@@ -485,7 +485,7 @@ fn compile_bounded_template_from_source(
                 prepared, vocab, table_construction,
             )?;
             for body in component.constraints_mut() {
-                body.table.set_embedded_start_nullable(source_start_nullable);
+                body.set_composition_start_nullable(source_start_nullable);
             }
             compiled.push(component);
         }
@@ -1946,6 +1946,38 @@ mod tests {
         state.commit_bytes(bytes).is_ok() && state.is_accepting()
     }
 
+    fn assert_native_import_compiler_policy(
+        constraint: &Constraint,
+        construction: GlrTableConstruction,
+        compiler_admission: AdmissionPolicy,
+        accepted: &[u8],
+        rejected: &[u8],
+    ) {
+        // Construction policy belongs to compiler analysis. Check the
+        // temporary table directly; it must never enter a Constraint.
+        let source = constraint.template_parser.as_ref().unwrap()
+            .link_grammar.as_ref().unwrap();
+        let analyzed = source.analyze(constraint.terminal_display_names.clone());
+        let table = crate::compiler::glr::table::GLRTable::build_with_default_construction(
+            &analyzed, construction.clone(),
+        );
+        assert_eq!(table.construction, construction);
+        assert_eq!(table.admission_policy, compiler_admission);
+        assert_eq!(constraint.parser_symbol_count(), table.num_states);
+        assert_eq!(constraint.parser_terminal_count(), table.num_terminals);
+        drop(table);
+
+        let loaded = Constraint::load(&constraint.save()).unwrap();
+        assert_eq!(constraint.start().mask(), loaded.start().mask());
+        for native in [constraint, &loaded] {
+            assert!(native.has_template_parser());
+            assert!(!native.table.is_present());
+            assert_eq!(native.parser_admission_policy(), AdmissionPolicy::ExactSimulation);
+            assert!(accepts_bytes(native, accepted));
+            assert!(!accepts_bytes(native, rejected));
+        }
+    }
+
     #[test]
     #[allow(deprecated)]
     fn programmatic_json_constructors_are_unsupported() {
@@ -2144,8 +2176,13 @@ mod tests {
         )
         .unwrap();
 
-        assert_eq!(constraint.table.construction, GlrTableConstruction::LegacyRowBisim);
-        assert_eq!(constraint.table.admission_policy, AdmissionPolicy::RowPresenceExact);
+        assert_native_import_compiler_policy(
+            &constraint,
+            GlrTableConstruction::LegacyRowBisim,
+            AdmissionPolicy::RowPresenceExact,
+            b"\"a\"",
+            b"a",
+        );
     }
 
     fn token_allowed(mask: &[u32], token_id: u32) -> bool {
@@ -2253,11 +2290,13 @@ mod tests {
         )
         .unwrap();
 
-        assert_eq!(
-            constraint.table.construction,
-            GlrTableConstruction::ExperimentalCoreMerged
+        assert_native_import_compiler_policy(
+            &constraint,
+            GlrTableConstruction::ExperimentalCoreMerged,
+            AdmissionPolicy::ExactSimulation,
+            b"a",
+            b"aa",
         );
-        assert_eq!(constraint.table.admission_policy, AdmissionPolicy::ExactSimulation);
     }
 
     #[test]
@@ -2676,7 +2715,7 @@ mod tests {
         )
         .unwrap();
         assert!(
-            composed.table.control_terminals.is_empty(),
+            composed.parser_control_terminals().is_empty(),
             "a child followed directly by an end token must compile linker controls away",
         );
         let loaded = Constraint::load(&composed.save()).unwrap();
@@ -2697,10 +2736,12 @@ mod tests {
     fn ebnf_import_uses_core_merged_table_by_default() {
         let constraint = Constraint::from_ebnf("start ::= 'a'", &vocab(&["a"])).unwrap();
 
-        assert_eq!(
-            constraint.table.construction,
-            GlrTableConstruction::ExperimentalCoreMerged
+        assert_native_import_compiler_policy(
+            &constraint,
+            GlrTableConstruction::ExperimentalCoreMerged,
+            AdmissionPolicy::ExactSimulation,
+            b"a",
+            b"aa",
         );
-        assert_eq!(constraint.table.admission_policy, AdmissionPolicy::ExactSimulation);
     }
 }
