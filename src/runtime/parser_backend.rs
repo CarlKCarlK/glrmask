@@ -916,6 +916,40 @@ impl Constraint {
                     report["dynamic_boundary_shards"] = overlay.segmented_parser_components.iter().filter(|component|
                         matches!(component.boundary.as_ref().map(|shard| &shard.backend),
                             Some(super::SegmentedBoundaryShardBackend::DynamicDirect))).count().into();
+                    report["boundary_candidate_tokens"] = serde_json::Value::Array(
+                        overlay.segmented_parser_components.iter().enumerate().map(|(index, component)|
+                            serde_json::json!({"component": index, "count": component.boundary.as_ref()
+                                .and_then(|shard| shard.candidate_tokens.as_ref()).map(|ids| ids.len())})).collect());
+                    if let Some(composition) = &parser.composition {
+                        let mut checked = 0usize; let mut sources = 0usize;
+                        let mut domains = 0usize; let mut identities = 0usize;
+                        let mut offset = 0usize;
+                        for component in &overlay.segmented_parser_components {
+                            let local = component.constraint.template_parser.as_ref().expect("native component");
+                            for terminal in 0..local.terminal_count as usize {
+                                let view = &composition.outer_views[offset + terminal];
+                                if let Some(nested) = &local.composition {
+                                    checked += 1;
+                                    sources += usize::from(Arc::ptr_eq(&view.source, &nested.outer_views[terminal].source));
+                                    domains += usize::from(Arc::ptr_eq(&view.domain, &nested.outer_views[terminal].domain));
+                                } else if component.constraint.ignore_terminal == Some(terminal as u32)
+                                    || local.skip_terminals.contains(&(terminal as u32)) {
+                                    identities += 1;
+                                } else {
+                                    checked += 1;
+                                    sources += usize::from(Arc::ptr_eq(&view.source,
+                                        component.constraint.template_dfas_by_terminal[terminal].as_ref().unwrap()));
+                                    domains += usize::from(Arc::ptr_eq(&view.domain, &local.domains[terminal]));
+                                }
+                            }
+                            offset += local.terminal_count as usize;
+                        }
+                        report["component_sharing"] = serde_json::json!({
+                            "checked_retained_terminal_relations": checked,
+                            "shared_retained_sources": sources, "shared_retained_domains": domains,
+                            "synthetic_ignore_or_skip_relations": identities,
+                            "dense_global_certificate_rows": parser.possible.len() + parser.unconditional.len()});
+                    }
                 }
                 report
             }

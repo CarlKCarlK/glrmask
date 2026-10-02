@@ -277,6 +277,10 @@ required-features = ["internal-api"]
 name = "template_precompiled_composition"
 required-features = ["internal-api"]
 
+[[example]]
+name = "template_schema_reparse_oracle"
+required-features = ["internal-api"]
+
 [[test]]
 name = "template_follow_support_oracle"
 path = "tests/template_follow_support_oracle.rs"
