@@ -72,7 +72,12 @@ impl<G:SignedGraph+?Sized,R:ResultRows> Solver<'_,G,R> {
         let row=graph.row(state as usize);
         self.account(2 * (row.transition_count() + 1).ilog2() as usize + 1)?;
         let mut result = FastBoundaryDerivedRow::default();
-        let selected=[label,DEFAULT_LABEL];
+        // Ordinary callers keep additive literal+DEFAULT cancellation. Native
+        // classes are already row-local complements, so test membership here;
+        // no concrete alphabet expansion or wildcard reinterpretation occurs.
+        self.account(graph.class_read_labels().len())?;
+        let selected = [label,DEFAULT_LABEL].into_iter().chain(graph.class_read_labels().iter().copied()
+            .filter(|&key|graph.class_read_matches(key,label)));
         for (position,key) in selected.into_iter().enumerate() {
             if position==1 && label==DEFAULT_LABEL{continue;}
             let Some(index)=row.find_label(key)
@@ -255,7 +260,11 @@ fn compute_with_rows<G:SignedGraph+?Sized,R:ResultRows>(
             let mut may=0u128;
             for index in 0..source.transition_count() {
                 let label=source.label(index);
-                if label==DEFAULT_LABEL {may=u128::MAX;break;}
+                if label==DEFAULT_LABEL || states.class_read_labels().binary_search(&label).is_ok() {
+                    // A conservative synopsis cannot reject a PUSH merely
+                    // because its matching POP uses an opaque class identity.
+                    may=u128::MAX;break;
+                }
                 if !is_negative_label(label) {may|=read_signature(label);}
             }
             for &(target,_) in &row {may|=solver.may_read[target as usize];}

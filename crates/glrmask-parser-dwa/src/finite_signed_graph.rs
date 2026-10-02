@@ -35,6 +35,8 @@ pub(super) trait SignedGraph {
     type Row<'a>:SignedRow where Self:'a;
     fn len(&self) -> usize;
     fn row(&self,index:usize) -> Self::Row<'_>;
+    fn class_read_labels(&self) -> &[i32] { &[] }
+    fn class_read_matches(&self, _label:i32, _symbol:i32) -> bool { false }
 }
 
 impl SignedRow for &FastBoundaryNwaState {
@@ -221,6 +223,8 @@ pub(super) struct VirtualSignedGraph {
     alphabet:u32,
     templates:Vec<TemplateTopology>,instances:Vec<Instance>,ports:Vec<FastBoundaryNwaState>,
     node_instance:Vec<u32>,
+    pop_classes:Option<crate::pop_classes::PopLabelClasses>,
+    class_reads:Vec<i32>,
     pub profile:VirtualGraphProfile,
 }
 
@@ -275,6 +279,14 @@ impl SignedRow for VirtualRow<'_> {
 impl SignedGraph for VirtualSignedGraph {
     type Row<'a>=VirtualRow<'a>;
     #[inline] fn len(&self)->usize {self.node_instance.len()}
+    fn class_read_labels(&self)->&[i32] { &self.class_reads }
+    fn class_read_matches(&self,label:i32,symbol:i32)->bool {
+        self.pop_classes.as_ref().is_some_and(|classes| {
+            let index = label - classes.symbol_count() as i32;
+            symbol >= 0 && index >= 0 && (index as usize) < classes.len()
+                && classes.matches(DEFAULT_LABEL-1-index,symbol as u32)
+        })
+    }
     #[inline] fn row(&self,q:usize)->VirtualRow<'_> {
         if q<self.ports.len(){return VirtualRow{kind:RowKind::Port(&self.ports[q])};}
         let instance=&self.instances[self.node_instance[q]as usize];
@@ -289,6 +301,21 @@ impl SignedGraph for VirtualSignedGraph {
 }
 
 impl VirtualSignedGraph {
+    pub fn build_with_pop_classes(program:&FiniteTemplateProgram<'_>,alphabet:u32,
+        pool:&mut FastBoundaryWeightInterner,limits:FiniteCompileLimits,
+        classes:&crate::pop_classes::PopLabelClasses,
+    )->Option<(Self,Vec<u32>)> {
+        if classes.symbol_count().checked_add(classes.len() as u32)? != alphabet {return None;}
+        // PUSH is always a concrete stack symbol, never an opaque class.
+        if program.templates.iter().flat_map(|graph| graph.states()).any(|row|
+            row.transitions.keys().any(|&label| is_negative_label(label)
+                && negative_to_positive_label(label) as u32 >= classes.symbol_count())) {return None;}
+        let(mut graph,order)=Self::build(program,alphabet,pool,limits)?;
+        graph.class_reads=(classes.symbol_count()..alphabet).map(|label|label as i32).collect();
+        graph.pop_classes=Some(classes.clone());
+        Some((graph,order))
+    }
+
     pub fn build(program:&FiniteTemplateProgram<'_>,alphabet:u32,
         pool:&mut FastBoundaryWeightInterner,limits:FiniteCompileLimits,
     )->Option<(Self,Vec<u32>)> {
@@ -380,7 +407,8 @@ impl VirtualSignedGraph {
             stored_template_states:templates.iter().map(|t|t.rows.len()).sum(),
             stored_template_edges:templates.iter().map(|t|t.logical_edges).sum(),
             instances:instances.len(),port_edges:port_rows.iter().map(|r|r.epsilons.len()).sum()};
-        let graph=Self{alphabet,templates,instances,ports:port_rows,node_instance,profile};
+        let graph=Self{alphabet,templates,instances,ports:port_rows,node_instance,profile,
+            pop_classes:None,class_reads:Vec::new()};
         let order=topological_order(&graph)?;
         Some((graph,order))
     }
@@ -689,6 +717,60 @@ impl<G:SignedGraph+?Sized> SignedGraph for EpsilonOverlay<'_,G> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn compact_class_cancellation_matches_the_independent_scoped_resolver() {
+        use crate::compiler::glr::labels::encode_negative_label;
+        use crate::pop_classes::PopLabelClasses;
+        use crate::automata::weighted::nwa::{NWA,NWAState};
+        let mut classes=PopLabelClasses::new(8).unwrap();
+        let a=classes.intern_scoped_complement(2..5,[3]).unwrap().unwrap();
+        let b=classes.intern_scoped_complement(4..7,[5]).unwrap().unwrap();
+        for top in 0..8 {
+            let mut source=NWA::from_parts(vec![NWAState::default();8],vec![0]);
+            source.add_transition(0,encode_negative_label(top),1,Weight::all());
+            source.add_transition(1,a,2,Weight::all());
+            source.add_transition(1,b,3,Weight::all());
+            source.add_transition(1,4,4,Weight::all()); // Overlap is additive.
+            source.add_transition(1,3,5,Weight::all()); // Explicit dead shadow.
+            source.add_transition(2,a,6,Weight::all());
+            source.add_transition(3,b,6,Weight::all());
+            source.add_transition(4,6,6,Weight::all());
+            source.add_transition(6,encode_negative_label(7),7,Weight::all());
+            source.set_final_weight(7,Weight::all());
+            let mut expected=source.clone();
+            crate::resolve_negatives::resolve_negative_codes_in_nwa_with_pop_classes(&mut expected,&classes).unwrap();
+            let expected=classes.compile_positive(expected,10000).unwrap();
+            let mut dense=source;
+            for row in dense.states_mut() {
+                row.transitions=std::mem::take(&mut row.transitions).into_iter().map(|(label,edges)| {
+                    let label=if label==a {8} else if label==b {9} else {label};
+                    (label,edges)
+                }).collect();
+            }
+            let refs=[&dense];let coefficients=[Weight::all()];let finals=[None,Some(0)];
+            let instances=[FiniteTemplateInstance{template:0,coefficient:0,continuation:1,entries:0..1}];
+            let program=FiniteTemplateProgram{templates:&refs,coefficients:&coefficients,port_finals:&finals,
+                starts:&[0],instances:&instances};
+            let mut pool=FastBoundaryWeightInterner::new(1,64).unwrap();
+            let(graph,order)=VirtualSignedGraph::build_with_pop_classes(&program,10,&mut pool,Default::default(),&classes).unwrap();
+            for filter in [false,true] {
+                let actual=graph.resolve_positive_reachable(&mut pool,&order,false,filter,&[0]).unwrap();
+                let states=actual.states.iter().map(|row| NWAState {
+                    final_weight:(row.final_weight!=0).then(||pool.to_weight(row.final_weight)),
+                    epsilons:row.epsilons.iter().map(|&(q,w)|(q,pool.to_weight(w))).collect(),
+                    transitions:row.transitions.iter().map(|(label,edges)| {
+                        let label=if *label==8 {a} else if *label==9 {b} else {*label};
+                        (label,edges.iter().map(|&(q,w)|(q,pool.to_weight(w))).collect())
+                    }).collect(),
+                }).collect();
+                let actual=classes.compile_positive(NWA::from_parts(states,actual.starts),10000).unwrap();
+                let comparison=crate::parser_equivalence::compare_parser_mask_prefix_languages(
+                    &expected,&actual,8,10000).unwrap();
+                assert!(comparison.difference.is_none(),"PUSH {top}, filter {filter}: {:?}",comparison.difference);
+            }
+        }
+    }
 
     fn assert_same_rows(left:&[FastBoundaryNwaState],right:&[FastBoundaryNwaState],case:usize){
         assert_eq!(left.len(),right.len(),"case={case}");

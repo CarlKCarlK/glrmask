@@ -186,6 +186,26 @@ pub fn normalize_finite_template_program(
     program: &FiniteTemplateProgram<'_>, parser_states: u32, rows: usize,
     read_context: Option<&FiniteParserReadSupport>, trim_positive: bool,
 ) -> Option<(FiniteBoundaryDwa, FiniteTemplateProgramProfile)> {
+    normalize_finite_template_program_impl(program,parser_states,rows,read_context,trim_positive,None)
+}
+
+/// The same compact finite compiler with dense construction-only POP class
+/// labels immediately above the concrete alphabet. Negative labels remain
+/// concrete. Unsupported virtual modes decline to the caller's exact route.
+pub fn normalize_finite_template_program_with_pop_classes(
+    program:&FiniteTemplateProgram<'_>,classes:&crate::pop_classes::PopLabelClasses,rows:usize,
+    read_context:Option<&FiniteParserReadSupport>,trim_positive:bool,
+) -> Option<(FiniteBoundaryDwa,FiniteTemplateProgramProfile)> {
+    let alphabet=classes.symbol_count().checked_add(classes.len() as u32)?;
+    let extended=match read_context {Some(context)=>Some(context.with_pop_classes(classes)?),None=>None};
+    normalize_finite_template_program_impl(program,alphabet,rows,extended.as_ref(),trim_positive,Some(classes))
+}
+
+fn normalize_finite_template_program_impl(
+    program:&FiniteTemplateProgram<'_>,parser_states:u32,rows:usize,
+    read_context:Option<&FiniteParserReadSupport>,trim_positive:bool,
+    classes:Option<&crate::pop_classes::PopLabelClasses>,
+) -> Option<(FiniteBoundaryDwa,FiniteTemplateProgramProfile)> {
     let started = Instant::now();
     let limits = FiniteCompileLimits::default();
     let mut interner = FastBoundaryWeightInterner::new(rows, 64)?;
@@ -202,8 +222,13 @@ pub fn normalize_finite_template_program(
             .iter().all(|name|std::env::var_os(name).is_none());
     let virtual_read_context=select_virtual_read_context(read_context,parser_states,
         virtual_selected && crate::optimized_env_flag("GLRMASK_BOUNDARY_VIRTUAL_READ_CONTEXT"));
+    if classes.is_some() && !virtual_selected {return None;}
     let(mut states,edges,topology_order,mut active_starts,logical_states,assembly_ms,virtual_resolve_ms)=if virtual_selected {
-        let(graph,order)=finite_signed_graph::VirtualSignedGraph::build(program,parser_states,&mut interner,limits)?;
+        let(graph,order)=match classes {
+            Some(classes)=>finite_signed_graph::VirtualSignedGraph::build_with_pop_classes(
+                program,parser_states,&mut interner,limits,classes)?,
+            None=>finite_signed_graph::VirtualSignedGraph::build(program,parser_states,&mut interner,limits)?,
+        };
         if !selected_for_state_count(graph.profile.logical_states) { return None; }
         let assembly_ms=elapsed_ms(started);
         let phase=Instant::now();
@@ -321,6 +346,47 @@ pub fn normalize_finite_template_program(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn classed_compact_finite_program_keeps_every_pop_and_certified_context() {
+        let mut classes=crate::pop_classes::PopLabelClasses::new(8).unwrap();
+        let class=classes.intern_scoped_complement(2..5,[3]).unwrap().unwrap();
+        let mut template=NWA::from_parts(vec![Default::default();2],vec![0]);
+        template.add_transition(0,8,1,Weight::all());template.set_final_weight(1,Weight::all());
+        let refs=[&template];
+        let coefficient=Weight::from_uniform(0..=0,std::iter::once(0u32).collect());
+        let coefficients=[Weight::all(),coefficient];
+        let mut finals=vec![None;4098];finals[4097]=Some(1);
+        let instances=(0..4097).map(|q|FiniteTemplateInstance {
+            template:0,coefficient:0,continuation:q+1,entries:q..q+1,
+        }).collect::<Vec<_>>();
+        let program=FiniteTemplateProgram{templates:&refs,coefficients:&coefficients,
+            port_finals:&finals,starts:&[0],instances:&instances};
+        let context=FiniteParserReadSupport::new_checked(8,0,
+            &[(0..8).map(|q|(q,0)).collect()],&[true],true).unwrap();
+        let (native,profile)=normalize_finite_template_program_with_pop_classes(
+            &program,&classes,1,Some(&context),true).expect("existing compact finite path must run");
+        assert!(profile.input_states>=4096);
+        let mut candidate=native.to_generic_dwa();
+        for row in candidate.states_mut() {
+            let default=row.transitions.remove(&DEFAULT_LABEL);
+            if let Some(edge)=default {
+                for label in 0..9 {row.transitions.entry(label).or_insert_with(||edge.clone());}
+            }
+            row.transitions=row.transitions.entries()
+                .map(|(label,target,weight)|(if label==8 {class} else {label},(target,weight.clone()))).collect();
+        }
+        let candidate=classes.compile_positive(candidate.to_nwa(),100000).unwrap();
+        let mut expected=reference(&program);
+        for row in expected.states_mut() {
+            if let Some(edges)=row.transitions.remove(&8) {row.transitions.insert(class,edges);}
+        }
+        let expected=classes.compile_positive(expected,100000).unwrap();
+        let comparison=crate::parser_equivalence::compare_parser_mask_prefix_languages(
+            &expected,&candidate,8,20000).unwrap();
+        assert!(comparison.difference.is_none(),"{:?}",comparison.difference);
+        assert!(comparison.product_states>=4097);
+    }
 
     #[test]
     fn virtual_context_selector_requires_enabled_matching_certificate() {

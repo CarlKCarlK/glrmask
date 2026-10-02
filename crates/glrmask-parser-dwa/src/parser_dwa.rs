@@ -3764,7 +3764,7 @@ mod finite_weight_support;
 mod finite_requotient;
 #[cfg(feature = "internal-api")]
 pub use finite_template_program::{FiniteTemplateInstance, FiniteTemplateProgram,
-    FiniteTemplateProgramProfile, normalize_finite_template_program};
+    FiniteTemplateProgramProfile, normalize_finite_template_program, normalize_finite_template_program_with_pop_classes};
 
 
 

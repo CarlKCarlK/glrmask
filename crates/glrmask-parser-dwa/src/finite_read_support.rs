@@ -18,6 +18,26 @@ pub struct FiniteParserReadSupport {
 }
 
 impl FiniteParserReadSupport {
+    pub(super) fn with_pop_classes(&self,classes:&crate::pop_classes::PopLabelClasses)->Option<Self> {
+        if self.alphabet()!=classes.symbol_count() as usize {return None;}
+        let alphabet=self.alphabet().checked_add(classes.len())?;
+        if alphabet>50_000 || alphabet.checked_mul(self.words)?>8_000_000 {return None;}
+        let mut target=self.target.clone(); let mut allowed=self.allowed.clone();
+        for index in 0..classes.len() {
+            let label=DEFAULT_LABEL-1-index as i32;
+            let mut union=vec![0u64;self.words];
+            for symbol in classes.matching_symbols(label) {
+                let begin=symbol as usize*self.words;
+                for (out,bits) in union.iter_mut().zip(&self.allowed[begin..begin+self.words]) {*out|=*bits;}
+            }
+            // Matching concrete labels may lead to several predecessor
+            // residuals. Forgetting to the certified free-first-symbol root
+            // is conservative, preserving every possible suffix context.
+            target.push(self.root as u32); allowed.extend(union);
+        }
+        Some(Self {states:self.states,root:self.root,words:self.words,target,allowed})
+    }
+
     pub(super) fn alphabet(&self) -> usize { self.target.len() }
     /// Rows are deterministic, epsilon-free adjacency residuals. Every label
     /// has one residual target independent of the source row. `live` records
