@@ -71,6 +71,16 @@ impl PopLabelClasses {
             .is_some_and(|excluded| excluded.binary_search(&symbol).is_err())
     }
 
+    pub(crate) fn matching_symbol_count(&self, label: i32) -> usize {
+        let domain = self.domain(label).expect("known POP class");
+        (domain.end - domain.start) as usize - self.exclusion(label).unwrap().len()
+    }
+
+    pub(crate) fn matching_symbols(&self, label: i32) -> impl Iterator<Item = u32> + '_ {
+        self.domain(label).expect("known POP class").clone()
+            .filter(move |symbol| self.exclusion(label).unwrap().binary_search(symbol).is_err())
+    }
+
     fn domain(&self, label: i32) -> Option<&std::ops::Range<u32>> {
         let index = DEFAULT_LABEL.checked_sub(1)?.checked_sub(label)?;
         self.domains.get(usize::try_from(index).ok()?)

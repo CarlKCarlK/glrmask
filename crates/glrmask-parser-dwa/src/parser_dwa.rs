@@ -7248,16 +7248,33 @@ fn determinize_parser_dwa_with_fallbacks_and_classes(
             }
         }
         if let Some(classes) = pop_classes {
-            // Non-exception symbols have the same derivative: all live class
-            // coefficients, and no literal transition. Only touched literals
-            // and class exclusions need an individual row in the output.
+            // A small scoped class is cheaper as literal local derivatives
+            // with an implicit empty default. Using a nonempty global DEFAULT
+            // would materialize a rejecting edge for every foreign symbol.
+            // The sum is a conservative upper bound when classes overlap.
+            let support_upper_bound = class_raw_targets.keys().fold(0usize, |count, &label|
+                count.saturating_add(classes.matching_symbol_count(label)));
+            let sparse_classes = default_raw_targets.is_empty()
+                && support_upper_bound <= dense_label_limit / 2;
             for (&label, contributions) in &class_raw_targets {
-                extend_target_contribs(&mut default_raw_targets, contributions);
-                for symbol in classes.excluded_symbols(label) {
-                    let index = symbol as usize;
-                    if !dense_label_touched[index] {
-                        dense_label_touched[index] = true;
-                        touched_dense_labels.push(index);
+                if sparse_classes {
+                    for symbol in classes.matching_symbols(label) {
+                        let index = symbol as usize;
+                        if !dense_label_touched[index] {
+                            dense_label_touched[index] = true;
+                            touched_dense_labels.push(index);
+                        }
+                    }
+                } else {
+                    // Outside all exceptions, every live class contributes
+                    // the same complete derivative. Preserve dead shadows.
+                    extend_target_contribs(&mut default_raw_targets, contributions);
+                    for symbol in classes.excluded_symbols(label) {
+                        let index = symbol as usize;
+                        if !dense_label_touched[index] {
+                            dense_label_touched[index] = true;
+                            touched_dense_labels.push(index);
+                        }
                     }
                 }
             }
@@ -7281,6 +7298,11 @@ fn determinize_parser_dwa_with_fallbacks_and_classes(
         let label_started = detail.as_ref().map(|_| Instant::now());
         let class_default_present = pop_classes.is_some() && default_touched;
         let mut process_label = |label: i32, mut contribs: TargetContribs| -> Result<(), String> {
+            // Empty derivatives without a nonempty DEFAULT emit no edge and
+            // must not spend the representation budget on an absent row.
+            if contribs.is_empty() && (!class_default_present || label == DEFAULT_LABEL) {
+                return Ok(());
+            }
             if pop_classes.is_some() {
                 class_work = class_work.checked_sub(contribs.len()).ok_or("class derivative work budget exceeded")?;
                 class_edges = class_edges.checked_add(1).ok_or("class derivative edge overflow")?;

@@ -265,6 +265,28 @@ fn class_derivatives_keep_empty_exceptions_and_never_lift_consuming_finals() {
 }
 
 #[test]
+fn small_scoped_class_does_not_materialize_foreign_rejecting_edges() {
+    let mut classes = PopLabelClasses::new(4096).unwrap();
+    let local = classes.intern_scoped_complement(100..104, [103]).unwrap().unwrap();
+    let mut graph = NWA::from_parts(vec![NWAState::default(); 3], vec![0]);
+    graph.add_transition(0, local, 1, weight(3));
+    graph.add_transition(1, local, 2, weight(3));
+    graph.set_final_weight(2, weight(3));
+    // Two local rows each need only three consuming edges. Foreign symbols
+    // must reject at every depth without thousands of explicit dead shadows.
+    let result = classes.compile_positive(graph.clone(), 6).unwrap();
+    assert_eq!(result.num_transitions(), 6);
+    assert_eq!(accepted(&result, &[]), 0);
+    for symbol in 0..4096 {
+        let expected = if (100..103).contains(&symbol) { 3 } else { 0 };
+        assert_eq!(accepted(&result, &[100, symbol]), expected);
+        assert_eq!(accepted(&result, &[symbol, 100]), expected);
+        assert_eq!(accepted(&result, &[symbol]), 0);
+    }
+    assert!(classes.compile_positive(graph, 5).unwrap_err().contains("budget"));
+}
+
+#[test]
 fn class_derivatives_match_concrete_expansion_over_complete_alphabet_exceptions() {
     let mut classes = PopLabelClasses::new(3).unwrap();
     let not_zero = classes.intern_complement([0]).unwrap().unwrap();
