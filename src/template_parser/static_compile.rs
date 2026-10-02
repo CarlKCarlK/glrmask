@@ -28,7 +28,7 @@ use std::collections::VecDeque;
 
 /// Bound representation growth, not the accepted language. Exceeding any
 /// bound is an explicit build error, never a truncation or runtime fallback.
-#[derive(Default)]
+#[derive(Clone, Default)]
 struct ExpansionBudget {
     states: usize,
     edges: usize,
@@ -294,7 +294,34 @@ pub(crate) fn prepare_static_templates_for_terminals(
     Ok(Templates::from_terminal_dfas(terminal_templates))
 }
 
-/// Linear-size phase programs for a boundary query. POP complements stay
+fn boundary_action_program(nfa: NFA, budget: &mut ExpansionBudget) -> NWA {
+    // Reuse the ordinary action-word constructor before instantiation. Class
+    // labels are distinct consuming symbols here; replacing them with their
+    // finite local languages later preserves this exact subset construction.
+    // A refused representation keeps the complete original phase program.
+    let mut candidate_budget = budget.clone();
+    if let Ok(dfa) = bounded_determinize(&nfa, &mut candidate_budget) {
+        *budget = candidate_budget;
+        let states = dfa.states.into_iter().map(|state| NWAState {
+            final_weight: state.is_accepting.then(crate::ds::weight::Weight::all),
+            transitions: state.transitions.into_iter().map(|(label, target)|
+                (label, vec![(target, crate::ds::weight::Weight::all())])).collect(),
+            epsilons: Vec::new(),
+        }).collect();
+        return NWA::from_parts(states, vec![dfa.start_state]);
+    }
+    let states = nfa.states.into_iter().map(|state| NWAState {
+        final_weight: state.is_accepting.then(crate::ds::weight::Weight::all),
+        transitions: state.transitions.into_iter().map(|(label, targets)|
+            (label, targets.into_iter().map(|target|
+                (target, crate::ds::weight::Weight::all())).collect())).collect(),
+        epsilons: state.epsilons.into_iter().map(|target|
+            (target, crate::ds::weight::Weight::all())).collect(),
+    }).collect();
+    NWA::from_parts(states, nfa.start_states)
+}
+
+/// Bounded ordinary action-word programs for a boundary query. POP complements stay
 /// symbolic until the common cancellation solver knows which concrete PUSH
 /// symbols reach them. Neither a template DFA nor the global stack alphabet is
 /// eagerly expanded merely to build a construction-only intermediate graph.
@@ -326,13 +353,7 @@ pub(crate) fn prepare_classed_boundary_programs(
             .ok_or_else(|| Error::Compilation(format!("missing selected terminal relation {terminal}")))?;
         let nfa = action_nfa(split, symbol_count, &mut budget, Some(&mut classes), None)
             .map_err(|error| Error::Compilation(format!("terminal {terminal}: {error}")))?;
-        let states = nfa.states.into_iter().map(|state| NWAState {
-            final_weight: state.is_accepting.then(crate::ds::weight::Weight::all),
-            transitions: state.transitions.into_iter().map(|(label, targets)|
-                (label, targets.into_iter().map(|target| (target, crate::ds::weight::Weight::all())).collect())).collect(),
-            epsilons: state.epsilons.into_iter().map(|target| (target, crate::ds::weight::Weight::all())).collect(),
-        }).collect();
-        result.insert(terminal, NWA::from_parts(states, nfa.start_states));
+        result.insert(terminal, boundary_action_program(nfa, &mut budget));
     }
     Ok((result, classes))
 }
@@ -349,13 +370,7 @@ pub(crate) fn prepare_scoped_boundary_programs(
             Error::Compilation(format!("missing scoped relation {terminal}")))?;
         view.validate_coordinate(symbol_count)?;
         let nfa = action_nfa(&view.source, symbol_count, &mut budget, Some(&mut classes), Some(view))?;
-        let states = nfa.states.into_iter().map(|state| NWAState {
-            final_weight: state.is_accepting.then(crate::ds::weight::Weight::all),
-            transitions: state.transitions.into_iter().map(|(label, targets)|
-                (label, targets.into_iter().map(|target| (target, crate::ds::weight::Weight::all())).collect())).collect(),
-            epsilons: state.epsilons.into_iter().map(|target| (target, crate::ds::weight::Weight::all())).collect(),
-        }).collect();
-        result.insert(terminal, NWA::from_parts(states, nfa.start_states));
+        result.insert(terminal, boundary_action_program(nfa, &mut budget));
     }
     Ok((result, classes))
 }
@@ -393,6 +408,89 @@ mod selected_inventory_tests {
         for id in [0, 3] {
             let error = prepare_static_templates_for_terminals(&programs, 4, &BTreeSet::from([id])).unwrap_err();
             assert!(error.to_string().contains("missing selected terminal relation"));
+        }
+    }
+
+    #[test]
+    fn scoped_action_word_constructor_matches_raw_phases_before_and_after_cancellation() {
+        use crate::runtime::parser_backend::scoped_program::ScopedProgram;
+        use crate::ds::weight::Weight;
+        let mut pop = DFA::new();
+        for _ in 0..3 { pop.add_state(); }
+        pop.set_accepting(2, true);
+        pop.add_transition(0, DEFAULT_LABEL, 1);
+        pop.add_transition(0, 3, 3); // A dead literal shadows the first POP.
+        pop.add_transition(1, DEFAULT_LABEL, 2);
+        pop.add_transition(1, 2, 3); // The second POP has its own shadow.
+        let mut read = DFA::new();
+        let end = read.add_state(); read.set_accepting(end, true);
+        read.add_transition(0, 1, end);
+        let mut push = DFA::new();
+        let end = push.add_state(); push.set_accepting(end, true);
+        push.add_transition(0, encode_negative_label(0), end);
+        let source = Arc::new(CommitTemplateDfas { pop, read, push,
+            pop_to_read: vec![None, None, Some(0), None],
+            pop_to_push: vec![], read_to_push: vec![None, Some(0)] });
+        let mut view = ScopedProgram::prepare(source, 4).unwrap().relocated(2).unwrap();
+        view.append_push = Some(7); // The concrete CALL frame stays typed.
+        let mut classes = PopLabelClasses::new(8).unwrap();
+        let nfa = action_nfa(&view.source, 8, &mut ExpansionBudget::default(),
+            Some(&mut classes), Some(&view)).unwrap();
+        let normalized = boundary_action_program(nfa.clone(), &mut ExpansionBudget::default());
+        // Refuse the subset budget deliberately: the fallback must retain
+        // every original phase state, epsilon, final and concrete/class key.
+        let mut refused = ExpansionBudget { work: 33_554_432, ..Default::default() };
+        let raw = boundary_action_program(nfa.clone(), &mut refused);
+        assert_eq!(raw.states().len(), nfa.states.len());
+        assert_eq!(refused.work, 33_554_432);
+        assert!(normalized.states().iter().all(|row| row.epsilons.is_empty()));
+        assert!(normalized.states().len() < raw.states().len());
+        // Independently interpret the original NFA against the deterministic
+        // action graph. Compare finals at every product, including after an
+        // earlier final, so this proves the full signed action-word language.
+        let closure = |seeds: Vec<u32>| {
+            let mut seen = BTreeSet::new(); let mut todo = seeds;
+            while let Some(q) = todo.pop() {
+                if seen.insert(q) { todo.extend(nfa.states[q as usize].epsilons.iter().copied()); }
+            }
+            seen.into_iter().collect::<Vec<_>>()
+        };
+        let initial = (closure(nfa.start_states.clone()), Some(normalized.start_states()[0]));
+        let mut seen = BTreeSet::from([initial.clone()]);
+        let mut todo = VecDeque::from([initial]);
+        while let Some((subset, state)) = todo.pop_front() {
+            assert_eq!(subset.iter().any(|&q| nfa.states[q as usize].is_accepting),
+                state.is_some_and(|q| normalized.states()[q as usize].final_weight.is_some()));
+            let labels = subset.iter().flat_map(|&q| nfa.states[q as usize].transitions.keys().copied())
+                .chain(state.into_iter().flat_map(|q| normalized.states()[q as usize].transitions.keys().copied()))
+                .collect::<BTreeSet<_>>();
+            for label in labels {
+                let seeds = subset.iter().flat_map(|&q| nfa.states[q as usize].transitions.get(&label)
+                    .into_iter().flatten().copied()).collect();
+                let next = (closure(seeds), state.and_then(|q| normalized.states()[q as usize]
+                    .transitions.get(&label).map(|edges| edges[0].0)));
+                if seen.insert(next.clone()) { todo.push_back(next); }
+            }
+            assert!(seen.len() < 10000);
+        }
+        // Put a concrete PUSH before the scoped program so cancellation also
+        // exercises local class membership and each literal-dead exception.
+        for top in 0..8 {
+            let compile = |mut graph: NWA| {
+                let entry = graph.add_state();
+                let starts = graph.start_states().to_vec();
+                graph.set_start_states(vec![entry]);
+                for start in starts {
+                    graph.add_transition(entry, encode_negative_label(top), start, Weight::all());
+                }
+                glrmask_parser_dwa::__private::resolve_negatives::resolve_negative_codes_in_nwa_with_pop_classes(
+                    &mut graph, &classes).unwrap();
+                classes.compile_positive(graph, 10000).unwrap()
+            };
+            let reference = compile(raw.clone()); let candidate = compile(normalized.clone());
+            let comparison = glrmask_parser_dwa::__private::parser_equivalence::compare_parser_mask_prefix_languages(
+                &reference, &candidate, 8, 10000).unwrap();
+            assert!(comparison.difference.is_none(), "PUSH {top}: {:?}", comparison.difference);
         }
     }
 }
