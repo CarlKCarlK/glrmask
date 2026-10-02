@@ -91,9 +91,9 @@ pub(crate) fn compose(mut parent: Constraint, children: &[(String, Arc<Constrain
         tokenizer_count = tokenizer_count.checked_add(span).ok_or_else(|| fail("tokenizer coordinate overflow"))?;
         names.extend(component.terminal_display_names.iter().cloned());
     }
-    if state_count as u64 * (terminal_count as u64 + 1) > 16_000_000 {
-        return Err(fail("linked template certificates exceed 16 million symbol/terminal pairs"));
-    }
+    // Components retain their bounded local certificates. Scoped composition
+    // does not construct dense certificates for the global Cartesian product;
+    // its control inventory enforces its own resource budget in from_views.
     let mut outer = Vec::new(); let mut outer_views = Vec::new();
     let mut exact_views = Vec::new(); let mut control_views = Vec::new();
     for (index, component) in components.iter().enumerate() {

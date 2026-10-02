@@ -217,6 +217,37 @@ mod prepared_relation_tests {
     }
 
     #[test]
+    fn large_scoped_alphabet_uses_exact_local_admission_and_completion() {
+        // A scoped parser can have a large global state/terminal product
+        // without requiring any global dense certificate. Exercise admission
+        // through the actual provider, including its private completion callback.
+        let symbols = 4_001;
+        let terminals = 4_000;
+        assert!(u64::from(symbols) * (u64::from(terminals) + 1) > 16_000_000);
+        let view = ScopedProgram::prepare(Arc::new(shift()), symbols).unwrap();
+        let composition = TemplateComposition::from_views(symbols, terminals,
+            vec![view.clone(); terminals as usize], vec![view.clone(); terminals as usize],
+            Some(view.clone())).unwrap();
+        let parser = TemplateParser::from_composition(symbols, terminals, composition).unwrap();
+        assert!(parser.possible.is_empty() && parser.unconditional.is_empty(),
+            "scoped queries must not materialize the unused global Cartesian product");
+        let mut candidates = crate::ds::bitset::BitSet::new(terminals as usize + 1);
+        candidates.set(0); candidates.set(terminals as usize - 1);
+        for stack in inputs() {
+            // This program reads exactly top symbol 5 and pushes 7. Its input
+            // language has no dependence on the lower concrete stack suffix.
+            let expected = stack.peek_values().contains(&5);
+            assert_eq!(parser.admits(&stack, 0), expected);
+            assert_eq!(parser.admits(&stack, terminals - 1), expected);
+            assert_eq!(parser.admits_any(&stack, &candidates), expected);
+            let admitted = parser.admitted(&stack, &candidates);
+            assert_eq!(admitted.contains(0), expected);
+            assert_eq!(admitted.contains(terminals as usize - 1), expected);
+            assert_eq!(parser.finished(&stack), expected);
+        }
+    }
+
+    #[test]
     fn composition_scoped_and_outer_advance_use_the_shared_prepared_shift() {
         let outer = vec![Some(Arc::new(shift()))];
         let scoped = vec![Some(Arc::new(shift())), Some(Arc::new(suffix_dependent()))];

@@ -449,23 +449,16 @@ impl TemplateParser {
         }
         let completion = composition.completion_view.as_ref().ok_or_else(||
             crate::Error::Compilation("missing scoped completion view".into()))?;
-        let mut possible = vec![BitSet::new(terminal_count as usize + 1); state_count as usize];
-        let mut unconditional = possible.clone();
-        for (terminal, view) in composition.outer_views.iter().chain(std::iter::once(completion)).enumerate() {
-            for local in 0..view.symbols {
-                let top = view.offset + local;
-                match view.classify_top(top) {
-                    TopAdmission::Never => {},
-                    TopAdmission::Always => { possible[top as usize].set(terminal); unconditional[top as usize].set(terminal); },
-                    TopAdmission::DependsOnSuffix => possible[top as usize].set(terminal),
-                }
-            }
-        }
+        // Scoped providers answer outer, control and completion queries through
+        // their shared local domains. Every composed admission path dispatches
+        // there before reading dense rows, and Constraint row helpers explicitly
+        // decline composed rows. No global state/terminal product is needed.
         Ok(Self { state_count, terminal_count, skip_terminals: BTreeSet::new(),
             completion_template: Arc::clone(&completion.source), completion: Arc::clone(&completion.domain),
             domains: composition.outer_views.iter().map(|view| Arc::clone(&view.domain)).collect(),
             composition: Some(Arc::new(composition)), embedding: None, link_grammar: None,
-            possible, unconditional, profile: std::env::var_os("GLRMASK_PROFILE_TEMPLATE_BACKEND").is_some(),
+            possible: Vec::new(), unconditional: Vec::new(),
+            profile: std::env::var_os("GLRMASK_PROFILE_TEMPLATE_BACKEND").is_some(),
             advances: AtomicU64::new(0), admissions: AtomicU64::new(0), completions: AtomicU64::new(0) })
     }
 
