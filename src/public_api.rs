@@ -395,17 +395,24 @@ impl<'a> Grammar<'a> {
         spec.allow_open_source_tokens = true;
         spec.automatic_boundary_selection = true;
         spec.open_token_placeholders = placeholder_ids.clone();
-        let (constraint, source_modules) = rayon::join(
-            || spec.compile(),
-            || {
-                source_children
-                    .into_par_iter()
-                    .map(|(name, child)| {
-                        Ok((name, ModuleBinding::Module(Box::new(child.compile_unlinked(vocab)?))))
-                    })
-                    .collect::<Result<Vec<_>>>()
-            },
-        );
+        // A leaf has no independent child work. Entering the global Rayon pool
+        // here lets a worker waiting on a compiler-local pool re-enter another
+        // unrelated compilation while retaining its heavy compiler stack.
+        let (constraint, source_modules) = if source_children.is_empty() {
+            (spec.compile(), Ok(Vec::new()))
+        } else {
+            rayon::join(
+                || spec.compile(),
+                || {
+                    source_children
+                        .into_par_iter()
+                        .map(|(name, child)| {
+                            Ok((name, ModuleBinding::Module(Box::new(child.compile_unlinked(vocab)?))))
+                        })
+                        .collect::<Result<Vec<_>>>()
+                },
+            )
+        };
         let constraint = constraint?;
         for (name, binding) in source_modules? {
             bindings.insert(name, binding);
