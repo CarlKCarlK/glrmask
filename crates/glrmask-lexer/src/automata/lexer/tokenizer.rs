@@ -16976,7 +16976,8 @@ mod tests {
         assert_eq!(exact.virtual_residual_bounded_code_liveness_oracle_count(), 1);
         assert_eq!(
             exact.virtual_residual_mask_projection_dense_state_work(HORIZON),
-            Some(72),
+            // Includes the future acceptance witness after the token horizon.
+            Some(112),
         );
         let (mask, projections) = exact
             .virtual_residuals_mask_tokenizer(HORIZON)

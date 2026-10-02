@@ -1429,6 +1429,20 @@ fn expand_exact_byte_classes(dfa: &mut DFA, class_members: &[Vec<u8>]) {
 }
 
 impl BoundedCodeIntersectionOracle {
+    /// A shortest suffix-reaching path through complete body copies is a
+    /// simple path in the relation graph on the P pattern states. It uses at
+    /// most P - 1 copies; finishing an already-started copy costs at most one
+    /// more. P + 1 is therefore conservative for every productive coordinate.
+    /// Retain that witness after the candidate token even when the witness
+    /// itself spans several future model tokens.
+    fn finite_mask_future_repeat_headroom(&self) -> Option<usize> {
+        self.pattern.num_states().checked_add(1)
+    }
+
+    fn finite_mask_stencil_crossings(&self, token_crossings: usize) -> Option<usize> {
+        token_crossings.checked_add(self.finite_mask_future_repeat_headroom()?)
+    }
+
     fn from_expr(expr: &Expr) -> Option<Self> {
         Self::from_expr_with_coordinate_policy(expr, true)
     }
@@ -2411,6 +2425,7 @@ impl PreparedBoundedCodeMaskComponent {
         total_started: std::time::Instant,
     ) -> Option<(DFA, u32)> {
         let profile = std::env::var_os("GLRMASK_PROFILE_TOKENIZER_TIMING").is_some();
+        let crossed_boundaries = oracle.finite_mask_stencil_crossings(crossed_boundaries)?;
         // Preserve the complete lower-bound prefix when it is still small enough
         // for the finite mask coordinate. `finite_mask_dfa` enforces the global
         // dense-state cap, so a moderate minLength need not fall back to the
@@ -3939,6 +3954,7 @@ impl VirtualResidualRuntime {
         let crossed_boundaries = max_token_len
             .div_ceil(minimum_body_width)
             .saturating_add(1);
+        let crossed_boundaries = oracle.finite_mask_stencil_crossings(crossed_boundaries)?;
         if oracle.min > crossed_boundaries.saturating_add(1) {
             return None;
         }
@@ -4548,6 +4564,7 @@ impl VirtualResidualRuntime {
         let crossed_boundaries = max_token_len
             .div_ceil(minimum_body_width)
             .saturating_add(1);
+        let crossed_boundaries = oracle.finite_mask_stencil_crossings(crossed_boundaries)?;
         if oracle.min > crossed_boundaries.saturating_add(1) {
             return None;
         }
@@ -5891,7 +5908,9 @@ impl VirtualResidualRuntime {
             .checked_add(crossed_boundaries)
             .and_then(|value| value.checked_add(1))
             .ok_or_else(|| "compiled virtual residual projection stencil overflow".to_owned())?;
-        if crossed_boundaries == 0 || mask_max != oracle.max.min(desired_mask_max) {
+        let future_headroom = oracle.finite_mask_future_repeat_headroom()
+            .ok_or_else(|| "compiled virtual residual projection future stencil overflow".to_owned())?;
+        if crossed_boundaries < future_headroom || mask_max != oracle.max.min(desired_mask_max) {
             return Err("compiled virtual residual projection stencil is inconsistent".to_owned());
         }
         let expected_dense_states = oracle
@@ -5961,6 +5980,8 @@ impl VirtualResidualRuntime {
         let crossed_boundaries = max_token_len
             .div_ceil(minimum_body_width)
             .saturating_add(1);
+        let crossed_boundaries = oracle.finite_mask_stencil_crossings(crossed_boundaries)
+            .ok_or_else(|| "virtual residual projection future stencil overflow".to_owned())?;
         if oracle.min > crossed_boundaries.saturating_add(1) {
             return Err("virtual residual projection lower bound exceeds finite stencil".to_owned());
         }
@@ -6037,7 +6058,9 @@ impl VirtualResidualRuntime {
     )> {
         let store = self.store.lock().unwrap();
         let oracle = store.liveness_oracle.as_ref()?;
-        // Keep the first accepting layer plus a full upper-bound token stencil.
+        // Preserve token crossings and a complete future witness. Distinguish
+        // distance to the real upper bound with the same extended stencil.
+        let crossed_boundaries = oracle.finite_mask_stencil_crossings(crossed_boundaries)?;
         // Large lower minima need their own lower-bound abstraction; decline
         // rather than making this first exact lane scale with minLength.
         if oracle.min > crossed_boundaries.saturating_add(1) {
@@ -6784,6 +6807,71 @@ mod tests {
                 ),
                 Some((32 - (2 * max_words - 1)) as u32),
             );
+        }
+    }
+
+    #[test]
+    fn finite_mask_projection_retains_future_witness_beyond_token_horizon() {
+        // Independent finite literal language: <a{0,75}bcdef>. One-byte
+        // tokens need a five-copy future witness before the closing suffix.
+        let body = Expr::Choice(b"abcdef".iter().map(|&byte| bytes(&[byte])).collect());
+        let pattern = Expr::Seq(vec![
+            bytes(b"<"),
+            Expr::Repeat { expr: Box::new(bytes(b"a")), min: 0, max: None },
+            bytes(b"bcdef>"),
+        ]);
+        let expr = Expr::Intersect {
+            expr: Box::new(pattern),
+            intersect: Box::new(bounded_code_envelope_with_body(body, 0, 80)),
+        };
+        let runtime = Arc::new(VirtualResidualRuntime::new_dynamic(
+            &expr, 0, 0, 1, 2, 1,
+            Arc::new(VirtualStateAllocator::new(2).unwrap()),
+            Arc::new(VirtualRuntimeStateOwners::new(2, &[1]).unwrap()),
+        ).expect("bounded-code tail fixture"));
+        let (dfa, segment, _, projection) = runtime
+            .build_finite_mask_projection_for_crossed_boundaries(1, 0)
+            .expect("future-preserving one-byte vocabulary projection");
+        let words = (0..=75).map(|count| {
+            let mut word = vec![b'<'];
+            word.extend(std::iter::repeat_n(b'a', count));
+            word.extend_from_slice(b"bcdef>");
+            word
+        }).collect::<Vec<_>>();
+        for count in [0, 4, 74, 75] {
+            for tail in [b"".as_slice(), b"b", b"bcde", b"bcdef"] {
+                let mut prefix = vec![b'<'];
+                prefix.extend(std::iter::repeat_n(b'a', count));
+                prefix.extend_from_slice(tail);
+                let mut source = 1;
+                for &byte in &prefix {
+                    source = runtime.step(source, byte).expect("independently live prefix");
+                }
+                let projected = projection.project(source).expect("live prefix projects");
+                for &byte in b"abcdefz>" {
+                    let mut candidate = prefix.clone();
+                    candidate.push(byte);
+                    let expected = (
+                        words.iter().any(|word| word == &candidate),
+                        words.iter().any(|word| word.len() > candidate.len()
+                            && word.starts_with(&candidate)),
+                    );
+                    let exact = runtime.step(source, byte)
+                        .and_then(|target| runtime.observation(target))
+                        .unwrap_or((false, false));
+                    assert_eq!(exact, expected, "exact prefix={candidate:?}");
+                    let row_start = segment.row_offsets[projected as usize] as usize;
+                    let row_end = segment.row_offsets[projected as usize + 1] as usize;
+                    let class = segment.byte_to_class[byte as usize];
+                    let projected_target = segment.entries.iter_range(row_start, row_end)
+                        .find_map(|(edge_class, target)| (edge_class == class).then_some(target));
+                    let observed = projected_target.map(|target| (
+                        dfa.finalizers(target).contains(0),
+                        dfa.possible_future_group_ids(target).contains(0),
+                    )).unwrap_or((false, false));
+                    assert_eq!(observed, expected, "projected prefix={candidate:?}");
+                }
+            }
         }
     }
 
