@@ -298,11 +298,25 @@ fn compiled_parent_late_binding_matches_monolithic_across_backend_matrix() {
         .unwrap();
     assert_static_xy_matches(&reference, &loaded_static_bound);
 
-    let loaded_dynamic_parent = DynamicConstraint::load(&dynamic_parent.save()).unwrap();
+    let error = DynamicConstraint::load(&dynamic_parent.save()).unwrap_err();
+    assert!(
+        error.to_string().contains("unresolved slots")
+            && error.to_string().contains("UnlinkedConstraint"),
+        "an unresolved parent must not load as a runnable constraint: {error}",
+    );
+    let loaded_dynamic_parent = UnlinkedConstraint::load(
+        Grammar::from_glrm(parent_source)
+            .compile_unlinked(&vocab)
+            .unwrap()
+            .save(),
+    )
+    .unwrap();
     let loaded_dynamic_bound = loaded_dynamic_parent
-        .bind_grammar("child", &static_child)
+        .bind("child", &static_child)
+        .unwrap()
+        .link_with(BuildOptions::default().optimization(Optimization::FastBuild))
         .unwrap();
-    assert_dynamic_xy_matches(&reference, &loaded_dynamic_bound);
+    assert_static_xy_matches(&reference, &loaded_dynamic_bound);
 
     assert!(static_parent.bind_grammar("missing", &static_child).is_err());
     assert!(dynamic_parent

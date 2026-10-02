@@ -1,7 +1,7 @@
 use std::{env, ffi::OsString, sync::{Mutex, MutexGuard}};
 
 use glrmask::{Constraint as Constraint, Vocab};
-use glrmask::__private::{ConstraintExt as _, ConstraintStateExt as _};
+use glrmask::__private::{ConstraintExt as _, ConstraintStateExt as _, parser_backend_report};
 
 static ENV_LOCK: Mutex<()> = Mutex::new(());
 
@@ -352,11 +352,9 @@ fn chunk16_bounded_service_name_allows_spaces_token_after_open_quote() {
     let vocab = Vocab::new(vec![(0, vec![b' '; 24])]);
 
     let constraint = Constraint::compile(glrmask::Grammar::json_schema(schema), &vocab).unwrap();
-    let table_ambiguities = constraint.table_ambiguous_actions();
-    assert!(
-        table_ambiguities.is_empty(),
-        "table-level ambiguity should be eliminated before runtime: {table_ambiguities:#?}",
-    );
+    let parser = parser_backend_report(&constraint);
+    assert_eq!(parser["backend"], "acyclic-template-dfa");
+    assert_eq!(parser["lr_table_present"], false, "native runtime retained LR storage: {parser}");
     let mut state = constraint.start();
     state.commit_bytes(prefix).unwrap();
 

@@ -164,8 +164,9 @@ fn virtual_parent_observation_is_not_its_component_mask_quotient() {
 
 #[test]
 fn malformed_projected_observation_offsets_are_rejected_on_load() {
-    let vocab = Vocab::new(vec![(0, b"p".to_vec()), (1, b"\"x:a\"".to_vec()),
-        (2, b"q".to_vec()), (3, b"p\"x:a\"q".to_vec())]);
+    let tokens = vec![(0, b"p".to_vec()), (1, b"\"x:a\"".to_vec()),
+        (2, b"q".to_vec()), (3, b"p\"x:a\"q".to_vec())];
+    let vocab = Vocab::new(tokens.clone());
     let leaf = Grammar::from_json_schema(URI).compile_with(&vocab, options(Optimization::FastRuntime)).unwrap();
     let candidate = Grammar::from_glrm(r#"glrm 1; start root; extern grammar leaf; nt root = "p" leaf "q";"#)
         .compile_unlinked(&vocab).unwrap().bind("leaf", &leaf).unwrap()
@@ -174,18 +175,31 @@ fn malformed_projected_observation_offsets_are_rejected_on_load() {
     let offsets = report["finite_observation_offsets"].as_array().unwrap().iter()
         .map(|value| value.as_u64().unwrap() as u32).collect::<Vec<_>>();
     let saved = candidate.save();
+    let loaded = Constraint::load(&saved).expect("corruption fixture must have a valid native baseline");
+    assert_eq!(loaded.save(), saved);
+    let prefixes = vec![vec![], b"p".to_vec(), b"p\"".to_vec(), b"p\"x:".to_vec(),
+        b"p\"x:a".to_vec(), b"p\"x:a\"".to_vec(), b"p\"x:a\"q".to_vec()];
+    compare(&candidate, &loaded, &tokens, &prefixes);
+    assert_eq!(u16::from_le_bytes(saved[8..10].try_into().unwrap()), 33);
     assert_eq!(&saved[18..22], b"S30\0");
     let sizes = (0..11).map(|index| u64::from_le_bytes(saved[22 + index * 8..30 + index * 8].try_into().unwrap()) as usize).collect::<Vec<_>>();
     let start = 18 + 4 + 11 * 8 + sizes[..4].iter().sum::<usize>();
     let runtime = &saved[start..start + sizes[4]];
-    assert_eq!(&runtime[..4], b"R29\0");
+    // R33 retains the 20-byte header (magic, metadata length, residual length).
+    // Its metadata now starts with variable-size native dynamic proofs, so
+    // locate the observation inventory inside that bounded metadata section.
+    const RUNTIME_HEADER_LEN: usize = 20;
+    assert_eq!(&runtime[..4], b"R33\0");
     let metadata_len = u64::from_le_bytes(runtime[4..12].try_into().unwrap()) as usize;
-    let metadata = &runtime[20..20 + metadata_len];
+    let residual_len = u64::from_le_bytes(runtime[12..20].try_into().unwrap()) as usize;
+    assert_eq!(runtime.len(), RUNTIME_HEADER_LEN + metadata_len + residual_len);
+    let metadata = &runtime[RUNTIME_HEADER_LEN..RUNTIME_HEADER_LEN + metadata_len];
+    assert!(offsets.len() >= 3, "fixture must retain parent and virtual child observations");
     let mut needle = (offsets.len() as u64).to_le_bytes().to_vec();
     for offset in &offsets { needle.extend(offset.to_le_bytes()); }
     let positions = metadata.windows(needle.len()).enumerate().filter_map(|(i, value)| (value == needle).then_some(i)).collect::<Vec<_>>();
     assert_eq!(positions.len(), 1, "the exact encoded observation must be unique in this fixture");
-    let base = start + 20 + positions[0];
+    let base = start + RUNTIME_HEADER_LEN + positions[0];
     for (index, replacement) in [(0, 0), (1, 1), (offsets.len() - 1, u32::MAX)] {
         let mut corrupted = saved.clone();
         corrupted[base + 8 + index * 4..base + 12 + index * 4].copy_from_slice(&u32::to_le_bytes(replacement));
@@ -202,6 +216,7 @@ fn malformed_projected_observation_offsets_are_rejected_on_load() {
     let count = u64::from_le_bytes(saved[descriptor + 8..descriptor + 16].try_into().unwrap()) as usize;
     assert_eq!(count, offsets.len() - 1);
     let mut digest = descriptor + 16;
+    let mut corrupted_fingerprint = false;
     for _ in 0..count {
         let present = saved[digest]; digest += 1;
         if present != 0 {
@@ -209,9 +224,11 @@ fn malformed_projected_observation_offsets_are_rejected_on_load() {
             let mut corrupted = saved.clone(); corrupted[digest] ^= 1;
             let error = Constraint::load(corrupted).unwrap_err().to_string();
             assert!(error.contains("observation"), "{error}");
+            corrupted_fingerprint = true;
             break;
         }
     }
+    assert!(corrupted_fingerprint, "virtual child must supply an observation fingerprint to corrupt");
     let loaded = Constraint::load(saved).unwrap();
     let mut state = loaded.start(); state.commit_token(3).unwrap(); assert!(state.is_accepting());
 }
