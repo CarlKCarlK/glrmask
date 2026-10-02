@@ -169,15 +169,50 @@ fn invalid_lexer_or_nonidentity_ignore_never_changes_the_requested_language() {
 }
 
 #[test]
-fn builtin_parser_selection_is_per_constraint_and_survives_loading() {
+fn builtin_parser_default_and_explicit_selection_are_native_across_loading() {
     let v=Vocab::new(vec![(0,b"a".to_vec()),(1,b"b".to_vec()),(2,b"ab".to_vec())]);
     let grammar=Grammar::from_glrm(r#"start root; nt root ::= "a" "b"?;"#);
-    let lr=grammar.compile(&v).unwrap();assert_eq!(lr.parser_backend(),ParserBackend::LrTable);
-    let tp=grammar.compile_with(&v,BuildOptions::default().parser_backend(ParserBackend::TemplateDfa)).unwrap();
-    assert_eq!(tp.parser_backend(),ParserBackend::TemplateDfa);
-    let loaded=Constraint::load(tp.save()).unwrap();assert_eq!(loaded.parser_backend(),ParserBackend::TemplateDfa);
-    for c in [&lr,&tp,&loaded] {let mut s=c.start();s.commit_bytes(b"ab").unwrap();assert!(s.is_accepting());}
-    assert_eq!(lr.parser_backend(),ParserBackend::LrTable,"selecting another constraint must not change an existing backend");
+    let ordinary=grammar.compile(&v).unwrap();
+    let ordinary_bytes=ordinary.save();
+    let explicit=grammar.compile_with(&v,BuildOptions::default().parser_backend(ParserBackend::TemplateDfa)).unwrap();
+    for compiled in [&ordinary,&explicit] {
+        for form in native_representations(compiled,&v) {
+            assert_finite_language(&form,&v,&[b"a",b"ab"]);
+            let mut state=form.start();state.commit_bytes(b"ab").unwrap();assert!(state.is_accepting());
+        }
+    }
+    assert_eq!(ordinary.save(),ordinary_bytes,"another compilation must not mutate an existing constraint");
+}
+
+fn native_representations(compiled:&Constraint,vocab:&Vocab)->[Constraint;3] {
+    let bytes=compiled.save();
+    let loaded=Constraint::load(bytes.clone()).unwrap();
+    assert_eq!(loaded.save(),bytes);
+    let external=compiled.save_with_external_vocab().unwrap();
+    assert!(Constraint::load(external.clone()).is_err());
+    let external=Constraint::load_with_vocab(external,vocab).unwrap();
+    [compiled.clone(),loaded,external]
+}
+
+fn assert_finite_language(compiled:&Constraint,vocab:&Vocab,language:&[&[u8]]) {
+    assert_eq!(compiled.parser_backend(),ParserBackend::TemplateDfa);
+    let mut prefixes=std::collections::BTreeSet::new();
+    for word in language {for length in 0..=word.len() {prefixes.insert(word[..length].to_vec());}}
+    for prefix in prefixes {
+        let mut state=compiled.start();state.commit_bytes(&prefix).unwrap();
+        assert_eq!(state.is_accepting(),language.contains(&prefix.as_slice()),"completion at {prefix:?}");
+        let mut mask=vec![0;compiled.mask_len()];state.fill_mask(&mut mask);
+        for (token,bytes) in vocab.iter() {
+            let mut next=prefix.clone();next.extend_from_slice(bytes);
+            let expected=language.iter().any(|complete|complete.starts_with(&next));
+            let allowed=mask[token as usize/32]&(1u32<<(token%32))!=0;
+            assert_eq!(allowed,expected,"prefix={prefix:?} token={token} bytes={bytes:?}");
+            if expected {
+                let mut branch=compiled.start();branch.commit_bytes(&prefix).unwrap();branch.commit_token(token).unwrap();
+                assert_eq!(branch.is_accepting(),language.contains(&next.as_slice()));
+            }
+        }
+    }
 }
 
 #[test]
@@ -196,9 +231,11 @@ fn bounded_fast_build_selection_supports_all_builtin_source_frontends() {
         let c=source.compile_with(&v,BuildOptions::default().optimization(Optimization::FastBuild)
             .parser_backend(ParserBackend::TemplateDfa)).unwrap();
         assert_eq!(c.parser_backend(),ParserBackend::TemplateDfa);
-        let lr=source.compile_with(&v,BuildOptions::default().optimization(Optimization::FastBuild)).unwrap();
-        for parser in [&c,&Constraint::load(c.save()).unwrap()] {
-            let mut candidate=parser.start();let mut reference=lr.start();
+        let ordinary=source.compile_with(&v,BuildOptions::default().optimization(Optimization::FastBuild)).unwrap();
+        let language: &[&[u8]]=if word.starts_with('"') {&[b"\"a\"",b"\"ab\""]} else {&[b"a",b"ab"]};
+        for parser in native_representations(&c,&v).into_iter().chain(native_representations(&ordinary,&v)) {
+            assert_finite_language(&parser,&v,language);
+            let mut candidate=parser.start();let mut reference=ordinary.start();
             for &byte in word.as_bytes() {
                 assert_eq!(candidate.mask(),reference.mask());
                 assert_eq!(candidate.is_accepting(),reference.is_accepting());
@@ -210,7 +247,7 @@ fn bounded_fast_build_selection_supports_all_builtin_source_frontends() {
 }
 
 #[test]
-fn supported_template_composition_does_not_change_the_default_lr_backend() {
+fn source_and_precompiled_composition_use_native_defaults() {
     let v=Vocab::new(vec![(0,b"a".to_vec()),(1,b"xa".to_vec()),(2,b"x".to_vec())]);
     let child=Grammar::from_glrm(r#"start root; nt root ::= "a";"#);
     let parent=Grammar::from_glrm(r#"glrm 1; start root; extern grammar child; nt root = "x" child;"#);
@@ -218,14 +255,19 @@ fn supported_template_composition_does_not_change_the_default_lr_backend() {
     let template=bound.compile_with(&v,BuildOptions::default().parser_backend(ParserBackend::TemplateDfa)).unwrap();
     assert_eq!(template.parser_backend(),ParserBackend::TemplateDfa);
     let mut state=template.start();state.commit_bytes(b"xa").unwrap();assert!(state.is_accepting());
-    assert_eq!(bound.compile(&v).unwrap().parser_backend(),ParserBackend::LrTable);
-    let module=parent.compile_unlinked(&v).unwrap().bind("child",&child.compile(&v).unwrap()).unwrap();
-    assert_eq!(module.link_with(BuildOptions::default().parser_backend(ParserBackend::TemplateDfa)).unwrap().parser_backend(),ParserBackend::TemplateDfa);
-    assert_eq!(module.link().unwrap().parser_backend(),ParserBackend::LrTable);
+    let ordinary=bound.compile(&v).unwrap();
+    let child=child.compile(&v).unwrap();let child_bytes=child.save();
+    let module=parent.compile_unlinked(&v).unwrap().bind("child",&child).unwrap();
+    let explicit=module.link_with(BuildOptions::default().parser_backend(ParserBackend::TemplateDfa)).unwrap();
+    let default=module.link().unwrap();
+    for compiled in [&template,&ordinary,&explicit,&default] {
+        for form in native_representations(compiled,&v) {assert_finite_language(&form,&v,&[b"xa"]);}
+    }
+    assert_eq!(child.save(),child_bytes);
 }
 
 #[test]
-fn ordinary_lr_parents_reject_table_free_children_without_panicking() {
+fn native_parents_bind_fresh_and_loaded_children_in_all_optimization_modes() {
     let v = Vocab::new(vec![(0, b"a".to_vec()), (1, b"xa".to_vec()), (2, b"x".to_vec())]);
     let child = Grammar::from_glrm(r#"start root; nt root ::= "a";"#)
         .compile_with(&v, BuildOptions::default().parser_backend(ParserBackend::TemplateDfa))
@@ -233,21 +275,37 @@ fn ordinary_lr_parents_reject_table_free_children_without_panicking() {
     let module = Grammar::from_glrm(
         r#"glrm 1; start root; extern grammar child; nt root = "x" child;"#,
     ).compile_unlinked(&v).unwrap();
-    for child in [&child, &Constraint::load(child.save()).unwrap()] {
+    for child in native_representations(&child,&v) {
+        let child_bytes=child.save();
         for optimization in [glrmask::Optimization::Auto, glrmask::Optimization::FastRuntime, glrmask::Optimization::FastBuild] {
             let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                module.bind("child", child).and_then(|bound| bound.link_with(
+                module.bind("child", &child).and_then(|bound| bound.link_with(
                     BuildOptions::default().optimization(optimization)))
             }));
-            assert!(outcome.is_ok(), "unsupported composition must return an error, not touch an absent LR table");
-            let error = outcome.unwrap().unwrap_err();
-            assert!(error.to_string().contains("template") && error.to_string().contains("composition"), "{error}");
+            assert!(outcome.is_ok(), "native composition must not touch an absent LR table");
+            let linked=outcome.unwrap().unwrap();
+            for form in native_representations(&linked,&v) {assert_finite_language(&form,&v,&[b"xa"]);}
             assert_eq!(child.parser_backend(), ParserBackend::TemplateDfa);
+            assert_eq!(child.save(),child_bytes,"linking must not mutate a reusable child");
         }
     }
-    let lr_child = Grammar::from_glrm(r#"start root; nt root ::= "a";"#).compile(&v).unwrap();
-    let linked = module.bind("child", &lr_child).unwrap().link().unwrap();
-    let mut state = linked.start(); state.commit_bytes(b"xa").unwrap(); assert!(state.is_accepting());
+}
+
+#[test]
+fn explicit_lr_compile_and_link_requests_panic_loudly() {
+    let vocab=Vocab::new(vec![(0,b"a".to_vec())]);
+    let grammar=Grammar::from_ebnf(r#"start ::= "a""#);
+    let module=grammar.compile_unlinked(&vocab).unwrap();
+    for link in [false,true] {
+        let rejected=std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let options=BuildOptions::default().parser_backend(ParserBackend::LrTable);
+            if link {module.link_with(options)} else {grammar.compile_with(&vocab,options)}
+        }));
+        let panic=rejected.expect_err("explicit LR materialization must panic");
+        let message=panic.downcast_ref::<String>().map(String::as_str)
+            .or_else(||panic.downcast_ref::<&str>().copied()).unwrap_or("");
+        assert!(message.contains("LR-BACKED CONSTRAINT REQUEST IS FORBIDDEN"),"wrong panic: {message}");
+    }
 }
 
 #[test]

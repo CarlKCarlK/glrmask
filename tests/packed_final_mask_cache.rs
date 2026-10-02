@@ -96,14 +96,12 @@ fn packed_final_cache_preserves_wire_masks_and_cloned_loads() {
     for schema in schemas {
         let source = schema.to_string();
         for optimization in [Optimization::FastRuntime, Optimization::FastBuild] {
-            for backend in [ParserBackend::LrTable, ParserBackend::TemplateDfa] {
+            for explicit_backend in [false, true] {
+                let backend = ParserBackend::TemplateDfa;
+                let options = BuildOptions::default().optimization(optimization);
+                let options = if explicit_backend { options.parser_backend(backend) } else { options };
                 let fresh = Grammar::from_json_schema(&source)
-                    .compile_with(
-                        &vocab,
-                        BuildOptions::default()
-                            .optimization(optimization)
-                            .parser_backend(backend),
-                    )
+                    .compile_with(&vocab, options)
                     .unwrap();
                 let bytes = fresh.save();
                 let loaded = Constraint::load(&bytes).unwrap();
@@ -166,14 +164,12 @@ fn loaded_exact_transition_cache_crosses_the_old_8192_state_cutoff() {
         (1, b"b".to_vec()),
         (2, b"x".to_vec()),
     ]);
-    for backend in [ParserBackend::LrTable, ParserBackend::TemplateDfa] {
+    for explicit_backend in [false, true] {
+        let backend = ParserBackend::TemplateDfa;
+        let options = BuildOptions::default().optimization(Optimization::FastBuild);
+        let options = if explicit_backend { options.parser_backend(backend) } else { options };
         let fresh = Grammar::from_glrm(&source)
-            .compile_with(
-                &vocab,
-                BuildOptions::default()
-                    .optimization(Optimization::FastBuild)
-                    .parser_backend(backend),
-            )
+            .compile_with(&vocab, options)
             .unwrap();
         let bytes = fresh.save();
         let loaded = Constraint::load(&bytes).unwrap();
