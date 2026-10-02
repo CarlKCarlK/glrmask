@@ -6437,7 +6437,12 @@ impl Constraint {
                             let static_virtual_residual_wire = {
                                 self.dynamic_mask_vocab
                                     .virtual_residual_mask_projection_parts()
-                                    .map(|(mask_tokenizer, projections)| encode_static_virtual_residual_mask_wire(&self.tokenizer, mask_tokenizer, projections))
+                                    .map(|(mask_tokenizer, projections)| encode_static_virtual_residual_mask_wire_with_fallback(
+                                        &self.tokenizer,
+                                        self.retained_terminal_exprs(),
+                                        mask_tokenizer,
+                                        projections,
+                                    ))
                                     .unwrap_or_default()
                             };
                             let metadata = ConstraintArtifactCurrentRuntimeRef {
