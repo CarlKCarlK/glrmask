@@ -64,6 +64,32 @@ fn needs_static_boundaries(constraint: &Constraint) -> bool {
             overlay.segmented_parser_components.iter().any(|component| needs_static_boundaries(&component.constraint))))
 }
 
+/// A same-owner child word needs B only if it can cross RETURN/CALL without
+/// consuming a caller lexeme. Prove absence from exact local template domains,
+/// for every concrete lower suffix, rather than from reachable grammar states.
+/// Unknown output tops, nullable links and nested components retain the word.
+fn retain_same_owner_paths(constraint: &Constraint, component: usize, bounded: bool) -> Result<bool> {
+    if !bounded { return Ok(true); }
+    if component == 0 { return Ok(false); }
+    let overlay = constraint.static_dynamic_overlay.as_ref().unwrap();
+    let parent = overlay.segmented_parser_components[0].constraint.as_ref();
+    let child = overlay.segmented_parser_components[component].constraint.as_ref();
+    if parent.template_parser.as_ref().unwrap().composition.is_some()
+        || child.template_parser.as_ref().unwrap().composition.is_some() { return Ok(true); }
+    let slots = overlay.segmented_parser_links.iter().filter(|link|
+        link.parent_component == 0 && link.child_component as usize == component)
+        .map(|link| link.slot_terminal as usize).collect::<std::collections::BTreeSet<_>>();
+    if slots.is_empty() { return Ok(true); }
+    // The original caller relation excludes CALL's appended child frame.
+    // Exact RETURN removes that frame, exposing precisely these output tops.
+    let views = slots.into_iter().map(|terminal|
+        crate::runtime::parser_backend::scoped_program::ScopedProgram::terminal(parent, terminal))
+        .collect::<Vec<_>>();
+    let excluded = super::template_follow_support::disallowed_scoped(&views, views.len(), 1_000_000)
+        .map_err(fail)?;
+    Ok(!excluded.iter().all(|row| row.len() == views.len()))
+}
+
 pub(crate) fn install(constraint: &mut Constraint, vocab: &Vocab) -> Result<()> {
     if !constraint.uses_compact_segmented_parser_runtime() { return Ok(()); }
     if !constraint.has_template_parser() { return Err(fail("static template boundary requires a table-free parser")); }
@@ -177,6 +203,8 @@ pub(crate) fn install(constraint: &mut Constraint, vocab: &Vocab) -> Result<()> 
             starts[offset..offset + state_counts[leaf_index] as usize].fill(true);
         }
         if starts.iter().any(|value| *value) {
+            let retain_non_crossing_paths = retain_same_owner_paths(constraint, component, certificate.is_some())?;
+            if profile { eprintln!("[glrmask/profile][static_template_boundary] phase=owner_paths component={component} retain_same_owner={retain_non_crossing_paths}"); }
             plans.push(BoundaryShardWalkPlan { start_component: component,
                 crossing_owner: ImmediateComponentId(component as u32), commit_states: starts,
                 // A nullable call can enable a terminal word entirely within
@@ -185,10 +213,9 @@ pub(crate) fn install(constraint: &mut Constraint, vocab: &Vocab) -> Result<()> 
                 // The exact control-star program below still decides viability.
                 // RETURN followed by another CALL to the same component can
                 // cross its interface without consuming a caller lexeme.
-                // Equal lexical owners therefore do not prove that a child
-                // token stayed within one invocation. Keep those candidates;
-                // the exact scoped control-star program decides viability.
-                retain_non_crossing_paths: component != 0 || certificate.is_none() });
+                // A complete local-domain proof may exclude that crossing;
+                // otherwise the exact scoped control-star decides viability.
+                retain_non_crossing_paths });
         }
     }
     let metadata = parser.link_grammar.as_deref()
@@ -219,6 +246,9 @@ pub(crate) fn install(constraint: &mut Constraint, vocab: &Vocab) -> Result<()> 
             tokenizer_offsets[index], layout.leaf_terminal_offsets[index])).collect::<Vec<_>>());
     if profile { eprintln!("[glrmask/profile][static_template_boundary] phase=follow_support rows={} excluded_pairs={} elapsed_ms={:.3}",
         follows.len(), excluded_pairs, follow_started.elapsed().as_secs_f64() * 1000.0); }
+    if profile { eprintln!("[glrmask/profile][static_template_boundary] phase=scoped_adjacency metadata={} rows={} excluded_pairs={}",
+        metadata.is_some(), scoped_adjacent.as_ref().map_or(0, BTreeMap::len),
+        scoped_adjacent.as_ref().map_or(0, |rows| rows.values().map(BitSet::count_ones).sum::<usize>())); }
     let inputs = BoundaryShardLinkInputs {
         merged_tokenizer: &merged, vocab, grammar: &context, disallowed_follows: &follows,
         ignore_terminal: None, follow_transparent_ignores: Some(&transparent),
@@ -385,6 +415,38 @@ pub(crate) fn install(constraint: &mut Constraint, vocab: &Vocab) -> Result<()> 
 mod tests {
     use super::*;
     use crate::{BuildOptions, Grammar, Optimization};
+
+    #[test]
+    fn exact_caller_domains_distinguish_one_call_from_adjacent_child_calls() {
+        let vocab = Vocab::new(vec![(0,b"x".to_vec()),(1,b"a".to_vec()),
+            (2,b"aa".to_vec()),(3,b"xa".to_vec()),(4,b"xaa".to_vec()),(5,b"aaa".to_vec())]);
+        let child = Grammar::from_ebnf(r#"start ::= "a""#).compile(&vocab).unwrap();
+        for (source, inline, retain) in [
+            (r#"start root; extern grammar child; nt root ::= "x" child;"#, r#"start ::= "x" "a""#, false),
+            (r#"start root; extern grammar child; nt root ::= "x" child child;"#, r#"start ::= "x" "a" "a""#, true),
+        ] {
+            let options = BuildOptions::default().optimization(Optimization::FastRuntime);
+            let unlinked = Grammar::from_glrm(source).compile_unlinked(&vocab).unwrap();
+            let mut candidate = unlinked.bind("child", &child).unwrap().link().unwrap();
+            assert_eq!(retain_same_owner_paths(&candidate, 1, true).unwrap(), retain);
+            install(&mut candidate, &vocab).unwrap();
+            let reference = Grammar::from_ebnf(inline).compile_with(&vocab, options).unwrap();
+            for text in [b"x".as_slice(),b"xa",b"xaa",b"xaaa"] {
+                let mut actual = candidate.start(); let mut expected = reference.start();
+                for prefix in 0..=text.len() {
+                    let mut a = vec![0; candidate.mask_len()]; let mut b = vec![0; reference.mask_len()];
+                    actual.fill_mask(&mut a); expected.fill_mask(&mut b);
+                    assert_eq!(a,b,"retain={retain} prefix={prefix} text={text:?}");
+                    assert_eq!(actual.is_accepting(),expected.is_accepting());
+                    assert_eq!(actual.is_rejected(),expected.is_rejected());
+                    if prefix < text.len() {
+                        assert_eq!(actual.commit_bytes(&text[prefix..prefix+1]).is_ok(),
+                            expected.commit_bytes(&text[prefix..prefix+1]).is_ok());
+                    }
+                }
+            }
+        }
+    }
 
     #[test]
     fn existing_static_component_bodies_are_retained_without_cloning_or_rebuilding() {
