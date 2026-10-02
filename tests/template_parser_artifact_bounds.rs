@@ -121,7 +121,7 @@ fn every_compact_graph_phase_and_link_rejects_out_of_bounds_fields() {
             let original = fixture(optimization, external);
             let parser = &original[parser_range(&original)];
             let header = if external { 36 } else { 0 };
-            assert_eq!(&parser[header..header + 4], b"TPR6");
+            assert_eq!(&parser[header..header + 4], b"TPR7");
             let mut offset = header + 4;
             let (alphabet, _) = read_var(parser, &mut offset);
             let (terminals, _) = read_var(parser, &mut offset);

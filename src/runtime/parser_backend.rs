@@ -290,6 +290,18 @@ impl PreparedTemplateParser {
             parser.embedding = crate::compiler::glr::table::subgrammar_child_return_pop(table, &table.rules).ok().and_then(|return_pop| embedding::TemplateEmbedding::from_table(table, table.embedded_start_nullable(), return_pop, (0..terminal_count).filter(|&terminal| crate::compiler::boundary_transfer::validate_slot_entry_shape(table, terminal).is_ok())).ok()).map(Arc::new);
         }
         parser.link_grammar = link_grammar::LinkGrammar::from_compiler_table(table, ignore).map_err(crate::Error::Compilation)?;
+        if let Some(grammar) = parser.link_grammar.as_mut() {
+            use crate::compiler::boundary_stack_support::CompilerEffects;
+            let summary = if sparse_regular {
+                CompilerEffects::from_regular_programs(&templates,&parser.completion_template,state_count)
+            } else {
+                parser.embedding.as_ref().ok_or_else(|| "missing effect entry certificate".to_string())
+                    .and_then(|embedding| CompilerEffects::from_table(table,&embedding.entries))
+            };
+            // A budget/unsupported-shape refusal leaves this proof absent;
+            // later composition keeps its complete template fallback.
+            Arc::make_mut(grammar).stack_effects = summary.ok();
+        }
         Ok(PreparedTemplateParser {
             source_state_count: table.num_states,
             source_terminal_count: terminal_count,
@@ -1130,6 +1142,36 @@ mod tests {
             }
         }
         assert!(retained_total > 0, "fixture must exercise compiler template reuse");
+    }
+
+    #[test]
+    fn native_compiler_effect_metadata_survives_reload_and_nested_links_without_tables() {
+        use crate::compiler::boundary_stack_support::CompilerEffects;
+        let vocab = crate::Vocab::new(["a","b","(",")","ab"]
+            .into_iter().enumerate().map(|(id,word)| (id as u32,word.as_bytes().to_vec())).collect());
+        for source in [r#"start root; nt root ::= "a" | "ab";"#,
+            r#"start root; nt root ::= "a" | "(" root ")";"#] {
+            let component = Constraint::compile(crate::Grammar::glrm(source),&vocab).unwrap();
+            let parser = component.template_parser.as_ref().unwrap();
+            let summary = parser.link_grammar.as_ref().unwrap().stack_effects.as_ref().unwrap();
+            assert_eq!(summary.states,parser.state_count);
+            assert!(!summary.effects.is_empty());
+            let loaded = Constraint::load(&component.save()).unwrap();
+            assert!(!loaded.table.is_present());
+            assert_eq!(loaded.template_parser.as_ref().unwrap().link_grammar.as_ref().unwrap()
+                .stack_effects.as_ref().unwrap(),summary);
+            // A later link needs only the retained scalar effects and validated
+            // entry records. Its nested child offsets remain complete.
+            let slot = *summary.entries.iter().find(|(_,row)| !row.is_empty()).unwrap().0;
+            let end = summary.states.checked_mul(2).unwrap();
+            let terminals = summary.terminals.checked_mul(2).unwrap();
+            let linked = CompilerEffects::compose(&[summary,summary],&[0,summary.states],
+                &[0,summary.terminals],&[(0,slot,1,0,1,false)],end,terminals).unwrap();
+            let nested = CompilerEffects::compose(&[&linked,summary],&[0,end],
+                &[0,terminals],&[],end+summary.states,terminals+summary.terminals).unwrap();
+            assert!(nested.effects.iter().any(|e| e.source >= end));
+            assert_eq!(nested.accepting,summary.accepting);
+        }
     }
 
     fn phase_parallel_fixture(seed: u32) -> DFA {

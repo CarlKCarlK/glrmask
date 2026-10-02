@@ -209,8 +209,8 @@ vocabulary, or with a different mapping, fails. End-token policy uses
 `BuildOptions::end_tokens` for built-in grammars. Both forms retain the policy
 through save/load.
 
-Current native artifacts use self-contained envelope33 or external-vocabulary
-envelope34 and parser section `TPR6` (wrapped by `TPX1` for an external binding).
+Current native artifacts use self-contained envelope35 or external-vocabulary
+envelope36 and parser section `TPR7` (wrapped by `TPX1` for an external binding).
 Obsolete pre-release formats are rejected explicitly; known LR artifacts panic
 rather than materializing a table. Compiled components link directly with
 shared template graphs and scoped views; see [composition](template-parser-composition.md).

@@ -180,16 +180,16 @@ fn malformed_projected_observation_offsets_are_rejected_on_load() {
     let prefixes = vec![vec![], b"p".to_vec(), b"p\"".to_vec(), b"p\"x:".to_vec(),
         b"p\"x:a".to_vec(), b"p\"x:a\"".to_vec(), b"p\"x:a\"q".to_vec()];
     compare(&candidate, &loaded, &tokens, &prefixes);
-    assert_eq!(u16::from_le_bytes(saved[8..10].try_into().unwrap()), 33);
+    assert_eq!(u16::from_le_bytes(saved[8..10].try_into().unwrap()), 35);
     assert_eq!(&saved[18..22], b"S30\0");
     let sizes = (0..11).map(|index| u64::from_le_bytes(saved[22 + index * 8..30 + index * 8].try_into().unwrap()) as usize).collect::<Vec<_>>();
     let start = 18 + 4 + 11 * 8 + sizes[..4].iter().sum::<usize>();
     let runtime = &saved[start..start + sizes[4]];
-    // R33 retains the 20-byte header (magic, metadata length, residual length).
+    // R35 retains the 20-byte header (magic, metadata length, residual length).
     // Its metadata now starts with variable-size native dynamic proofs, so
     // locate the observation inventory inside that bounded metadata section.
     const RUNTIME_HEADER_LEN: usize = 20;
-    assert_eq!(&runtime[..4], b"R33\0");
+    assert_eq!(&runtime[..4], b"R35\0");
     let metadata_len = u64::from_le_bytes(runtime[4..12].try_into().unwrap()) as usize;
     let residual_len = u64::from_le_bytes(runtime[12..20].try_into().unwrap()) as usize;
     assert_eq!(runtime.len(), RUNTIME_HEADER_LEN + metadata_len + residual_len);

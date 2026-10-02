@@ -54,11 +54,11 @@ const PREVIOUS_STATIC_RESIDUAL_CONSTRAINT_VERSION: u16 = 27;
 const PREVIOUS_STATIC_PROJECTION_CONSTRAINT_VERSION: u16 = 28;
 const PREVIOUS_BOUNDARY_SUMMARYLESS_CONSTRAINT_VERSION: u16 = 29;
 const CONSTRAINT_VERSION: u16 = 30;
-// V33 retains S30 section framing with TPR6 parser views and exact dynamic
-// proof metadata in R33. Earlier pre-release template formats are unsupported.
-const TEMPLATE_CONSTRAINT_VERSION: u16 = 33;
-// V34 is the same native body bound to an external vocabulary (TPX1).
-const EXTERNAL_TEMPLATE_CONSTRAINT_VERSION: u16 = 34;
+// V35 retains S30 framing with TPR7 views, compiler stack-effect analysis and dynamic
+// proof metadata in R35. Earlier pre-release template formats are unsupported.
+const TEMPLATE_CONSTRAINT_VERSION: u16 = 35;
+// V36 is the same native body bound to an external vocabulary (TPX1).
+const EXTERNAL_TEMPLATE_CONSTRAINT_VERSION: u16 = 36;
 const CONSTRAINT_HEADER_LEN: usize = CONSTRAINT_MAGIC.len() + 2 + 8;
 const COMPRESSED_PAYLOAD_HEADER_LEN: usize = 8;
 const CONSTRAINT_COMPRESSION_LEVEL: i32 = 1;
@@ -92,7 +92,7 @@ const V29_SECTION_MAGIC: [u8; 4] = *b"S29\0";
 const V29_SECTION_HEADER_LEN: usize = V29_SECTION_MAGIC.len() + 11 * 8;
 const V30_SECTION_MAGIC: [u8; 4] = *b"S30\0";
 const V30_SECTION_HEADER_LEN: usize = V30_SECTION_MAGIC.len() + 11 * 8;
-const CURRENT_RUNTIME_MAGIC: [u8; 4] = *b"R33\0";
+const CURRENT_RUNTIME_MAGIC: [u8; 4] = *b"R35\0";
 const CURRENT_RUNTIME_HEADER_LEN: usize = CURRENT_RUNTIME_MAGIC.len() + 2 * 8;
 const PREVIOUS_STATIC_RESIDUAL_MASK_MAGIC: [u8; 4] = *b"SRM2";
 const STATIC_RESIDUAL_MASK_MAGIC: [u8; 4] = *b"SRM3";

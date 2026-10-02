@@ -9,7 +9,7 @@ use std::collections::{BTreeSet, BTreeMap};
 use super::super::scoped_program::ScopedProgram;
 use std::sync::Arc;
 
-const MAGIC: &[u8; 4] = b"TPR6";
+const MAGIC: &[u8; 4] = b"TPR7";
 const MAX_DECODED_STATES: usize = 2_000_000;
 const MAX_DECODED_EDGES: usize = 8_000_000;
 
@@ -411,6 +411,9 @@ pub(super) fn decode(bytes:&[u8])->Result<ParserSeed,String> {
             input.offset = end;
             grammar.validate()?;
             if grammar.terminal_count != terminal_count { return Err("template grammar terminal coordinate mismatch".into()); }
+            if grammar.stack_effects.as_ref().is_some_and(|effects| effects.states != state_count) {
+                return Err("compiler stack-effect parser coordinate mismatch".into());
+            }
             Some(Arc::new(grammar))
         }
         _ => return Err("invalid template grammar metadata flag".into()),

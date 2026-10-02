@@ -14,6 +14,7 @@ pub(crate) struct LinkGrammar {
     pub(crate) embedded_end_token_ids: Vec<u32>,
     pub(crate) component_nonterminals: Vec<usize>,
     pub(crate) scoped_ignores: Vec<Vec<u32>>,
+    pub(crate) stack_effects: Option<crate::compiler::boundary_stack_support::CompilerEffects>,
 }
 
 impl LinkGrammar {
@@ -30,12 +31,18 @@ impl LinkGrammar {
             control_terminals: table.control_terminals.clone(),
             root_nullable: table.embedded_start_nullable(),
             embedded_end_token_ids: table.embedded_end_token_ids(),
-            scoped_ignores: vec![ignores.into_iter().collect()] };
+            scoped_ignores: vec![ignores.into_iter().collect()], stack_effects: None };
         grammar.validate()?;
         Ok(Some(Arc::new(grammar)))
     }
 
     pub(crate) fn validate(&self) -> Result<(), String> {
+        if let Some(effects) = &self.stack_effects {
+            effects.validate()?;
+            if effects.terminals != self.terminal_count {
+                return Err("compiler stack effects disagree with grammar terminals".into());
+            }
+        }
         let n = self.nonterminal_names.len();
         if self.rules.is_empty() || n == 0 || self.rules.len() > 1_000_000
             || self.component_nonterminals.len() != self.scoped_ignores.len()
@@ -114,10 +121,24 @@ impl LinkGrammar {
             .flat_map(|source| source.embedded_end_token_ids.iter().copied()).collect::<Vec<_>>();
         embedded_end_token_ids.sort_unstable();
         embedded_end_token_ids.dedup();
+        let summaries = sources.iter().map(|source| source.stack_effects.as_ref()).collect::<Option<Vec<_>>>();
+        let stack_effects = summaries.and_then(|summaries| {
+            let mut offsets = Vec::new(); let mut states = 0u32;
+            for component in components {
+                offsets.push(states);
+                states = states.checked_add(component.template_parser.as_ref()?.state_count)?;
+            }
+            let links = slots.iter().enumerate().flat_map(|(child, slots)| {
+                let embedding = components[child+1].template_parser.as_ref().unwrap().embedding.as_ref().unwrap();
+                slots.iter().map(move |&slot| (0,slot,child as u32+1,0,embedding.return_pop,embedding.nullable))
+            }).collect::<Vec<_>>();
+            crate::compiler::boundary_stack_support::CompilerEffects::compose(
+                &summaries,&offsets,terminal_offsets,&links,states,terminals).ok()
+        });
         let grammar = Self { rules: Arc::from(rules), nonterminal_names: names,
             terminal_count: terminals, control_terminals: controls, root_nullable: parent.root_nullable,
             embedded_end_token_ids,
-            component_nonterminals: counts, scoped_ignores: ignores };
+            component_nonterminals: counts, scoped_ignores: ignores, stack_effects };
         grammar.validate()?;
         Ok(Some(Arc::new(grammar)))
     }

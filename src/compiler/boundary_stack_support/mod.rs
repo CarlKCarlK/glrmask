@@ -17,6 +17,12 @@ use crate::compiler::glr::table::GLRTable;
 use crate::compiler::glr::parser::ScopedSubgrammarLink;
 use crate::automata::weighted_u32::{nwa::NWA,dwa::DWA};
 pub(super) use coarse::Certificate;
+pub(crate) use effects::CompilerEffects;
+
+pub(super) fn from_compiler_effects(summary: &CompilerEffects) -> Result<Certificate, String> {
+    summary.validate()?;
+    coarse::certify(&[0], &summary.effects, summary.states)
+}
 
 pub(super) fn build(tables:&[&GLRTable],offsets:&[u32],links:&[ScopedSubgrammarLink],alphabet:u32)
     -> Result<Certificate,String>

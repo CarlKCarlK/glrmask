@@ -114,8 +114,8 @@ completion relations. Completion is an input predicate; it does not specify
 how an arbitrary parser should remove a child frame. The built-in compiler
 derives that embedding contract before discarding its LR construction data.
 
-Embedding-capable programs use the `TPR6` parser section in current envelope33
-or34. Obsolete pre-release program sections are rejected. An artifact without an embedding
+Embedding-capable programs use the `TPR7` parser section in current envelope35
+or36. Obsolete pre-release program sections are rejected. An artifact without an embedding
 contract cannot acquire one merely by being loaded. Invalid indices, cycles,
 alphabet labels, control inventories, and embedding fields are rejected.
 

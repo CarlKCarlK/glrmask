@@ -4,7 +4,7 @@ pub(crate) mod boundary_transfer;
 pub(crate) mod template_boundary;
 pub(crate) mod boundary_bit_minimize;
 pub(crate) mod boundary_weight_codec;
-mod boundary_stack_support;
+pub(crate) mod boundary_stack_support;
 mod boundary_preimage;
 mod boundary_tagged_templates;
 mod boundary_query_view;
