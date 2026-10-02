@@ -906,6 +906,38 @@ impl Constraint {
         Ok(())
     }
 
+    /// Storage evidence only: drop optional compiler analysis in an isolated
+    /// clone, preserving every executable graph and the original Constraint.
+    #[cfg(feature="internal-api")]
+    pub(crate) fn save_without_effect_metadata_for_diagnostic(&self) -> Vec<u8> {
+        fn strip(constraint:&mut Constraint) {
+            if let Some(parser)=constraint.template_parser.as_mut() {
+                // TemplateParser contains atomics and intentionally has no general Clone.
+                // Copy only this diagnostic view; executable graphs and domains stay shared.
+                let source=parser.as_ref();
+                let mut replacement=TemplateParser {
+                    state_count:source.state_count,terminal_count:source.terminal_count,
+                    skip_terminals:source.skip_terminals.clone(),completion_template:source.completion_template.clone(),
+                    composition:source.composition.clone(),embedding:source.embedding.clone(),
+                    link_grammar:source.link_grammar.clone(),domains:source.domains.clone(),completion:source.completion.clone(),
+                    possible:source.possible.clone(),unconditional:source.unconditional.clone(),profile:source.profile,
+                    advances:AtomicU64::new(source.advances.load(Ordering::Relaxed)),
+                    admissions:AtomicU64::new(source.admissions.load(Ordering::Relaxed)),
+                    completions:AtomicU64::new(source.completions.load(Ordering::Relaxed)),
+                };
+                if let Some(grammar)=replacement.link_grammar.as_mut() {Arc::make_mut(grammar).stack_effects=None;}
+                *parser=Arc::new(replacement);
+            }
+            constraint.serialized_artifact_cache=None;
+            if let Some(overlay)=constraint.static_dynamic_overlay.as_mut() {
+                for component in &mut overlay.segmented_parser_components {
+                    strip(Arc::make_mut(&mut component.constraint));
+                }
+            }
+        }
+        let mut isolated=self.clone();strip(&mut isolated);isolated.save()
+    }
+
     pub(crate) fn parser_backend_report(&self) -> serde_json::Value {
         match &self.template_parser {
             Some(parser) => {

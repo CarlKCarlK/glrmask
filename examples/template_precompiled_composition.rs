@@ -231,6 +231,15 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     assert_eq!(sharing["dense_global_certificate_rows"], 0);
     fs::write(output.join("backend.json"), serde_json::to_vec_pretty(&report)?)?;
     let start = Instant::now(); let saved = candidate.save(); let save_ns = start.elapsed().as_nanos();
+    if std::env::var_os("GLRMASK_PROFILE_METADATA_STORAGE").is_some() {
+        let isolated=glrmask::__private::save_without_effect_metadata_for_diagnostic(&candidate);
+        let checked=Constraint::load(&isolated)?;assert_table_free(&parser_backend_report(&checked));
+        let footprint=serde_json::json!({"with_metadata_bytes":saved.len(),"without_optional_effect_metadata_bytes":isolated.len(),
+            "actual_artifact_difference_bytes":saved.len() as i64-isolated.len() as i64,
+            "isolated_clone_only":true,"original_artifact_and_runtime_unchanged":true});
+        fs::write(output.join("effect-metadata-storage.json"),serde_json::to_vec_pretty(&footprint)?)?;
+        eprintln!("EFFECT_METADATA_STORAGE {footprint}");
+    }
     let start = Instant::now(); let loaded = Constraint::load(&saved)?; let load_ns = start.elapsed().as_nanos();
     assert_table_free(&parser_backend_report(&loaded)); if args[3] == "static" { assert_static(&parser_backend_report(&loaded)); } assert_eq!(saved, loaded.save());
     let external = candidate.save_with_external_vocab()?; let external_loaded = Constraint::load_with_vocab(&external, &vocab)?;

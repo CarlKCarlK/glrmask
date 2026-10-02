@@ -345,6 +345,11 @@ pub mod __private {
         constraint.parser_backend_report()
     }
 
+    /// Diagnostic artifact bytes; never used for runtime, linking or timing.
+    pub fn save_without_effect_metadata_for_diagnostic(constraint:&Constraint) -> Vec<u8> {
+        constraint.save_without_effect_metadata_for_diagnostic()
+    }
+
     /// Native research gate for the bounded O2 frontend; compare against the
     /// ordinary O2 parser independently before adopting as a public policy.
     pub fn compile_bounded_template_o2_glrm(source: &str, vocab: &Vocab) -> Result<DynamicConstraint> {
