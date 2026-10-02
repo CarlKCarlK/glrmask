@@ -11246,6 +11246,98 @@ fn remap_unmapped_component_artifacts(
     ))
 }
 
+/// Transport complete PM relations across the same intact disjoint leaf
+/// lexer union used by native static boundaries. The component coordinate
+/// carries PM as well as parser observations; terminal-DWA equivalence alone
+/// is never a certificate of possible-match equivalence.
+pub(super) fn prepared_leaf_possible_matches(
+    leaves: &[&Constraint],
+    tokenizer_offsets: &[u32],
+    terminal_offsets: &[u32],
+    merged_tokenizer_states: u32,
+    vocab: &Vocab,
+) -> Result<Option<MappedArtifact<PossibleMatches>>, String> {
+    if leaves.len()!=tokenizer_offsets.len() || leaves.len()!=terminal_offsets.len() {
+        return Err("prepared PM leaf coordinate count disagrees".into());
+    }
+    if leaves.iter().any(|leaf| !leaf.possible_matches_complete
+        || leaf.tokenizer.has_any_virtual_runtime()
+        || !(leaf.state_internal_tsid_offsets.is_empty() || tokenizer_tsid_relation_is_singleton(leaf))
+        || leaf.state_to_internal_tsid.len()!=leaf.tokenizer.num_states() as usize) {
+        return Ok(None);
+    }
+    let started=Instant::now();
+    let components=leaves.iter().zip(tokenizer_offsets).zip(terminal_offsets)
+        .map(|((&constraint,&tokenizer_state_offset),&terminal_offset)|ParserDwaComponent {
+            constraint,parser_state_relation:&[],tokenizer_state_offset,terminal_offset,composed_table:None,
+        }).collect::<Vec<_>>();
+    let mut original_tokens=vocab.entries_map().keys().copied().collect::<Vec<_>>();
+    original_tokens.sort_unstable();
+    // Native leaf PM deliberately leaves non-query lexer states unmapped.
+    // Parser coordinates require total state coverage, so do not use their
+    // total-state builder here. Lift precisely the retained PM classes and
+    // the synthetic root's epsilon membership, preserving the empty domain.
+    let mut state_map=vec![u32::MAX;merged_tokenizer_states as usize];
+    let mut state_groups=vec![vec![0]];
+    if let Some(root)=state_map.first_mut() {*root=0;}
+    let mut local_state_maps=Vec::with_capacity(leaves.len());
+    for component in &components {
+        let leaf=component.constraint;
+        let groups=leaf.internal_tsid_groups();
+        let mut local=vec![Vec::new();groups.len()];
+        for (tsid,group) in groups.iter().enumerate() {
+            if group.is_empty() {continue;}
+            let global=state_groups.len() as u32;
+            let mut translated=Vec::with_capacity(group.len());
+            for &state in group {
+                let state=component.tokenizer_state_offset.checked_add(state)
+                    .ok_or_else(||"prepared PM tokenizer state overflow".to_string())?;
+                let slot=state_map.get_mut(state as usize)
+                    .ok_or_else(||"prepared PM state lies outside lexical union".to_string())?;
+                if *slot!=u32::MAX {return Err("prepared PM leaf state coordinates overlap".into());}
+                *slot=global;translated.push(state);
+            }
+            local[tsid].push(global);state_groups.push(translated);
+        }
+        let start=leaf.state_to_internal_tsid[leaf.tokenizer.initial_state() as usize];
+        if start!=u32::MAX {
+            local.get_mut(start as usize).ok_or_else(||"prepared PM initial class is invalid".to_string())?.push(0);
+        }
+        local_state_maps.push(local);
+    }
+    let tokenizer_states=ManyToOneIdMap::from_original_to_internal_allowing_unmapped(state_map,state_groups.len() as u32);
+    let (vocab_tokens,local_token_maps,_)=build_direct_component_token_coordinates(&components,&original_tokens)?;
+    let maps=local_state_maps.into_iter().zip(local_token_maps)
+        .map(|(local_to_global_tsids,local_to_global_tokens)|DirectComponentCoordinateMaps {
+            local_to_global_tsids,local_to_global_tokens,
+        }).collect::<Vec<_>>();
+    let id_map=InternalIdMap {tokenizer_states,vocab_tokens,deferred_vocab_singleton_original_ids:None};
+    let coordinate_ms=started.elapsed().as_secs_f64()*1000.0;
+    let remap_started=Instant::now();
+    let mut possible=PossibleMatches::new();
+    for (component,maps) in components.iter().zip(maps) {
+        let mut local=component_possible_matches(component,component.terminal_offset)?;
+        remap_weights_with_maps(&mut local.weight_refs_mut(),&maps.local_to_global_tsids,
+            &maps.local_to_global_tokens,id_map.num_tsids() as usize);
+        for (terminal,weight) in local {
+            if weight.is_empty() {continue;}
+            possible.entry(terminal).and_modify(|existing|*existing=existing.union(&weight)).or_insert(weight);
+        }
+    }
+    let remap_ms=remap_started.elapsed().as_secs_f64()*1000.0;
+    let compact_started=Instant::now();
+    let mut mapped=MappedArtifact::new(possible,id_map);
+    // Remove component parser-only distinctions before B is reconciled. This
+    // exact PM observation quotient avoids inflating the boundary artifact.
+    mapped.compact_dimensions_fast();
+    if compose_profile_enabled() {
+        eprintln!("[glrmask/profile][prepared_leaf_possible_matches] leaves={} rows={} tsids={} tokens={} coordinate_ms={coordinate_ms:.3} remap_ms={remap_ms:.3} compact_ms={:.3} total_ms={:.3}",
+            leaves.len(),mapped.artifact().len(),mapped.id_map().num_tsids(),mapped.id_map().num_internal_tokens(),
+            compact_started.elapsed().as_secs_f64()*1000.0,started.elapsed().as_secs_f64()*1000.0);
+    }
+    Ok(Some(mapped))
+}
+
 fn component_possible_matches(
     component: &ParserDwaComponent<'_>,
     terminal_offset: u32,

@@ -208,6 +208,10 @@ pub(crate) fn compose(mut parent: Constraint, children: &[(String, Arc<Constrain
                 .map(|link| link.slot_terminal).collect::<Vec<_>>();
             if let Ok(refined) = crate::compiler::boundary_tail::build_root_call_candidates(leaves[0], &children, &calls, vocab) {
                 let ids = existing.iter().copied().filter(|id| refined.candidate_ids.binary_search(id).is_ok()).collect::<Vec<_>>();
+                if std::env::var_os("GLRMASK_PROFILE_COMPILE_SUMMARY").is_some() {
+                    eprintln!("[glrmask/profile][native_link_root_call_proof] reusable={} filtered={} summary_ms={:.3} map_ms={:.3}",
+                        existing.len(),ids.len(),refined.summary_ms,refined.map_ms);
+                }
                 candidate_tokens[0] = Some(Arc::from(ids));
             }
         }

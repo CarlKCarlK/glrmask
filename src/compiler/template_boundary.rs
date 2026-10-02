@@ -90,6 +90,19 @@ fn retain_same_owner_paths(constraint: &Constraint, component: usize, bounded: b
     Ok(!excluded.iter().all(|row| row.len() == views.len()))
 }
 
+// The native linker already ran the same necessary root-CALL proof for
+// this actual flat, non-nullable binding. Reuse its link-local result, never
+// a source component's broad certificate or a previous static cut subset.
+fn prepared_root_call_candidates(constraint:&Constraint)->Option<Arc<[u32]>> {
+    let overlay=constraint.static_dynamic_overlay.as_ref()?;
+    if !overlay.segmented_parser_components.iter().all(|component|
+        component.constraint.template_parser.as_ref().is_some_and(|parser|parser.composition.is_none()))
+        || overlay.segmented_parser_links.iter().any(|link|link.child_start_nullable) {return None;}
+    let shard=overlay.segmented_parser_components.first()?.boundary.as_ref()?;
+    if shard.start_component!=0 || !matches!(shard.backend,SegmentedBoundaryShardBackend::DynamicDirect) {return None;}
+    shard.candidate_tokens.as_ref().map(Arc::clone)
+}
+
 pub(crate) fn install(constraint: &mut Constraint, vocab: &Vocab) -> Result<()> {
     if !constraint.uses_compact_segmented_parser_runtime() { return Ok(()); }
     if !constraint.has_template_parser() { return Err(fail("static template boundary requires a table-free parser")); }
@@ -146,11 +159,15 @@ pub(crate) fn install(constraint: &mut Constraint, vocab: &Vocab) -> Result<()> 
         let children = components.iter().skip(1).map(|component| component.constraint.as_ref()).collect::<Vec<_>>();
         let calls = constraint.static_dynamic_overlay.as_ref().unwrap().segmented_parser_links.iter()
             .filter(|link| link.parent_component == 0).map(|link| link.slot_terminal).collect::<Vec<_>>();
-        if let Some(existing) = candidate_tokens_by_component[0].as_mut()
-            && let Ok(refined) = super::boundary_tail::build_root_call_candidates(parent, &children, &calls, vocab) {
-            let before = existing.len();
-            existing.retain(|id| refined.candidate_ids.binary_search(id).is_ok());
-            if profile { eprintln!("[glrmask/profile][boundary_root_call_candidates] reusable={before} filtered={}", existing.len()); }
+        if let Some(existing) = candidate_tokens_by_component[0].as_mut() {
+            let before=existing.len();
+            if let Some(prepared)=prepared_root_call_candidates(constraint) {
+                existing.retain(|id|prepared.binary_search(id).is_ok());
+                if profile {eprintln!("[glrmask/profile][boundary_root_call_candidates] reused_link_proof=true reusable={before} filtered={}",existing.len());}
+            } else if let Ok(refined)=super::boundary_tail::build_root_call_candidates(parent,&children,&calls,vocab) {
+                existing.retain(|id|refined.candidate_ids.binary_search(id).is_ok());
+                if profile {eprintln!("[glrmask/profile][boundary_root_call_candidates] reused_link_proof=false reusable={before} filtered={} summary_ms={:.3} map_ms={:.3}",existing.len(),refined.summary_ms,refined.map_ms);}
+            }
         }
     }
     let candidate_tokens_by_component = candidate_tokens_by_component.iter()
@@ -276,10 +293,22 @@ pub(crate) fn install(constraint: &mut Constraint, vocab: &Vocab) -> Result<()> 
     // Materialize its exclusions now, independently of the B quotient. The
     // shared static evaluator must never fall back to a vocabulary walk merely
     // because a remembered exclusion first appears after a token boundary.
-    let possible = pm::compute_constraint_possible_matches_for_vocab(&merged, vocab,
-        pm::ConstraintPossibleMatchesConfig::EAGER);
-    if !possible.complete { return Err(fail("static template boundary has incomplete exclusions")); }
-    let mut common = complete_possible_match_coordinate(possible.mapped_possible_matches.id_map(),
+    let prepared_possible=if projected {None} else {
+        super::constraint_compose::prepared_leaf_possible_matches(&leaves,&tokenizer_offsets,
+            &layout.leaf_terminal_offsets,merged.num_states(),vocab).map_err(fail)?
+    };
+    let reused_possible=prepared_possible.is_some();
+    let possible=match prepared_possible {
+        Some(possible)=>possible,
+        None=>{
+            let computed=pm::compute_constraint_possible_matches_for_vocab(&merged,vocab,
+                pm::ConstraintPossibleMatchesConfig::EAGER);
+            if !computed.complete {return Err(fail("static template boundary has incomplete exclusions"));}
+            computed.mapped_possible_matches
+        }
+    };
+    if profile {eprintln!("[glrmask/profile][boundary_possible_matches] reused_leaf_relations={reused_possible}");}
+    let mut common = complete_possible_match_coordinate(possible.id_map(),
         merged.num_states(), vocab)?;
     if projected {
         // One observation per finite source state: neither A nor PM alone can
@@ -287,7 +316,7 @@ pub(crate) fn install(constraint: &mut Constraint, vocab: &Vocab) -> Result<()> 
         common.tokenizer_states = ManyToOneIdMap::from_original_to_internal_allowing_unmapped(
             (0..merged.num_states()).collect(), merged.num_states());
     }
-    let possible_matches = possible.mapped_possible_matches.remap_into_existing_common(&common)
+    let possible_matches = possible.remap_into_existing_common(&common)
         .into_artifact().into_iter().map(|(terminal, weight)| {
             let runtime_terminal = layout.outer_terminal_count.checked_add(terminal)
                 .ok_or_else(|| fail("scoped exclusion terminal overflow"))?;
@@ -430,6 +459,102 @@ pub(crate) fn install(constraint: &mut Constraint, vocab: &Vocab) -> Result<()> 
 mod tests {
     use super::*;
     use crate::{BuildOptions, Grammar, Optimization};
+
+    #[test]
+    fn prepared_root_call_proof_matches_recomputation_and_static_runtime_after_reload() {
+        let vocab=Vocab::new(vec![(0,b"x".to_vec()),(1,b"a".to_vec()),(2,b"y".to_vec()),
+            (3,b"xay".to_vec()),(4,b"xa".to_vec()),(5,b"ay".to_vec()),(6,b"xb".to_vec())]);
+        for nullable in [false,true] {
+            let child=Grammar::from_ebnf(if nullable {r#"start ::= "a" | """#} else {r#"start ::= "a""#})
+                .compile(&vocab).unwrap();
+            let dynamic=Grammar::from_glrm(r#"glrm 1; extern grammar child; start root; nt root = "x" child "y";"#)
+                .compile_unlinked(&vocab).unwrap().bind("child",&child).unwrap()
+                .link_with(BuildOptions::default().optimization(Optimization::FastBuild)).unwrap();
+            let prepared=prepared_root_call_candidates(&dynamic);
+            assert_eq!(prepared.is_none(),nullable);
+            if let Some(prepared)=prepared {
+                let overlay=dynamic.static_dynamic_overlay.as_ref().unwrap();
+                let parent=overlay.segmented_parser_components[0].constraint.as_ref();
+                let children=overlay.segmented_parser_components.iter().skip(1)
+                    .map(|component|component.constraint.as_ref()).collect::<Vec<_>>();
+                let calls=overlay.segmented_parser_links.iter().map(|link|link.slot_terminal).collect::<Vec<_>>();
+                let refined=super::super::boundary_tail::build_root_call_candidates(parent,&children,&calls,&vocab).unwrap();
+                let mut independent=super::super::boundary_candidates::persisted_boundary_candidate_ids(parent,&vocab)
+                    .unwrap().unwrap();independent.retain(|id|refined.candidate_ids.binary_search(id).is_ok());
+                assert_eq!(prepared.as_ref(),independent.as_slice());
+            }
+            let mut candidate=dynamic;install(&mut candidate,&vocab).unwrap();
+            let reference=Grammar::from_ebnf(if nullable {r#"start ::= "x" ("a" | "") "y""#}
+                else {r#"start ::= "x" "a" "y""#})
+                .compile_with(&vocab,BuildOptions::default().optimization(Optimization::FastRuntime)).unwrap();
+            let loaded=Constraint::load(&candidate.save()).unwrap();
+            let mut words=vec![Vec::new()];
+            for depth in 0..=4 {
+                let mut next=Vec::new();
+                for word in words {
+                    for actual in [&candidate,&loaded] {
+                        let mut a=actual.start();let mut b=reference.start();
+                        for prefix in 0..=word.len() {
+                            let mut actual_mask=vec![0;actual.mask_len()];let mut expected_mask=vec![0;reference.mask_len()];
+                            a.fill_mask(&mut actual_mask);b.fill_mask(&mut expected_mask);
+                            assert_eq!(actual_mask,expected_mask,"nullable={nullable} word={word:?} prefix={prefix}");
+                            assert_eq!(a.is_accepting(),b.is_accepting());assert_eq!(a.is_rejected(),b.is_rejected());
+                            if prefix<word.len() {assert_eq!(a.commit_bytes(&word[prefix..prefix+1]).is_ok(),
+                                b.commit_bytes(&word[prefix..prefix+1]).is_ok());}
+                        }
+                    }
+                    if depth<4 {for byte in [b'x',b'a',b'y',b'b'] {let mut following=word.clone();following.push(byte);next.push(following);}}
+                }
+                words=next;
+            }
+        }
+    }
+
+    #[test]
+    fn prepared_leaf_possible_matches_equal_eager_union_for_every_cell_and_reload() {
+        let vocab=Vocab::new(vec![(1,Vec::new()),(3,b"a".to_vec()),(7,b"ab".to_vec()),
+            (11,b"a".to_vec()),(15,b"!".to_vec()),(19,b"?".to_vec()),(23,b"b".to_vec()),
+            (27,b"aa!".to_vec()),(31,b"xa".to_vec()),(37,vec![0]),(41,b" ".to_vec()),(43,b"abab".to_vec())]);
+        let left=Grammar::from_glrm(r#"glrm 1; start root; t WORD = /[a-z]+/; nt root = WORD "!";"#)
+            .compile_with(&vocab,BuildOptions::default().optimization(Optimization::FastRuntime)).unwrap();
+        let right=Grammar::from_glrm(r#"glrm 1; start root; t TEXT = /a[ab]*/; nt root = TEXT "?";"#)
+            .compile_with(&vocab,BuildOptions::default().optimization(Optimization::FastRuntime)).unwrap();
+        let loaded_left=Constraint::load(&left.save()).unwrap();let loaded_right=Constraint::load(&right.save()).unwrap();
+        for leaves in [vec![&left,&right],vec![&loaded_left,&loaded_right],vec![&left,&loaded_right]] {
+            let terminals=vec![0,leaves[0].tokenizer.num_terminals()];
+            let inputs=leaves.iter().zip(&terminals).map(|(&leaf,&offset)|(leaf.tokenizer.as_ref(),offset)).collect::<Vec<_>>();
+            let (merged,offsets)=Tokenizer::disjoint_union_with_terminal_offsets(&inputs);
+            for (index,leaf) in leaves.iter().enumerate() {
+                assert!(leaf.possible_matches_complete,"leaf={index} incomplete PM");
+                assert!(!leaf.tokenizer.has_any_virtual_runtime(),"leaf={index} projected tokenizer");
+                assert!(leaf.state_internal_tsid_offsets.is_empty() || leaf.state_internal_tsid_offsets.as_slice()==[u32::MAX],
+                    "leaf={index} multivalued TSID");
+                assert_eq!(leaf.state_to_internal_tsid.len(),leaf.tokenizer.num_states() as usize,"leaf={index} state coordinate");
+            }
+            let prepared=super::super::constraint_compose::prepared_leaf_possible_matches(&leaves,&offsets,
+                &terminals,merged.num_states(),&vocab).unwrap().expect("complete intact leaf PM must be reusable");
+            let expected=pm::compute_constraint_possible_matches_for_vocab(&merged,&vocab,pm::ConstraintPossibleMatchesConfig::EAGER);
+            assert!(expected.complete);
+            let contains=|mapped:&MappedArtifact<BTreeMap<u32,crate::ds::weight::Weight>>,state:u32,token:u32,terminal:u32| {
+                let tsid=mapped.id_map().tokenizer_states.original_to_internal[state as usize];
+                let itoken=mapped.id_map().vocab_tokens.original_to_internal[token as usize];
+                tsid!=u32::MAX && itoken!=u32::MAX && mapped.artifact().get(&terminal)
+                    .is_some_and(|weight|weight.tokens_for_tsid(tsid).contains(itoken))
+            };
+            for state in 0..merged.num_states() {for &token in vocab.entries_map().keys() {
+                for terminal in 0..merged.num_terminals() {
+                    assert_eq!(contains(&prepared,state,token,terminal),contains(&expected.mapped_possible_matches,state,token,terminal),
+                        "state={state} token={token} terminal={terminal}");
+                }
+            }}
+        }
+        let mut incomplete=loaded_left.clone();incomplete.possible_matches_complete=false;
+        let leaves=vec![&incomplete,&loaded_right];let terminals=vec![0,incomplete.tokenizer.num_terminals()];
+        let (merged,offsets)=Tokenizer::disjoint_union_with_terminal_offsets(&[(incomplete.tokenizer.as_ref(),0),
+            (loaded_right.tokenizer.as_ref(),terminals[1])]);
+        assert!(super::super::constraint_compose::prepared_leaf_possible_matches(&leaves,&offsets,&terminals,
+            merged.num_states(),&vocab).unwrap().is_none());
+    }
 
     #[test]
     fn exact_caller_domains_distinguish_one_call_from_adjacent_child_calls() {
