@@ -1176,6 +1176,11 @@ pub(super) struct BoundedCodeIntersectionOracle {
     /// every pattern state on the first such query can dominate mask latency.
     #[serde(skip)]
     completion_row_cache: FxHashMap<(u32, u32), BitSet>,
+    /// Mask-result-only proof cache; never changes recognition or persisted
+    /// finite-mask DFA coordinates. Each bound uses a body-copy-reachable
+    /// closed subset, not observed mask equality.
+    #[serde(skip)]
+    mask_result_future_headroom: FxHashMap<(u32, u32), usize>,
     exact_powers: Vec<BoolRelation>,
     prefix_sums: Vec<BoolRelation>,
 }
@@ -1266,6 +1271,7 @@ impl SparseBoundedCodeOracleWire {
             suffix_accepting: self.suffix_accepting,
             completion_relations,
             completion_row_cache: FxHashMap::default(),
+            mask_result_future_headroom: FxHashMap::default(),
             exact_powers,
             prefix_sums,
         })
@@ -1441,6 +1447,65 @@ impl BoundedCodeIntersectionOracle {
 
     fn finite_mask_stencil_crossings(&self, token_crossings: usize) -> Option<usize> {
         token_crossings.checked_add(self.finite_mask_future_repeat_headroom()?)
+    }
+
+    /// Close all completions of the current partial body under whole body-code
+    /// copies. Every later body boundary belongs to this closed relation graph.
+    /// Compute shortest distances to suffix-admitting boundaries in this closed
+    /// graph, and retain the maximum finite distance plus two. A shortest path
+    /// has at most R-1 copies among R boundary states, so this never exceeds the
+    /// global P+1 bound. The extra copies cover partial-body/strict-future cases.
+    /// Keep the global P+1 stencil for compiler/recognition/transition caches.
+    fn mask_result_future_repeat_headroom(&mut self, pattern_state: u32, body_state: u32) -> Option<usize> {
+        let key = (pattern_state, body_state);
+        if let Some(&headroom) = self.mask_result_future_headroom.get(&key) {
+            return Some(headroom);
+        }
+        let states = self.pattern.num_states();
+        if pattern_state as usize >= states || body_state as usize >= self.body.num_states()
+            || self.pattern.has_epsilon_transitions() || self.body.has_epsilon_transitions() {
+            return None;
+        }
+        let mut seen = vec![false; states];
+        let mut incoming = vec![Vec::<u32>::new(); states];
+        let mut pending = vec![pattern_state];
+        seen[pattern_state as usize] = true;
+        // Include the source pattern state conservatively even for a partial
+        // body. Completing that partial body seeds every real next boundary.
+        for target in self.completion_row(body_state, pattern_state).iter_ones() {
+            if !seen[target] { seen[target] = true; pending.push(target as u32); }
+        }
+        while let Some(state) = pending.pop() {
+            for target in self.completion_row(0, state).iter_ones() {
+                if target >= states { return None; }
+                incoming[target].push(state);
+                if !seen[target] {
+                    seen[target] = true;
+                    pending.push(target as u32);
+                }
+            }
+        }
+        let mut distances = vec![None::<usize>; states];
+        let mut queue = VecDeque::new();
+        for state in 0..states {
+            if seen[state] && self.suffix_accepting.contains(state) {
+                distances[state] = Some(0);
+                queue.push_back(state);
+            }
+        }
+        while let Some(state) = queue.pop_front() {
+            let distance = distances[state]?.checked_add(1)?;
+            for &predecessor in &incoming[state] {
+                let predecessor = predecessor as usize;
+                if distances[predecessor].is_none() {
+                    distances[predecessor] = Some(distance);
+                    queue.push_back(predecessor);
+                }
+            }
+        }
+        let headroom = distances.into_iter().flatten().max().unwrap_or(0).checked_add(2)?;
+        self.mask_result_future_headroom.insert(key, headroom);
+        Some(headroom)
     }
 
     fn from_expr(expr: &Expr) -> Option<Self> {
@@ -1628,6 +1693,7 @@ impl BoundedCodeIntersectionOracle {
             suffix_accepting,
             completion_relations: vec![None; body_states],
             completion_row_cache: FxHashMap::default(),
+            mask_result_future_headroom: FxHashMap::default(),
             exact_powers: Vec::new(),
             prefix_sums: Vec::new(),
         };
@@ -3922,6 +3988,7 @@ impl VirtualResidualRuntime {
             suffix_accepting: artifact.suffix_accepting.clone(),
             completion_relations: vec![None; body_states],
             completion_row_cache: FxHashMap::default(),
+            mask_result_future_headroom: FxHashMap::default(),
             // The transferred backward-future table is the exact dynamic-
             // programming replacement for these relation powers. Loaded
             // runtimes route future queries through that table below.
@@ -3964,6 +4031,51 @@ impl VirtualResidualRuntime {
             .checked_add(1)?;
         let mask_max = oracle.max.min(desired_mask_max);
         oracle.finite_mask_dense_state_count(mask_max)
+    }
+
+    /// Exact one-model-token RESULT key. Unlike the reusable finite-mask DFA
+    /// coordinate, this may use a smaller closed-subgraph future-witness bound.
+    /// Do not use it for lexer byte-transition rows or compiled projection maps.
+    ///
+    /// Let R count body-boundary pattern states reachable by completing the
+    /// current body and then taking whole body-code copies. Every boundary
+    /// reached during any candidate token remains in this closed set. A
+    /// shortest accepting body-copy path has no repeated pattern vertex. Use
+    /// the maximum finite shortest distance to a suffix-admitting boundary,
+    /// plus two conservative copies; this is at most R+1. Add the maximum
+    /// copies crossed by a token of length K before collapsing only counts
+    /// already above the lower bound and farther than that sum from the upper
+    /// bound. Acceptance itself, prefix/suffix positions and body state remain
+    /// exact. This is not a claim of equal unrestricted residual languages.
+    ///
+    /// The dense encoding retains pattern_state as its residue modulo the
+    /// pattern-state count. Thus state-dependent stencil sizes cannot alias
+    /// different pattern states; within one pattern state phase ranges remain
+    /// disjoint. Full parser paths, correlated exclusions, initial-state status
+    /// and vocabulary identity are retained by the caller's result key.
+    pub(super) fn direct_coordinate_mask_result_dense_key(
+        &self,
+        source: VirtualResidualDirectCoordinate,
+        max_token_len: usize,
+    ) -> Option<(u32, u32)> {
+        if source.runtime_index != self.runtime_index || max_token_len == 0 {
+            return None;
+        }
+        let mut store = self.store.lock().ok()?;
+        let oracle = store.liveness_oracle.as_mut()?;
+        let minimum_body_width = oracle.body.min_match_byte_len()?.max(1);
+        let token_crossings = max_token_len.div_ceil(minimum_body_width).checked_add(1)?;
+        let BoundedCodeEnvelopeState::Body { body_state, .. } = source.coordinate.envelope else {
+            let crossings = oracle.finite_mask_stencil_crossings(token_crossings)?;
+            return self.direct_coordinate_dense_key_with_stencil(source, oracle, crossings);
+        };
+        let headroom = oracle.mask_result_future_repeat_headroom(source.coordinate.pattern_state, body_state)?;
+        let mut crossed_boundaries = token_crossings.checked_add(headroom)?;
+        // Retain the already-supported global lane for large lower minima.
+        if oracle.min > crossed_boundaries.checked_add(1)? {
+            crossed_boundaries = oracle.finite_mask_stencil_crossings(token_crossings)?;
+        }
+        self.direct_coordinate_dense_key_with_stencil(source, oracle, crossed_boundaries)
     }
 
     pub(super) fn new(
@@ -4565,6 +4677,15 @@ impl VirtualResidualRuntime {
             .div_ceil(minimum_body_width)
             .saturating_add(1);
         let crossed_boundaries = oracle.finite_mask_stencil_crossings(crossed_boundaries)?;
+        self.direct_coordinate_dense_key_with_stencil(source, oracle, crossed_boundaries)
+    }
+
+    fn direct_coordinate_dense_key_with_stencil(
+        &self,
+        source: VirtualResidualDirectCoordinate,
+        oracle: &BoundedCodeIntersectionOracle,
+        crossed_boundaries: usize,
+    ) -> Option<(u32, u32)> {
         if oracle.min > crossed_boundaries.saturating_add(1) {
             return None;
         }
@@ -6873,6 +6994,110 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn mask_result_dense_key_retains_closed_subgraph_future_witnesses() {
+        // Long unreachable pattern prefixes must not inflate this query's
+        // witness. The required bcdef tail still spans more than one token.
+        fn check(prefix_len: usize, min: usize, max: usize) {
+            let mut required = vec![b'<'];
+            required.extend(std::iter::repeat_n(b'p', prefix_len));
+            let pattern = Expr::Seq(vec![
+                bytes(&required),
+                Expr::Repeat { expr: Box::new(bytes(b"a")), min: 0, max: None },
+                bytes(b"bcdef>"),
+            ]);
+            let body = Expr::Choice(b"pabcdef".iter().map(|&b| bytes(&[b])).collect());
+            let expr = Expr::Intersect {
+                expr: Box::new(pattern),
+                intersect: Box::new(bounded_code_envelope_with_body(body, min, max)),
+            };
+            let runtime = Arc::new(VirtualResidualRuntime::new_dynamic(
+                &expr, 0, 0, 1, 2, 1,
+                Arc::new(VirtualStateAllocator::new(2).unwrap()),
+                Arc::new(VirtualRuntimeStateOwners::new(2, &[1]).unwrap()),
+            ).expect("certified prefix-free nonnullable body"));
+            let words = (0..=max-prefix_len-5).filter_map(|count| {
+                if prefix_len+count+5 < min { return None; }
+                let mut word = required.clone();
+                word.extend(std::iter::repeat_n(b'a', count));
+                word.extend_from_slice(b"bcdef>");
+                Some(word)
+            }).collect::<Vec<_>>();
+            let mut candidates = vec![Vec::new()];
+            let mut layer = vec![Vec::new()];
+            for _ in 0..3 {
+                let mut next = Vec::new();
+                for prefix in &layer {
+                    for &byte in b"abcdef>z" {
+                        let mut candidate = prefix.clone();
+                        candidate.push(byte);
+                        next.push(candidate);
+                    }
+                }
+                candidates.extend(next.iter().cloned());
+                layer = next;
+            }
+            let mut by_key = FxHashMap::<(u32,u32), Vec<(bool,bool)>>::default();
+            let mut aliases = 0;
+            let mut focused = Vec::new();
+            for count in 0..=max-prefix_len-5 {
+                for tail in [b"".as_slice(), b"b", b"bcde", b"bcdef", b"bcdef>"] {
+                    let mut prefix = required.clone();
+                    prefix.extend(std::iter::repeat_n(b'a', count));
+                    prefix.extend_from_slice(tail);
+                    let root = runtime.direct_coordinate_for_state(1).unwrap();
+                    let Some(coordinate) = prefix.iter().try_fold(root, |state,&byte|
+                        runtime.direct_coordinate_step(state,byte)) else { continue; };
+                    let Some(key) = runtime.direct_coordinate_mask_result_dense_key(coordinate,3) else { continue; };
+                    let observations = candidates.iter().map(|candidate| {
+                        let target = candidate.iter().try_fold(coordinate, |state,&byte|
+                            runtime.direct_coordinate_step(state,byte));
+                        let observed = target.map(|target| (
+                            runtime.direct_coordinate_accepting(target).unwrap(),
+                            runtime.direct_coordinate_has_future(target).unwrap(),
+                        )).unwrap_or((false,false));
+                        let mut full = prefix.clone();
+                        full.extend(candidate);
+                        let expected = (
+                            words.iter().any(|word| word == &full),
+                            words.iter().any(|word| word.len()>full.len() && word.starts_with(&full)),
+                        );
+                        assert_eq!(observed,expected,"prefix={prefix:?} candidate={candidate:?}");
+                        observed
+                    }).collect::<Vec<_>>();
+                    if let Some(previous) = by_key.insert(key,observations.clone()) {
+                        aliases += 1;
+                        assert_eq!(previous,observations,"equal result keys must preserve every <=3-byte observation");
+                    }
+                    if prefix_len == 100 && tail.is_empty() && matches!(count,10|15) {
+                        focused.push((key,runtime.direct_coordinate_finite_mask_dense_key(coordinate,3).unwrap()));
+                    }
+                }
+            }
+            assert!(aliases>0);
+            if prefix_len == 100 {
+                assert_eq!(focused.len(),2);
+                assert_eq!(focused[0].0,focused[1].0,"closed-subgraph result cache must coalesce the interior pair");
+                assert_ne!(focused[0].1,focused[1].1,"compiler/global finite projection must keep its original distinction");
+            }
+            let mut store = runtime.store.lock().unwrap();
+            let oracle = store.liveness_oracle.as_mut().unwrap();
+            let before = bincode::serialize(oracle).unwrap();
+            for p in 0..oracle.pattern.num_states() as u32 {
+                let bound = oracle.mask_result_future_repeat_headroom(p, 0).unwrap();
+                assert!(bound<=oracle.finite_mask_future_repeat_headroom().unwrap());
+                let targets = oracle.completion_row(0, p).iter_ones().map(|target| target as u32).collect::<Vec<_>>();
+                for target in targets {
+                    // Closure can only shrink after a complete body code.
+                    assert!(oracle.mask_result_future_repeat_headroom(target, 0).unwrap() <= bound);
+                }
+            }
+            assert_eq!(before,bincode::serialize(oracle).unwrap());
+        }
+        check(100,0,160);
+        check(3,9,25);
     }
 
     #[test]

@@ -8999,7 +8999,7 @@ fn dynamic_mask_lookup_query_for_vocab(
             && let Some((runtime, projected_state)) = state
                 .constraint
                 .tokenizer
-                .virtual_residual_direct_coordinate_finite_mask_dense_key(
+                .virtual_residual_direct_coordinate_mask_result_dense_key(
                     coordinate,
                     max_token_byte_len.unwrap_or(0),
                 )
@@ -10385,6 +10385,75 @@ fn fill_mask_dynamic_impl(
 
 #[cfg(test)]
 mod tests {
+    /// Local canonical-fixture qualification; never silently succeeds without
+    /// the explicit fixture paths. Production builds do not include this test.
+    #[test]
+    #[ignore = "requires the pinned canonical vocabulary and residual witness corpus"]
+    fn mask_result_key_canonical_witnesses_match_independent_full_masks() {
+        let corpus_path = std::env::var("GLRMASK_TEST_WITNESS_CORPUS").unwrap();
+        let vocab_path = std::env::var("GLRMASK_TEST_WITNESS_VOCAB_HEX").unwrap();
+        let compressed = std::fs::read(corpus_path).unwrap();
+        let decoded = zstd::stream::decode_all(compressed.as_slice()).unwrap();
+        let corpus: serde_json::Value = serde_json::from_slice(&decoded).unwrap();
+        let hex_tokens: Vec<String> = serde_json::from_slice(&std::fs::read(vocab_path).unwrap()).unwrap();
+        let max_token_len = hex_tokens.iter().map(|token| token.len() / 2).max().unwrap();
+        assert_eq!(max_token_len, 128, "canonical vocabulary fixture identity");
+        let vocab = Vocab::new(hex_tokens.into_iter().enumerate().map(|(id, hex)| {
+            assert_eq!(hex.len() % 2, 0);
+            let bytes = (0..hex.len()).step_by(2)
+                .map(|offset| u8::from_str_radix(&hex[offset..offset + 2], 16).unwrap()).collect();
+            (id as u32, bytes)
+        }).collect());
+        let mut checked = 0;
+        for (suffix, example_index, generations) in [("o21073", 3u64, [64usize, 65]), ("o55337", 0, [118, 120])] {
+            let problem = corpus["problems"].as_array().unwrap().iter()
+                .find(|p| p["problem_id"].as_str().unwrap().ends_with(suffix)).unwrap();
+            let example = problem["tests"].as_array().unwrap().iter()
+                .find(|t| t["index"].as_u64() == Some(example_index)).unwrap();
+            let tokens: Vec<u32> = example["token_ids"].as_array().unwrap().iter()
+                .map(|t| u32::try_from(t.as_u64().unwrap()).unwrap()).collect();
+            let compiled = crate::DynamicConstraint::compile(
+                Grammar::json_schema(&problem["schema"].to_string()), &vocab).unwrap();
+            assert!(compiled.inner.has_template_parser());
+            let mut public = compiled.start();
+            let mut exact = compiled.inner.start_dynamic();
+            let mut keys = Vec::new();
+            let mut strong = Vec::new();
+            for generation in 0..=generations[1] {
+                let mut mask = vec![0; compiled.mask_len()];
+                public.fill_mask(&mut mask);
+                assert_eq!(exact.mask(), mask, "public alternative union at {suffix}/{generation}");
+                if generations.contains(&generation) {
+                    let mut independent = vec![0; mask.len()];
+                    exact.fill_recursive_mask_by_exact_full_walk(&mut independent);
+                    assert_eq!(mask, independent, "independent full mask at {suffix}/{generation}");
+                    let (hash, query) = dynamic_mask_lookup_query(&exact).expect("result key");
+                    let key = query.to_owned_state_key();
+                    assert!(key.iter().any(|entry| matches!(entry.0, DynamicMaskLexerStateKey::VirtualDenseProjection { .. })));
+                    keys.push((hash, key));
+                    let coordinates: Vec<_> = exact.state.keys().map(|&state| {
+                        let coordinate = compiled.inner.tokenizer.virtual_residual_direct_coordinate(state).unwrap();
+                        compiled.inner.tokenizer.virtual_residual_direct_coordinate_finite_mask_dense_key(coordinate, max_token_len).unwrap()
+                    }).collect();
+                    strong.push(coordinates);
+                    checked += 1;
+                }
+                if generation < generations[1] {
+                    let token = tokens[generation];
+                    assert!(token_allowed(&mask, token), "fixture prefix is live {suffix}/{generation}");
+                    // This API explicitly rejects multiple alternatives. The
+                    // check prevents treating one inner constraint as a union.
+                    public.commit_token_profiled(token).expect("single alternative");
+                    exact.commit_token(token).unwrap();
+                }
+            }
+            assert_eq!(keys[0], keys[1], "proven closed-subgraph key must recover {suffix}");
+            assert_ne!(strong[0], strong[1], "compiler/transition headroom must remain stronger {suffix}");
+            println!("mask_result_witness {suffix} exact_full_masks=2 result_keys_equal=true strong_keys_equal=false");
+        }
+        assert_eq!(checked, 4);
+    }
+
     #[test]
     fn packed_boundary_vocab_preserves_aliases_bytes_and_complete_masks() {
         let entries = vec![(0,vec![]),(1,b"P".to_vec()),(2,b"a".to_vec()),
