@@ -60,13 +60,9 @@ impl TemplateEmbedding {
         let finish = try_split_commit_template_dfas(&raw)
             .ok_or("embedding return is not a finite POP/READ/PUSH relation")?;
         super::compile_domain(&finish).map_err(|error| error.to_string())?;
-        let mut entries = BTreeSet::new();
-        for terminal in slots {
-            // Preserve only slots whose complete terminal relation can be
-            // turned into CALL by appending the child's initial stack symbol.
-            crate::compiler::boundary_transfer::validate_slot_entry_shape(table, terminal)?;
-            entries.insert(terminal);
-        }
+        let entries = slots.into_iter().collect::<BTreeSet<_>>();
+        // Identical complete logical slot checks, batched over table rows.
+        crate::compiler::boundary_transfer::validate_slot_entry_shapes(table, &entries)?;
         Self::new(nullable, return_pop, entries, Arc::new(finish), table.num_states)
     }
 

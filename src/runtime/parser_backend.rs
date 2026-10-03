@@ -287,7 +287,7 @@ impl PreparedTemplateParser {
                 0..terminal_count,
             ).map_err(crate::Error::Compilation)?));
         } else {
-            parser.embedding = crate::compiler::glr::table::subgrammar_child_return_pop(table, &table.rules).ok().and_then(|return_pop| embedding::TemplateEmbedding::from_table(table, table.embedded_start_nullable(), return_pop, (0..terminal_count).filter(|&terminal| crate::compiler::boundary_transfer::validate_slot_entry_shape(table, terminal).is_ok())).ok()).map(Arc::new);
+            parser.embedding = crate::compiler::glr::table::subgrammar_child_return_pop(table, &table.rules).ok().and_then(|return_pop| embedding::TemplateEmbedding::from_table(table, table.embedded_start_nullable(), return_pop, crate::compiler::boundary_transfer::valid_slot_entry_terminals(table)).ok()).map(Arc::new);
         }
         parser.link_grammar = link_grammar::LinkGrammar::from_compiler_table(table, ignore).map_err(crate::Error::Compilation)?;
         if let Some(grammar) = parser.link_grammar.as_mut() {
