@@ -7825,7 +7825,10 @@ impl Constraint {
             direct_regular_terminal_support,
         );
         let slice_leftovers_started_at = profile.then(std::time::Instant::now);
-        self.prepare_llg_slice_leftovers(&mut dynamic_mask_vocab);
+        let recursive_provider = self.uses_compact_segmented_parser_runtime();
+        if !recursive_provider {
+            self.prepare_llg_slice_leftovers(&mut dynamic_mask_vocab);
+        }
         let slice_leftovers_ms = slice_leftovers_started_at
             .map_or(0.0, |started| started.elapsed().as_secs_f64() * 1000.0);
         // Master-slice prover preparation remains available for O1 experiments
@@ -7844,8 +7847,8 @@ impl Constraint {
         let ordinary_eager = self.uses_dynamic_runtime()
             && !dynamic_mask_vocab.is_grammar_quotiented()
             && std::env::var_os("GLRMASK_DISABLE_EAGER_CONTAINMENT_QUOTIENTS").is_none();
-        let eager_containment_quotients = o2_prepared_master || ordinary_eager
-            || std::env::var_os("GLRMASK_EXPERIMENT_EAGER_CONTAINMENT_QUOTIENTS").is_some();
+        let eager_containment_quotients = !recursive_provider && (o2_prepared_master || ordinary_eager
+            || std::env::var_os("GLRMASK_EXPERIMENT_EAGER_CONTAINMENT_QUOTIENTS").is_some());
         let eager_component_state_cap = ordinary_eager.then(|| {
             std::env::var("GLRMASK_EAGER_CONTAINMENT_MAX_STATES")
                 .ok().and_then(|value| value.parse::<usize>().ok())
