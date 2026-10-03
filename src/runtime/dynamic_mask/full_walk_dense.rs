@@ -1863,7 +1863,10 @@ pub(super) fn try_scalar_dispatch(
     if root_branches
         .iter()
         .any(|branch| !branch.initial_prune_guard.is_passed())
-        && !joint_initial_guard_walk_enabled(root_branches)
+        && !joint_initial_guard_walk_enabled(
+            root_branches,
+            state.constraint.tokenizer.initial_state(),
+        )
     {
         let mut merged = vec![0u32; buf.len()];
         let mut scratch = vec![0u32; buf.len()];
@@ -2280,7 +2283,10 @@ pub(super) fn try_flat16<const HOT_SINGLE_ROOT: bool>(
     if root_branches
         .iter()
         .any(|branch| !branch.initial_prune_guard.is_passed())
-        && !joint_initial_guard_walk_enabled(root_branches)
+        && !joint_initial_guard_walk_enabled(
+            root_branches,
+            state.constraint.tokenizer.initial_state(),
+        )
     {
         let profile = dynamic_mask_profile_enabled(state.generation);
         let mut merged = vec![0u32; buf.len()];

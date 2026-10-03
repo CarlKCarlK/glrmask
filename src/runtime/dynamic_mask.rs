@@ -3745,7 +3745,10 @@ fn full_walk_acceleration_enabled() -> bool {
 /// lexer/parser/guard correlation. The shared walk advances pending guards
 /// through each candidate byte; the factored walk subtracts the same rejected
 /// words afterwards. Keep the established single-root and large-frontier paths.
-fn joint_initial_guard_walk_enabled(roots: &DynamicBranches) -> bool {
+fn joint_initial_guard_walk_enabled(
+    roots: &DynamicBranches,
+    initial_tokenizer_state: u32,
+) -> bool {
     // Scope fixtures deliberately exercise the factored-root path even when
     // a full-suite environment enables joint execution globally. Keep this
     // override thread-local; parallel tests must not mutate process settings.
@@ -3754,18 +3757,34 @@ fn joint_initial_guard_walk_enabled(roots: &DynamicBranches) -> bool {
     (2..=8).contains(&roots.len())
         && full_walk_acceleration_enabled()
         && joint_initial_guard_shape_profitable(
-            roots.len(), roots.iter().any(|root| root.parser_filtered_transparent),
+            roots.len(),
+            roots.iter().any(|root| root.parser_filtered_transparent),
+            roots.iter().any(|root| {
+                !root.initial_prune_guard.is_passed()
+                    && root.exact_tokenizer_state == Some(initial_tokenizer_state)
+            }),
         )
 }
 
 #[inline]
-fn joint_initial_guard_shape_profitable(root_count: usize, has_transparent_root: bool) -> bool {
+fn joint_initial_guard_shape_profitable(
+    root_count: usize,
+    has_transparent_root: bool,
+    has_guarded_initial_root: bool,
+) -> bool {
     // A root narrowed by exact parser admission has a dedicated transparent
     // execution path. Factoring its token-start exclusion preserves that
     // shortcut; merging it into a guarded generic frontier can turn a cheap
     // filtered walk into a full-vocabulary traversal. This is a scheduling
     // choice only: both routes preserve each root's correlated exclusions.
-    (2..=8).contains(&root_count) && !has_transparent_root
+    // A guarded initial root paired with a continuation root is similarly
+    // asymmetric: the joint executor keeps the pair correlated through the
+    // complete vocabulary and disables the continuation's master-trie proof.
+    // Factoring retains that proof and subtracts the initial root's immutable
+    // blocked-token set afterwards.
+    (2..=8).contains(&root_count)
+        && !has_transparent_root
+        && !has_guarded_initial_root
 }
 
 #[cfg(test)]
@@ -3773,10 +3792,14 @@ mod joint_root_scheduling_tests {
     use super::joint_initial_guard_shape_profitable;
 
     #[test]
-    fn preserves_transparent_root_specialization_without_grammar_name_exceptions() {
+    fn factors_specialized_or_guarded_initial_root_shapes() {
         for count in 0..=16 {
-            assert_eq!(joint_initial_guard_shape_profitable(count, false), (2..=8).contains(&count));
-            assert!(!joint_initial_guard_shape_profitable(count, true));
+            assert_eq!(
+                joint_initial_guard_shape_profitable(count, false, false),
+                (2..=8).contains(&count),
+            );
+            assert!(!joint_initial_guard_shape_profitable(count, true, false));
+            assert!(!joint_initial_guard_shape_profitable(count, false, true));
         }
     }
 }
@@ -3841,7 +3864,10 @@ fn try_full_walk_mask_in_output_scope(
     if root_branches
         .iter()
         .any(|branch| !branch.initial_prune_guard.is_passed())
-        && !joint_initial_guard_walk_enabled(root_branches)
+        && !joint_initial_guard_walk_enabled(
+            root_branches,
+            state.constraint.tokenizer.initial_state(),
+        )
     {
         let guarded_root_diagnostic = std::env::var("GLRMASK_DIAG_GUARDED_ROOT_GENERATION")
             .ok().and_then(|v| v.parse::<u64>().ok()) == Some(state.generation);
