@@ -914,6 +914,75 @@ fn root_call_candidate_ids_reference(
     ids
 }
 
+/// Pure vocabulary relation: tokens having each adjacent byte pair at a
+/// positive proper cut. No grammar, CALL slot, lexer or parser result is kept.
+struct VocabProperCutPostings {
+    offsets: Box<[usize]>,
+    ids: Box<[u32]>,
+}
+impl glrmask_vocab::__private::VocabDerivedArtifact for VocabProperCutPostings {}
+
+impl VocabProperCutPostings {
+    fn build(vocab: &crate::Vocab) -> Option<Self> {
+        const PAIRS: usize = 256 * 256;
+        const MAX_POSTINGS: usize = 4_000_000;
+        let mut counts = vec![0usize; PAIRS];
+        let mut seen = vec![0usize; PAIRS];
+        let mut total = 0usize;
+        for (index, (_, bytes)) in vocab.iter().enumerate() {
+            let stamp = index.checked_add(1)?;
+            for pair in bytes.windows(2) {
+                let key = (pair[0] as usize) * 256 + pair[1] as usize;
+                if seen[key] != stamp {
+                    seen[key] = stamp;
+                    total = total.checked_add(1)?;
+                    if total > MAX_POSTINGS { return None; }
+                    counts[key] += 1;
+                }
+            }
+        }
+        let mut offsets = Vec::with_capacity(PAIRS + 1);
+        offsets.push(0usize);
+        for count in counts {
+            offsets.push(offsets.last()?.checked_add(count)?);
+        }
+        let mut cursor = offsets[..PAIRS].to_vec();
+        let mut ids = vec![0u32; total];
+        seen.fill(0);
+        for (index, (id, bytes)) in vocab.iter().enumerate() {
+            let stamp = index.checked_add(1)?;
+            for pair in bytes.windows(2) {
+                let key = (pair[0] as usize) * 256 + pair[1] as usize;
+                if seen[key] != stamp {
+                    seen[key] = stamp;
+                    ids[cursor[key]] = id;
+                    cursor[key] += 1;
+                }
+            }
+        }
+        Some(Self { offsets: offsets.into_boxed_slice(), ids: ids.into_boxed_slice() })
+    }
+
+    fn select(&self, exits: ByteSet, ranges: &[(usize, usize); 256], limit: usize) -> Option<Vec<u32>> {
+        let mut pairs = Vec::new();
+        let mut count = 0usize;
+        for left in 0..256u16 {
+            if !exits.contains(left as u8) { continue; }
+            for right in 0..256usize {
+                if ranges[right].0 == ranges[right].1 { continue; }
+                let key = left as usize * 256 + right;
+                count = count.checked_add(self.offsets[key + 1] - self.offsets[key])?;
+                if count > limit { return None; }
+                pairs.push(key);
+            }
+        }
+        let mut ids = Vec::with_capacity(count);
+        for key in pairs { ids.extend_from_slice(&self.ids[self.offsets[key]..self.offsets[key + 1]]); }
+        ids.sort_unstable(); ids.dedup();
+        Some(ids)
+    }
+}
+
 /// Nonempty comparable byte strings must have the same first byte. Index the
 /// already-sorted entry cover once, then compare only that byte's contiguous
 /// prefix range at each positive, proper token cut. This changes no proof or
@@ -945,18 +1014,34 @@ fn root_call_candidate_ids_indexed(
         }
         ranges[first] = (start, cursor);
     }
+    let postings = vocab.vocab_derived_cache_get::<VocabProperCutPostings>().or_else(|| {
+        // A small vocabulary is cheaper to scan. Large-vocabulary first
+        // construction remains inside this query/link timer; only subsequent
+        // queries reuse the pure-byte artifact.
+        if vocab.len() < 4096 { return None; }
+        let postings = std::sync::Arc::new(VocabProperCutPostings::build(vocab)?);
+        vocab.vocab_derived_cache_set(std::sync::Arc::clone(&postings));
+        Some(postings)
+    });
+    let selected = postings.as_ref().and_then(|index| index.select(exits, &ranges, vocab.len() / 4));
     let mut ids = Vec::new();
-    for (id, bytes) in vocab.iter() {
-        if bytes.windows(2).enumerate().any(|(offset, pair)| {
-            if !exits.contains(pair[0]) { return false; }
-            let (lo, hi) = ranges[pair[1] as usize];
-            if lo == hi { return false; }
-            let suffix = &bytes[offset + 1..];
-            prefixes[lo..hi].iter().any(|prefix| {
-                suffix.starts_with(prefix) || prefix.starts_with(suffix)
-            })
-        }) {
-            ids.push(id);
+    let matches = |bytes: &[u8]| bytes.windows(2).enumerate().any(|(offset, pair)| {
+        if !exits.contains(pair[0]) { return false; }
+        let (lo, hi) = ranges[pair[1] as usize];
+        if lo == hi { return false; }
+        let suffix = &bytes[offset + 1..];
+        prefixes[lo..hi].iter().any(|prefix| {
+            suffix.starts_with(prefix) || prefix.starts_with(suffix)
+        })
+    });
+    if let Some(selected) = selected {
+        for id in selected {
+            let bytes = vocab.entries_map().get(&id).expect("pure vocabulary posting must name a byte token");
+            if matches(bytes) { ids.push(id); }
+        }
+    } else {
+        for (id, bytes) in vocab.iter() {
+            if matches(bytes) { ids.push(id); }
         }
     }
     ids.sort_unstable();
@@ -1840,4 +1925,42 @@ mod tests {
         assert!(build_composition_boundary_tail_r2(&parent, &[(slot, &child)], &vocab).is_err());
     }
 
+}
+
+#[cfg(test)]
+#[test]
+fn pure_cut_postings_preserve_binary_sparse_same_cut_predicates() {
+    let mut random = 811u64;
+    for case in 0..128u32 {
+        let mut entries = vec![(u32::MAX, vec![0, 255, 0]), (1, vec![]), (17, vec![255]),
+            (777, vec![1, 2, 1, 2]), (909, vec![1, 2, 1, 2])];
+        for row in 0..32u32 {
+            random = random.wrapping_mul(6364136223846793005).wrapping_add(1);
+            let len = (random >> 32) as usize % 9;
+            entries.push((1000 + row * 73, (0..len).map(|_| {
+                random = random.wrapping_mul(6364136223846793005).wrapping_add(1);
+                ((random >> 32) % 6) as u8
+            }).collect()));
+        }
+        let vocab = crate::Vocab::new_with_exact_token_ids(entries, [88]);
+        let index = std::sync::Arc::new(VocabProperCutPostings::build(&vocab).unwrap());
+        vocab.vocab_derived_cache_set(index);
+        let mut exits = ByteSet::default();
+        for byte in 0..=255u8 { if (byte as u32 + case) % 7 == 0 { exits.insert(byte); } }
+        let mut prefixes = vec![vec![0], vec![1, 2], vec![3, 4, 5], vec![255, 0]];
+        prefixes.sort_unstable();
+        for cover in [Some(prefixes.clone()), Some(vec![]), Some(vec![vec![]]),
+            Some(vec![vec![255], vec![0]]), None] {
+            assert_eq!(root_call_candidate_ids_indexed(&vocab, exits, cover.as_deref()),
+                root_call_candidate_ids_reference(&vocab, exits, cover.as_deref()), "case={case}");
+        }
+        let mut ranges = [(0, 0); 256]; ranges[2] = (0, 1);
+        let mut left = ByteSet::default(); left.insert(1);
+        let cached = vocab.vocab_derived_cache_get::<VocabProperCutPostings>().unwrap();
+        let selected = cached.select(left, &ranges, usize::MAX).unwrap();
+        let expected = vocab.iter().filter_map(|(id, bytes)|
+            bytes.windows(2).any(|pair| pair == [1, 2]).then_some(id)).collect::<Vec<_>>();
+        assert_eq!(selected, expected);
+        assert_eq!(cached.select(left, &ranges, 0), if expected.is_empty() { Some(vec![]) } else { None });
+    }
 }
