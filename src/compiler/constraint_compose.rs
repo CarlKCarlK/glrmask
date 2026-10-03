@@ -20845,6 +20845,21 @@ fn compose_constraints_owned_parent_impl(
             .map(|(&count, offset)| (0..count).map(|local| vec![offset + local]).collect()).collect();
         return Ok(ConstraintComposition { constraint, terminal_offsets, tokenizer_state_offsets, parser_state_relations });
     }
+    panic!("LR-BACKED CONSTRAINT COMPOSITION IS FORBIDDEN");
+}
+
+// Keep the unsupported compiler reference in a separate frame. Debug builds
+// otherwise reserve all of its by-value Constraint slots even when the native
+// path above returns before entering it, leaving less stack for nested linking.
+#[allow(dead_code)]
+fn compose_constraints_owned_parent_legacy_impl(
+    mut parent: Constraint,
+    children: &[CompiledSubgrammarInput<'_>],
+    shared_children: Option<&[Arc<Constraint>]>,
+    explicit_segmented_boundary: Option<SegmentedBoundaryBackend>,
+    static_boundary_components: Option<&BitSet>,
+    vocab: &Vocab,
+) -> Result<ConstraintComposition, String> {
     assert!(parent.has_template_parser(), "LR-BACKED CONSTRAINT COMPOSITION IS FORBIDDEN");
     let direct_dynamic_boundary =
         explicit_segmented_boundary == Some(SegmentedBoundaryBackend::Dynamic);
