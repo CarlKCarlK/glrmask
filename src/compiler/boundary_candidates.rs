@@ -15,7 +15,9 @@ use crate::runtime::{
     SummaryPrecision, SummaryUnavailable,
 };
 
-const BOUNDARY_CANDIDATE_ALGORITHM_VERSION: u16 = 4;
+// Version 4's r=2 child algebra could lose a validated nullable empty word.
+// Its persisted exclusion certificates must widen rather than be reused.
+const BOUNDARY_CANDIDATE_ALGORITHM_VERSION: u16 = 5;
 const DEFAULT_MAX_FRONTIER_PAIRS: usize = 250_000;
 // Frontier steps manipulate grammar-position sets rather than raw bytes, so
 // one "step" is materially more expensive than a tokenizer transition. Keep
@@ -1552,6 +1554,37 @@ mod preparation_tests {
             assert!(loaded.deferred_composition_metadata_blob.is_some(),
                 "read-only proof lookup must retain deferred compiler metadata");
         }
+    }
+
+    #[test]
+    fn persisted_pre_nullable_fix_proof_is_rejected_before_composition() {
+        let vocab = crate::Vocab::new(vec![(0, b"X[a]!".to_vec()),
+            (1, b"a]!".to_vec()), (2, b"[]!".to_vec()), (3, b"X[]!".to_vec())]);
+        let options = crate::BuildOptions::default().optimization(crate::Optimization::FastBuild)
+            .parser_backend(crate::ParserBackend::TemplateDfa);
+        let leaf = crate::Grammar::from_glrm(r#"glrm 1; start value; nt value = "a"?;"#)
+            .compile_with(&vocab, options.clone()).unwrap();
+        let mut middle = crate::Grammar::from_glrm(r#"glrm 1; start middle; extern grammar leaf; nt middle = "[" leaf "]";"#)
+            .compile_unlinked(&vocab).unwrap().bind("leaf", &leaf).unwrap()
+            .link_with(options.clone()).unwrap();
+        let BoundaryCandidateSummary::Known { mut fingerprint, precision, .. } =
+            middle.boundary_candidate_summary.take().unwrap() else { panic!("expected known proof"); };
+        // Version 4 could omit []! because it lost the nullable leaf's empty
+        // ordinary word. Preserve that historical certificate through save/load.
+        fingerprint.algorithm_version = 4;
+        middle.boundary_candidate_summary.set(BoundaryCandidateSummary::Known {
+            fingerprint, tokens: OriginalTokenSet::Sparse(std::sync::Arc::from([0, 1])), precision,
+        }).unwrap();
+        middle.serialized_artifact_cache = None;
+        let loaded = Constraint::load_with_vocab(middle.save(), &vocab).unwrap();
+        assert!(persisted_boundary_candidate_ids(&loaded, &vocab).unwrap().is_none(),
+            "pre-fix nullable candidate proof must widen before it can exclude []!");
+        let root = crate::Grammar::from_glrm(r#"glrm 1; start root; extern grammar middle; nt root = "X" middle "!";"#)
+            .compile_unlinked(&vocab).unwrap().bind("middle", &loaded).unwrap()
+            .link_with(options).unwrap();
+        let mut state = root.start(); state.commit_bytes(b"X").unwrap();
+        assert_ne!(state.mask()[0] & (1 << 2), 0);
+        state.commit_token(2).unwrap(); assert!(state.is_accepting());
     }
 
     #[test]

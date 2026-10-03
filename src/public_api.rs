@@ -399,10 +399,10 @@ impl<'a> Grammar<'a> {
         // here lets a worker waiting on a compiler-local pool re-enter another
         // unrelated compilation while retaining its heavy compiler stack.
         let (constraint, source_modules) = if source_children.is_empty() {
-            (spec.compile(), Ok(Vec::new()))
+            (spec.compile_boxed(), Ok(Vec::new()))
         } else {
             rayon::join(
-                || spec.compile(),
+                || spec.compile_boxed(),
                 || {
                     source_children
                         .into_par_iter()
@@ -418,7 +418,7 @@ impl<'a> Grammar<'a> {
             bindings.insert(name, binding);
         }
         let module = UnlinkedConstraint {
-            inner: Arc::new(constraint),
+            inner: Arc::from(constraint),
             token_slots: placeholder_ids.keys().cloned().collect(),
             bindings,
         };
@@ -844,7 +844,13 @@ impl<'a> ConstraintSpec<'a> {
 
     /// Compile this specification into a [`Constraint`](crate::Constraint).
     pub fn compile(&self) -> Result<RuntimeConstraint> {
-        let mut constraint = self.compile_static_with_trigger_uncached()?;
+        Ok(*self.compile_boxed()?)
+    }
+
+    // Keep the large native value off compiler/join frames that can remain
+    // live while Rayon executes another source compilation on this worker.
+    fn compile_boxed(&self) -> Result<Box<RuntimeConstraint>> {
+        let mut constraint = self.compile_static_with_trigger_boxed()?;
         // A constraint with unresolved external grammars is explicitly a
         // reusable late-bind parent.  Cache its exact tokenizer-reset
         // terminal -> model-token relation now, while compilation already owns
@@ -895,7 +901,7 @@ impl<'a> ConstraintSpec<'a> {
         }
     }
 
-    fn compile_static_with_trigger_uncached(&self) -> Result<RuntimeConstraint> {
+    fn compile_static_with_trigger_boxed(&self) -> Result<Box<RuntimeConstraint>> {
         let mut constraint = self.compile_static_uncached()?;
         constraint
             .build_boundary_trigger(self.boundary_trigger_detail)
@@ -927,17 +933,21 @@ impl<'a> ConstraintSpec<'a> {
         Ok(())
     }
 
-    fn compile_static_uncached(&self) -> Result<RuntimeConstraint> {
+    #[inline(never)]
+    fn compile_static_parent_boxed(&self) -> Result<Box<RuntimeConstraint>> {
         let token_bindings = self.token_binding_refs();
-        let compile_parent = || {
-            if let Some(source) = self.grammar.glrm_source() {
-                RuntimeConstraint::from_glrm_grammar_with_subgrammars_bindings_and_end_tokens(
-                    source, &[], self.vocab, &token_bindings, &[],
-                )
-            } else {
-                compile_static_source(&self.grammar, self.vocab, &token_bindings)
-            }
-        };
+        let parent = if let Some(source) = self.grammar.glrm_source() {
+            RuntimeConstraint::from_glrm_grammar_with_subgrammars_bindings_and_end_tokens(
+                source, &[], self.vocab, &token_bindings, &[],
+            )
+        } else {
+            compile_static_source(&self.grammar, self.vocab, &token_bindings)
+        }?;
+        Ok(Box::new(parent))
+    }
+
+    fn compile_static_uncached(&self) -> Result<Box<RuntimeConstraint>> {
+        let compile_parent = || self.compile_static_parent_boxed();
         if self.grammar_bindings.is_empty() {
             let mut parent = compile_parent()?;
             self.register_open_token_placeholders(&mut parent)?;
@@ -962,11 +972,15 @@ impl<'a> ConstraintSpec<'a> {
         } else {
             SegmentedBoundaryBackend::StaticParserDwa
         };
-        compose_named_children(parent, &children, self.vocab, boundary_backend)
+        compose_boxed_parent(parent, &children, self.vocab, boundary_backend)
     }
 
     /// Compile this specification into a [`DynamicConstraint`].
     pub fn compile_dynamic(&self) -> Result<DynamicConstraint> {
+        Ok(*self.compile_dynamic_boxed()?)
+    }
+
+    fn compile_dynamic_boxed(&self) -> Result<Box<DynamicConstraint>> {
         let mut constraint = self.compile_dynamic_uncached()?;
         for component in constraint.constraints_mut() {
             // Retain the supplied shared vocabulary, just as static compilation
@@ -996,54 +1010,37 @@ impl<'a> ConstraintSpec<'a> {
         Ok(constraint)
     }
 
-    fn compile_dynamic_uncached(&self) -> Result<DynamicConstraint> {
+    #[inline(never)]
+    fn compile_dynamic_parent_boxed(&self) -> Result<Box<DynamicConstraint>> {
         let token_bindings = self.token_binding_refs();
-        if self.grammar_bindings.is_empty() {
-            if let Some(source) = self.grammar.glrm_source() {
-                return DynamicConstraint::from_glrm_grammar_with_subgrammars_and_bindings(
-                    source,
-                    &[],
-                    self.vocab,
-                    &token_bindings,
-                );
-            }
-            return compile_dynamic_source(&self.grammar, self.vocab, &token_bindings);
-        }
+        let parent = if let Some(source) = self.grammar.glrm_source() {
+            DynamicConstraint::from_glrm_grammar_with_subgrammars_and_bindings(
+                source, &[], self.vocab, &token_bindings,
+            )
+        } else {
+            compile_dynamic_source(&self.grammar, self.vocab, &token_bindings)
+        }?;
+        Ok(Box::new(parent))
+    }
 
-        let source = self.grammar.glrm_source().ok_or_else(|| {
-            Error::Compilation("external grammar bindings require a GLRM grammar".to_owned())
-        })?;
+    fn compile_dynamic_uncached(&self) -> Result<Box<DynamicConstraint>> {
+        if self.grammar_bindings.is_empty() {
+            return self.compile_dynamic_parent_boxed();
+        }
+        if self.grammar.glrm_source().is_none() {
+            return Err(Error::Compilation(
+                "external grammar bindings require a GLRM grammar".to_owned(),
+            ));
+        }
         let (parents, children) = rayon::join(
-            || {
-                DynamicConstraint::from_glrm_grammar_with_subgrammars_and_bindings(
-                    source,
-                    &[],
-                    self.vocab,
-                    &token_bindings,
-                )
-            },
+            || self.compile_dynamic_parent_boxed(),
             || self.compile_children(ChildCompileMode::Dynamic),
         );
         let parents = parents?;
-        let children = children?;
         let children = prepare_compiled_children(
-            children,
-            self.vocab,
-            SegmentedBoundaryBackend::Dynamic,
+            children?, self.vocab, SegmentedBoundaryBackend::Dynamic,
         )?;
-        let alternatives = parents
-            .clone_constraints()
-            .into_iter()
-            .map(|parent| {
-                compose_named_children(
-                    parent,
-                    &children,
-                    self.vocab,
-                    SegmentedBoundaryBackend::Dynamic,
-                )
-            })
-            .collect::<Result<Vec<_>>>()?;
-        Ok(DynamicConstraint::from_constraints(alternatives))
+        compose_boxed_dynamic_parents(parents, &children, self.vocab)
     }
 
     fn token_binding_refs(&self) -> Vec<(&str, &[u32])> {
@@ -1307,16 +1304,16 @@ enum ChildCompileMode {
 
 enum CompiledChild<'a> {
     StaticBorrowed(&'a RuntimeConstraint),
-    StaticOwned(RuntimeConstraint),
+    StaticOwned(Box<RuntimeConstraint>),
     DynamicBorrowed(&'a DynamicConstraint),
-    DynamicOwned(DynamicConstraint),
+    DynamicOwned(Box<DynamicConstraint>),
 }
 
 impl CompiledChild<'_> {
     fn into_constraints(self) -> Vec<RuntimeConstraint> {
         match self {
             Self::StaticBorrowed(constraint) => vec![constraint.clone()],
-            Self::StaticOwned(constraint) => vec![constraint],
+            Self::StaticOwned(constraint) => vec![*constraint],
             Self::DynamicBorrowed(constraint) => constraint.clone_constraints(),
             Self::DynamicOwned(constraint) => constraint.clone_constraints(),
         }
@@ -1369,19 +1366,19 @@ impl GrammarBinding<'_> {
                         }
                     }
                     let module = grammar.compile_unlinked(vocab)?;
-                    Ok(CompiledChild::StaticOwned(module.materialize_template_components(Optimization::Auto)?))
+                    Ok(CompiledChild::StaticOwned(Box::new(module.materialize_template_components(Optimization::Auto)?)))
                 }
                 ChildCompileMode::Dynamic => {
                     let spec = ConstraintSpec::builder(grammar.clone(), vocab)?.build()?;
-                    Ok(CompiledChild::DynamicOwned(spec.compile_dynamic()?))
+                    Ok(CompiledChild::DynamicOwned(spec.compile_dynamic_boxed()?))
                 }
             },
             Self::Spec(spec) => match mode {
                 ChildCompileMode::Static => {
-                    Ok(CompiledChild::StaticOwned(spec.compile_static_with_trigger_uncached()?))
+                    Ok(CompiledChild::StaticOwned(spec.compile_static_with_trigger_boxed()?))
                 }
                 ChildCompileMode::Dynamic => {
-                    Ok(CompiledChild::DynamicOwned(spec.compile_dynamic()?))
+                    Ok(CompiledChild::DynamicOwned(spec.compile_dynamic_boxed()?))
                 }
             },
             Self::StaticBorrowed(constraint) => Ok(CompiledChild::StaticBorrowed(constraint)),
@@ -1411,29 +1408,29 @@ impl GrammarBinding<'_> {
                         )));
                     }
                     let module = grammar.compile_unlinked(vocab)?;
-                    Ok(CompiledChild::StaticOwned(module.materialize_template_components(Optimization::Auto)?))
+                    Ok(CompiledChild::StaticOwned(Box::new(module.materialize_template_components(Optimization::Auto)?)))
                 }
                 ChildCompileMode::Dynamic => {
                     let spec = ConstraintSpec::builder(grammar, vocab)?.build()?;
-                    Ok(CompiledChild::DynamicOwned(spec.compile_dynamic()?))
+                    Ok(CompiledChild::DynamicOwned(spec.compile_dynamic_boxed()?))
                 }
             },
             Self::Spec(spec) => match mode {
                 ChildCompileMode::Static => {
-                    Ok(CompiledChild::StaticOwned(spec.compile_static_with_trigger_uncached()?))
+                    Ok(CompiledChild::StaticOwned(spec.compile_static_with_trigger_boxed()?))
                 }
                 ChildCompileMode::Dynamic => {
-                    Ok(CompiledChild::DynamicOwned(spec.compile_dynamic()?))
+                    Ok(CompiledChild::DynamicOwned(spec.compile_dynamic_boxed()?))
                 }
             },
             Self::StaticBorrowed(constraint) => Ok(CompiledChild::StaticBorrowed(constraint)),
-            Self::StaticOwned(constraint) => Ok(CompiledChild::StaticOwned(
+            Self::StaticOwned(constraint) => Ok(CompiledChild::StaticOwned(Box::new(
                 Arc::try_unwrap(constraint).unwrap_or_else(|shared| (*shared).clone()),
-            )),
+            ))),
             Self::DynamicBorrowed(constraint) => Ok(CompiledChild::DynamicBorrowed(constraint)),
-            Self::DynamicOwned(constraint) => Ok(CompiledChild::DynamicOwned(
+            Self::DynamicOwned(constraint) => Ok(CompiledChild::DynamicOwned(Box::new(
                 Arc::try_unwrap(constraint).unwrap_or_else(|shared| (*shared).clone()),
-            )),
+            ))),
         }
     }
 }
@@ -1524,6 +1521,33 @@ fn collapse_dynamic_alternatives(
         }
     }
     Ok(union)
+}
+
+#[inline(never)]
+fn compose_boxed_dynamic_parents(
+    parents: Box<DynamicConstraint>,
+    children: &[(String, Arc<RuntimeConstraint>)],
+    vocab: &Vocab,
+) -> Result<Box<DynamicConstraint>> {
+    let alternatives = parents.clone_constraints().into_iter()
+        .map(|parent| compose_named_children(
+            parent, children, vocab, SegmentedBoundaryBackend::Dynamic,
+        ))
+        .collect::<Result<Vec<_>>>()?;
+    Ok(Box::new(DynamicConstraint::from_constraints(alternatives)))
+}
+
+// Unbox only after the independent compiler jobs have completed. Keeping this
+// in a separate frame prevents the by-value linker slots from occupying every
+// suspended source-compiler frame in unoptimized builds.
+#[inline(never)]
+fn compose_boxed_parent(
+    parent: Box<RuntimeConstraint>,
+    children: &[(String, Arc<RuntimeConstraint>)],
+    vocab: &Vocab,
+    boundary_backend: SegmentedBoundaryBackend,
+) -> Result<Box<RuntimeConstraint>> {
+    compose_named_children(*parent, children, vocab, boundary_backend).map(Box::new)
 }
 
 fn compose_named_children(
@@ -2159,7 +2183,7 @@ impl UnlinkedConstraint {
         let prepared = prepare_compiled_children(
             raw_children
                 .into_iter()
-                .map(|(name, child)| (name, CompiledChild::StaticOwned(child)))
+                .map(|(name, child)| (name, CompiledChild::StaticOwned(Box::new(child))))
                 .collect(),
             &vocab,
             backend,
