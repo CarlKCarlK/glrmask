@@ -197,6 +197,7 @@ fn dfa_to_nwa_skeleton(dfa: &UnweightedDfa) -> NWA {
 }
 
 
+#[cfg(test)]
 fn nfa_epsilon_closure(nfa: &NFA, seeds: impl IntoIterator<Item = u32>) -> BTreeSet<u32> {
     let mut closure = BTreeSet::new();
     let mut worklist = VecDeque::new();
@@ -218,10 +219,12 @@ fn nfa_epsilon_closure(nfa: &NFA, seeds: impl IntoIterator<Item = u32>) -> BTree
     closure
 }
 
+#[cfg(test)]
 fn nfa_accepts_at(nfa: &NFA, states: &BTreeSet<u32>) -> bool {
     states.iter().any(|&state| nfa.is_accepting(state))
 }
 
+#[cfg(test)]
 fn nfa_outgoing_labels(nfa: &NFA, states: &BTreeSet<u32>, labels: &mut BTreeSet<i32>) {
     for &state in states {
         if let Some(node) = nfa.states.get(state as usize) {
@@ -230,6 +233,7 @@ fn nfa_outgoing_labels(nfa: &NFA, states: &BTreeSet<u32>, labels: &mut BTreeSet<
     }
 }
 
+#[cfg(test)]
 fn nfa_advance(nfa: &NFA, states: &BTreeSet<u32>, label: i32) -> BTreeSet<u32> {
     let targets = states.iter().flat_map(|&state| {
         nfa.states
@@ -240,6 +244,68 @@ fn nfa_advance(nfa: &NFA, states: &BTreeSet<u32>, label: i32) -> BTreeSet<u32> {
             .copied()
     });
     nfa_epsilon_closure(nfa, targets)
+}
+
+/// Reused for one complete product comparison. Each closure uses dense epoch
+/// marks and a vector worklist, then sorts the unique result for product keys.
+/// Invalid IDs remain members, just as in the original set-based closure;
+/// their sparse fallback never indexes marks or follows nonexistent nodes.
+struct NfaClosureScratch {
+    marks: Vec<u32>,
+    epoch: u32,
+    states: Vec<u32>,
+    invalid: BTreeSet<u32>,
+}
+
+impl NfaClosureScratch {
+    fn new(nfa: &NFA) -> Self {
+        Self {
+            marks: vec![0; nfa.states.len()],
+            epoch: 0,
+            states: Vec::new(),
+            invalid: BTreeSet::new(),
+        }
+    }
+
+    fn insert(&mut self, state: u32) {
+        let fresh = if let Some(mark) = self.marks.get_mut(state as usize) {
+            if *mark == self.epoch {
+                false
+            } else {
+                *mark = self.epoch;
+                true
+            }
+        } else {
+            self.invalid.insert(state)
+        };
+        if fresh {
+            self.states.push(state);
+        }
+    }
+
+    fn closure(&mut self, nfa: &NFA, seeds: impl IntoIterator<Item = u32>) -> Vec<u32> {
+        self.epoch = self.epoch.wrapping_add(1);
+        if self.epoch == 0 {
+            self.marks.fill(0);
+            self.epoch = 1;
+        }
+        self.states.clear();
+        self.invalid.clear();
+        for state in seeds {
+            self.insert(state);
+        }
+        let mut cursor = 0;
+        while cursor < self.states.len() {
+            if let Some(node) = nfa.states.get(self.states[cursor] as usize) {
+                for &target in &node.epsilons {
+                    self.insert(target);
+                }
+            }
+            cursor += 1;
+        }
+        self.states.sort_unstable();
+        self.states.clone()
+    }
 }
 
 /// Exact NFA-vs-DFA language comparison, including epsilon closure. The
@@ -261,16 +327,17 @@ fn reconstruct_equivalence_witness(parents: &[Option<(usize,i32)>], mut node: us
 /// Every edge from the current epsilon-closed subset is visited once. The
 /// previous checker rediscovered it by probing every member for every label.
 /// Keep the identical sorted alphabet, epsilon closures, finite product and
-/// first BFS witness; only batch the sparse target collection.
+/// first BFS witness; batch the sparse targets and reuse closure scratch.
 fn find_nfa_dfa_language_mismatch_with_batched_targets(nfa: &NFA, dfa: &UnweightedDfa) -> Option<Vec<i32>> {
-    let nfa_start = nfa_epsilon_closure(nfa, nfa.start_states.iter().copied());
+    let mut closure = NfaClosureScratch::new(nfa);
+    let nfa_start = closure.closure(nfa, nfa.start_states.iter().copied());
     let dfa_start = Some(dfa.start_state);
     let mut seen = BTreeSet::from([(nfa_start.clone(), dfa_start)]);
     let mut parents = vec![None];
     let mut worklist = VecDeque::from([(nfa_start, dfa_start, 0usize)]);
 
     while let Some((nfa_states, dfa_state, witness)) = worklist.pop_front() {
-        if nfa_accepts_at(nfa, &nfa_states) != dfa_accepts_at(dfa, dfa_state) {
+        if nfa_states.iter().any(|&state| nfa.is_accepting(state)) != dfa_accepts_at(dfa, dfa_state) {
             return Some(reconstruct_equivalence_witness(&parents,witness));
         }
         let mut targets_by_label = BTreeMap::<i32, Vec<u32>>::new();
@@ -287,13 +354,25 @@ fn find_nfa_dfa_language_mismatch_with_batched_targets(nfa: &NFA, dfa: &Unweight
             }
             labels.extend(targets_by_label.keys().copied());
         } else {
-            nfa_outgoing_labels(nfa,&nfa_states,&mut labels);
+            for &state in &nfa_states {
+                if let Some(node) = nfa.states.get(state as usize) {
+                    labels.extend(node.transitions.keys().copied());
+                }
+            }
         }
         add_outgoing_labels(dfa, dfa_state, &mut labels);
         for label in labels {
             let next = (
-                if batch {nfa_epsilon_closure(nfa, targets_by_label.remove(&label).unwrap_or_default())}
-                    else {nfa_advance(nfa,&nfa_states,label)},
+                if batch {
+                    closure.closure(nfa, targets_by_label.remove(&label).unwrap_or_default())
+                } else {
+                    let targets = nfa_states.iter().flat_map(|&state| {
+                        nfa.states.get(state as usize)
+                            .and_then(|node| node.transitions.get(&label))
+                            .into_iter().flatten().copied()
+                    });
+                    closure.closure(nfa, targets)
+                },
                 dfa_target(dfa, dfa_state, label),
             );
             if seen.insert(next.clone()) {
@@ -1612,6 +1691,117 @@ fn build_template_nfa(characterization: &TerminalCharacterization) -> NFA {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn dense_closure_preserves_generated_subsets_and_exact_witnesses() {
+        let mut random = 0xb13642c9u32;
+        let mut next = || {
+            random = random.wrapping_mul(1664525).wrapping_add(1013904223);
+            random ^ (random >> 16)
+        };
+        for case in 0..192 {
+            let mut nfa = super::NFA::new();
+            for _ in 1..8 { nfa.add_state(); }
+            nfa.start_states = vec![0, 0, next() % 8];
+            let mut dfa = super::UnweightedDfa::new();
+            for _ in 1..5 { dfa.add_state(); }
+            for state in 0..8u32 {
+                nfa.states[state as usize].is_accepting = next() % 3 == 0;
+                for _ in 0..2 {
+                    if next() & 3 == 0 {
+                        let target = next() % 8;
+                        nfa.add_epsilon(state, target);
+                        nfa.add_epsilon(state, target);
+                    }
+                }
+                for label in [i32::MIN, -3, 0, 1, 9] {
+                    if next() & 3 != 0 {
+                        let target = next() % 8;
+                        nfa.add_transition(state, label, target);
+                        nfa.add_transition(state, label, target);
+                        nfa.add_transition(state, label, next() % 8);
+                    }
+                }
+            }
+            // Force cycles and reconvergence, including the batched >4 path.
+            nfa.states[0].epsilons.extend([1, 2, 3, 4, 5]);
+            nfa.states[1].epsilons.extend([0, 6]);
+            nfa.states[2].epsilons.push(6);
+            nfa.add_transition(6, 0, 0);
+            for state in 0..5u32 {
+                dfa.states[state as usize].is_accepting = next() % 3 == 0;
+                for label in [i32::MIN, -3, 0, 1, 9, 17] {
+                    if next() & 3 != 0 {
+                        dfa.add_transition(state, label, next() % 5);
+                    }
+                }
+            }
+            if case % 4 == 0 {
+                nfa.start_states.extend([u32::MAX, 19, u32::MAX]);
+                nfa.states[3].epsilons.extend([u32::MAX, 19, 19]);
+                nfa.add_transition(4, -3, u32::MAX);
+                nfa.add_transition(4, -3, 19);
+                dfa.states[0].transitions.insert(0, u32::MAX);
+            }
+            let mut scratch = super::NfaClosureScratch::new(&nfa);
+            for seeds in [vec![], nfa.start_states.clone(), vec![6, 6, 7], vec![u32::MAX, 19, 19]] {
+                assert_eq!(scratch.closure(&nfa, seeds.clone()),
+                    super::nfa_epsilon_closure(&nfa, seeds).into_iter().collect::<Vec<_>>(),
+                    "closure case {case}");
+            }
+            assert_eq!(super::find_nfa_dfa_language_mismatch(&nfa, &dfa),
+                reference_nfa_dfa_mismatch(&nfa, &dfa), "witness case {case}");
+            // Prevent early empty-word mismatches from hiding the graph walk.
+            for state in &mut nfa.states { state.is_accepting = false; }
+            for state in &mut dfa.states { state.is_accepting = false; }
+            assert_eq!(super::find_nfa_dfa_language_mismatch(&nfa, &dfa), None);
+            dfa.states[4].is_accepting = true;
+            assert_eq!(super::find_nfa_dfa_language_mismatch(&nfa, &dfa),
+                reference_nfa_dfa_mismatch(&nfa, &dfa), "deep witness case {case}");
+        }
+    }
+
+    #[test]
+    fn dense_closure_wrap_and_empty_malformed_graphs_match_reference() {
+        let mut nfa = super::NFA::new();
+        nfa.add_state();
+        nfa.add_epsilon(0, 1);
+        nfa.add_epsilon(1, 0);
+        let mut scratch = super::NfaClosureScratch::new(&nfa);
+        assert_eq!(scratch.closure(&nfa, [0]), vec![0, 1]);
+        scratch.epoch = u32::MAX;
+        // Stale marks for epoch one must not survive wrap.
+        scratch.marks.fill(1);
+        assert_eq!(scratch.closure(&nfa, [1, u32::MAX, u32::MAX]), vec![0, 1, u32::MAX]);
+        assert_eq!(scratch.epoch, 1);
+        assert!(scratch.closure(&nfa, []).is_empty());
+        for mut empty in [super::NFA::new_empty(), super::NFA::default()] {
+            empty.start_states = vec![u32::MAX, 7, 7];
+            for mut dfa in [super::UnweightedDfa::new(), super::UnweightedDfa::default()] {
+                assert_eq!(super::find_nfa_dfa_language_mismatch(&empty, &dfa),
+                    reference_nfa_dfa_mismatch(&empty, &dfa));
+                if let Some(state) = dfa.states.first_mut() { state.is_accepting = true; }
+                assert_eq!(super::find_nfa_dfa_language_mismatch(&empty, &dfa),
+                    reference_nfa_dfa_mismatch(&empty, &dfa));
+            }
+        }
+    }
+
+    #[test]
+    fn dense_closure_keeps_signed_fifo_shortest_witness_and_empty_word() {
+        let mut nfa = super::NFA::new();
+        let accept = nfa.add_state();
+        nfa.set_accepting(accept);
+        for label in [0, -3, i32::MIN] { nfa.add_transition(0, label, accept); }
+        let mut dfa = super::UnweightedDfa::new();
+        assert_eq!(super::find_nfa_dfa_language_mismatch(&nfa, &dfa), Some(vec![i32::MIN]));
+        nfa.states[0].transitions.remove(&i32::MIN);
+        assert_eq!(super::find_nfa_dfa_language_mismatch(&nfa, &dfa), Some(vec![-3]));
+        nfa.states[0].transitions.remove(&-3);
+        assert_eq!(super::find_nfa_dfa_language_mismatch(&nfa, &dfa), Some(vec![0]));
+        dfa.states[0].is_accepting = true;
+        assert_eq!(super::find_nfa_dfa_language_mismatch(&nfa, &dfa), Some(vec![]));
+    }
+
     fn reference_nfa_dfa_mismatch(nfa: &super::NFA, dfa: &super::UnweightedDfa) -> Option<Vec<i32>> {
         use std::collections::{BTreeSet,VecDeque};
         let start=(super::nfa_epsilon_closure(nfa,nfa.start_states.iter().copied()),Some(dfa.start_state));
