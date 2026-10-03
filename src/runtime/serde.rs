@@ -684,6 +684,7 @@ fn summary_precision_from_code(code: u8) -> Result<crate::runtime::SummaryPrecis
 }
 
 fn boundary_candidate_summary_wire(constraint: &Constraint) -> BoundaryCandidateSummaryWire {
+    crate::compiler::boundary_candidates::materialize_deferred_composition_boundary_summary(constraint);
     let summary = constraint.boundary_candidate_summary.get();
     match summary {
         None => BoundaryCandidateSummaryWire::Unknown {
@@ -1003,6 +1004,7 @@ fn split_composition_metadata_parts(
 }
 
 fn encode_composition_metadata(constraint: &Constraint) -> Vec<u8> {
+    crate::compiler::boundary_candidates::materialize_deferred_composition_boundary_summary(constraint);
     if constraint.composition_reset_tokens_by_terminal.is_empty()
         && constraint.unbound_grammar_placeholders.is_empty()
         && constraint.composition_parser_templates_by_terminal.is_empty()
@@ -5957,6 +5959,7 @@ impl Constraint {
     pub(crate) fn retained_boundary_candidate_summary_for_compilation(
         &self,
     ) -> Result<Option<crate::runtime::BoundaryCandidateSummary>, String> {
+        crate::compiler::boundary_candidates::materialize_deferred_composition_boundary_summary(self);
         if let Some(summary) = self.boundary_candidate_summary.get() {
             return Ok(Some(summary.clone()));
         }

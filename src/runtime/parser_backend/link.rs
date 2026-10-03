@@ -58,19 +58,9 @@ pub(crate) fn compose(mut parent: Constraint, children: &[(String, Arc<Constrain
     }
     if components.len() == 1 { return Ok((*components.remove(0)).clone()); }
     let bound_slots = slots.iter().flatten().copied().collect::<BTreeSet<_>>();
-    // Preserve the ordinary linker's reusable outgoing interface-tail proof
-    // while the semantic parent/child bindings are still explicit. A failed
-    // bounded proof remains unavailable and later candidate queries widen.
-    let tail_components = &components;
-    let tail_bindings = slots.iter().enumerate().flat_map(|(index, slots)|
-        slots.iter().map(move |&slot| (slot, tail_components[index + 1].as_ref())))
-        .collect::<Vec<_>>();
-    let boundary_tail = crate::compiler::boundary_tail::build_composition_boundary_tail_r2(
-        &components[0], &tail_bindings, vocab,
-    ).map(|proof| (proof.candidate_ids, proof.fixed_point_widened))
-        .or_else(|_| crate::compiler::boundary_tail::build_composition_boundary_tail_r1(
-            &components[0], &tail_bindings, vocab,
-        ).map(|proof| (proof.candidate_ids, proof.fixed_point_widened))).ok();
+    // Retain the original immediate bindings for a later outgoing-proof
+    // consumer. Current root-CALL and component shard proofs remain eager.
+    let tail_components = components.clone();
     let mut state_offsets = Vec::new(); let mut terminal_offsets = Vec::new();
     let mut tokenizer_offsets = Vec::new(); let mut names = Vec::new();
     let mut state_count = 0u32; let mut terminal_count = 0u32; let mut tokenizer_count = 0u32;
@@ -253,10 +243,25 @@ pub(crate) fn compose(mut parent: Constraint, children: &[(String, Arc<Constrain
     // source grammar rules. Its reusable fingerprint is then unavailable;
     // retain the ordinary conservative candidate query for that component.
     if constraint.template_parser.as_ref().is_some_and(|parser| parser.link_grammar.is_some())
-        && let Some((ids, widened)) = boundary_tail {
-        crate::compiler::boundary_candidates::install_precomputed_boundary_candidate_ids(
-            &mut constraint, vocab, &ids, widened,
-        ).map_err(fail)?;
+        && !crate::compiler::boundary_candidates::defer_composition_boundary_candidate_summary(
+            &mut constraint, vocab, &tail_components, &slots) {
+        // A component whose source cannot be fingerprinted keeps the previous
+        // eager behavior, including its conservative refusal/error semantics.
+        let tail_sources = &tail_components;
+        let bindings = slots.iter().enumerate().flat_map(|(child, slots)|
+            slots.iter().map(move |&slot| (slot, tail_sources[child + 1].as_ref())))
+            .collect::<Vec<_>>();
+        let boundary_tail = crate::compiler::boundary_tail::build_composition_boundary_tail_r2(
+            &tail_components[0], &bindings, vocab,
+        ).map(|proof| (proof.candidate_ids, proof.fixed_point_widened))
+            .or_else(|_| crate::compiler::boundary_tail::build_composition_boundary_tail_r1(
+                &tail_components[0], &bindings, vocab,
+            ).map(|proof| (proof.candidate_ids, proof.fixed_point_widened))).ok();
+        if let Some((ids, widened)) = boundary_tail {
+            crate::compiler::boundary_candidates::install_precomputed_boundary_candidate_ids(
+                &mut constraint, vocab, &ids, widened,
+            ).map_err(fail)?;
+        }
     }
     if std::env::var_os("GLRMASK_PROFILE_COMPOSE").is_some() {
         eprintln!("[glrmask/profile][native_link_metadata] phase=complete materialized={}",
@@ -322,6 +327,87 @@ mod candidate_tests {
             assert_eq!(boundary.candidate_tokens.as_deref(), Some(expected.as_slice()));
         };
         check(&linked);
+        assert!(linked.boundary_candidate_summary.get().is_none());
+        assert!(linked.template_parser.as_ref().unwrap().link_grammar.as_ref().unwrap()
+            .deferred_boundary_summary.get().is_some());
+        let mut state = linked.start();
+        let _ = state.mask();
+        state.commit_bytes(b"xa").unwrap();
+        let _ = state.mask();
+        assert!(linked.boundary_candidate_summary.get().is_none(),
+            "current masks and commits must not request the wrapper's future outward proof");
         check(&Constraint::load(&linked.save()).unwrap());
+        assert!(linked.boundary_candidate_summary.get().unwrap().is_known());
+    }
+
+    #[test]
+    fn deferred_wrapper_proof_matches_eager_query_and_wire_for_nullable_and_ignore() {
+        let vocab = Vocab::new(vec![(0, b"a".to_vec()), (1, b"x".to_vec()),
+            (2, b"y".to_vec()), (3, b"xay".to_vec()), (4, b"xy".to_vec()),
+            (5, b" xay".to_vec()), (6, b"xayxay".to_vec()), (7, b"yz".to_vec())]);
+        for parent in [
+            r#"glrm 1; start root; extern grammar child; nt root = "x" child "y";"#,
+            r#"glrm 1; start root; extern grammar child; nt root = "x" child "y" "x" child "y";"#,
+            r#"start root; extern grammar child; ignore WS; t WS ::= " "+; nt root ::= "x" child "y";"#,
+        ] {
+            for child in [r#"glrm 1; start value; nt value = "a";"#,
+                r#"glrm 1; start value; nt value = "a"?;"#] {
+                let options = BuildOptions::default().optimization(Optimization::FastBuild)
+                    .parser_backend(ParserBackend::TemplateDfa);
+                let child = Grammar::from_glrm(child).compile_with(&vocab, options.clone()).unwrap();
+                let linked = Grammar::from_glrm(parent).compile_unlinked(&vocab).unwrap()
+                    .bind("child", &child).unwrap().link_with(options).unwrap();
+                assert!(linked.boundary_candidate_summary.get().is_none());
+                let mut eager = linked.clone();
+                let overlay = eager.static_dynamic_overlay.as_ref().unwrap();
+                let parent = &overlay.segmented_parser_components[0].constraint;
+                let bindings = overlay.segmented_parser_links.iter().map(|link|
+                    (link.slot_terminal, overlay.segmented_parser_components[link.child_component as usize]
+                        .constraint.as_ref())).collect::<Vec<_>>();
+                let (ids, widened) = crate::compiler::boundary_tail::build_composition_boundary_tail_r2(
+                    parent, &bindings, &vocab).map(|p| (p.candidate_ids, p.fixed_point_widened))
+                    .or_else(|_| crate::compiler::boundary_tail::build_composition_boundary_tail_r1(
+                        parent, &bindings, &vocab).map(|p| (p.candidate_ids, p.fixed_point_widened))).unwrap();
+                crate::compiler::boundary_candidates::install_precomputed_boundary_candidate_ids(
+                    &mut eager, &vocab, &ids, widened).unwrap();
+                let wrong_vocab = Vocab::new(vec![(0, b"wrong".to_vec())]);
+                assert!(crate::compiler::boundary_candidates::persisted_boundary_candidate_ids(
+                    &linked, &wrong_vocab).unwrap().is_none());
+                assert!(linked.boundary_candidate_summary.get().is_none());
+                assert_eq!(linked.save(), eager.save(), "saving forces the exact original certificate");
+                assert_eq!(crate::compiler::boundary_candidates::persisted_boundary_candidate_ids(
+                    &linked, &vocab).unwrap(), Some(ids.clone()));
+                let queried = crate::compiler::boundary_candidates::boundary_candidate_summary(&linked, &vocab).0;
+                let crate::runtime::BoundaryCandidateSummary::Known { fingerprint, tokens, .. } = queried
+                    else { panic!("expected known queried proof"); };
+                let expected = eager.boundary_candidate_summary.get().unwrap();
+                assert!(expected.known_tokens_for(&fingerprint).is_some());
+                assert_eq!(tokens.canonical_ids(vocab.iter()), ids);
+            }
+        }
+    }
+
+    #[test]
+    fn disabled_and_stale_deferred_wrapper_proofs_cannot_prune() {
+        let vocab = Vocab::new(vec![(0, b"a".to_vec()), (1, b"x".to_vec()),
+            (2, b"y".to_vec()), (3, b"xay".to_vec()), (4, b"yz".to_vec())]);
+        let child = Grammar::from_glrm(r#"glrm 1; start value; nt value = "a";"#)
+            .compile(&vocab).unwrap();
+        let mut linked = Grammar::from_glrm(r#"glrm 1; start root; extern grammar child;
+            nt root = "x" child "y";"#)
+            .compile_unlinked(&vocab).unwrap().bind("child", &child).unwrap()
+            .link_with(BuildOptions::default().optimization(Optimization::FastBuild)).unwrap();
+        let disabled = linked.clone();
+        disabled.boundary_candidate_summary.set(crate::runtime::BoundaryCandidateSummary::Unknown {
+            reason: crate::runtime::SummaryUnavailable::Disabled }).unwrap();
+        assert!(crate::compiler::boundary_candidates::persisted_boundary_candidate_ids(
+            &disabled, &vocab).unwrap().is_none());
+        let loaded = Constraint::load(disabled.save()).unwrap();
+        assert!(matches!(loaded.retained_boundary_candidate_summary_for_compilation().unwrap(),
+            Some(crate::runtime::BoundaryCandidateSummary::Unknown {
+                reason: crate::runtime::SummaryUnavailable::Disabled })));
+        linked.unbound_grammar_placeholders.insert("changed_interface".into(), 0);
+        assert!(crate::compiler::boundary_candidates::persisted_boundary_candidate_ids(
+            &linked, &vocab).unwrap().is_none(), "captured proof must fail the changed interface check");
     }
 }

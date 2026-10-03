@@ -881,6 +881,75 @@ fn fingerprint_for_constraint(
     fingerprint(constraint, vocab, rules)
 }
 
+/// The same immutable immediate inputs used by the eager native linker. This
+/// recipe is issued only for a validated fresh composition, and is never read
+/// from a wire artifact or inferred from an absent certificate.
+#[derive(Debug)]
+pub(crate) struct DeferredCompositionSummary {
+    // Keep the auto-trait boundary finite for public ParserProgram users.
+    // The concrete typed recipe still owns the immutable component inputs.
+    recipe: Box<dyn DeferredBoundaryRecipe>,
+    completed: std::sync::OnceLock<Option<BoundaryCandidateSummary>>,
+}
+
+trait DeferredBoundaryRecipe: std::fmt::Debug + Send + Sync {
+    fn compute(&self) -> Option<BoundaryCandidateSummary>;
+}
+
+#[derive(Debug)]
+struct NativeCompositionBoundaryRecipe {
+    components: Vec<std::sync::Arc<Constraint>>,
+    slots: Vec<Vec<u32>>,
+    vocab: crate::Vocab,
+    fingerprint: BoundaryCandidateFingerprint,
+}
+
+impl DeferredBoundaryRecipe for NativeCompositionBoundaryRecipe {
+    fn compute(&self) -> Option<BoundaryCandidateSummary> {
+        let bindings = self.slots.iter().enumerate().flat_map(|(child, slots)|
+            slots.iter().map(move |&slot| (slot, self.components[child + 1].as_ref())))
+            .collect::<Vec<_>>();
+        let proof = crate::compiler::boundary_tail::build_composition_boundary_tail_r2(
+            &self.components[0], &bindings, &self.vocab,
+        ).map(|proof| (proof.candidate_ids, proof.fixed_point_widened))
+            .or_else(|_| crate::compiler::boundary_tail::build_composition_boundary_tail_r1(
+                &self.components[0], &bindings, &self.vocab,
+            ).map(|proof| (proof.candidate_ids, proof.fixed_point_widened))).ok()?;
+        let mut ids = proof.0;
+        ids.sort_unstable(); ids.dedup();
+        Some(BoundaryCandidateSummary::Known {
+            fingerprint: self.fingerprint.clone(),
+            tokens: OriginalTokenSet::from_sorted_unique(ids, self.vocab.max_token_id()),
+            precision: if proof.1 { SummaryPrecision::BudgetWidenedUpperBound }
+                else { SummaryPrecision::RegularUpperBound },
+        })
+    }
+}
+
+pub(crate) fn defer_composition_boundary_candidate_summary(
+    constraint: &mut Constraint, vocab: &crate::Vocab,
+    components: &[std::sync::Arc<Constraint>], slots: &[Vec<u32>],
+) -> bool {
+    let Ok(fingerprint) = fingerprint_for_constraint(constraint, vocab) else { return false; };
+    let Some(grammar) = constraint.template_parser.as_ref()
+        .and_then(|parser| parser.link_grammar.as_ref()) else { return false; };
+    grammar.deferred_boundary_summary.set(std::sync::Arc::new(
+        DeferredCompositionSummary { recipe: Box::new(NativeCompositionBoundaryRecipe {
+            components: components.to_vec(), slots: slots.to_vec(), vocab: vocab.clone(), fingerprint }),
+            completed: std::sync::OnceLock::new() })).is_ok()
+}
+
+pub(crate) fn materialize_deferred_composition_boundary_summary(constraint: &Constraint) {
+    if constraint.boundary_candidate_summary.get().is_some() { return; }
+    let Some(recipe) = constraint.template_parser.as_ref()
+        .and_then(|parser| parser.link_grammar.as_ref())
+        .and_then(|grammar| grammar.deferred_boundary_summary.get()) else { return; };
+    let summary = recipe.completed.get_or_init(|| recipe.recipe.compute());
+    if let Some(summary) = summary {
+        let _ = constraint.boundary_candidate_summary.set(summary.clone());
+    }
+}
+
 pub(crate) fn install_precomputed_boundary_candidate_ids(
     constraint: &mut Constraint,
     vocab: &crate::Vocab,
@@ -911,11 +980,8 @@ pub(crate) fn boundary_candidate_summary(
     constraint: &Constraint,
     vocab: &crate::Vocab,
 ) -> (BoundaryCandidateSummary, BoundaryCandidateStats) {
-    let rules = match constraint.retained_table_rules() {
-        Ok(rules) if !rules.is_empty() => rules,
-        _ => return compute_summary(constraint, vocab),
-    };
-    let wanted = fingerprint(constraint, vocab, rules).ok();
+    materialize_deferred_composition_boundary_summary(constraint);
+    let wanted = fingerprint_for_constraint(constraint, vocab).ok();
     if let Some(existing) = constraint.boundary_candidate_summary.get() {
         if wanted
             .as_ref()
@@ -1581,6 +1647,7 @@ mod preparation_tests {
         let mut middle = crate::Grammar::from_glrm(r#"glrm 1; start middle; extern grammar leaf; nt middle = "[" leaf "]";"#)
             .compile_unlinked(&vocab).unwrap().bind("leaf", &leaf).unwrap()
             .link_with(options.clone()).unwrap();
+        materialize_deferred_composition_boundary_summary(&middle);
         let BoundaryCandidateSummary::Known { mut fingerprint, precision, .. } =
             middle.boundary_candidate_summary.take().unwrap() else { panic!("expected known proof"); };
         // Version 4 could omit []! because it lost the nullable leaf's empty
