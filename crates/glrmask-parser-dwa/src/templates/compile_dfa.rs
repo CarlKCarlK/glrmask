@@ -245,27 +245,61 @@ fn nfa_advance(nfa: &NFA, states: &BTreeSet<u32>, label: i32) -> BTreeSet<u32> {
 /// Exact NFA-vs-DFA language comparison, including epsilon closure. The
 /// product state is finite: `(epsilon-closed NFA subset, optional DFA state)`.
 fn find_nfa_dfa_language_mismatch(nfa: &NFA, dfa: &UnweightedDfa) -> Option<Vec<i32>> {
+    find_nfa_dfa_language_mismatch_with_batched_targets(nfa, dfa)
+}
+
+fn reconstruct_equivalence_witness(parents: &[Option<(usize,i32)>], mut node: usize) -> Vec<i32> {
+    let mut witness=Vec::new();
+    while let Some((parent,label))=parents[node] {
+        witness.push(label);
+        node=parent;
+    }
+    witness.reverse();
+    witness
+}
+
+/// Every edge from the current epsilon-closed subset is visited once. The
+/// previous checker rediscovered it by probing every member for every label.
+/// Keep the identical sorted alphabet, epsilon closures, finite product and
+/// first BFS witness; only batch the sparse target collection.
+fn find_nfa_dfa_language_mismatch_with_batched_targets(nfa: &NFA, dfa: &UnweightedDfa) -> Option<Vec<i32>> {
     let nfa_start = nfa_epsilon_closure(nfa, nfa.start_states.iter().copied());
     let dfa_start = Some(dfa.start_state);
     let mut seen = BTreeSet::from([(nfa_start.clone(), dfa_start)]);
-    let mut worklist = VecDeque::from([(nfa_start, dfa_start, Vec::new())]);
+    let mut parents = vec![None];
+    let mut worklist = VecDeque::from([(nfa_start, dfa_start, 0usize)]);
 
     while let Some((nfa_states, dfa_state, witness)) = worklist.pop_front() {
         if nfa_accepts_at(nfa, &nfa_states) != dfa_accepts_at(dfa, dfa_state) {
-            return Some(witness);
+            return Some(reconstruct_equivalence_witness(&parents,witness));
         }
-        let mut labels = BTreeSet::new();
-        nfa_outgoing_labels(nfa, &nfa_states, &mut labels);
+        let mut targets_by_label = BTreeMap::<i32, Vec<u32>>::new();
+        // Tiny subsets do not benefit from a second materialized edge map.
+        let batch = nfa_states.len()>4;
+        let mut labels=BTreeSet::new();
+        if batch {
+            for &state in &nfa_states {
+                if let Some(node) = nfa.states.get(state as usize) {
+                    for (&label, targets) in &node.transitions {
+                        targets_by_label.entry(label).or_default().extend(targets.iter().copied());
+                    }
+                }
+            }
+            labels.extend(targets_by_label.keys().copied());
+        } else {
+            nfa_outgoing_labels(nfa,&nfa_states,&mut labels);
+        }
         add_outgoing_labels(dfa, dfa_state, &mut labels);
         for label in labels {
             let next = (
-                nfa_advance(nfa, &nfa_states, label),
+                if batch {nfa_epsilon_closure(nfa, targets_by_label.remove(&label).unwrap_or_default())}
+                    else {nfa_advance(nfa,&nfa_states,label)},
                 dfa_target(dfa, dfa_state, label),
             );
             if seen.insert(next.clone()) {
-                let mut next_witness = witness.clone();
-                next_witness.push(label);
-                worklist.push_back((next.0, next.1, next_witness));
+                let child=parents.len();
+                parents.push(Some((witness,label)));
+                worklist.push_back((next.0,next.1,child));
             }
         }
     }
@@ -1486,6 +1520,65 @@ fn build_template_nfa(characterization: &TerminalCharacterization) -> NFA {
 
 #[cfg(test)]
 mod tests {
+    fn reference_nfa_dfa_mismatch(nfa: &super::NFA, dfa: &super::UnweightedDfa) -> Option<Vec<i32>> {
+        use std::collections::{BTreeSet,VecDeque};
+        let start=(super::nfa_epsilon_closure(nfa,nfa.start_states.iter().copied()),Some(dfa.start_state));
+        let mut seen=BTreeSet::from([start.clone()]);
+        let mut pending=VecDeque::from([(start.0,start.1,Vec::new())]);
+        while let Some((subset,state,witness))=pending.pop_front() {
+            if super::nfa_accepts_at(nfa,&subset)!=super::dfa_accepts_at(dfa,state) {return Some(witness);}
+            let mut labels=BTreeSet::new();
+            super::nfa_outgoing_labels(nfa,&subset,&mut labels);
+            super::add_outgoing_labels(dfa,state,&mut labels);
+            for label in labels {
+                let next=(super::nfa_advance(nfa,&subset,label),super::dfa_target(dfa,state,label));
+                if seen.insert(next.clone()) {
+                    let mut path=witness.clone();path.push(label);
+                    pending.push_back((next.0,next.1,path));
+                }
+            }
+        }
+        None
+    }
+
+    #[test]
+    fn batched_equivalence_targets_preserve_complete_product_and_first_witness() {
+        // Include epsilon cycles, nondeterministic same-label edges, negative
+        // labels, missing successors, and acceptance/edge corruptions.
+        let mut seed=0x7351c2a4u32;
+        for _ in 0..96 {
+            let mut nfa=super::NFA::new();
+            for _ in 1..6 {nfa.add_state();}
+            for from in 0..6 {
+                seed=seed.wrapping_mul(1664525).wrapping_add(1013904223);
+                if seed&1!=0 {nfa.set_accepting(from);}
+                if from<5 {nfa.add_epsilon(from,from+1);}
+                for label in [-3,0,1,4,11] {
+                    seed=seed.wrapping_mul(1664525).wrapping_add(1013904223);
+                    if from<5 && seed&3!=0 {nfa.add_transition(from,label,from+1+(seed>>8)%(5-from));}
+                    if from<5 && seed&7==3 {nfa.add_transition(from,label,from+1+(seed>>16)%(5-from));}
+                }
+            }
+            // Break some of the epsilon ring to exercise multiple subsets.
+            nfa.states[1].epsilons.clear();
+            nfa.states[4].epsilons.clear();
+            let dfa=super::determinize(&nfa);
+            assert_eq!(super::find_nfa_dfa_language_mismatch(&nfa,&dfa),None);
+            for index in 0..dfa.states.len() {
+                let mut changed=dfa.clone();
+                changed.states[index].is_accepting=!changed.states[index].is_accepting;
+                assert_eq!(super::find_nfa_dfa_language_mismatch(&nfa,&changed),reference_nfa_dfa_mismatch(&nfa,&changed));
+                changed.states[index].transitions.remove(&1);
+                assert_eq!(super::find_nfa_dfa_language_mismatch(&nfa,&changed),reference_nfa_dfa_mismatch(&nfa,&changed));
+            }
+            // The compiler's determinizer intentionally rejects cyclic input,
+            // but the equivalence checker still has a finite subset product.
+            nfa.add_epsilon(2,1);
+            nfa.add_transition(4,4,0);
+            assert_eq!(super::find_nfa_dfa_language_mismatch(&nfa,&dfa),reference_nfa_dfa_mismatch(&nfa,&dfa));
+        }
+    }
+
     use super::{
         specialize_template_dfa_defaults_for_commit_determinized,
         find_nfa_dfa_language_mismatch,
