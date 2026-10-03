@@ -1818,6 +1818,23 @@ fn constraint_vocab(constraint: &RuntimeConstraint) -> Vocab {
         .clone()
 }
 
+// Native precompiled components are immutable across this materialization.
+// Revalidate the persisted certificate in the same coordinate as the linker;
+// recompute unavailable/stale certificates before installing any parser view.
+fn prepare_immutable_template_component_boundary_summary(
+    constraint: &mut RuntimeConstraint,
+    vocab: &Vocab,
+) {
+    if matches!(
+        crate::compiler::boundary_candidates::persisted_boundary_candidate_ids(constraint, vocab),
+        Ok(Some(_)),
+    ) {
+        constraint.serialized_artifact_cache = None;
+        return;
+    }
+    crate::compiler::boundary_candidates::persist_boundary_candidate_summary(constraint, vocab);
+}
+
 fn ensure_runnable_constraint(constraint: &RuntimeConstraint) -> Result<()> {
     if let Some(slot) = constraint.late_grammar_slots.first() {
         return Err(Error::Compilation(format!(
@@ -2220,7 +2237,7 @@ impl UnlinkedConstraint {
         let vocab = constraint_vocab(self.inner.as_ref());
         let mut parent = self.inner.as_ref().clone();
         if parent.has_template_parser() {
-            crate::compiler::boundary_candidates::persist_boundary_candidate_summary(
+            prepare_immutable_template_component_boundary_summary(
                 &mut parent,
                 &vocab,
             );
@@ -2235,7 +2252,7 @@ impl UnlinkedConstraint {
             };
             child.end_tokens = Arc::from([]);
             if child.has_template_parser() {
-                crate::compiler::boundary_candidates::persist_boundary_candidate_summary(
+                prepare_immutable_template_component_boundary_summary(
                     &mut child,
                     &vocab,
                 );
@@ -2616,6 +2633,56 @@ mod tests {
         let bit = token_id % 32;
         mask.get(word)
             .is_some_and(|bits| bits & (1u32 << bit) != 0)
+    }
+
+    #[test]
+    fn immutable_template_certificate_reuse_recomputes_stale_versions_and_preserves_disabled() {
+        use crate::runtime::{BoundaryCandidateSummary, OriginalTokenSet, SummaryUnavailable};
+        let vocab = Vocab::new(vec![
+            (0, b"[a]tail".to_vec()), (1, b"[]tail".to_vec()),
+            (2, b"[".to_vec()), (3, b"a".to_vec()), (4, b"]".to_vec()),
+        ]);
+        let mut component = Grammar::glrm(
+            r#"glrm 1; start value; nt value = "[" "a"? "]";"#,
+        ).compile(&vocab).unwrap();
+        crate::compiler::boundary_candidates::persist_boundary_candidate_summary(&mut component, &vocab);
+        let expected = crate::compiler::boundary_candidates::persisted_boundary_candidate_ids(&component, &vocab)
+            .unwrap().expect("fresh component must carry a checked certificate");
+        assert!(!expected.is_empty());
+        let mut stale = component.boundary_candidate_summary.take().unwrap();
+        let BoundaryCandidateSummary::Known { fingerprint, tokens, .. } = &mut stale else {
+            panic!("expected known certificate");
+        };
+        fingerprint.algorithm_version -= 1;
+        *tokens = OriginalTokenSet::from_sorted_unique(Vec::new(), vocab.max_token_id());
+        component.boundary_candidate_summary.set(stale).unwrap();
+        assert!(crate::compiler::boundary_candidates::persisted_boundary_candidate_ids(&component, &vocab)
+            .unwrap().is_none());
+        prepare_immutable_template_component_boundary_summary(&mut component, &vocab);
+        assert_eq!(crate::compiler::boundary_candidates::persisted_boundary_candidate_ids(&component, &vocab)
+            .unwrap(), Some(expected));
+        component.boundary_candidate_summary.take();
+        component.boundary_candidate_summary.set(BoundaryCandidateSummary::Unknown {
+            reason: SummaryUnavailable::Disabled,
+        }).unwrap();
+        prepare_immutable_template_component_boundary_summary(&mut component, &vocab);
+        assert!(matches!(component.boundary_candidate_summary.get(),
+            Some(BoundaryCandidateSummary::Unknown { reason: SummaryUnavailable::Disabled })));
+    }
+
+    #[test]
+    fn immutable_template_certificate_reuse_invalidates_unchanged_resave_cache() {
+        let vocab = Vocab::new(vec![(0, b"a".to_vec()), (1, b"ab".to_vec())]);
+        let component = Grammar::glrm(r#"glrm 1; start value; nt value = "a";"#)
+            .compile(&vocab).unwrap();
+        let mut loaded = RuntimeConstraint::load_with_vocab(component.save(), &vocab).unwrap();
+        let expected = crate::compiler::boundary_candidates::persisted_boundary_candidate_ids(&loaded, &vocab)
+            .unwrap().expect("loaded native component must carry a checked certificate");
+        assert!(loaded.serialized_artifact_cache.is_some());
+        prepare_immutable_template_component_boundary_summary(&mut loaded, &vocab);
+        assert!(loaded.serialized_artifact_cache.is_none());
+        assert_eq!(crate::compiler::boundary_candidates::persisted_boundary_candidate_ids(&loaded, &vocab)
+            .unwrap(), Some(expected));
     }
 
     #[test]
