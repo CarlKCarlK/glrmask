@@ -340,6 +340,8 @@ Each transition carries a Boolean mask over the model vocabulary. These masks ar
 
 ## Performance
 
+Current native integration checkpoint (`4c92d2457`, 3 October 2026): matched Mac/Rayon2 static linking measured a warm median of 352.89 ms, compared with 368.00 ms for the preceding qualified source. This performance level is accepted for the current integration work; further link optimization is future work. Loader reliability qualification remains open, so this checkpoint does not establish overall release readiness.
+
 Latest corrected engineering result: the **9,558 official JSONSchemaBench schemas**, using their corresponding MaskBench replay payloads. The historical run originally contained 705 additional MaskBench-only cases; those are excluded from every number and graph shown here. The original full sweep used AWS M8azn, and the corrected GLRMask runtime tail was refreshed on the same CPU family after fixing a deterministic post-deserialization first-commit bug. This is intentionally not presented as the final native publication run.
 
 | TBM | GLRMask | LLGuidance |

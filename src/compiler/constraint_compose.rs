@@ -20666,7 +20666,7 @@ pub(crate) fn compose_constraints(
 /// base of the returned ordinary `Constraint`; child tokenizer states are
 /// appended to it, so the million-state parent is neither cloned nor rebased.
 #[deprecated(
-    note = "Legacy owned-parent composition is unsupported; use explicit segmented composition or compose_constraints for flattened validation"
+    note = "Legacy owned-parent composition is unsupported; use explicit segmented composition or the grammar-level inline reference"
 )]
 #[allow(unreachable_code)]
 pub(crate) fn compose_constraints_owned_parent(
@@ -20675,7 +20675,7 @@ pub(crate) fn compose_constraints_owned_parent(
     vocab: &Vocab,
 ) -> Result<ConstraintComposition, String> {
     // Retained for reference; this entry point is intentionally unsupported.
-    return Err("legacy owned-parent composition is unsupported; use explicit segmented composition or compose_constraints for flattened validation".into());
+    return Err("legacy owned-parent composition is unsupported; use explicit segmented composition or the grammar-level inline reference".into());
     compose_constraints_owned_parent_impl(parent, children, None, None, None, vocab)
 }
 
@@ -20761,7 +20761,7 @@ pub(crate) fn compose_constraints_owned_parent_segmented_shared(
 }
 
 #[deprecated(
-    note = "Legacy owned-parent composition is unsupported; use explicit segmented composition or compose_constraints for flattened validation"
+    note = "Legacy owned-parent composition is unsupported; use explicit segmented composition or the grammar-level inline reference"
 )]
 #[allow(unreachable_code)]
 pub(crate) fn compose_constraints_owned_parent_shared(
@@ -20771,7 +20771,7 @@ pub(crate) fn compose_constraints_owned_parent_shared(
     vocab: &Vocab,
 ) -> Result<ConstraintComposition, String> {
     // Retained for reference; this entry point is intentionally unsupported.
-    return Err("legacy owned-parent composition is unsupported; use explicit segmented composition or compose_constraints for flattened validation".into());
+    return Err("legacy owned-parent composition is unsupported; use explicit segmented composition or the grammar-level inline reference".into());
     if shared_children.len() != children.len() {
         return Err("shared child/component count mismatch".into());
     }
