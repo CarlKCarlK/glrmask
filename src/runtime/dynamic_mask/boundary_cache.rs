@@ -43,6 +43,24 @@ impl FullWalkBoundaryDirectCache {
         if cell >> 2 == u64::from(lexer) { (cell & 3) as u8 } else { 0 }
     }
 
+    /// Read a coordinate already proved to belong to the walk's fixed domain.
+    ///
+    /// # Safety
+    /// `parser` must name a retained row. If that row is dense, `lexer` must
+    /// lie in its fixed transition domain. This is the same invariant used by
+    /// the caller's pre-existing unchecked dense-row representation.
+    #[inline(always)]
+    pub(super) unsafe fn get_physical(&self, parser: usize, lexer: u32) -> u8 {
+        debug_assert!(parser < self.rows.len());
+        let row = unsafe { self.rows.get_unchecked(parser) };
+        if let Some(dense) = row.dense.as_ref() {
+            debug_assert!((lexer as usize) < dense.len());
+            return unsafe { *dense.get_unchecked(lexer as usize) };
+        }
+        let cell = row.cells[lexer as usize & (SLOTS - 1)];
+        if cell >> 2 == u64::from(lexer) { (cell & 3) as u8 } else { 0 }
+    }
+
     #[inline(always)]
     pub(super) fn set(&mut self, parser: usize, lexer: u32, value: u8) {
         debug_assert!(value == 1 || value == 2);
@@ -159,6 +177,7 @@ mod tests {
         for parser in 0..100 {
             for lexer in 0..1025 {
                 let cached = cache.get(parser, lexer);
+                assert_eq!(unsafe { cache.get_physical(parser, lexer) }, cached);
                 if cached != 0 { assert_eq!(cached, 1 + (lexer % 2) as u8); }
             }
         }

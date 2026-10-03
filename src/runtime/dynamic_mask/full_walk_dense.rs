@@ -3649,7 +3649,9 @@ impl FullWalkParserCache {
         let node = parser_node as usize;
         let lexer = lexer_state as usize;
         let cached = if let Some(cache) = self.direct_boundary_rows.as_ref() {
-            cache.get(node, lexer_state)
+            // Nodes are append-only and this transition domain is fixed for
+            // the walk. Use the same proved indices as the dense branch below.
+            unsafe { cache.get_physical(node, lexer_state) }
         } else {
             unsafe { *self.boundary_rows.get_unchecked(node).get_unchecked(lexer) }
         };
