@@ -6927,6 +6927,23 @@ fn determinize_parser_dwa_with_fallbacks_and_classes(
     let mut row_group_misses = 0usize;
     let mut row_group_symbols = 0usize;
 
+    // Membership is a property of the finite class alphabet, independent of
+    // each derivative row. A single-word class inventory can reuse those exact
+    // answers locally instead of binary-searching exclusions for every row.
+    // Larger inventories retain the original lookup path.
+    let class_membership_by_symbol = pop_classes
+        .filter(|classes| classes.len() > 0 && classes.len() <= u64::BITS as usize)
+        .map(|classes| {
+            let mut membership = vec![0u64; dense_label_limit];
+            for index in 0..classes.len() {
+                let label = DEFAULT_LABEL - 1 - index as i32;
+                for symbol in classes.matching_symbols(label) {
+                    membership[symbol as usize] |= 1u64 << index;
+                }
+            }
+            membership
+        });
+
     let mut intersection_cache = ScopedWeightOpCache::default();
     let mut key_buf: Vec<(u32, usize)> = Vec::new();
     let mut final_contributions: Vec<Weight> = Vec::new();
@@ -7312,7 +7329,13 @@ fn determinize_parser_dwa_with_fallbacks_and_classes(
                 let mut membership: RowClassMembershipBits = smallvec::smallvec![0u64; (num_classes + 63) / 64];
                 for (class_idx, (&class_label, class_contribs)) in class_raw_targets.iter().enumerate() {
                     class_work = class_work.checked_sub(1).ok_or("class derivative work budget exceeded")?;
-                    if classes.matches(class_label, label as u32) {
+                    let matches = if let Some(membership) = class_membership_by_symbol.as_ref() {
+                        let index = (DEFAULT_LABEL - 1 - class_label) as usize;
+                        membership[label as usize] & (1u64 << index) != 0
+                    } else {
+                        classes.matches(class_label, label as u32)
+                    };
+                    if matches {
                         class_work = class_work.checked_sub(class_contribs.len()).ok_or("class derivative work budget exceeded")?;
                         membership[class_idx / 64] |= 1u64 << (class_idx % 64);
                     }

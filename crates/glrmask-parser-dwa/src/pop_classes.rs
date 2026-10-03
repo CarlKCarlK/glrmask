@@ -682,4 +682,32 @@ mod group_reuse_tests {
         assert!(classes.compile_positive(graph.clone(), 1).is_err(), "edge budget = 1 must be refused");
         assert!(classes.compile_positive_dwa(nwa_to_dwa(&graph), 1).is_err(), "direct edge budget = 1 must be refused");
     }
+
+    #[test]
+    fn regression_pop_class_membership_high_bit_preserves_weighted_language() {
+        let mut classes = PopLabelClasses::new(9).unwrap();
+        let mut graph = NWA::new(1, 3);
+        let start = graph.add_state();
+        let target = graph.add_state();
+        graph.set_start_states(vec![start]);
+        graph.set_final_weight(target, test_weight(7));
+        for mask in 0..63u32 {
+            let exclusions = (0..6).filter(|bit| mask & (1 << bit) != 0).map(|bit| 2 + bit);
+            let label = classes.intern_scoped_complement(2..9, exclusions).unwrap().unwrap();
+            graph.add_transition(start, label, target, test_weight(1));
+        }
+        // The distinguishing class occupies bit63 in the local alphabet
+        // lookup. Foreign scoped classes cannot admit symbols0 or1.
+        let label = classes.intern_scoped_complement(0..2, [1]).unwrap().unwrap();
+        graph.add_transition(start, label, target, test_weight(2));
+        assert_eq!(classes.len(), 64);
+        let direct = classes.compile_positive_dwa(nwa_to_dwa(&graph), 100_000).unwrap();
+        assert_eq!(full_accepted(&direct, &[0]), 2);
+        assert_eq!(full_accepted(&direct, &[1]), 0);
+        for word in all_words(2, 9) {
+            assert_eq!(full_accepted(&direct, &word), literal_oracle(&graph, &classes, &word, false), "full {word:?}");
+            assert_eq!(prefix_accepted(&direct, &word), literal_oracle(&graph, &classes, &word, true), "prefix {word:?}");
+        }
+        assert!(classes.compile_positive_dwa(nwa_to_dwa(&graph), 1).is_err());
+    }
 }
