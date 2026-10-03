@@ -3763,6 +3763,12 @@ fn joint_initial_guard_walk_enabled(
                 !root.initial_prune_guard.is_passed()
                     && root.exact_tokenizer_state == Some(initial_tokenizer_state)
             }),
+            roots.iter().any(|root| {
+                root.initial_prune_guard.is_passed()
+                    && root.exact_tokenizer_state.is_some_and(|state| {
+                        state != initial_tokenizer_state
+                    })
+            }),
         )
 }
 
@@ -3771,6 +3777,7 @@ fn joint_initial_guard_shape_profitable(
     root_count: usize,
     has_transparent_root: bool,
     has_guarded_initial_root: bool,
+    has_exact_continuation_root: bool,
 ) -> bool {
     // A root narrowed by exact parser admission has a dedicated transparent
     // execution path. Factoring its token-start exclusion preserves that
@@ -3782,9 +3789,13 @@ fn joint_initial_guard_shape_profitable(
     // complete vocabulary and disables the continuation's master-trie proof.
     // Factoring retains that proof and subtracts the initial root's immutable
     // blocked-token set afterwards.
+    // Exact continuation roots can use the same master-trie proof even when
+    // the guarded alternative is itself a continuation. Keep their singleton
+    // walks separate so the pending guard cannot disable that proof.
     (2..=8).contains(&root_count)
         && !has_transparent_root
         && !has_guarded_initial_root
+        && !has_exact_continuation_root
 }
 
 #[cfg(test)]
@@ -3795,11 +3806,12 @@ mod joint_root_scheduling_tests {
     fn factors_specialized_or_guarded_initial_root_shapes() {
         for count in 0..=16 {
             assert_eq!(
-                joint_initial_guard_shape_profitable(count, false, false),
+                joint_initial_guard_shape_profitable(count, false, false, false),
                 (2..=8).contains(&count),
             );
-            assert!(!joint_initial_guard_shape_profitable(count, true, false));
-            assert!(!joint_initial_guard_shape_profitable(count, false, true));
+            assert!(!joint_initial_guard_shape_profitable(count, true, false, false));
+            assert!(!joint_initial_guard_shape_profitable(count, false, true, false));
+            assert!(!joint_initial_guard_shape_profitable(count, false, false, true));
         }
     }
 }
