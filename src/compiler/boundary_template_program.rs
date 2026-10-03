@@ -73,10 +73,55 @@ fn compile_compact_classed(
     compile_shared_classed(templates,admissions,controls,Some(max_controls),lexical,classes,context)
 }
 
+/// Immutable construction-only alphabet conversion shared by the lexical
+/// shards of one link. It contains no coefficients or assembled parser query.
+pub(crate) struct PreparedClassedPrograms {
+    ids: BTreeMap<(bool,u32),usize>,
+    templates: Vec<NWA>,
+}
+
+pub(crate) fn prepare_classed_programs(
+    templates:&BTreeMap<u32,NWA>,admissions:Option<&BTreeMap<u32,NWA>>,
+    classes:&glrmask_parser_dwa::__private::pop_classes::PopLabelClasses,
+)->Option<PreparedClassedPrograms> {
+    use crate::automata::weighted_u32::nwa::NWAState;
+    let mut ids=BTreeMap::new(); let mut dense_templates=Vec::new();
+    for (admission,inventory) in std::iter::once((false,templates)).chain(admissions.map(|a|(true,a))) {
+        for (&terminal,source) in inventory {
+            let mut states=Vec::with_capacity(source.states().len());
+            for row in source.states() {
+                let mut mapped=BTreeMap::new();
+                for (&label,edges) in &row.transitions {
+                    let label=if label>=classes.symbol_count() as i32 {
+                        let index=crate::compiler::glr::labels::DEFAULT_LABEL.checked_sub(1)?.checked_sub(label)?;
+                        if index<0 || index as usize>=classes.len() {return None;}
+                        classes.symbol_count() as i32+index
+                    } else {label};
+                    mapped.insert(label,edges.clone());
+                }
+                states.push(NWAState { final_weight:row.final_weight.clone(),
+                    transitions:mapped,epsilons:row.epsilons.clone() });
+            }
+            let dense=NWA::from_parts(states,source.start_states().to_vec());
+            ids.insert((admission,terminal),dense_templates.len()); dense_templates.push(dense);
+        }
+    }
+    Some(PreparedClassedPrograms { ids,templates:dense_templates })
+}
+
 fn compile_shared_classed(
     templates:&BTreeMap<u32,NWA>,admissions:Option<&BTreeMap<u32,NWA>>,controls:&[u32],
     max_controls:Option<u32>,lexical:&DWA,classes:&glrmask_parser_dwa::__private::pop_classes::PopLabelClasses,
     context:Option<&crate::compiler::stages::parser_dwa::FiniteParserReadSupport>,
+)->Option<SignedShardOutput> {
+    compile_shared_classed_prepared(templates,admissions,controls,max_controls,lexical,classes,context,None)
+}
+
+fn compile_shared_classed_prepared(
+    templates:&BTreeMap<u32,NWA>,admissions:Option<&BTreeMap<u32,NWA>>,controls:&[u32],
+    max_controls:Option<u32>,lexical:&DWA,classes:&glrmask_parser_dwa::__private::pop_classes::PopLabelClasses,
+    context:Option<&crate::compiler::stages::parser_dwa::FiniteParserReadSupport>,
+    prepared:Option<&PreparedClassedPrograms>,
 )->Option<SignedShardOutput> {
     use crate::compiler::stages::parser_dwa::{FiniteTemplateInstance,FiniteTemplateProgram,
         normalize_finite_template_program_with_pop_classes};
@@ -86,25 +131,11 @@ fn compile_shared_classed(
     if max_controls.is_some() && depths>16 {return None;}
     let ports=lexical.states().len().checked_mul(depths)?;
     let alphabet=classes.symbol_count().checked_add(classes.len() as u32)?;
-    let mut ids=BTreeMap::new();let mut dense_templates=Vec::new();
-    for (admission,inventory) in std::iter::once((false,templates)).chain(admissions.map(|a|(true,a))) {
-        for (&terminal,source) in inventory {
-            let mut dense=source.clone();
-            for row in dense.states_mut() {
-                let mut mapped=BTreeMap::new();
-                for (label,edges) in std::mem::take(&mut row.transitions) {
-                    let label=if label>=classes.symbol_count() as i32 {
-                        let index=crate::compiler::glr::labels::DEFAULT_LABEL.checked_sub(1)?.checked_sub(label)?;
-                        if index<0 || index as usize>=classes.len() {return None;}
-                        classes.symbol_count() as i32+index
-                    } else {label};
-                    mapped.insert(label,edges);
-                }
-                row.transitions=mapped;
-            }
-            ids.insert((admission,terminal),dense_templates.len());dense_templates.push(dense);
-        }
-    }
+    let owned;
+    let prepared=if let Some(prepared)=prepared {prepared} else {
+        owned=prepare_classed_programs(templates,admissions,classes)?; &owned
+    };
+    let ids=&prepared.ids; let dense_templates=&prepared.templates;
     let mut coefficients=vec![Weight::all()];let mut indices=rustc_hash::FxHashMap::default();
     indices.insert(coefficients[0].ptr_key(),0usize);
     let mut weight_id=|weight:&Weight| {
@@ -349,10 +380,11 @@ pub(crate) fn compile_classed_with_admissions(
     certificate:Option<&ClosureCertificate>,lexical:&DWA,
     classes:&glrmask_parser_dwa::__private::pop_classes::PopLabelClasses,
     read_context:Option<&crate::compiler::stages::parser_dwa::FiniteParserReadSupport>,
+    prepared:Option<&PreparedClassedPrograms>,
 )->Result<SignedShardOutput,String> {
     assert!(lexical.is_acyclic(),"shared template constructor requires an acyclic lexical query");
     let depth=certificate.map(|c|c.max_controls_per_gap).or_else(||controls.is_empty().then_some(0));
-    Ok(compile_shared_classed(templates,Some(admissions),controls,depth,lexical,classes,read_context)
+    Ok(compile_shared_classed_prepared(templates,Some(admissions),controls,depth,lexical,classes,read_context,prepared)
         .expect("shared template constructor refused its checked contract; redundant expanded-builder fallback is disabled"))
 }
 
@@ -527,4 +559,37 @@ mod symbolic_class_tests {
         assert!(comparison.product_states > 0);
         assert!(candidate.states()[candidate.start_state() as usize].final_weight.is_none());
     }
+    #[test]
+    fn shared_program_inventory_preserves_independent_shard_coefficients() {
+        let mut classes=glrmask_parser_dwa::__private::pop_classes::PopLabelClasses::new(4).unwrap();
+        let class=classes.intern_scoped_complement(0..4,[2]).unwrap().unwrap();
+        let mut template=NWA::from_parts(vec![Default::default();3],vec![0]);
+        template.add_transition(0,class,1,Weight::all());
+        template.add_transition(1,crate::compiler::glr::labels::encode_negative_label(1),2,Weight::all());
+        template.set_final_weight(2,Weight::all());
+        let mut admission=NWA::from_parts(vec![Default::default();2],vec![0]);
+        admission.add_transition(0,class,1,Weight::all()); admission.set_final_weight(1,Weight::all());
+        let templates=BTreeMap::from([(0,template)]); let admissions=BTreeMap::from([(0,admission)]);
+        let prepared=prepare_classed_programs(&templates,Some(&admissions),&classes).unwrap();
+        let snapshot=||prepared.templates.iter().map(|graph|
+            (graph.start_states().to_vec(),graph.states().to_vec())).collect::<Vec<_>>();
+        let inventory_before=snapshot();
+        for tokens in [&[0][..],&[1][..],&[0,1][..]] {
+            let weight=token_weight(tokens); let mut lexical=DWA::new(1,0);
+            let middle=lexical.add_state(); let end=lexical.add_state();
+            lexical.add_transition(0,0,middle,weight.clone());
+            lexical.add_transition(middle,0,end,weight); lexical.set_final_weight(end,Weight::all());
+            let expected=compile_shared_classed(&templates,Some(&admissions),&[],Some(0),&lexical,&classes,None).unwrap();
+            let actual=compile_shared_classed_prepared(&templates,Some(&admissions),&[],Some(0),&lexical,&classes,None,Some(&prepared)).unwrap();
+            assert_eq!(bincode::serialize(&expected.parser_dwa).unwrap(),bincode::serialize(&actual.parser_dwa).unwrap());
+            let (mut expanded,_,_)=assemble_impl(&templates,&[],Some(0),&lexical,None,Some(&admissions)).unwrap();
+            glrmask_parser_dwa::__private::resolve_negatives::resolve_negative_codes_in_nwa_with_pop_classes(&mut expanded,&classes).unwrap();
+            let reference=classes.compile_positive(expanded,10000).unwrap();
+            let comparison=glrmask_parser_dwa::__private::parser_equivalence::compare_parser_mask_prefix_languages(
+                &reference,&actual.parser_dwa,4,10000).unwrap();
+            assert!(comparison.difference.is_none(),"{tokens:?}: {:?}",comparison.difference);
+        }
+        assert_eq!(inventory_before,snapshot());
+    }
+
 }

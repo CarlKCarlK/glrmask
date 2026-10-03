@@ -710,4 +710,31 @@ mod group_reuse_tests {
         }
         assert!(classes.compile_positive_dwa(nwa_to_dwa(&graph), 1).is_err());
     }
+    #[test]
+    fn regression_row_membership_reuse_keeps_row_local_weights_and_dead_shadows() {
+        let mut classes=PopLabelClasses::new(10).unwrap();
+        let a=classes.intern_scoped_complement(0..7,[2,4]).unwrap().unwrap();
+        let b=classes.intern_scoped_complement(2..10,[3,8]).unwrap().unwrap();
+        let c=classes.intern_scoped_complement(0..10,[2,3,4,7]).unwrap().unwrap();
+        let scoped_default=classes.intern_complement([4]).unwrap().unwrap();
+        let mut graph=NWA::from_parts(vec![Default::default();7],vec![0]);
+        graph.add_transition(0,a,1,test_weight(1));
+        graph.add_transition(0,b,2,test_weight(2));
+        graph.add_transition(0,5,3,test_weight(4));
+        graph.add_transition(1,b,4,test_weight(1));
+        graph.add_transition(1,scoped_default,5,test_weight(2));
+        graph.add_transition(1,4,6,Weight::empty());
+        graph.add_transition(2,a,4,test_weight(2));
+        graph.add_transition(2,5,5,test_weight(4));
+        graph.add_transition(3,c,5,test_weight(4));
+        graph.set_final_weight(4,test_weight(7));
+        graph.set_final_weight(5,test_weight(7));
+        let direct=classes.compile_positive_dwa(nwa_to_dwa(&graph),100_000).unwrap();
+        for word in all_words(3,10) {
+            assert_eq!(full_accepted(&direct,&word),literal_oracle(&graph,&classes,&word,false),"full {word:?}");
+            assert_eq!(prefix_accepted(&direct,&word),literal_oracle(&graph,&classes,&word,true),"prefix {word:?}");
+        }
+        assert!(classes.compile_positive_dwa(nwa_to_dwa(&graph),1).is_err());
+    }
+
 }
