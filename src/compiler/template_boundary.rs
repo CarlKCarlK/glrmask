@@ -122,6 +122,10 @@ pub(crate) fn install(constraint: &mut Constraint, vocab: &Vocab) -> Result<()> 
     // was upgraded; no parser, lexer or boundary graph is rebuilt here.
     constraint.serialized_artifact_cache = None;
     if local_boundaries_are_static(constraint) { return Ok(()); }
+    // A loaded component's packed non-DWA weights use its old PM coordinates.
+    // Static publication replaces those coordinates and possible_matches, so
+    // first preserve the other weights and retire the old packed ID map.
+    constraint.materialize_non_dwa_weights_for_compilation().map_err(fail)?;
     let layout = constraint.recursive_parser_layout().map_err(fail)?
         .ok_or_else(|| fail("static template boundary has no scoped layout"))?;
     let profile = std::env::var_os("GLRMASK_PROFILE_COMPILE_SUMMARY").is_some();

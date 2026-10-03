@@ -180,7 +180,7 @@ fn malformed_projected_observation_offsets_are_rejected_on_load() {
     let prefixes = vec![vec![], b"p".to_vec(), b"p\"".to_vec(), b"p\"x:".to_vec(),
         b"p\"x:a".to_vec(), b"p\"x:a\"".to_vec(), b"p\"x:a\"q".to_vec()];
     compare(&candidate, &loaded, &tokens, &prefixes);
-    assert_eq!(u16::from_le_bytes(saved[8..10].try_into().unwrap()), 35);
+    assert_eq!(u16::from_le_bytes(saved[8..10].try_into().unwrap()), 37);
     assert_eq!(&saved[18..22], b"S30\0");
     let sizes = (0..11).map(|index| u64::from_le_bytes(saved[22 + index * 8..30 + index * 8].try_into().unwrap()) as usize).collect::<Vec<_>>();
     let start = 18 + 4 + 11 * 8 + sizes[..4].iter().sum::<usize>();

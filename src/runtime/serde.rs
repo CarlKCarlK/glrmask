@@ -53,11 +53,12 @@ const PREVIOUS_STATIC_RESIDUAL_CONSTRAINT_VERSION: u16 = 27;
 const PREVIOUS_STATIC_PROJECTION_CONSTRAINT_VERSION: u16 = 28;
 const PREVIOUS_BOUNDARY_SUMMARYLESS_CONSTRAINT_VERSION: u16 = 29;
 const CONSTRAINT_VERSION: u16 = 30;
-// V35 retains S30 framing with TPR7 views, compiler stack-effect analysis and dynamic
-// proof metadata in R35. Earlier pre-release template formats are unsupported.
-const TEMPLATE_CONSTRAINT_VERSION: u16 = 35;
-// V36 is the same native body bound to an external vocabulary (TPX1).
-const EXTERNAL_TEMPLATE_CONSTRAINT_VERSION: u16 = 36;
+// V37 retains S30 framing with TPR7 views, compiler stack-effect analysis and
+// dynamic proof metadata in R35. V35/V36 could contain boundary programs built
+// from the pre-fix nullable proof; those pre-release artifacts are unsupported.
+const TEMPLATE_CONSTRAINT_VERSION: u16 = 37;
+// V38 is the same native body bound to an external vocabulary (TPX1).
+const EXTERNAL_TEMPLATE_CONSTRAINT_VERSION: u16 = 38;
 const CONSTRAINT_HEADER_LEN: usize = CONSTRAINT_MAGIC.len() + 2 + 8;
 const COMPRESSED_PAYLOAD_HEADER_LEN: usize = 8;
 const CONSTRAINT_COMPRESSION_LEVEL: i32 = 1;
@@ -181,6 +182,17 @@ where
     D: serde::Deserializer<'de>,
 {
     ConstraintSerde::deserialize(deserializer)
+}
+
+// Keep the large runtime object out of the core visitor and the nested Rayon
+// join results. Source-bound compilation can itself be running on a worker;
+// retaining inline core copies at each join exhausts its ordinary stack.
+#[inline(never)]
+fn deserialize_boxed_constraint<'de, D>(deserializer: D) -> Result<Box<Constraint>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    ConstraintSerde::deserialize(deserializer).map(Box::new)
 }
 
 struct DeserializedConstraint(Constraint);
@@ -343,8 +355,8 @@ struct ConstraintArtifactCurrentCoreBaseRef<'a> {
 
 #[derive(Deserialize)]
 struct ConstraintArtifactCurrentCoreBase {
-    #[serde(deserialize_with = "deserialize_constraint")]
-    constraint: Constraint,
+    #[serde(deserialize_with = "deserialize_boxed_constraint")]
+    constraint: Box<Constraint>,
     ignore_expr: Option<Expr>,
     parser_state_domain_labels: Vec<i32>,
     static_dynamic_overlay: Option<crate::runtime::artifact::StaticDynamicOverlayMetadata>,
@@ -505,7 +517,7 @@ fn decode_current_core(
             &input[header_len..base_end],
         )
         .map(|base| ConstraintArtifactCurrentCoreBase {
-            constraint: base.constraint,
+            constraint: Box::new(base.constraint),
             ignore_expr: base.ignore_expr,
             parser_state_domain_labels: base.parser_state_domain_labels,
             static_dynamic_overlay: base.static_dynamic_overlay,
@@ -517,7 +529,7 @@ fn decode_current_core(
             &input[header_len..base_end],
         )
         .map(|base| ConstraintArtifactCurrentCoreBase {
-            constraint: base.constraint,
+            constraint: Box::new(base.constraint),
             ignore_expr: base.ignore_expr,
             parser_state_domain_labels: base.parser_state_domain_labels,
             static_dynamic_overlay: None,
@@ -1329,7 +1341,7 @@ struct DecodedNativeArtifactLoad {
 }
 
 struct DecodedConstraintCore {
-    constraint: Constraint,
+    constraint: Box<Constraint>,
     ignore_expr: Option<Expr>,
     terminal_exprs: Option<Vec<Expr>>,
     terminal_exprs_blob: Option<crate::runtime::artifact::DeferredTerminalExprBytes>,
@@ -7795,7 +7807,7 @@ impl Constraint {
                         } else {
                             bincode::deserialize::<ConstraintArtifactV18Core>(core_section)
                                 .map(|artifact| DecodedConstraintCore {
-                                    constraint: artifact.constraint,
+                                    constraint: Box::new(artifact.constraint),
                                     ignore_expr: artifact.ignore_expr,
                                     terminal_exprs: artifact.terminal_exprs,
                                     terminal_exprs_blob: None,
@@ -7807,7 +7819,7 @@ impl Constraint {
                     } else {
                         bincode::deserialize::<ConstraintArtifactV14Core>(core_section)
                             .map(|artifact| DecodedConstraintCore {
-                                constraint: artifact.constraint,
+                                constraint: Box::new(artifact.constraint),
                                 ignore_expr: artifact.ignore_expr,
                                 terminal_exprs: artifact.terminal_exprs,
                                 terminal_exprs_blob: None,
@@ -8056,7 +8068,7 @@ impl Constraint {
             constraint.token_bytes = vocab.entries_arc();
         }
         Ok(DecodedNativeArtifactLoad {
-            constraint: Box::new(constraint),
+            constraint,
             runtime,
             token_mask_cache,
             terminal_exprs: artifact.terminal_exprs,

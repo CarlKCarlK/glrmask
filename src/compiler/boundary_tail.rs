@@ -475,6 +475,15 @@ fn summarize_rules_module_r1(
     }
 
     let mut module = byte_rule_summary(&rules[0], &nts, &terminals);
+    // Native compiler rules may have their empty productions removed while
+    // the validated embedding retains exact root nullability. Child summaries
+    // feed the r=2 concatenation algebra: omitting this empty ordinary word
+    // loses a caller's adjacent byte pair across a nullable child (e.g. []).
+    if constraint.composition_start_nullable()? {
+        module.historical_productive = true;
+        module.normal.epsilon = true;
+        module.tail_to_return.epsilon = true;
+    }
 
     // Local Skip/IGNORE is modeled conservatively at module exits. This keeps
     // real ignore-before-public-event/root-return witnesses while avoiding any
@@ -637,6 +646,32 @@ fn candidate_ids_for_r1(vocab: &crate::Vocab, language: ByteLanguage) -> Vec<u32
     ids.sort_unstable();
     ids.dedup();
     ids
+}
+
+#[cfg(test)]
+#[test]
+fn nullable_nested_return_keeps_the_empty_child_crossing_token() {
+    use crate::{BuildOptions, Grammar, Optimization, ParserBackend, Vocab};
+    let vocab = Vocab::new(vec![(0, b"X[a]!".to_vec()), (1, b"a]!".to_vec()),
+        (2, b"[]!".to_vec()), (3, b"X[]!".to_vec())]);
+    for mode in [Optimization::FastRuntime, Optimization::FastBuild] {
+        let options = || BuildOptions::default().optimization(mode).parser_backend(ParserBackend::TemplateDfa);
+        let leaf = Grammar::from_glrm(r#"glrm 1; start value; nt value = "a"?;"#)
+            .compile_with(&vocab, options()).unwrap();
+        let parent = Grammar::from_glrm(r#"glrm 1; start middle; extern grammar leaf; nt middle = "[" leaf "]";"#)
+            .compile_unlinked(&vocab).unwrap();
+        let middle = parent.bind("leaf", &leaf).unwrap().link_with(options()).unwrap();
+        let overlay = middle.static_dynamic_overlay.as_ref().unwrap();
+        let local = &overlay.segmented_parser_components[0].constraint;
+        let slot = overlay.segmented_parser_links[0].slot_terminal;
+        let refined = build_composition_boundary_tail_r2(local, &[(slot, &leaf)], &vocab).unwrap();
+        assert!(refined.candidate_ids.contains(&2),
+            "two-byte tail lost nullable []! return: mode={mode:?} candidates={:?}", refined.candidate_ids);
+        assert!(summarize_constraint_module_r1(&leaf).unwrap().0.normal.epsilon,
+            "a validated nullable native root must include an empty ordinary word");
+        let candidates = build_boundary_tail_r1(&middle, &vocab).unwrap().candidate_ids;
+        assert!(candidates.contains(&2), "nullable child return excludes []!: mode={mode:?} candidates={candidates:?}");
+    }
 }
 
 pub(crate) fn build_composition_boundary_tail_r1(

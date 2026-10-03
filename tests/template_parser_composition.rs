@@ -328,6 +328,62 @@ fn nullable_nested_table_free_children_keep_every_repetition_count() {
 }
 
 #[test]
+fn nested_nullable_return_keeps_the_empty_child_crossing_mask() {
+    let mut tokens = (0..128).map(|id| (id, vec![id as u8])).collect::<Vec<_>>();
+    for bytes in ["X[a]!", "X[]!", "X[ab]!", "[a]", "a]!", "[]!", "X!",
+        "Xa!", "a!", "X[", "a", "a", "dead-branch"] {
+        tokens.push((tokens.len() as u32, bytes.as_bytes().to_vec()));
+    }
+    let vocab = Vocab::new(tokens.clone());
+    let words: &[&[u8]] = &[b"X[]!", b"X[a]!"];
+    let prefixes = words.iter().flat_map(|word| (0..=word.len()).map(|end| &word[..end]))
+        .collect::<BTreeSet<_>>();
+    let options = |mode| BuildOptions::default().optimization(mode).parser_backend(ParserBackend::TemplateDfa);
+    let oracle = Grammar::from_glrm(r#"glrm 1; start root; nt root = "X" "[" "a"? "]" "!";"#)
+        .compile_with(&vocab, options(Optimization::FastRuntime)).unwrap();
+    for leaf_mode in [Optimization::FastRuntime, Optimization::FastBuild] {
+        let leaf = Grammar::from_glrm(r#"glrm 1; start value; nt value = "a"?;"#)
+            .compile_with(&vocab, options(leaf_mode)).unwrap();
+        for middle_mode in [Optimization::FastRuntime, Optimization::FastBuild] {
+            let middle = Grammar::from_glrm(r#"glrm 1; start middle; extern grammar leaf; nt middle = "[" leaf "]";"#)
+                .compile_unlinked(&vocab).unwrap().bind("leaf", &leaf).unwrap()
+                .link_with(options(middle_mode)).unwrap();
+            let reloaded_middle = Constraint::load(middle.save()).unwrap();
+            for middle in [&middle, &reloaded_middle] {
+                for outer_mode in [Optimization::FastRuntime, Optimization::FastBuild] {
+                    let linked = Grammar::from_glrm(r#"glrm 1; start root; extern grammar middle; nt root = "X" middle "!";"#)
+                        .compile_unlinked(&vocab).unwrap().bind("middle", middle).unwrap()
+                        .link_with(options(outer_mode)).unwrap();
+                    let loaded = Constraint::load(linked.save()).unwrap();
+                    let external = Constraint::load_with_vocab(linked.save_with_external_vocab().unwrap(), &vocab).unwrap();
+                    if outer_mode == Optimization::FastRuntime { assert_static_boundaries(&linked); }
+                    for constraint in [&linked, &loaded, &external] {
+                        for &prefix in &prefixes {
+                            let mut reference = oracle.start(); reference.commit_bytes(prefix).unwrap();
+                            let expected = reference.mask();
+                            let mut state = constraint.start(); state.commit_bytes(prefix).unwrap();
+                            assert_eq!(state.mask(), expected,
+                                "leaf={leaf_mode:?} middle={middle_mode:?} outer={outer_mode:?} prefix={prefix:?}");
+                            assert_eq!(state.is_accepting(), words.contains(&prefix));
+                            for (id, bytes) in &tokens {
+                                let mut word = prefix.to_vec(); word.extend(bytes);
+                                let viable = words.iter().any(|candidate| candidate.starts_with(&word));
+                                let bit = expected[*id as usize / 32] & (1 << (*id % 32)) != 0;
+                                assert_eq!(bit, viable, "independent finite language: prefix={prefix:?} token={bytes:?}");
+                                let mut endpoint = state.clone();
+                                assert_eq!(endpoint.commit_token(*id).is_ok(), viable,
+                                    "mask/commit endpoint: prefix={prefix:?} token={bytes:?}");
+                                if viable { assert_eq!(endpoint.is_accepting(), words.contains(&word.as_slice())); }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+#[test]
 fn scoped_ignores_match_the_independent_lr_composition() {
     let (vocab, _) = vocabulary();
     let parent = Grammar::from_glrm(r#"glrm 1; start root; ignore WS; t WS = "~"+; extern grammar child; nt root = "x" child "y";"#)
