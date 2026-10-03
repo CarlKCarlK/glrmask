@@ -183,26 +183,46 @@ fn action_nfa(
 /// assumes trusted finite inputs; the public data-only entry point must also
 /// handle a small NFA whose deterministic representation is exponential.
 fn bounded_determinize(nfa: &NFA, budget: &mut ExpansionBudget) -> Result<DFA> {
-    fn closure(nfa: &NFA, seeds: &[u32], budget: &mut ExpansionBudget) -> Result<Vec<u32>> {
-        let mut seen = BTreeSet::new();
-        let mut pending = Vec::new();
-        for &q in seeds {
-            budget.charge(0, 0, 0, 1)?;
-            if seen.insert(q) {
-                pending.push(q);
+    // Every derivative closure shares one local scratch allocation. Membership
+    // marks replace per-closure tree nodes; traversal and budget charges stay
+    // identical, and sorted retained keys preserve the original state order.
+    struct ClosureScratch {
+        marks: Vec<u32>, generation: u32, pending: Vec<u32>, members: Vec<u32>,
+    }
+    impl ClosureScratch {
+        fn closure(&mut self, nfa: &NFA, seeds: &[u32], budget: &mut ExpansionBudget) -> Result<Vec<u32>> {
+            if self.generation == u32::MAX {
+                self.marks.fill(0);
+                self.generation = 0;
             }
-        }
-        while let Some(q) = pending.pop() {
-            for &to in &nfa.states[q as usize].epsilons {
+            self.generation += 1;
+            self.pending.clear();
+            self.members.clear();
+            for &q in seeds {
                 budget.charge(0, 0, 0, 1)?;
-                if seen.insert(to) {
-                    pending.push(to);
+                if self.marks[q as usize] != self.generation {
+                    self.marks[q as usize] = self.generation;
+                    self.pending.push(q);
+                    self.members.push(q);
                 }
             }
+            while let Some(q) = self.pending.pop() {
+                for &to in &nfa.states[q as usize].epsilons {
+                    budget.charge(0, 0, 0, 1)?;
+                    if self.marks[to as usize] != self.generation {
+                        self.marks[to as usize] = self.generation;
+                        self.pending.push(to);
+                        self.members.push(to);
+                    }
+                }
+            }
+            self.members.sort_unstable();
+            Ok(self.members.clone())
         }
-        Ok(seen.into_iter().collect())
     }
-    let start = closure(nfa, &nfa.start_states, budget)?;
+    let mut scratch = ClosureScratch { marks: vec![0;nfa.states.len()], generation: 0,
+        pending: Vec::new(), members: Vec::new() };
+    let start = scratch.closure(nfa, &nfa.start_states, budget)?;
     budget.charge(1, 0, start.len(), 0)?;
     let mut dfa = DFA::new();
     let mut known = FxHashMap::from_iter([(start.clone(), 0u32)]);
@@ -220,7 +240,7 @@ fn bounded_determinize(nfa: &NFA, budget: &mut ExpansionBudget) -> Result<DFA> {
             }
         }
         for (label, seeds) in targets {
-            let key = closure(nfa, &seeds, budget)?;
+            let key = scratch.closure(nfa, &seeds, budget)?;
             let target = if let Some(&target) = known.get(&key) {
                 target
             } else {
@@ -615,4 +635,99 @@ pub(super) fn compile(
         "custom static compilation retained an LR table"
     );
     Ok(inner)
+}
+
+#[cfg(test)]
+mod closure_scratch_regressions {
+    use super::*;
+fn ordered_set_reference(nfa: &NFA, budget: &mut ExpansionBudget) -> Result<DFA> {
+    fn closure(nfa: &NFA, seeds: &[u32], budget: &mut ExpansionBudget) -> Result<Vec<u32>> {
+        let mut seen = BTreeSet::new();
+        let mut pending = Vec::new();
+        for &q in seeds {
+            budget.charge(0, 0, 0, 1)?;
+            if seen.insert(q) {
+                pending.push(q);
+            }
+        }
+        while let Some(q) = pending.pop() {
+            for &to in &nfa.states[q as usize].epsilons {
+                budget.charge(0, 0, 0, 1)?;
+                if seen.insert(to) {
+                    pending.push(to);
+                }
+            }
+        }
+        Ok(seen.into_iter().collect())
+    }
+    let start = closure(nfa, &nfa.start_states, budget)?;
+    budget.charge(1, 0, start.len(), 0)?;
+    let mut dfa = DFA::new();
+    let mut known = FxHashMap::from_iter([(start.clone(), 0u32)]);
+    let mut pending = VecDeque::from([(0u32, start)]);
+    while let Some((id, subset)) = pending.pop_front() {
+        let mut targets = BTreeMap::<i32, Vec<u32>>::new();
+        for q in subset {
+            dfa.states[id as usize].is_accepting |= nfa.states[q as usize].is_accepting;
+            for (&label, destinations) in &nfa.states[q as usize].transitions {
+                budget.charge(0, 0, 0, destinations.len())?;
+                targets
+                    .entry(label)
+                    .or_default()
+                    .extend_from_slice(destinations);
+            }
+        }
+        for (label, seeds) in targets {
+            let key = closure(nfa, &seeds, budget)?;
+            let target = if let Some(&target) = known.get(&key) {
+                target
+            } else {
+                budget.charge(1, 0, key.len(), 0)?;
+                let target = dfa.add_state();
+                known.insert(key.clone(), target);
+                pending.push_back((target, key));
+                target
+            };
+            budget.charge(0, 1, 0, 1)?;
+            dfa.add_transition(id, label, target);
+        }
+    }
+    Ok(dfa)
+}
+
+    fn counts(b: &ExpansionBudget) -> (usize,usize,usize,usize) {
+        (b.states,b.edges,b.subset_members,b.work)
+    }
+    #[test]
+    fn exact_graph_and_budget_match_for_duplicate_seeds_and_epsilon_cycles() {
+        let mut seed=73u64;
+        let mut next=|| { seed=seed.wrapping_mul(6364136223846793005).wrapping_add(1); (seed>>32) as usize };
+        for case in 0..128 {
+            let mut nfa=NFA::new_empty();
+            nfa.states.resize_with(8,Default::default);
+            nfa.start_states=vec![0,1,0];
+            for q in 0..8u32 {
+                nfa.states[q as usize].is_accepting=next()%3==0;
+                for _ in 0..3 { nfa.add_epsilon(q,(next()%8) as u32); }
+                for label in [-7,0,1,DEFAULT_LABEL-1] {
+                    for _ in 0..next()%3 { nfa.add_transition(q,label,(next()%8) as u32); }
+                }
+            }
+            for initial in [ExpansionBudget::default(),
+                ExpansionBudget {states:131_071,..Default::default()},
+                ExpansionBudget {edges:1_048_575,..Default::default()},
+                ExpansionBudget {subset_members:2_097_151,..Default::default()},
+                ExpansionBudget {work:33_554_425,..Default::default()}] {
+                let mut a=initial.clone(); let mut b=initial;
+                let expected=ordered_set_reference(&nfa,&mut a);
+                let actual=bounded_determinize(&nfa,&mut b);
+                assert_eq!(counts(&a),counts(&b),"case={case}");
+                match (expected,actual) {
+                    (Ok(x),Ok(y))=>assert_eq!(x,y,"case={case}"),
+                    (Err(x),Err(y))=>assert_eq!(x.to_string(),y.to_string(),"case={case}"),
+                    _=>panic!("different representation refusal case={case}"),
+                }
+            }
+        }
+    }
 }

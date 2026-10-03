@@ -7320,26 +7320,48 @@ fn determinize_parser_dwa_with_fallbacks_and_classes(
 
         let label_started = detail.as_ref().map(|_| Instant::now());
         let class_default_present = pop_classes.is_some() && default_touched;
+        // Symbols with the same global class membership have the same live
+        // row membership and contribution charge. Reuse this pure row-local
+        // result while keeping explicit contributions in the derivative key.
+        let mut row_memberships = FxHashMap::<u64,(RowClassMembershipBits,usize)>::default();
         let mut process_label = |label: i32, mut contribs: TargetContribs, is_concrete_dense: bool| -> Result<(), String> {
             let mut maybe_key = None;
             let mut keepalive = None;
             if is_concrete_dense && pop_classes.is_some() && !class_raw_targets.is_empty() {
                 let classes = pop_classes.unwrap();
                 let num_classes = class_raw_targets.len();
-                let mut membership: RowClassMembershipBits = smallvec::smallvec![0u64; (num_classes + 63) / 64];
-                for (class_idx, (&class_label, class_contribs)) in class_raw_targets.iter().enumerate() {
-                    class_work = class_work.checked_sub(1).ok_or("class derivative work budget exceeded")?;
-                    let matches = if let Some(membership) = class_membership_by_symbol.as_ref() {
-                        let index = (DEFAULT_LABEL - 1 - class_label) as usize;
-                        membership[label as usize] & (1u64 << index) != 0
+                let membership = if let Some(by_symbol) = class_membership_by_symbol.as_ref() {
+                    let global_membership = by_symbol[label as usize];
+                    let (membership, work) = if let Some(cached) = row_memberships.get(&global_membership) {
+                        cached.clone()
                     } else {
-                        classes.matches(class_label, label as u32)
+                        let mut membership: RowClassMembershipBits = smallvec::smallvec![0u64; (num_classes + 63) / 64];
+                        let mut work = num_classes;
+                        for (class_idx, (&class_label, contributions)) in class_raw_targets.iter().enumerate() {
+                            let index = (DEFAULT_LABEL - 1 - class_label) as usize;
+                            if global_membership & (1u64 << index) != 0 {
+                                work = work.checked_add(contributions.len()).ok_or("class derivative work budget exceeded")?;
+                                membership[class_idx / 64] |= 1u64 << (class_idx % 64);
+                            }
+                        }
+                        row_memberships.insert(global_membership, (membership.clone(), work));
+                        (membership, work)
                     };
-                    if matches {
-                        class_work = class_work.checked_sub(class_contribs.len()).ok_or("class derivative work budget exceeded")?;
-                        membership[class_idx / 64] |= 1u64 << (class_idx % 64);
+                    // Exactly the original one charge per live class plus
+                    // each matching class's contribution count, on every label.
+                    class_work = class_work.checked_sub(work).ok_or("class derivative work budget exceeded")?;
+                    membership
+                } else {
+                    let mut membership: RowClassMembershipBits = smallvec::smallvec![0u64; (num_classes + 63) / 64];
+                    for (class_idx, (&class_label, contributions)) in class_raw_targets.iter().enumerate() {
+                        class_work = class_work.checked_sub(1).ok_or("class derivative work budget exceeded")?;
+                        if classes.matches(class_label, label as u32) {
+                            class_work = class_work.checked_sub(contributions.len()).ok_or("class derivative work budget exceeded")?;
+                            membership[class_idx / 64] |= 1u64 << (class_idx % 64);
+                        }
                     }
-                }
+                    membership
+                };
                 let explicit_sig: RowClassExplicitContribSig = contribs
                     .iter()
                     .map(|(sid, w)| (*sid, w.ptr_key()))
