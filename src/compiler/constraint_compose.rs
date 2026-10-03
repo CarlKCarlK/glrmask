@@ -26200,7 +26200,7 @@ table: &child_table,
     }
 
     #[inline(never)]
-    fn scoped_oracle_test_start(source: &Constraint) -> Box<crate::runtime::state::ConstraintState<'_>> {
+    fn scoped_oracle_test_start(source: &Constraint) -> Box<crate::ConstraintState<'_>> {
         Box::new(source.start())
     }
 
