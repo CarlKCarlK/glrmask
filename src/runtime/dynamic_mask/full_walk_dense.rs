@@ -3244,6 +3244,15 @@ fn full_walk_identity_context_profitable(
     roots >= 2 || parser_nodes >= 32
 }
 
+#[inline(always)]
+fn full_walk_executed_root_count(roots: usize, lexer_lane: u32) -> usize {
+    if lexer_lane < FULL_WALK_LEXER_TWO_DISTINCT {
+        usize::from(roots != 0)
+    } else {
+        roots
+    }
+}
+
 /// An alphabet of exact self-loops is closed under concatenation. When every
 /// byte in a vocabulary subtree belongs to it, all descendant token endpoints
 /// see exactly the current full parser/lexer/guard state. Unseen bytes never
@@ -7162,6 +7171,15 @@ fn try_full_walk_mask_with_table_from_initial_in_output_scope<
         }
     }
 
+    // Select proof bookkeeping from the executed root frontier. Several exact
+    // lexer roots can merge behind one parser into the ordinary scalar lane;
+    // counting their original alternatives enables costly identity probes even
+    // though the resulting walk has the same shape as a single-root fallback.
+    // Parser-node growth still enables the existing monotone policy below.
+    let executed_root_count = full_walk_executed_root_count(root_branches.len(), stack_lexer[0]);
+    parser_cache.identity_proofs_enabled = accelerated
+        && full_walk_identity_context_profitable(executed_root_count, parser_cache.nodes.len());
+
     let walk_ops = trie.full_walk_ops();
     let token_markers = vocab.full_walk_token_markers_for(trie);
     let mut token_marker_index = 0usize;
@@ -8976,6 +8994,21 @@ mod full_walk_acceleration_tests {
                 assert_eq!(now, roots >= 2 || parser_nodes >= 32);
                 assert!(!admitted || now);
                 admitted |= now;
+            }
+        }
+    }
+
+    #[test]
+    fn identity_context_counts_executed_scalar_root_after_exact_union() {
+        for roots in 0..16 {
+            for scalar in [0, 1, FULL_WALK_LEXER_TWO_DISTINCT - 1] {
+                let executed = full_walk_executed_root_count(roots, scalar);
+                assert_eq!(executed, usize::from(roots != 0));
+                assert!(!full_walk_identity_context_profitable(executed, 31));
+                assert!(full_walk_identity_context_profitable(executed, 32));
+            }
+            for correlated in [FULL_WALK_LEXER_TWO_DISTINCT, FULL_WALK_LEXER_MULTI] {
+                assert_eq!(full_walk_executed_root_count(roots, correlated), roots);
             }
         }
     }
