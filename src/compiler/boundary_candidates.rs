@@ -864,7 +864,7 @@ fn compute_summary(
     )
 }
 
-fn fingerprint_for_constraint(
+pub(crate) fn fingerprint_for_constraint(
     constraint: &Constraint, vocab: &crate::Vocab,
 ) -> Result<BoundaryCandidateFingerprint, SummaryUnavailable> {
     if constraint.static_dynamic_overlay.as_ref()

@@ -624,8 +624,54 @@ fn summarize_constraint_module_r1(
     Ok((module, iterations, widened))
 }
 
-fn summarize_root_r1(constraint: &Constraint) -> Result<(ByteLanguage, usize, bool), String> {
-    let (module, iterations, widened) = summarize_constraint_module_r1(constraint)?;
+/// A proof of the original flat module algebra, before root-CALL refinement.
+/// The fingerprint covers rules, expressions, skips/controls, special tokens,
+/// public slots and vocabulary. Nullable/terminal-count scalars are checked too.
+#[derive(Debug, Clone)]
+pub(crate) struct FlatBoundaryTailR1 {
+    fingerprint: crate::runtime::BoundaryCandidateFingerprint,
+    nullable: bool,
+    terminal_count: u32,
+    summary: (BytePhaseSummary, usize, bool),
+}
+
+fn summarize_flat_module_r1_reusing_proof(
+    constraint: &Constraint, vocab: &crate::Vocab,
+) -> Result<(BytePhaseSummary, usize, bool), String> {
+    let grammar = constraint.template_parser.as_ref()
+        .and_then(|parser| parser.link_grammar.as_ref());
+    let identity = grammar.and_then(|grammar| {
+        // The leaf fingerprint must cover every lexical input to this proof.
+        constraint.retained_terminal_exprs()?;
+        let fingerprint = crate::compiler::boundary_candidates::fingerprint_for_constraint(
+            constraint, vocab).ok()?;
+        let nullable = constraint.composition_start_nullable().ok()?;
+        Some((grammar, fingerprint, nullable, constraint.tokenizer.num_terminals()))
+    });
+    if let Some((grammar, fingerprint, nullable, terminal_count)) = &identity {
+        if let Some(proof) = grammar.flat_boundary_tail_r1.get() {
+            if proof.fingerprint == *fingerprint && proof.nullable == *nullable
+                && proof.terminal_count == *terminal_count {
+                return Ok(proof.summary);
+            }
+        }
+    }
+    let summary = summarize_rules_module_r1(constraint, &BTreeMap::new(), &BTreeSet::new())?;
+    if let Some((grammar, fingerprint, nullable, terminal_count)) = identity {
+        let _ = grammar.flat_boundary_tail_r1.set(FlatBoundaryTailR1 {
+            fingerprint, nullable, terminal_count, summary,
+        });
+    }
+    Ok(summary)
+}
+
+fn summarize_root_r1(constraint: &Constraint, vocab: &crate::Vocab) -> Result<(ByteLanguage, usize, bool), String> {
+    let (module, iterations, widened) = if constraint.static_dynamic_overlay.as_ref()
+        .is_some_and(|overlay| !overlay.segmented_parser_components.is_empty()) {
+        summarize_constraint_module_r1(constraint)?
+    } else {
+        summarize_flat_module_r1_reusing_proof(constraint, vocab)?
+    };
     let mut exits = module.tail_to_return;
     exits.union_with(module.tail_to_event);
     Ok((exits, iterations, widened))
@@ -715,7 +761,7 @@ pub(crate) fn build_boundary_tail_r1(
     vocab: &crate::Vocab,
 ) -> Result<BoundaryTailR1Result, String> {
     let summary_started = Instant::now();
-    let (language, fixed_point_iterations, fixed_point_widened) = summarize_root_r1(constraint)?;
+    let (language, fixed_point_iterations, fixed_point_widened) = summarize_root_r1(constraint, vocab)?;
     let summary_ms = summary_started.elapsed().as_secs_f64() * 1000.0;
     let map_started = Instant::now();
     let candidate_ids = candidate_ids_for_r1(vocab, language);
@@ -1078,7 +1124,15 @@ pub(crate) fn build_root_call_candidates(
         tail_to_return: ByteLanguage::epsilon(),
         tail_to_event: ByteLanguage::epsilon(),
     })).collect();
-    let (module, _, _) = summarize_rules_module_r1(parent, &calls, &BTreeSet::new())?;
+    // An ordinary outward terminal already has exactly the CALL override
+    // summary. Reuse that identical flat proof only when every actual binding
+    // is outward; byte-backed special bindings still run the original algebra.
+    let outward = outward_terminals(parent);
+    let (module, _, _) = if call_terminals.iter().all(|terminal| outward.contains(terminal)) {
+        summarize_flat_module_r1_reusing_proof(parent, vocab)?
+    } else {
+        summarize_rules_module_r1(parent, &calls, &BTreeSet::new())?
+    };
     let language = module.tail_to_event;
     let mut entries = Some(Vec::new());
     for child in children {
@@ -1598,6 +1652,91 @@ mod tests {
         let call = parent.terminal_display_names.iter()
             .position(|name| name == "SUB").expect("fixture CALL terminal") as u32;
         build_root_call_candidates(parent, children, &[call], vocab).unwrap()
+    }
+
+    #[test]
+    fn flat_r1_proof_reuse_checks_interface_vocabulary_nullable_and_disabled_guards() {
+        let vocabulary = vocab(&[(0, b"ac"), (1, b"bc"), (2, b"ab"), (3, b"cat")]);
+        let parent = Constraint::from_glrm_grammar(
+            r#"start document; t SUB ::= @token(999); nt document ::= "a" SUB "b";"#,
+            &vocabulary).unwrap();
+        let expected = summarize_rules_module_r1(&parent, &BTreeMap::new(), &BTreeSet::new()).unwrap();
+        assert_eq!(summarize_flat_module_r1_reusing_proof(&parent, &vocabulary).unwrap(), expected);
+        assert!(parent.template_parser.as_ref().unwrap().link_grammar.as_ref().unwrap()
+            .flat_boundary_tail_r1.get().is_some());
+        let changed_vocab = vocab(&[(0, b"xx"), (9, b"zz"), (999, b"?")]);
+        for variant in 0..5 {
+            let mut modified = Constraint::from_glrm_grammar(
+                r#"start document; t SUB ::= @token(999); nt document ::= "a" SUB "b";"#,
+                &vocabulary).unwrap();
+            summarize_flat_module_r1_reusing_proof(&modified, &vocabulary).unwrap();
+            match variant {
+                0 => { modified.special_token_terminals.clear(); }
+                1 => { modified.ignore_terminal = Some(0); }
+                2 => { modified.unbound_grammar_placeholders.insert("another".into(), 0); }
+                3 => {
+                    let parser = std::sync::Arc::get_mut(modified.template_parser.as_mut().unwrap()).unwrap();
+                    std::sync::Arc::make_mut(parser.embedding.as_mut().unwrap()).nullable = true;
+                }
+                _ => {
+                    let parser = std::sync::Arc::get_mut(modified.template_parser.as_mut().unwrap()).unwrap();
+                    let grammar = std::sync::Arc::make_mut(parser.link_grammar.as_mut().unwrap());
+                    let mut proof = grammar.flat_boundary_tail_r1.take().unwrap();
+                    proof.fingerprint.algorithm_version += 1;
+                    proof.summary = (BytePhaseSummary::bottom(), 0, false);
+                    grammar.flat_boundary_tail_r1.set(proof).unwrap();
+                }
+            }
+            for vocab in [&vocabulary, &changed_vocab] {
+                assert_eq!(summarize_flat_module_r1_reusing_proof(&modified, vocab),
+                    summarize_rules_module_r1(&modified, &BTreeMap::new(), &BTreeSet::new()),
+                    "variant={variant}");
+            }
+        }
+        let mut disabled = parent.clone();
+        let _ = disabled.boundary_candidate_summary.take();
+        disabled.boundary_candidate_summary.set(crate::runtime::BoundaryCandidateSummary::Unknown {
+            reason: crate::runtime::SummaryUnavailable::Disabled }).unwrap();
+        assert!(crate::compiler::boundary_candidates::boundary_candidate_ids(&disabled, &vocabulary).0.is_none());
+    }
+
+    #[test]
+    fn flat_r1_proof_cache_is_transient_and_root_calls_match_original_overrides() {
+        let vocabulary = vocab(&[(0, b"ac"), (1, b"ax"), (2, b"a"), (3, b"bc"), (4, b"acatb")]);
+        let mut parent = Constraint::from_glrm_grammar(
+            r#"start document; t SUB ::= @token(999); nt document ::= "a" SUB "b";"#,
+            &vocabulary).unwrap();
+        let child = Constraint::from_glrm_grammar(
+            r#"start document; nt document ::= "cat";"#, &vocabulary).unwrap();
+        let parser = std::sync::Arc::get_mut(parent.template_parser.as_mut().unwrap()).unwrap();
+        let grammar = std::sync::Arc::make_mut(parser.link_grammar.as_mut().unwrap());
+        let _ = grammar.flat_boundary_tail_r1.take();
+        let before = bincode::serialize(&*grammar).unwrap();
+        let slot = parent.terminal_display_names.iter().position(|name| name == "SUB").unwrap() as u32;
+        let calls = BTreeMap::from([(slot, BytePhaseSummary {
+            historical_productive: true, normal: ByteLanguage::empty(),
+            event_from_entry: ByteLanguage::epsilon(), tail_to_return: ByteLanguage::epsilon(),
+            tail_to_event: ByteLanguage::epsilon(),
+        })]);
+        let original = summarize_rules_module_r1(&parent, &calls, &BTreeSet::new()).unwrap();
+        let cover = component_entry_prefix_cover(&child).unwrap();
+        let expected = root_call_candidate_ids_reference(&vocabulary, original.0.tail_to_event.bytes, Some(&cover));
+        for _ in 0..3 {
+            assert_eq!(build_root_call_candidates(&parent, &[&child], &[slot], &vocabulary).unwrap().candidate_ids,
+                expected);
+            assert_eq!(build_boundary_tail_r1(&parent, &vocabulary).unwrap().candidate_ids,
+                candidate_ids_for_r1(&vocabulary, {
+                    let plain = summarize_rules_module_r1(&parent, &BTreeMap::new(), &BTreeSet::new()).unwrap().0;
+                    let mut language = plain.tail_to_return;
+                    language.union_with(plain.tail_to_event); language
+                }));
+        }
+        let grammar = parent.template_parser.as_ref().unwrap().link_grammar.as_ref().unwrap();
+        assert!(grammar.flat_boundary_tail_r1.get().is_some());
+        assert_eq!(bincode::serialize(grammar.as_ref()).unwrap(), before);
+        let loaded: crate::runtime::parser_backend::link_grammar::LinkGrammar = bincode::deserialize(&before).unwrap();
+        assert!(loaded.flat_boundary_tail_r1.get().is_none());
+        assert_eq!(loaded, **grammar);
     }
 
     #[test]

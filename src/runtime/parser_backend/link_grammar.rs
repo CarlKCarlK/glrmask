@@ -21,6 +21,9 @@ pub(crate) struct LinkGrammar {
     // Fresh dynamic links retain the exact outward-proof recipe. It is forced
     // by a compiler/query/save consumer, never by current runtime masks.
     pub(crate) deferred_boundary_summary: OnceLock<Arc<crate::compiler::boundary_candidates::DeferredCompositionSummary>>,
+    // Transient flat proof only, validated against the complete component
+    // identity at every use. It does not enter artifact bytes or runtime state.
+    pub(crate) flat_boundary_tail_r1: OnceLock<crate::compiler::boundary_tail::FlatBoundaryTailR1>,
 }
 
 #[cfg(test)]
@@ -144,6 +147,7 @@ impl LinkGrammar {
             rule_count: flat.rules.len(), root_nonterminal: root,
             root_has_empty_rule: flat.rules.iter().any(|rule| rule.lhs == root && rule.rhs.is_empty()),
             source: None, flat: OnceLock::from(flat), deferred_boundary_summary: OnceLock::new(),
+            flat_boundary_tail_r1: OnceLock::new(),
         })
     }
 
@@ -254,6 +258,7 @@ impl LinkGrammar {
             source: Some(Arc::new(CompositionRecipe { sources, terminal_offsets, slots,
                 state_offsets, state_count, effect_links })), flat: OnceLock::new(),
             deferred_boundary_summary: OnceLock::new(),
+            flat_boundary_tail_r1: OnceLock::new(),
         };
         grammar.validate_manifest()?;
         Ok(grammar)
