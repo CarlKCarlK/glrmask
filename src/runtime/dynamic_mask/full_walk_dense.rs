@@ -3245,8 +3245,8 @@ fn full_walk_identity_context_profitable(
 }
 
 #[inline(always)]
-fn full_walk_executed_root_count(roots: usize, lexer_lane: u32) -> usize {
-    if lexer_lane < FULL_WALK_LEXER_TWO_DISTINCT {
+fn full_walk_executed_root_count(roots: usize, scalar_lane: bool) -> usize {
+    if scalar_lane {
         usize::from(roots != 0)
     } else {
         roots
@@ -7176,7 +7176,9 @@ fn try_full_walk_mask_with_table_from_initial_in_output_scope<
     // counting their original alternatives enables costly identity probes even
     // though the resulting walk has the same shape as a single-root fallback.
     // Parser-node growth still enables the existing monotone policy below.
-    let executed_root_count = full_walk_executed_root_count(root_branches.len(), stack_lexer[0]);
+    let executed_root_count = full_walk_executed_root_count(
+        root_branches.len(), stack_lexer[0] < FULL_WALK_LEXER_TWO_DISTINCT,
+    );
     parser_cache.identity_proofs_enabled = accelerated
         && full_walk_identity_context_profitable(executed_root_count, parser_cache.nodes.len());
 
@@ -9001,15 +9003,11 @@ mod full_walk_acceleration_tests {
     #[test]
     fn identity_context_counts_executed_scalar_root_after_exact_union() {
         for roots in 0..16 {
-            for scalar in [0, 1, FULL_WALK_LEXER_TWO_DISTINCT - 1] {
-                let executed = full_walk_executed_root_count(roots, scalar);
-                assert_eq!(executed, usize::from(roots != 0));
-                assert!(!full_walk_identity_context_profitable(executed, 31));
-                assert!(full_walk_identity_context_profitable(executed, 32));
-            }
-            for correlated in [FULL_WALK_LEXER_TWO_DISTINCT, FULL_WALK_LEXER_MULTI] {
-                assert_eq!(full_walk_executed_root_count(roots, correlated), roots);
-            }
+            let executed = full_walk_executed_root_count(roots, true);
+            assert_eq!(executed, usize::from(roots != 0));
+            assert!(!full_walk_identity_context_profitable(executed, 31));
+            assert!(full_walk_identity_context_profitable(executed, 32));
+            assert_eq!(full_walk_executed_root_count(roots, false), roots);
         }
     }
 
