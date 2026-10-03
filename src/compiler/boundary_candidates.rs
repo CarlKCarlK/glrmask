@@ -1093,8 +1093,16 @@ pub(crate) fn persisted_boundary_candidate_ids(
                 && public_interface_matches(constraint, &fingerprint) =>
         {
             let ids = tokens.canonical_ids(vocab.iter());
+            let max_token_id = vocab.max_token_id();
+            // Unique nonnegative IDs with this cardinality fill 0..=max exactly.
+            // Sparse byte domains still require the original membership check;
+            // exact-only IDs are excluded from both len() and max_token_id().
+            let dense_byte_domain = vocab.len() as u64 == u64::from(max_token_id) + 1;
             if ids.windows(2).any(|pair| pair[0] >= pair[1])
-                || ids.iter().any(|id| !vocab.entries_map().contains_key(id))
+                || ids.iter().any(|id| {
+                    if dense_byte_domain { *id > max_token_id }
+                    else { !vocab.entries_map().contains_key(id) }
+                })
             {
                 return Ok(None);
             }
@@ -1646,5 +1654,26 @@ mod preparation_tests {
         .unwrap();
         persist_boundary_candidate_summary(&mut empty, &empty_vocab);
         assert_eq!(persisted_boundary_candidate_ids(&empty, &empty_vocab).unwrap(), Some(vec![]));
+    }
+
+    #[test]
+    fn persisted_candidates_reject_sparse_byte_domain_holes_even_when_exact_only() {
+        let vocab = crate::Vocab::new_with_exact_token_ids(
+            vec![(0, b"a".to_vec()), (2, b"ab".to_vec())], [1],
+        );
+        let mut source = Constraint::from_glrm_grammar(
+            r#"glrm 1; start document; nt document = "a";"#, &vocab,
+        ).unwrap();
+        persist_boundary_candidate_summary(&mut source, &vocab);
+        assert_eq!(persisted_boundary_candidate_ids(&source, &vocab).unwrap(), Some(vec![2]));
+        assert!(vocab.contains_exact_token_id(1));
+        let mut summary = source.boundary_candidate_summary.take().unwrap();
+        let BoundaryCandidateSummary::Known { tokens, .. } = &mut summary else {
+            panic!("expected a checked component certificate");
+        };
+        *tokens = OriginalTokenSet::Sparse(std::sync::Arc::from([1]));
+        source.boundary_candidate_summary.set(summary).unwrap();
+        assert!(persisted_boundary_candidate_ids(&source, &vocab).unwrap().is_none(),
+            "an exact-only control ID is not a byte-backed boundary candidate");
     }
 }
