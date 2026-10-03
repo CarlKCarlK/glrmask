@@ -2953,8 +2953,12 @@ fn analyze_equivalences_impl(
         // per vocabulary class is sufficient for the subsequent state scan.
         // Keep the established large-state route, and also use vocab-first when
         // the direct state×token scan is large enough to amortize the vocab pass.
+        let small_state_p2_vocab_first = partition_label == "p2"
+            && dedup.representative_token_bytes.len() >= 16_000
+            && query_view_states.len() <= 64;
         let vocab_first = vocab_only
             || p0_vocab_first
+            || small_state_p2_vocab_first
             || prefer_vocab_first_equivalence(
                 dedup.representative_token_bytes.len(),
                 query_view_states.len(),

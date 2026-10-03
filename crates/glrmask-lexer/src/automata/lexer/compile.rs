@@ -9171,6 +9171,215 @@ fn build_finite_literal_language_dfa(expr: &Expr) -> Option<DFA> {
 /// sparse tuple of still-live DFA states plus one literal-trie DFA state.
 /// The product stays on the global byte-class alphabet through minimization and
 /// expands classes back to bytes only for the final compact automaton.
+const MAX_DIRECT_CHOICE_STATES: usize = 32_768;
+const MAX_DIRECT_CHOICE_CLASS_TRANSITIONS: usize = 2_000_000;
+
+fn collect_fixed_sequence_literal_bytes(expr: &Expr) -> Option<Vec<u8>> {
+    let mut byte_sets = Vec::new();
+    if !collect_fixed_sequence_byte_sets(expr, &mut byte_sets)
+        || byte_sets.iter().any(|set| set.len() != 1)
+    {
+        return None;
+    }
+    Some(
+        byte_sets
+            .into_iter()
+            .map(|set| set.iter().next().expect("singleton byte set"))
+            .collect(),
+    )
+}
+
+fn build_sparse_dfas_with_fixed_sequence_choice(
+    expr: &Expr,
+    options: &[Expr],
+) -> Option<DFA> {
+    // Preserve the historical direct path for choices made only from bare DFA,
+    // U8Seq, and epsilon arms. This sparse path exists for generated fixed
+    // sequences (typically Seq<U8Seq...>) that otherwise fall back to the
+    // general NFA determinizer.
+    let has_extended_fixed_sequence = options.iter().any(|option| {
+        !matches!(
+            unwrap_shared(option),
+            Expr::Dfa(_) | Expr::U8Seq(_) | Expr::Epsilon
+        )
+    });
+    if !has_extended_fixed_sequence {
+        return None;
+    }
+
+    let mut dfas = Vec::<Arc<DFA>>::new();
+    let mut literals = Vec::<Vec<u8>>::new();
+    for option in options {
+        match unwrap_shared(option) {
+            Expr::Dfa(dfa) => dfas.push(Arc::clone(dfa)),
+            Expr::U8Seq(bytes) => literals.push(bytes.clone()),
+            Expr::Epsilon => literals.push(Vec::new()),
+            other => literals.push(collect_fixed_sequence_literal_bytes(other)?),
+        }
+    }
+    if dfas.is_empty() || literals.is_empty() {
+        return None;
+    }
+    if dfas
+        .iter()
+        .any(|dfa| dfa.num_groups() != 1 || dfa.has_epsilon_transitions())
+    {
+        return None;
+    }
+
+    #[derive(Default)]
+    struct LiteralTrieNode {
+        children: BTreeMap<u8, usize>,
+        accepting: bool,
+    }
+    let mut trie = vec![LiteralTrieNode::default()];
+    for literal in &literals {
+        let mut node = 0usize;
+        for &byte in literal {
+            let next = if let Some(&next) = trie[node].children.get(&byte) {
+                next
+            } else {
+                let next = trie.len();
+                trie.push(LiteralTrieNode::default());
+                trie[node].children.insert(byte, next);
+                next
+            };
+            node = next;
+        }
+        trie[node].accepting = true;
+    }
+    let mut literal_dfa = DFA::new(trie.len());
+    literal_dfa.ensure_group_capacity(1);
+    literal_dfa.set_group_u8set(0, expr_u8set(expr));
+    for (node, trie_node) in trie.iter().enumerate() {
+        literal_dfa.set_transitions_from_sorted_entries(
+            node as u32,
+            trie_node
+                .children
+                .iter()
+                .map(|(&byte, &target)| (byte, target as u32))
+                .collect(),
+        );
+        let mut finalizers = BitSet::new(1);
+        if trie_node.accepting {
+            finalizers.set(0);
+        }
+        literal_dfa.overwrite_state_metadata(node as u32, finalizers, BitSet::new(1));
+    }
+
+    let mut components = dfas.iter().map(Arc::as_ref).collect::<Vec<_>>();
+    components.push(&literal_dfa);
+    let (class_map, class_members) = compute_dfa_byte_equivalence_classes(&components);
+    if class_members.len() > u8::MAX as usize + 1 {
+        return None;
+    }
+    let dead_states = components
+        .iter()
+        .map(|dfa| explicit_dead_sink_state(dfa))
+        .collect::<Vec<_>>();
+    let class_transitions = components
+        .iter()
+        .map(|dfa| build_product_class_transitions_for_dfa(dfa, &class_map))
+        .collect::<Vec<_>>();
+
+    let mut result = DFA::new(1);
+    result.ensure_group_capacity(1);
+    let mut start = ProductStateTuple::with_capacity(components.len());
+    for component_id in 0..components.len() {
+        start.push((component_id as u32, 0));
+    }
+    let set_metadata = |dfa: &mut DFA, state: u32, tuple: &ProductStateTuple| {
+        let accepting = tuple.iter().any(|&(component_id, component_state)| {
+            components[component_id as usize]
+                .finalizers(component_state)
+                .contains(0)
+        });
+        let future = tuple.iter().any(|&(component_id, component_state)| {
+            components[component_id as usize]
+                .possible_future_group_ids(component_state)
+                .contains(0)
+        });
+        let mut finalizers = BitSet::new(1);
+        let mut futures = BitSet::new(1);
+        if accepting {
+            finalizers.set(0);
+        }
+        if future {
+            futures.set(0);
+        }
+        dfa.overwrite_state_metadata(state, finalizers, futures);
+    };
+    set_metadata(&mut result, 0, &start);
+
+    let mut state_map = FxHashMap::<ProductStateTuple, u32>::default();
+    state_map.insert(start.clone(), 0);
+    let mut worklist = VecDeque::from([(0u32, start)]);
+    let mut class_buffers = (0..class_members.len())
+        .map(|_| ProductStateTuple::new())
+        .collect::<Vec<_>>();
+    let mut class_active = vec![false; class_members.len()];
+    let mut used_classes = Vec::<usize>::new();
+    let mut projected_byte_transitions = 0usize;
+
+    while let Some((result_state, tuple)) = worklist.pop_front() {
+        for &(component_id, component_state) in &tuple {
+            let component_index = component_id as usize;
+            for &(class_id, target) in
+                &class_transitions[component_index][component_state as usize]
+            {
+                if dead_states[component_index] == Some(target) {
+                    continue;
+                }
+                let class_index = class_id as usize;
+                if !class_active[class_index] {
+                    class_active[class_index] = true;
+                    used_classes.push(class_index);
+                }
+                class_buffers[class_index].push((component_id, target));
+            }
+        }
+
+        let mut transitions = Vec::with_capacity(used_classes.len());
+        for &class_index in &used_classes {
+            projected_byte_transitions = projected_byte_transitions
+                .saturating_add(class_members[class_index].len());
+            if projected_byte_transitions > MAX_DIRECT_CHOICE_CLASS_TRANSITIONS {
+                return None;
+            }
+            let next_tuple = &class_buffers[class_index];
+            let target = if let Some(&existing) = state_map.get(next_tuple) {
+                existing
+            } else {
+                if result.num_states() >= MAX_DIRECT_CHOICE_STATES {
+                    return None;
+                }
+                let new_state = result.add_state();
+                set_metadata(&mut result, new_state, next_tuple);
+                state_map.insert(next_tuple.clone(), new_state);
+                worklist.push_back((new_state, next_tuple.clone()));
+                new_state
+            };
+            transitions.push((class_index as u8, target));
+            class_buffers[class_index].clear();
+            class_active[class_index] = false;
+        }
+        used_classes.clear();
+        transitions.sort_unstable_by_key(|entry| entry.0);
+        result.set_transitions_from_sorted_entries(result_state, transitions);
+    }
+
+    result.recompute_possible_futures();
+    let mut result = result.minimize_owned_reachable();
+    expand_direct_expression_graph_classes(&mut result, &class_members);
+    result.set_group_u8set(0, expr_u8set(expr));
+    Some(result)
+}
+
+/// Exact union of already-deterministic single-group DFAs and fixed byte
+/// strings. General Choice compilation lowers every DFA arm back into an NFA
+/// and redeterminizes the union. For generated fixed sequences, the sparse path
+/// carries only the DFA arms still live after each prefix. Bare literal choices
+/// retain the historical direct product path below.
 fn build_dfas_with_literal_choice(expr: &Expr) -> Option<DFA> {
     let profile_timing = std::env::var_os("GLRMASK_PROFILE_TOKENIZER_TIMING").is_some();
     let total_started_at = profile_timing.then(Instant::now);
@@ -9180,6 +9389,10 @@ fn build_dfas_with_literal_choice(expr: &Expr) -> Option<DFA> {
     let Expr::Choice(options) = unwrap_shared(expr) else {
         return None;
     };
+    if let Some(dfa) = build_sparse_dfas_with_fixed_sequence_choice(expr, options) {
+        return Some(dfa);
+    }
+
     let mut dfas = Vec::<Arc<DFA>>::new();
     let mut literals = Vec::<&[u8]>::new();
     for option in options {
@@ -9278,8 +9491,6 @@ fn build_dfas_with_literal_choice(expr: &Expr) -> Option<DFA> {
     let mut state_by_tuple = FxHashMap::<SmallVec<[u32; 4]>, u32>::default();
     state_by_tuple.insert(start.clone(), 0);
     let mut queue = VecDeque::from([(0u32, start)]);
-    const MAX_DIRECT_CHOICE_STATES: usize = 32_768;
-    const MAX_DIRECT_CHOICE_CLASS_TRANSITIONS: usize = 2_000_000;
     let mut transition_count = 0usize;
     let construct_started_at = profile_timing.then(Instant::now);
 
@@ -12113,6 +12324,9 @@ fn compile_product_component_with_options(
         }
     }
     match expr {
+        Expr::Dfa(dfa) if dfa.num_groups() == 1 && !dfa.has_epsilon_transitions() => {
+            ProductComponent::Materialized(Arc::clone(dfa))
+        }
         Expr::Shared(inner) => compile_product_component_with_options(
             inner,
             preserve_coordinates,
@@ -15197,7 +15411,7 @@ mod tests {
         try_product_union_components,
     };
     use super::{compile_product_component_dfa, compile_product_component_dfa_direct};
-    use super::factor_regex_expr;
+    use super::{factor_regex_expr, factor_regex_expr_with_shared_cache};
     use crate::automata::lexer::ast::Expr;
     use crate::automata::lexer::regex::parse_regex;
     use crate::automata::lexer::tokenizer::Tokenizer;
@@ -15242,6 +15456,44 @@ mod tests {
         };
         assert_eq!(super::direct_bounded_suffix_state_count_estimate(&wrapped), None);
         assert_eq!(super::max_direct_bounded_suffix_state_count_estimate(&wrapped), Some(own));
+    }
+
+    #[test]
+    fn shared_aware_batch_factoring_matches_individual_factoring() {
+        let shared = Arc::new(Expr::Choice(vec![
+            Expr::Seq(vec![byte_expr(b'a'), byte_expr(b'b')]),
+            Expr::Seq(vec![byte_expr(b'a'), byte_expr(b'c')]),
+            Expr::Seq(vec![byte_expr(b'a'), byte_expr(b'd')]),
+        ]));
+        let shared_cache = rustc_hash::FxHashMap::from_iter([(
+            Arc::as_ptr(&shared) as usize,
+            Arc::new(factor_regex_expr(shared.as_ref().clone())),
+        )]);
+        let raw = vec![
+            Expr::Seq(vec![Expr::Shared(Arc::clone(&shared)), byte_expr(b'x')]),
+            Expr::Exclude {
+                expr: Box::new(Expr::Shared(Arc::clone(&shared))),
+                exclude: Box::new(Expr::U8Seq(b"ab".to_vec())),
+            },
+            Expr::Choice(vec![
+                Expr::Shared(Arc::clone(&shared)),
+                Expr::Seq(vec![Expr::Shared(shared), byte_expr(b'y')]),
+            ]),
+        ];
+        let individual = raw
+            .iter()
+            .cloned()
+            .map(factor_regex_expr)
+            .collect::<Vec<_>>();
+        let batch = raw.into_iter()
+            .map(|expr| factor_regex_expr_with_shared_cache(expr, &shared_cache))
+            .collect::<Vec<_>>();
+        assert_eq!(individual.len(), batch.len());
+        for (individual, batch) in individual.iter().zip(&batch) {
+            let individual = build_regex(std::slice::from_ref(individual)).dfa;
+            let batch = build_regex(std::slice::from_ref(batch)).dfa;
+            assert_dfa_observation_equivalent(&individual, &batch);
+        }
     }
 
     #[test]
@@ -18140,6 +18392,34 @@ mod tests {
         ]);
         let direct = super::build_dfas_with_literal_choice(&expression)
             .expect("multi-DFA plus literal choice should compile directly");
+        let generic = super::compile_expr_to_dfa(&expression);
+        assert_dfa_observation_equivalent(&direct, &generic);
+    }
+
+    #[test]
+    fn multi_dfa_fixed_sequence_choice_sparse_matches_generic_language() {
+        let arm_a = Arc::new(super::compile_expr_to_dfa(&Expr::Choice(vec![
+            Expr::U8Seq(b"alpha".to_vec()),
+            Expr::U8Seq(b"alpine".to_vec()),
+        ])));
+        let arm_b = Arc::new(super::compile_expr_to_dfa(&Expr::Choice(vec![
+            Expr::U8Seq(b"beta".to_vec()),
+            Expr::U8Seq(b"better".to_vec()),
+        ])));
+        let expression = Expr::Choice(vec![
+            Expr::Dfa(arm_a),
+            Expr::Seq(vec![
+                Expr::U8Seq(b"an".to_vec()),
+                Expr::U8Seq(b"chor".to_vec()),
+            ]),
+            Expr::Dfa(arm_b),
+            Expr::Seq(vec![
+                Expr::U8Seq(b"ze".to_vec()),
+                Expr::U8Seq(b"bra".to_vec()),
+            ]),
+        ]);
+        let direct = super::build_dfas_with_literal_choice(&expression)
+            .expect("multi-DFA plus fixed-sequence choice should compile sparsely");
         let generic = super::compile_expr_to_dfa(&expression);
         assert_dfa_observation_equivalent(&direct, &generic);
     }

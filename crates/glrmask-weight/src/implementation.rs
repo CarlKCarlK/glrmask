@@ -2347,6 +2347,37 @@ fn intersect_weights(left: &Weight, right: &Weight) -> Weight {
 }
 
 fn intersect_single_entry_with_weight(single: &WeightRangeEntry, other: &Weight) -> Weight {
+    // A very common parser-closure shape is one TSID-wide edge weight intersected
+    // with a much larger residual weight. `map_and_set_intersection` is a streaming
+    // merge and therefore walks from the first range of `other`; for a point query
+    // that needlessly scans every preceding TSID range. RangeMapBlaze::get() uses
+    // its BTreeMap index and gives the exact same token-set intersection in O(log n).
+    if single.start == single.end {
+        let other_tokens = match other.0.range_values().next() {
+            Some((range, tokens)) if *range.start() <= single.start && single.start <= *range.end() => {
+                tokens
+            }
+            Some((range, _)) if single.start < *range.start() => return Weight::empty(),
+            _ => {
+                let Some(tokens) = other.0.get(single.start) else {
+                    return Weight::empty();
+                };
+                tokens
+            }
+        };
+        let tokens = if same_shared_token_set(&single.tokens, other_tokens) {
+            Some(Arc::clone(&single.tokens))
+        } else {
+            shared_token_intersection(&single.tokens, other_tokens)
+        };
+        let Some(tokens) = tokens else {
+            return Weight::empty();
+        };
+        let mut builder = CompactRangeBuilder::new();
+        builder.push(single.start, single.end, tokens);
+        return builder.finish();
+    }
+
     let mut builder = CompactRangeBuilder::new();
     let mut overlap_cache: SmallVec<[(
         *const RangeSetBlaze<u32>,
@@ -3719,6 +3750,33 @@ mod tests {
     fn weight_for_tsid(tsid: u32, ranges: &[(u32, u32)]) -> Weight {
         let token_set = rangeset_from_ranges(ranges.iter().map(|(start, end)| *start..=*end));
         Weight::from_token_set_for_tsid(tsid, token_set)
+    }
+
+    #[test]
+    fn point_single_intersection_matches_general_intersection() {
+        let token_sets = [
+            shared_rangeset(RangeSetBlaze::from_iter([0..=7])),
+            shared_rangeset(RangeSetBlaze::from_iter([4..=15])),
+            shared_rangeset(RangeSetBlaze::from_iter([12..=23])),
+        ];
+        let other = Weight::from_per_tsid_shared(
+            (0..128).map(|tsid| (tsid, Arc::clone(&token_sets[tsid as usize % 3]))),
+        );
+        let point = Weight::from_token_set_for_tsid(
+            117,
+            RangeSetBlaze::from_iter([6..=18]),
+        );
+        let single = single_compact_entry(&point).expect("point weight must be compact");
+        let fast = intersect_single_entry_with_weight(&single, &other);
+        let reference = intersect_weights(&point, &other);
+        assert_eq!(fast, reference);
+
+        let absent = Weight::from_token_set_for_tsid(
+            256,
+            RangeSetBlaze::from_iter([6..=18]),
+        );
+        let absent_single = single_compact_entry(&absent).expect("point weight must be compact");
+        assert!(intersect_single_entry_with_weight(&absent_single, &other).is_empty());
     }
 
     #[test]

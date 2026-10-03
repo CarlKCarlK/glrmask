@@ -858,11 +858,27 @@ fn try_build_relevant_powerset_view(
         }
     } else {
         let direct_raw_target_views = raw_target_mode == RawPowersetTargetMode::Direct;
+        // Moderate raw-NFA domains benefit from aggregating sparse transitions
+        // directly into byte buckets. On very large bounded tokenizers the
+        // powerset is usually dominated by preseeded singleton closures, and
+        // retaining the old two-pass path avoids adding allocation/cache
+        // pressure to the P100 compile path for little useful work.
+        const ONE_PASS_RAW_TARGET_MAX_STATES: usize = 65_536;
+        let one_pass_raw_targets =
+            direct_raw_target_views && raw_state_count <= ONE_PASS_RAW_TARGET_MAX_STATES;
         let mut byte_marks = [0u32; 256];
         let mut byte_epoch = 0u32;
         let mut candidate_bytes = Vec::<u8>::new();
-        let mut target_marks = direct_raw_target_views.then(|| vec![0u32; raw_state_count]);
+        let mut target_marks = (direct_raw_target_views && !one_pass_raw_targets)
+            .then(|| vec![0u32; raw_state_count]);
         let mut target_epoch = 0u32;
+        // In the one-pass lane, keep one reusable target bucket per byte. The
+        // previous path first scanned every source row to discover candidate
+        // bytes, then rescanned every source once per candidate byte via
+        // `tokenizer.step`.
+        let mut direct_target_buckets = one_pass_raw_targets.then(|| {
+            (0..256).map(|_| Vec::<u32>::new()).collect::<Vec<_>>()
+        });
         while let Some(state) = worklist.pop_front() {
             assert_eq!(
                 state as usize + 1,
@@ -904,22 +920,51 @@ fn try_build_relevant_powerset_view(
                 byte_epoch = 1;
             }
             candidate_bytes.clear();
-            for &source in configs[config_index].iter() {
-                for (byte, _) in tokenizer.transitions_from(source) {
-                    let byte_index = byte as usize;
-                    if relevant_bytes[byte_index] && byte_marks[byte_index] != byte_epoch {
-                        byte_marks[byte_index] = byte_epoch;
-                        candidate_bytes.push(byte);
+            if one_pass_raw_targets {
+                let target_buckets = direct_target_buckets
+                    .as_mut()
+                    .expect("one-pass raw targets must retain target buckets");
+                for &source in configs[config_index].iter() {
+                    for (byte, raw_target) in tokenizer.transitions_from(source) {
+                        let byte_index = byte as usize;
+                        if !relevant_bytes[byte_index] {
+                            continue;
+                        }
+                        if byte_marks[byte_index] != byte_epoch {
+                            byte_marks[byte_index] = byte_epoch;
+                            candidate_bytes.push(byte);
+                        }
+                        let target_view = raw_start_to_view[raw_target as usize];
+                        target_buckets[byte_index]
+                            .extend_from_slice(configs[target_view as usize].as_ref());
+                    }
+                }
+            } else {
+                for &source in configs[config_index].iter() {
+                    for (byte, _) in tokenizer.transitions_from(source) {
+                        let byte_index = byte as usize;
+                        if relevant_bytes[byte_index] && byte_marks[byte_index] != byte_epoch {
+                            byte_marks[byte_index] = byte_epoch;
+                            candidate_bytes.push(byte);
+                        }
                     }
                 }
             }
             candidate_bytes.sort_unstable();
             for &byte in &candidate_bytes {
-                let projected = if direct_raw_target_views {
+                let projected = if one_pass_raw_targets {
+                    let target_buckets = direct_target_buckets
+                        .as_mut()
+                        .expect("one-pass raw targets must retain target buckets");
+                    let mut projected = std::mem::take(&mut target_buckets[byte as usize]);
+                    projected.sort_unstable();
+                    projected.dedup();
+                    projected
+                } else if direct_raw_target_views {
                     target_epoch = target_epoch.wrapping_add(1);
                     let target_marks = target_marks
                         .as_mut()
-                        .expect("direct raw targets must retain target marks");
+                        .expect("two-pass raw targets must retain target marks");
                     if target_epoch == 0 {
                         target_marks.fill(0);
                         target_epoch = 1;
@@ -2466,6 +2511,35 @@ pub fn build_bounded_analysis_view_from_combined_starts_with_trie(
         prebuilt_token_trie,
     )
     .expect("unbounded token analysis topology build")
+    .0
+    .materialize(tokenizer, active_groups)
+}
+
+/// Build the combined-start bounded view needed for exact L2P prefix scans.
+/// Unlike the general bounded view, this does not materialize reset-state
+/// transitions for every token suffix; callers must evaluate reset suffixes
+/// separately.
+pub fn build_bounded_analysis_view_from_combined_starts_prefix_only_with_trie(
+    tokenizer: &Tokenizer,
+    raw_start_states: &[usize],
+    tokens: &[&[u8]],
+    active_groups: Option<&[bool]>,
+    prebuilt_token_trie: Option<&TokenBoundedAnalysisTrie>,
+) -> BoundedAnalysisView {
+    build_bounded_analysis_topology_impl(
+        tokenizer,
+        None,
+        raw_start_states,
+        tokens,
+        true,
+        true,
+        false,
+        false,
+        None,
+        None,
+        prebuilt_token_trie,
+    )
+    .expect("unbounded prefix-only token analysis topology build")
     .0
     .materialize(tokenizer, active_groups)
 }

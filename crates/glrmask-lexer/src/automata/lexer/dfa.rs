@@ -5,7 +5,7 @@ use std::hash::{Hash, Hasher};
 use std::ops::Index;
 use std::sync::OnceLock;
 
-use rustc_hash::FxHashSet;
+use rustc_hash::{FxHashSet, FxHasher};
 use rayon::prelude::*;
 use serde::ser::SerializeSeq;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
@@ -245,6 +245,7 @@ pub struct DFA {
     group_id_to_u8set: Vec<U8Set>,
     derived_stats: OnceLock<DfaDerivedStats>,
     min_match_byte_len_cache: OnceLock<Option<usize>>,
+    structural_hash_cache: OnceLock<u64>,
 }
 
 impl PartialEq for DFA {
@@ -257,8 +258,7 @@ impl Eq for DFA {}
 
 impl Hash for DFA {
     fn hash<H: Hasher>(&self, state: &mut H) {
-        self.states.hash(state);
-        self.group_id_to_u8set.hash(state);
+        self.structural_hash().hash(state);
     }
 }
 
@@ -548,6 +548,7 @@ impl<'de> Deserialize<'de> for DFA {
             group_id_to_u8set: wire.group_id_to_u8set,
             derived_stats: OnceLock::new(),
             min_match_byte_len_cache: OnceLock::new(),
+            structural_hash_cache: OnceLock::new(),
         })
     }
 }
@@ -565,6 +566,7 @@ impl DFA {
             group_id_to_u8set: Vec::new(),
             derived_stats: OnceLock::new(),
             min_match_byte_len_cache: OnceLock::new(),
+            structural_hash_cache: OnceLock::new(),
         }
     }
 
@@ -616,6 +618,7 @@ impl DFA {
             group_id_to_u8set,
             derived_stats: OnceLock::new(),
             min_match_byte_len_cache: OnceLock::new(),
+            structural_hash_cache: OnceLock::new(),
         }
     }
 
@@ -668,6 +671,7 @@ impl DFA {
             group_id_to_u8set: vec![group_u8set],
             derived_stats: OnceLock::new(),
             min_match_byte_len_cache: OnceLock::new(),
+            structural_hash_cache: OnceLock::new(),
         }
     }
 
@@ -736,6 +740,7 @@ impl DFA {
             group_id_to_u8set: vec![group_u8set],
             derived_stats: OnceLock::new(),
             min_match_byte_len_cache: OnceLock::new(),
+            structural_hash_cache: OnceLock::new(),
         })
     }
 
@@ -745,9 +750,25 @@ impl DFA {
     }
 
     #[inline]
+    fn invalidate_structural_hash(&mut self) {
+        let _ = self.structural_hash_cache.take();
+    }
+
+    #[inline]
     fn invalidate_structural_caches(&mut self) {
         let _ = self.derived_stats.take();
         self.invalidate_min_match_byte_len();
+        self.invalidate_structural_hash();
+    }
+
+    #[inline]
+    fn structural_hash(&self) -> u64 {
+        *self.structural_hash_cache.get_or_init(|| {
+            let mut hasher = FxHasher::default();
+            self.states.hash(&mut hasher);
+            self.group_id_to_u8set.hash(&mut hasher);
+            hasher.finish()
+        })
     }
 
     fn compute_derived_stats(&self) -> DfaDerivedStats {
@@ -825,11 +846,17 @@ impl DFA {
     /// disjoint composition and avoids rewriting every state in a large parent.
     pub(super) fn ensure_group_mapping_capacity(&mut self, num_groups: usize) {
         if self.group_id_to_u8set.len() < num_groups {
+            self.invalidate_structural_hash();
             self.group_id_to_u8set.resize(num_groups, U8Set::empty());
         }
     }
 
     pub(super) fn ensure_group_capacity(&mut self, num_groups: usize) {
+        // The mapping may already have been extended by
+        // `ensure_group_mapping_capacity` while state metadata stayed narrow.
+        // Resizing those bitsets changes structural equality even when the
+        // mapping itself does not grow here.
+        self.invalidate_structural_hash();
         if self.group_id_to_u8set.len() < num_groups {
             self.group_id_to_u8set.resize(num_groups, U8Set::empty());
         }
@@ -1390,6 +1417,7 @@ impl DFA {
 
     pub(super) fn clear_finalizers_for_state(&mut self, state: u32) -> BitSet {
         self.invalidate_min_match_byte_len();
+        self.invalidate_structural_hash();
         let num_groups = self.group_id_to_u8set.len();
         if let Some(entry) = self.state_mut(state) {
             std::mem::replace(&mut entry.finalizers, BitSet::new(num_groups))
@@ -1405,6 +1433,7 @@ impl DFA {
         possible_future_group_ids: BitSet,
     ) {
         self.invalidate_min_match_byte_len();
+        self.invalidate_structural_hash();
         if let Some(entry) = self.state_mut(state) {
             entry.finalizers = finalizers;
             entry.possible_future_group_ids = possible_future_group_ids;
@@ -1441,6 +1470,7 @@ impl DFA {
     }
 
     pub(super) fn set_group_u8set(&mut self, group_id: GroupId, set: U8Set) {
+        self.invalidate_structural_hash();
         if let Some(entry) = self.group_id_to_u8set.get_mut(group_id as usize) {
             *entry = set;
         }
@@ -1499,12 +1529,14 @@ impl DFA {
     }
 
     pub(super) fn set_possible_future_group_ids(&mut self, state: u32, ids: BitSet) {
+        self.invalidate_structural_hash();
         if let Some(entry) = self.state_mut(state) {
             entry.possible_future_group_ids = ids;
         }
     }
     /// Mask all states' possible_future_group_ids with the given bitset.
     pub(super) fn mask_possible_futures(&mut self, mask: &BitSet) {
+        self.invalidate_structural_hash();
         for state in &mut self.states {
             state.possible_future_group_ids.intersect_with(mask);
         }
@@ -1568,6 +1600,10 @@ impl DFA {
                 }
             }
         }
+        if changed {
+            self.invalidate_min_match_byte_len();
+            self.invalidate_structural_hash();
+        }
         changed
     }
 
@@ -1583,6 +1619,10 @@ impl DFA {
                     changed = true;
                 }
             }
+        }
+        if changed {
+            self.invalidate_min_match_byte_len();
+            self.invalidate_structural_hash();
         }
         changed
     }
@@ -1811,6 +1851,84 @@ mod tests {
             hasher.finish()
         };
         assert_eq!(hash(&left), hash(&right));
+    }
+
+    #[test]
+    fn structural_hash_cache_invalidates_on_metadata_mutation() {
+        use std::collections::hash_map::DefaultHasher;
+        use std::hash::{Hash, Hasher};
+
+        let hash = |dfa: &DFA| {
+            let mut hasher = DefaultHasher::new();
+            dfa.hash(&mut hasher);
+            hasher.finish()
+        };
+        let cache_hash = |dfa: &DFA| {
+            let value = hash(dfa);
+            assert!(dfa.structural_hash_cache.get().is_some());
+            value
+        };
+
+        let mut dfa = DFA::new(2);
+        dfa.ensure_group_capacity(1);
+        dfa.add_transition(0, b'a', 1);
+        let mut accepting = BitSet::new(1);
+        accepting.set(0);
+        dfa.overwrite_state_metadata(1, accepting, BitSet::new(1));
+        let original_hash = cache_hash(&dfa);
+
+        dfa.ensure_group_mapping_capacity(2);
+        assert!(dfa.structural_hash_cache.get().is_none());
+        let mapping_hash = cache_hash(&dfa);
+        assert_ne!(mapping_hash, original_hash);
+
+        // The mapping is already wide here; this call changes only the state
+        // metadata bitset widths and must still invalidate the hash.
+        dfa.ensure_group_capacity(2);
+        assert!(dfa.structural_hash_cache.get().is_none());
+        let wide_hash = cache_hash(&dfa);
+        assert_ne!(wide_hash, mapping_hash);
+
+        let mut finalizers = BitSet::new(2);
+        finalizers.set(0);
+        finalizers.set(1);
+        let mut futures = BitSet::new(2);
+        futures.set(1);
+        dfa.overwrite_state_metadata(1, finalizers, futures);
+        assert!(dfa.structural_hash_cache.get().is_none());
+        let metadata_hash = cache_hash(&dfa);
+        assert_ne!(metadata_hash, wide_hash);
+
+        dfa.set_group_u8set(1, U8Set::single(b'z'));
+        assert!(dfa.structural_hash_cache.get().is_none());
+        let group_hash = cache_hash(&dfa);
+        assert_ne!(group_hash, metadata_hash);
+
+        let mut new_futures = BitSet::new(2);
+        new_futures.set(0);
+        dfa.set_possible_future_group_ids(0, new_futures);
+        assert!(dfa.structural_hash_cache.get().is_none());
+        let futures_hash = cache_hash(&dfa);
+        assert_ne!(futures_hash, group_hash);
+
+        let mut mask = BitSet::new(2);
+        mask.set(0);
+        dfa.mask_possible_futures(&mask);
+        assert!(dfa.structural_hash_cache.get().is_none());
+        let _ = cache_hash(&dfa);
+
+        let exclusions = BTreeMap::from([(0u32, BTreeSet::from([1u32]))]);
+        assert!(dfa.apply_group_exclusions(&exclusions));
+        assert!(dfa.structural_hash_cache.get().is_none());
+        let _ = cache_hash(&dfa);
+
+        let mut only_zero = BitSet::new(2);
+        only_zero.set(0);
+        dfa.overwrite_state_metadata(1, only_zero, BitSet::new(2));
+        let _ = cache_hash(&dfa);
+        let intersections = BTreeMap::from([(0u32, BTreeSet::from([1u32]))]);
+        assert!(dfa.apply_group_intersections(&intersections));
+        assert!(dfa.structural_hash_cache.get().is_none());
     }
 
     #[test]

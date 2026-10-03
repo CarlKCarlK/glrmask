@@ -15,7 +15,8 @@ use crate::Vocab;
 
 use super::l2p::equivalence_analysis::compat::FlatDfa;
 use super::l2p::equivalence_analysis::state_equivalence::nfa::{
-    TokenBoundedAnalysisTrie, build_bounded_analysis_view_from_combined_starts_with_trie,
+    TokenBoundedAnalysisTrie,
+    build_bounded_analysis_view_from_combined_starts_prefix_only_with_trie,
     build_token_bounded_analysis_view_from_combined_starts,
 };
 use super::types::TerminalPathLength;
@@ -2877,6 +2878,7 @@ fn tokens_have_exact_active_l2p_boundary_deterministic<
     active_bitset: &BitSet,
     disallowed_follows: &BTreeMap<u32, BitSet>,
     active_start_states: &[u32],
+    mut suffix_has_allowed: impl FnMut(&S, &[u8], &BitSet) -> bool,
 ) -> Vec<bool> {
     let total_started_at = std::time::Instant::now();
     let trie_started_at = std::time::Instant::now();
@@ -2980,11 +2982,7 @@ fn tokens_have_exact_active_l2p_boundary_deterministic<
                     suffixes_evaluated += 1;
                     let suffix_start = split_after + 1;
                     let suffix_has_allowed_terminal =
-                        suffix_has_allowed_l2p_follow_deterministic(
-                            scanner,
-                            &bytes[suffix_start..],
-                            allowed,
-                        );
+                        suffix_has_allowed(scanner, &bytes[suffix_start..], allowed);
                     suffixes_with_terminals += usize::from(suffix_has_allowed_terminal);
                     suffix_has_allowed_terminal
                 })
@@ -6316,6 +6314,7 @@ fn tokens_have_exact_active_l2p_boundary(
             active_bitset,
             disallowed_follows,
             active_start_states,
+            suffix_has_allowed_l2p_follow_deterministic,
         );
         assert_exact_boundary_batch_matches_scalar_reference(
             tokenizer,
@@ -6336,7 +6335,7 @@ fn tokens_have_exact_active_l2p_boundary(
     let active_groups = (0..active_bitset.len())
         .map(|terminal| active_bitset.contains(terminal))
         .collect::<Vec<_>>();
-    let bounded = build_bounded_analysis_view_from_combined_starts_with_trie(
+    let bounded = build_bounded_analysis_view_from_combined_starts_prefix_only_with_trie(
         tokenizer,
         &raw_start_states,
         tokens,
@@ -6364,6 +6363,9 @@ fn tokens_have_exact_active_l2p_boundary(
         active_bitset,
         disallowed_follows,
         &view_start_states,
+        |_, suffix, allowed| {
+            suffix_has_allowed_l2p_follow_from_reset(tokenizer, suffix, allowed)
+        },
     );
     let batch_ms = batch_started_at.elapsed().as_secs_f64() * 1000.0;
 

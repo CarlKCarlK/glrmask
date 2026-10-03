@@ -4266,7 +4266,12 @@ fn residual_finite_switch_states(input: BuildInput<'_>) -> usize {
         // projected kernel instead.
         ("GLRMASK_P5_RESIDUAL_FINITE_SWITCH_STATES", 50_000)
     } else if input.vocab.len() >= 50_000 {
-        ("GLRMASK_L1_RESIDUAL_FINITE_SWITCH_STATES", 9_000)
+        // The original 9K handoff predated the sparse-root, grouped-minimize,
+        // dense-reverse, and reverse-trie residual improvements. Revalidation
+        // on the 128K ordinary corpus shows the residual kernel remains cheaper
+        // through the ~20K projected-state regime; switching earlier throws
+        // away useful residual work and makes the p2 tail substantially slower.
+        ("GLRMASK_L1_RESIDUAL_FINITE_SWITCH_STATES", 20_000)
     } else {
         return usize::MAX;
     };

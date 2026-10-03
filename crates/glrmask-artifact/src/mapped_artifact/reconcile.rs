@@ -1592,13 +1592,19 @@ pub fn remap_weights_with_maps(
             }
         };
 
-    // Parser-family reconciliation often has 100-200 unique weights whose remaps
-    // are individually substantial; 256 leaves that expensive middle regime serial.
+    // The shared token-set precompute removes the per-weight token-remap cache
+    // dependency, so the remaining unique weight remaps are independent work.
+    // Once there is at least one such weight per worker, let Rayon schedule them;
+    // otherwise retain the higher generic cutoff to avoid parallel overhead on
+    // cheap remaps that do not use the shared precompute.
     const PARALLEL_UNIQUE_WEIGHT_THRESHOLD: usize = 128;
+    let compile_threads = rayon::current_num_threads();
+    let parallel_unique_remap = compile_threads > 1
+        && (unique_weights.len() >= PARALLEL_UNIQUE_WEIGHT_THRESHOLD
+            || (precomputed_token_sets.is_some()
+                && unique_weights.len() >= compile_threads));
     let unique_remap_started_at = profiling.then(Instant::now);
-    let remapped_unique: Vec<Weight> = if unique_weights.len() >= PARALLEL_UNIQUE_WEIGHT_THRESHOLD
-        && rayon::current_num_threads() > 1
-    {
+    let remapped_unique: Vec<Weight> = if parallel_unique_remap {
         unique_weights
             .par_iter()
             .map(|weight| remap_one(weight, precomputed_token_sets.as_ref()))

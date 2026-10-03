@@ -17,6 +17,7 @@ type CancellationTask = (u32, u32, i32);
 type QueryWeights = Vec<SmallQueryWeights>;
 type DerivedEpsilons = Vec<SmallTargetWeights>;
 type SubsetMemo = FxHashMap<(usize, usize), bool>;
+type SingleIntersectionMemo = FxHashMap<(usize, usize), (Weight, Weight, Weight)>;
 
 /// Wave scheduling pays two parallel-iterator setup costs per DAG layer.  This
 /// many predecessor edges per Rayon worker is enough to amortize that work on
@@ -243,6 +244,36 @@ fn intersect_with_single_weight_hint(
     }
 }
 
+fn intersect_with_single_weight_hint_cached(
+    left: &Weight,
+    left_single: Option<&(u32, u32, Arc<RangeSetBlaze<u32>>)>,
+    right: &Weight,
+    memo: &mut SingleIntersectionMemo,
+) -> Weight {
+    if left.is_full() {
+        return right.clone();
+    }
+    if right.is_full() {
+        return left.clone();
+    }
+    let Some((start, end, tokens)) = left_single else {
+        return left.intersection(right);
+    };
+
+    let key = (left.ptr_key(), right.ptr_key());
+    if let Some((cached_left, cached_right, result)) = memo.get(&key) {
+        debug_assert!(cached_left.storage_ptr_eq(left));
+        debug_assert!(cached_right.storage_ptr_eq(right));
+        return result.clone();
+    }
+
+    let result = right.intersect_single_parts(*start, *end, tokens);
+    // Holding both operands strongly makes pointer identity a safe cache key:
+    // neither address can be recycled while the entry is resident.
+    memo.insert(key, (left.clone(), right.clone(), result.clone()));
+    result
+}
+
 fn intersect_or_clone_right_if_subset(left: &Weight, right: &Weight) -> Weight {
     if right.is_subset(left) {
         right.clone()
@@ -462,18 +493,20 @@ fn propagate_query_through_derived_epsilons(
     worklist: &mut VecDeque<CancellationTask>,
     derived_epsilons: &DerivedEpsilons,
     foreign_derived: Option<&DerivedEpsilons>,
+    single_intersection_memo: &mut SingleIntersectionMemo,
 ) {
     let local = &derived_epsilons[current_state as usize];
     let foreign = foreign_derived.map(|derived| &derived[current_state as usize]);
 
-    let propagate = |target_state: u32,
-                     epsilon_weight: &Weight,
-                     query_weights: &mut QueryWeights,
-                     worklist: &mut VecDeque<CancellationTask>| {
-        let propagated = intersect_with_single_weight_hint(
+    let mut propagate = |target_state: u32,
+                         epsilon_weight: &Weight,
+                         query_weights: &mut QueryWeights,
+                         worklist: &mut VecDeque<CancellationTask>| {
+        let propagated = intersect_with_single_weight_hint_cached(
             query_weight_to_current,
             query_single,
             epsilon_weight,
+            single_intersection_memo,
         );
         if propagated.is_empty() {
             return;
@@ -510,11 +543,13 @@ fn extend_derived_epsilons(
     worklist: &mut VecDeque<CancellationTask>,
     derived_epsilons: &mut DerivedEpsilons,
     subset_memo: &mut SubsetMemo,
+    single_intersection_memo: &mut SingleIntersectionMemo,
 ) {
-    let new_derived_weight = intersect_with_single_weight_hint(
+    let new_derived_weight = intersect_with_single_weight_hint_cached(
         query_weight_to_current,
         query_single,
         edge_weight,
+        single_intersection_memo,
     );
     if new_derived_weight.is_empty() {
         return;
@@ -1068,6 +1103,7 @@ where
     let mut derived_epsilons: DerivedEpsilons =
         vec![SmallTargetWeights::Empty; state_count as usize];
     let mut subset_memo = SubsetMemo::default();
+    let mut single_intersection_memo = SingleIntersectionMemo::default();
     let use_dead_task_fast_path =
         state_count as usize >= DEAD_CANCELLATION_FAST_PATH_MIN_STATES;
 
@@ -1134,6 +1170,7 @@ where
             &mut worklist,
             &derived_epsilons,
             foreign_derived,
+            &mut single_intersection_memo,
         );
 
         if let Some(positive_targets) = positive_targets {
@@ -1149,6 +1186,7 @@ where
                         &mut worklist,
                         &mut derived_epsilons,
                         &mut subset_memo,
+                        &mut single_intersection_memo,
                     );
                 }
             }
@@ -1159,7 +1197,7 @@ where
                 extend_derived_epsilons(
                     &query_weight_to_current, query_single.as_ref(), source_state,
                     *target_state, edge_weight, &mut query_weights, &mut worklist,
-                    &mut derived_epsilons, &mut subset_memo,
+                    &mut derived_epsilons, &mut subset_memo, &mut single_intersection_memo,
                 );
             }
         }
@@ -1177,6 +1215,7 @@ where
                         &mut worklist,
                         &mut derived_epsilons,
                         &mut subset_memo,
+                        &mut single_intersection_memo,
                     );
                 }
             }
@@ -1187,10 +1226,11 @@ where
                 continue;
             }
 
-            let propagated = intersect_with_single_weight_hint(
+            let propagated = intersect_with_single_weight_hint_cached(
                 &query_weight_to_current,
                 query_single.as_ref(),
                 epsilon_weight,
+                &mut single_intersection_memo,
             );
             if propagated.is_empty() {
                 continue;
