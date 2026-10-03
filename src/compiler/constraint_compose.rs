@@ -26199,6 +26199,11 @@ table: &child_table,
         Box::new(Constraint::load(&source.save()).unwrap())
     }
 
+    #[inline(never)]
+    fn scoped_oracle_test_start(source: &Constraint) -> Box<crate::runtime::state::ConstraintState<'_>> {
+        Box::new(source.start())
+    }
+
     #[test]
     fn scoped_ignore_oracle_survives_reload_and_nested_recomposition() {
         let vocab = Vocab::new(vec![
@@ -26320,10 +26325,10 @@ table: &child_table,
             &[22],
         ];
         for &sequence in valid_sequences {
-            let mut actual = composed.start();
-            let mut dynamic = composed_dynamic.start();
-            let mut restored = loaded.start();
-            let mut expected = monolithic.start();
+            let mut actual = scoped_oracle_test_start(&composed);
+            let mut dynamic = scoped_oracle_test_start(&composed_dynamic);
+            let mut restored = scoped_oracle_test_start(&loaded);
+            let mut expected = scoped_oracle_test_start(&monolithic);
             for &token in sequence {
                 assert_eq!(actual.mask(), expected.mask(), "mask before {sequence:?} token {token}");
                 assert_eq!(dynamic.mask(), expected.mask(), "dynamic mask before {sequence:?} token {token}");
@@ -26343,10 +26348,10 @@ table: &child_table,
         // parsing, and child trivia must not leak back into the parent after
         // the child has returned.
         for sequence in [&[2u32, 13][..], &[19][..], &[21][..]] {
-            let mut actual = composed.start();
-            let mut dynamic = composed_dynamic.start();
-            let mut restored = loaded.start();
-            let mut expected = monolithic.start();
+            let mut actual = scoped_oracle_test_start(&composed);
+            let mut dynamic = scoped_oracle_test_start(&composed_dynamic);
+            let mut restored = scoped_oracle_test_start(&loaded);
+            let mut expected = scoped_oracle_test_start(&monolithic);
             for &token in &sequence[..sequence.len() - 1] {
                 actual.commit_token(token).unwrap();
                 dynamic.commit_token(token).unwrap();
@@ -26410,9 +26415,9 @@ table: &child_table,
             "outer-dynamic-vs-outer-monolithic",
         );
         for sequence in [&[0u32, 16, 1][..], &[14, 6, 15][..], &[17][..]] {
-            let mut actual = outer.start();
-            let mut dynamic = outer_dynamic.start();
-            let mut expected = outer_monolithic.start();
+            let mut actual = scoped_oracle_test_start(&outer);
+            let mut dynamic = scoped_oracle_test_start(&outer_dynamic);
+            let mut expected = scoped_oracle_test_start(&outer_monolithic);
             for &token in sequence {
                 assert_eq!(actual.mask(), expected.mask(), "outer mask before {sequence:?} token {token}");
                 assert_eq!(dynamic.mask(), expected.mask(), "outer dynamic mask before {sequence:?} token {token}");
@@ -26425,9 +26430,9 @@ table: &child_table,
             assert!(expected.is_accepting(), "outer reference incomplete for {sequence:?}");
         }
 
-        let mut actual = outer.start();
-        let mut dynamic = outer_dynamic.start();
-        let mut expected = outer_monolithic.start();
+        let mut actual = scoped_oracle_test_start(&outer);
+        let mut dynamic = scoped_oracle_test_start(&outer_dynamic);
+        let mut expected = scoped_oracle_test_start(&outer_monolithic);
         assert_eq!(actual.commit_token(23).is_ok(), expected.commit_token(23).is_ok());
         assert_eq!(dynamic.commit_token(23).is_ok(), expected.commit_token(23).is_ok());
         assert!(!expected.is_accepting());
