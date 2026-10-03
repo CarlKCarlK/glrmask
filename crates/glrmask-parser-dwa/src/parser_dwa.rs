@@ -6856,6 +6856,21 @@ fn determinize_parser_dwa_with_fallbacks_and_classes(
     pop_classes: Option<&crate::pop_classes::PopLabelClasses>,
     edge_budget: usize,
 ) -> Result<DWA, String> {
+    determinize_parser_dwa_with_fallbacks_and_classes_reuse(
+        dwa, possible_by_state, num_parser_states, normalize_singletons,
+        pop_classes, edge_budget, true,
+    )
+}
+
+fn determinize_parser_dwa_with_fallbacks_and_classes_reuse(
+    dwa: &DWA,
+    possible_by_state: &[PossibleOutgoingIds],
+    num_parser_states: u32,
+    normalize_singletons: bool,
+    pop_classes: Option<&crate::pop_classes::PopLabelClasses>,
+    edge_budget: usize,
+    reuse_last_class_derivative: bool,
+) -> Result<DWA, String> {
     fn subset_key(entries: &[(u32, Weight)]) -> Vec<(u32, usize)> {
         entries.iter().map(|(sid, w)| (*sid, w.ptr_key())).collect()
     }
@@ -7324,7 +7339,30 @@ fn determinize_parser_dwa_with_fallbacks_and_classes(
         // row membership and contribution charge. Reuse this pure row-local
         // result while keeping explicit contributions in the derivative key.
         let mut row_memberships = FxHashMap::<u64,(RowClassMembershipBits,usize)>::default();
+        // Consecutive symbols often repeat the same global membership with
+        // no explicit contribution. The already-completed derivative also
+        // records the original per-symbol membership and merged-work charges.
+        let mut last_class_derivative: Option<(u64, usize, u32, Weight, usize)> = None;
         let mut process_label = |label: i32, mut contribs: TargetContribs, is_concrete_dense: bool| -> Result<(), String> {
+            let global_empty = if reuse_last_class_derivative && is_concrete_dense
+                && contribs.is_empty() && !class_raw_targets.is_empty() {
+                class_membership_by_symbol.as_ref().map(|values| values[label as usize])
+            } else { None };
+            if let (Some(global), Some((previous, work, to_state, edge_weight, merged_len))) =
+                (global_empty, last_class_derivative.as_ref())
+                && global == *previous {
+                class_work = class_work.checked_sub(*work).ok_or("class derivative work budget exceeded")?;
+                class_work = class_work.checked_sub(*merged_len).ok_or("class derivative work budget exceeded")?;
+                class_edges = class_edges.checked_add(1).ok_or("class derivative edge overflow")?;
+                if class_edges > edge_budget || result.states().len() >= 1_000_000 {
+                    return Err("class derivative representation budget exceeded; no partial predicate returned".into());
+                }
+                row_group_hits += 1;
+                row_group_symbols += 1;
+                result.add_transition(from_state, label, *to_state, edge_weight.clone());
+                return Ok(());
+            }
+            let mut global_work = None;
             let mut maybe_key = None;
             let mut keepalive = None;
             if is_concrete_dense && pop_classes.is_some() && !class_raw_targets.is_empty() {
@@ -7350,6 +7388,7 @@ fn determinize_parser_dwa_with_fallbacks_and_classes(
                     // Exactly the original one charge per live class plus
                     // each matching class's contribution count, on every label.
                     class_work = class_work.checked_sub(work).ok_or("class derivative work budget exceeded")?;
+                    if global_empty.is_some() { global_work = Some(work); }
                     membership
                 } else {
                     let mut membership: RowClassMembershipBits = smallvec::smallvec![0u64; (num_classes + 63) / 64];
@@ -7376,6 +7415,10 @@ fn determinize_parser_dwa_with_fallbacks_and_classes(
                         class_edges = class_edges.checked_add(1).ok_or("class derivative edge overflow")?;
                         if class_edges > edge_budget || result.states().len() >= 1_000_000 {
                             return Err("class derivative representation budget exceeded; no partial predicate returned".into());
+                        }
+                        if let (Some(global), Some(work)) = (global_empty, global_work) {
+                            last_class_derivative = Some((global, work, cached.to_state,
+                                cached.edge_weight.clone(), cached.merged_len));
                         }
                         result.add_transition(from_state, label, cached.to_state, cached.edge_weight.clone());
                         return Ok(());
@@ -7494,6 +7537,9 @@ fn determinize_parser_dwa_with_fallbacks_and_classes(
                 }
             };
 
+            if let (Some(global), Some(work)) = (global_empty, global_work) {
+                last_class_derivative = Some((global, work, to_state, edge_weight.clone(), merged_len));
+            }
             if let (Some(cache), Some(key), Some(keepalive)) =
                 (row_class_cache.as_mut(), maybe_key, keepalive)
             {
@@ -11777,3 +11823,45 @@ fn exact_guard_class_union_preserves_empty_rows_full_explicit_and_wildcards(){
 #[cfg(test)]
 #[path = "empty_stack_domain_tests.rs"]
 mod empty_stack_domain_tests;
+
+#[cfg(test)]
+#[test]
+fn consecutive_pop_derivative_reuse_matches_predecessor_rows_and_budgets() {
+    use crate::pop_classes::PopLabelClasses;
+    use range_set_blaze::RangeSetBlaze;
+    for seed in 0..96u32 {
+        let mut classes = PopLabelClasses::new(24).unwrap();
+        let a = classes.intern_scoped_complement(0..16, [2, 5, 11]).unwrap().unwrap();
+        let b = classes.intern_scoped_complement(4..24, [7, 18]).unwrap().unwrap();
+        let c = classes.intern_complement([3, 8, 19]).unwrap().unwrap();
+        let mut input = DWA::from_parts(vec![DWAState::default(); 7], 0);
+        for state in 0..6u32 {
+            for (index, label) in [a, b, c, 4, 9, 15].into_iter().enumerate() {
+                let bits = (seed.wrapping_mul(17) + state * 5 + index as u32) % 8;
+                let weight = Weight::from_uniform(0..=0,
+                    (0..3u32).filter(|id| bits & (1 << id) != 0).collect::<RangeSetBlaze<u32>>());
+                input.add_transition(state, label, 1 + (state + index as u32) % 6, weight);
+            }
+            if (state + seed) % 3 == 0 { input.set_final_weight(state, Weight::all()); }
+        }
+        input.set_final_weight(6, Weight::all());
+        for budget in [0, 1, 5, 24, 48, 100, 100_000] {
+            let expected = determinize_parser_dwa_with_fallbacks_and_classes_reuse(
+                &input, &[], 24, true, Some(&classes), budget, false);
+            let actual = determinize_parser_dwa_with_fallbacks_and_classes_reuse(
+                &input, &[], 24, true, Some(&classes), budget, true);
+            match (expected, actual) {
+                (Err(a), Err(b)) => assert_eq!(a, b, "seed={seed} budget={budget}"),
+                (Ok(a), Ok(b)) => {
+                    assert_eq!(a.start_state(), b.start_state());
+                    assert_eq!(a.states().len(), b.states().len());
+                    for (i, (a, b)) in a.states().iter().zip(b.states()).enumerate() {
+                        assert_eq!(a.final_weight, b.final_weight, "seed={seed} row={i}");
+                        assert_eq!(a.transitions, b.transitions, "seed={seed} row={i}");
+                    }
+                }
+                _ => panic!("result mismatch seed={seed} budget={budget}"),
+            }
+        }
+    }
+}
