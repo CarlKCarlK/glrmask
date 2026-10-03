@@ -42,6 +42,16 @@ type DeferredFinalEntries = SmallVec<[(u32, Weight); 4]>;
 type FinalPathWeights = SmallVec<[Weight; 4]>;
 type FinalGroups = SmallVec<[(Weight, FinalPathWeights); 4]>;
 type FinalWeightSignature = SmallVec<[(usize, usize); 4]>;
+type RowClassMembershipBits = SmallVec<[u64; 1]>;
+type RowClassExplicitContribSig = SmallVec<[(u32, usize); 4]>;
+type RowClassDerivativeKey = (RowClassMembershipBits, RowClassExplicitContribSig);
+
+struct CachedRowDerivative {
+    to_state: u32,
+    edge_weight: Weight,
+    merged_len: usize,
+    _keepalive: TargetContribs,
+}
 
 /// The former key grouped a sorted set of path-weight identities under each
 /// final-weight identity. Sorted unique pairs encode exactly that same key,
@@ -6913,6 +6923,9 @@ fn determinize_parser_dwa_with_fallbacks_and_classes(
     let mut class_dead_state = None;
     let mut class_edges = 0usize;
     let mut class_work = 256_000_000usize;
+    let mut row_group_hits = 0usize;
+    let mut row_group_misses = 0usize;
+    let mut row_group_symbols = 0usize;
 
     let mut intersection_cache = ScopedWeightOpCache::default();
     let mut key_buf: Vec<(u32, usize)> = Vec::new();
@@ -7018,6 +7031,8 @@ fn determinize_parser_dwa_with_fallbacks_and_classes(
             .or_else(|| worklist.pop_front())
             .expect("fallback determinizer work queues unexpectedly empty");
         dense_default_all_raw_targets.clear();
+        let mut row_class_cache: Option<FxHashMap<RowClassDerivativeKey, CachedRowDerivative>> =
+            pop_classes.is_some().then(FxHashMap::default);
         if let Some(detail) = detail.as_mut() {
             detail.states_processed += 1;
         }
@@ -7280,17 +7295,7 @@ fn determinize_parser_dwa_with_fallbacks_and_classes(
                 }
             }
             default_touched = !default_raw_targets.is_empty() && touched_dense_labels.len() < dense_label_limit;
-            for &symbol in &touched_dense_labels {
-                for (&label, contributions) in &class_raw_targets {
-                    class_work = class_work.checked_sub(1).ok_or("class derivative work budget exceeded")?;
-                    if classes.matches(label, symbol as u32) {
-                        class_work = class_work.checked_sub(contributions.len()).ok_or("class derivative work budget exceeded")?;
-                        extend_target_contribs(&mut dense_raw_targets[symbol], contributions);
-                    }
-                }
-            }
             if !default_touched { default_raw_targets.clear(); }
-            class_raw_targets.clear();
         }
         if let (Some(detail), Some(started_at)) = (detail.as_mut(), scan_started) {
             detail.intersection_scan_ms += elapsed_ms(started_at);
@@ -7298,7 +7303,51 @@ fn determinize_parser_dwa_with_fallbacks_and_classes(
 
         let label_started = detail.as_ref().map(|_| Instant::now());
         let class_default_present = pop_classes.is_some() && default_touched;
-        let mut process_label = |label: i32, mut contribs: TargetContribs| -> Result<(), String> {
+        let mut process_label = |label: i32, mut contribs: TargetContribs, is_concrete_dense: bool| -> Result<(), String> {
+            let mut maybe_key = None;
+            let mut keepalive = None;
+            if is_concrete_dense && pop_classes.is_some() && !class_raw_targets.is_empty() {
+                let classes = pop_classes.unwrap();
+                let num_classes = class_raw_targets.len();
+                let mut membership: RowClassMembershipBits = smallvec::smallvec![0u64; (num_classes + 63) / 64];
+                for (class_idx, (&class_label, class_contribs)) in class_raw_targets.iter().enumerate() {
+                    class_work = class_work.checked_sub(1).ok_or("class derivative work budget exceeded")?;
+                    if classes.matches(class_label, label as u32) {
+                        class_work = class_work.checked_sub(class_contribs.len()).ok_or("class derivative work budget exceeded")?;
+                        membership[class_idx / 64] |= 1u64 << (class_idx % 64);
+                    }
+                }
+                let explicit_sig: RowClassExplicitContribSig = contribs
+                    .iter()
+                    .map(|(sid, w)| (*sid, w.ptr_key()))
+                    .collect();
+                let key: RowClassDerivativeKey = (membership.clone(), explicit_sig);
+
+                if let Some(cache) = row_class_cache.as_ref() {
+                    if let Some(cached) = cache.get(&key) {
+                        row_group_hits += 1;
+                        row_group_symbols += 1;
+                        class_work = class_work.checked_sub(cached.merged_len).ok_or("class derivative work budget exceeded")?;
+                        class_edges = class_edges.checked_add(1).ok_or("class derivative edge overflow")?;
+                        if class_edges > edge_budget || result.states().len() >= 1_000_000 {
+                            return Err("class derivative representation budget exceeded; no partial predicate returned".into());
+                        }
+                        result.add_transition(from_state, label, cached.to_state, cached.edge_weight.clone());
+                        return Ok(());
+                    }
+                }
+
+                row_group_misses += 1;
+                row_group_symbols += 1;
+                keepalive = Some(contribs.clone());
+                for (class_idx, (&_class_label, class_contribs)) in class_raw_targets.iter().enumerate() {
+                    if (membership[class_idx / 64] & (1u64 << (class_idx % 64))) != 0 {
+                        extend_target_contribs(&mut contribs, class_contribs);
+                    }
+                }
+                maybe_key = Some(key);
+            }
+
             // Empty derivatives without a nonempty DEFAULT emit no edge and
             // must not spend the representation budget on an absent row.
             if contribs.is_empty() && (!class_default_present || label == DEFAULT_LABEL) {
@@ -7324,6 +7373,8 @@ fn determinize_parser_dwa_with_fallbacks_and_classes(
 
             let edge_weight = Weight::union_all(contribs.iter().map(|(_, weight)| weight));
             if edge_weight.is_empty() { return Ok(()); }
+
+            let merged_len = contribs.len();
 
             let to_state = if let [(only_state, only_weight)] = contribs.as_slice() {
                 if normalize_singletons {
@@ -7398,6 +7449,20 @@ fn determinize_parser_dwa_with_fallbacks_and_classes(
                 }
             };
 
+            if let (Some(cache), Some(key), Some(keepalive)) =
+                (row_class_cache.as_mut(), maybe_key, keepalive)
+            {
+                cache.insert(
+                    key,
+                    CachedRowDerivative {
+                        to_state,
+                        edge_weight: edge_weight.clone(),
+                        merged_len,
+                        _keepalive: keepalive,
+                    },
+                );
+            }
+
             result.add_transition(from_state, label, to_state, edge_weight);
             Ok(())
         };
@@ -7413,15 +7478,18 @@ fn determinize_parser_dwa_with_fallbacks_and_classes(
             process_label(
                 label_idx as i32,
                 std::mem::take(&mut dense_raw_targets[label_idx]),
+                true,
             )?;
         }
         if default_touched {
             default_touched = false;
-            process_label(DEFAULT_LABEL, std::mem::take(&mut default_raw_targets))?;
+            process_label(DEFAULT_LABEL, std::mem::take(&mut default_raw_targets), false)?;
         }
         for (label, contribs) in sparse_raw_targets.drain() {
-            process_label(label, contribs)?;
+            process_label(label, contribs, false)?;
         }
+        drop(process_label);
+        class_raw_targets.clear();
         if pop_classes.is_some() {
             let row = &mut result.states_mut()[from_state as usize].transitions;
             if let Some((target, weight)) = row.get(&DEFAULT_LABEL).cloned() {
@@ -7431,6 +7499,13 @@ fn determinize_parser_dwa_with_fallbacks_and_classes(
         if let (Some(detail), Some(started_at)) = (detail.as_mut(), label_started) {
             detail.label_processing_ms += elapsed_ms(started_at);
         }
+    }
+
+    if pop_classes.is_some() && compile_profile_enabled() {
+        eprintln!(
+            "[pop_class_row_derivative_groups] hits={} misses={} symbols={}",
+            row_group_hits, row_group_misses, row_group_symbols
+        );
     }
 
     if let Some(started) = fallback_started {

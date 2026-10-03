@@ -315,3 +315,371 @@ impl PopLabelClasses {
 #[cfg(test)]
 #[path = "pop_classes_tests.rs"]
 mod tests;
+
+#[cfg(test)]
+mod group_reuse_tests {
+    use super::*;
+    use crate::automata::weighted::dwa::{DWA, DWAState};
+    use range_set_blaze::RangeSetBlaze;
+
+    fn test_weight(bits: u8) -> Weight {
+        Weight::from_uniform(
+            0..=0,
+            (0..3u32)
+                .filter(|&id| bits & (1 << id) != 0)
+                .collect::<RangeSetBlaze<u32>>(),
+        )
+    }
+
+    fn test_bits(weight: &Weight) -> u8 {
+        (0..3).fold(0, |result, token| {
+            result | if weight.tokens_for_tsid(0).contains(token) { 1 << token } else { 0 }
+        })
+    }
+
+    fn literal_oracle(graph: &NWA, classes: &PopLabelClasses, stack: &[u32], prefix: bool) -> u8 {
+        let mut reached = BTreeMap::<(u32, Vec<u32>), u8>::new();
+        let mut queue = VecDeque::new();
+        for &state in graph.start_states() {
+            reached.insert((state, stack.to_vec()), 7);
+            queue.push_back((state, stack.to_vec()));
+        }
+        let mut result = 0;
+        while let Some(key) = queue.pop_front() {
+            let live = reached[&key];
+            let (state, cur_stack) = key;
+            let row = &graph.states()[state as usize];
+            if prefix || cur_stack.is_empty() {
+                if let Some(final_weight) = &row.final_weight {
+                    result |= live & test_bits(final_weight);
+                }
+            }
+            let mut add = |target: u32, next_stack: Vec<u32>, coefficient: &Weight| {
+                let value = live & test_bits(coefficient);
+                if value == 0 {
+                    return;
+                }
+                let key = (target, next_stack);
+                let previous = reached.entry(key.clone()).or_default();
+                if value & !*previous != 0 {
+                    *previous |= value;
+                    queue.push_back(key);
+                }
+            };
+            for (target, coefficient) in &row.epsilons {
+                add(*target, cur_stack.clone(), coefficient);
+            }
+            for (&label, targets) in &row.transitions {
+                let mut next = cur_stack.clone();
+                let Some(top) = next.pop() else { continue; };
+                if top as i32 != label && !classes.matches(label, top) {
+                    continue;
+                }
+                for (target, coefficient) in targets {
+                    add(*target, next.clone(), coefficient);
+                }
+            }
+            assert!(reached.len() < 100_000, "literal oracle finite graph check");
+        }
+        result
+    }
+
+    fn prefix_accepted(dwa: &DWA, stack: &[u32]) -> u8 {
+        let mut state = dwa.start_state();
+        let mut live = 7;
+        let mut result = dwa.states()[state as usize]
+            .final_weight
+            .as_ref()
+            .map_or(0, test_bits);
+        for &top in stack.iter().rev() {
+            let row = &dwa.states()[state as usize];
+            let Some((target, coefficient)) = row
+                .transitions
+                .get(&(top as i32))
+                .or_else(|| row.transitions.get(&DEFAULT_LABEL))
+            else {
+                break;
+            };
+            live &= test_bits(coefficient);
+            state = *target;
+            result |= live
+                & dwa.states()[state as usize]
+                    .final_weight
+                    .as_ref()
+                    .map_or(0, test_bits);
+        }
+        result
+    }
+
+    fn full_accepted(dwa: &DWA, stack: &[u32]) -> u8 {
+        let mut state = dwa.start_state();
+        let mut live = 7;
+        for &top in stack.iter().rev() {
+            let row = &dwa.states()[state as usize];
+            let Some((target, coefficient)) = row
+                .transitions
+                .get(&(top as i32))
+                .or_else(|| row.transitions.get(&DEFAULT_LABEL))
+            else {
+                return 0;
+            };
+            live &= test_bits(coefficient);
+            if live == 0 {
+                return 0;
+            }
+            state = *target;
+        }
+        live & dwa.states()[state as usize]
+            .final_weight
+            .as_ref()
+            .map_or(0, test_bits)
+    }
+
+    fn expand_to_literal_nwa(graph: &NWA, classes: &PopLabelClasses) -> NWA {
+        let mut states = vec![NWAState::default(); graph.states().len()];
+        for (source, row) in graph.states().iter().zip(&mut states) {
+            row.final_weight = source.final_weight.clone();
+            row.epsilons = source.epsilons.clone();
+            for (&label, targets) in &source.transitions {
+                if let Some(excluded) = classes.exclusion(label) {
+                    let domain = classes.domain(label).unwrap();
+                    for sym in domain.clone().filter(|s| excluded.binary_search(s).is_err()) {
+                        row.transitions.entry(sym as i32).or_default().extend(targets.iter().cloned());
+                    }
+                } else {
+                    row.transitions.entry(label).or_default().extend(targets.iter().cloned());
+                }
+            }
+        }
+        NWA::from_parts(states, graph.start_states().to_vec())
+    }
+
+    fn nwa_to_dwa(graph: &NWA) -> DWA {
+        let mut states = Vec::with_capacity(graph.states().len());
+        for source in graph.states() {
+            let mut state = DWAState::default();
+            state.final_weight = source.final_weight.clone();
+            for (&label, targets) in &source.transitions {
+                assert!(targets.len() <= 1, "graph row must be deterministic for direct DWA");
+                if let Some((target, weight)) = targets.first() {
+                    state.transitions.insert(label, (*target, weight.clone()));
+                }
+            }
+            states.push(state);
+        }
+        let start = *graph.start_states().first().expect("start state");
+        DWA::from_parts(states, start)
+    }
+
+    fn all_words(depth: usize, alphabet: u32) -> Vec<Vec<u32>> {
+        let mut all = vec![vec![]];
+        let mut layer = vec![vec![]];
+        for _ in 0..depth {
+            let mut next = Vec::new();
+            for word in layer {
+                for sym in 0..alphabet {
+                    let mut w = word.clone();
+                    w.push(sym);
+                    next.push(w);
+                }
+            }
+            all.extend(next.iter().cloned());
+            layer = next;
+        }
+        all
+    }
+
+    #[test]
+    fn regression_pop_class_group_reuse_matches_literal_expansion() {
+        let mut classes = PopLabelClasses::new(7).unwrap();
+        // Class A: domain 0..5, excluding [4]. (matches 0, 1, 2, 3)
+        let class_a = classes.intern_scoped_complement(0..5, [4]).unwrap().unwrap();
+        // Class B: domain 2..6, excluding [3, 4]. (matches 2, 5)
+        let class_b = classes.intern_scoped_complement(2..6, [3, 4]).unwrap().unwrap();
+
+        assert!(classes.matches(class_a, 0));
+        assert!(classes.matches(class_a, 1));
+        assert!(classes.matches(class_a, 2));
+        assert!(classes.matches(class_a, 3));
+        assert!(!classes.matches(class_a, 4));
+        assert!(!classes.matches(class_a, 5));
+        assert!(!classes.matches(class_a, 6));
+
+        assert!(!classes.matches(class_b, 0));
+        assert!(!classes.matches(class_b, 1));
+        assert!(classes.matches(class_b, 2));
+        assert!(!classes.matches(class_b, 3));
+        assert!(!classes.matches(class_b, 4));
+        assert!(classes.matches(class_b, 5));
+        assert!(!classes.matches(class_b, 6));
+
+        let mut graph = NWA::new(1, 3);
+        let start = graph.add_state();
+        let s1 = graph.add_state();
+        let s2 = graph.add_state();
+        let s3 = graph.add_state();
+        let s4 = graph.add_state();
+
+        graph.set_start_states(vec![start]);
+        graph.set_final_weight(s1, test_weight(1)); // bit 0
+        graph.set_final_weight(s2, test_weight(2)); // bit 1
+        graph.set_final_weight(s4, test_weight(6)); // bits 1, 2
+
+        // Root row:
+        // Classes A and B carry different correlated weights
+        graph.add_transition(start, class_a, s1, test_weight(1));
+        graph.add_transition(start, class_b, s2, test_weight(2));
+
+        // Explicit 0 -> s3 weight 2, explicit 1 -> s3 weight 4 (same target, different observable bits)
+        graph.add_transition(start, 0, s3, test_weight(2));
+        graph.add_transition(start, 1, s3, test_weight(4));
+
+        // Source explicit dead 4 -> s4 Weight::empty()
+        graph.add_transition(start, 4, s4, Weight::empty());
+
+        // Following row s3: SAME membership but DIFFERENT class coefficients (weight 6)
+        graph.add_transition(s3, class_a, s4, test_weight(6));
+        graph.add_transition(s3, class_b, s4, test_weight(6));
+
+        // Live weighted loop on s4 on class_a (weight 6)
+        graph.add_transition(s4, class_a, s4, test_weight(6));
+
+        let literal_nwa = expand_to_literal_nwa(&graph, &classes);
+        let empty_classes = PopLabelClasses::new(7).unwrap();
+
+        // Exercise production direct compile_positive_dwa
+        let dwa_direct = classes.compile_positive_dwa(nwa_to_dwa(&graph), 100_000).unwrap();
+        let dwa = classes.compile_positive(graph.clone(), 100_000).unwrap();
+
+        // Concrete assertions:
+        // [] rejects
+        assert_eq!(full_accepted(&dwa_direct, &[]), 0);
+        assert_eq!(prefix_accepted(&dwa_direct, &[]), 0);
+        assert_eq!(literal_oracle(&graph, &classes, &[], false), 0);
+        assert_eq!(literal_oracle(&graph, &classes, &[], true), 0);
+
+        // [0] root prefix 1, [1] root prefix 1
+        assert_eq!(prefix_accepted(&dwa_direct, &[0]), 1);
+        assert_eq!(prefix_accepted(&dwa_direct, &[1]), 1);
+        assert_eq!(literal_oracle(&graph, &classes, &[0], true), 1);
+        assert_eq!(literal_oracle(&graph, &classes, &[1], true), 1);
+
+        // Consuming matching symbols after 0 allows bit 1 (value 2), after 1 allows bit 2 (value 4)
+        assert_eq!(full_accepted(&dwa_direct, &[2, 0]), 2);
+        assert_eq!(full_accepted(&dwa_direct, &[2, 1]), 4);
+        assert_eq!(literal_oracle(&graph, &classes, &[2, 0], false), 2);
+        assert_eq!(literal_oracle(&graph, &classes, &[2, 1], false), 4);
+
+        // Continuing through live loop on s4 preserves bit 1 and bit 2
+        assert_eq!(full_accepted(&dwa_direct, &[0, 2, 0]), 2);
+        assert_eq!(full_accepted(&dwa_direct, &[0, 2, 1]), 4);
+        assert_eq!(literal_oracle(&graph, &classes, &[0, 2, 0], false), 2);
+        assert_eq!(literal_oracle(&graph, &classes, &[0, 2, 1], false), 4);
+
+        // Symbol 4 is explicitly dead
+        assert_eq!(full_accepted(&dwa_direct, &[4]), 0);
+        assert_eq!(prefix_accepted(&dwa_direct, &[4]), 0);
+
+        // Check exact prefix and full acceptance for all words through depth 4 over alphabet 0..7
+        for word in all_words(4, 7) {
+            let direct_prefix = prefix_accepted(&dwa_direct, &word);
+            let direct_full = full_accepted(&dwa_direct, &word);
+            let oracle_prefix = literal_oracle(&graph, &classes, &word, true);
+            let oracle_full = literal_oracle(&graph, &classes, &word, false);
+            let literal_prefix = literal_oracle(&literal_nwa, &empty_classes, &word, true);
+            let literal_full = literal_oracle(&literal_nwa, &empty_classes, &word, false);
+
+            assert_eq!(direct_prefix, oracle_prefix, "prefix mismatch on word {:?}", word);
+            assert_eq!(direct_full, oracle_full, "full mismatch on word {:?}", word);
+            assert_eq!(direct_prefix, literal_prefix, "literal prefix mismatch on word {:?}", word);
+            assert_eq!(direct_full, literal_full, "literal full mismatch on word {:?}", word);
+
+            let dwa_prefix = prefix_accepted(&dwa, &word);
+            let dwa_full = full_accepted(&dwa, &word);
+            assert_eq!(dwa_prefix, direct_prefix, "compile_positive prefix mismatch on word {:?}", word);
+            assert_eq!(dwa_full, direct_full, "compile_positive full mismatch on word {:?}", word);
+        }
+
+        // Budget refusal
+        assert!(classes.compile_positive(graph.clone(), 1).is_err(), "edge budget = 1 must be refused");
+        assert!(classes.compile_positive_dwa(nwa_to_dwa(&graph), 1).is_err(), "direct edge budget = 1 must be refused");
+    }
+
+    #[test]
+    fn regression_pop_class_arbitrary_word_membership_over_64_classes() {
+        let mut classes = PopLabelClasses::new(9).unwrap();
+        // FIRST intern distinguishing class domain 0..2 excludes [1] -> matches 0 only
+        // (this is LAST BTree active-class bit 64)
+        let dist_class = classes.intern_scoped_complement(0..2, [1]).unwrap().unwrap();
+        assert!(classes.matches(dist_class, 0));
+        assert!(!classes.matches(dist_class, 1));
+
+        // Intern 64 distinct foreign classes domain 2..9 with exclusions derived from 6-bit masks 0..63
+        // over symbols 2..7 (symbol 8 always included).
+        let mut foreign_classes = Vec::with_capacity(64);
+        for mask in 0..64u32 {
+            let mut exclusions = Vec::new();
+            for bit in 0..6 {
+                if (mask & (1 << bit)) != 0 {
+                    exclusions.push(2 + bit as u32);
+                }
+            }
+            let c = classes
+                .intern_scoped_complement(2..9, exclusions)
+                .unwrap()
+                .unwrap();
+            foreign_classes.push(c);
+        }
+        assert_eq!(classes.len(), 65);
+
+        let mut graph = NWA::new(1, 3);
+        let start = graph.add_state();
+        let target = graph.add_state();
+        graph.set_start_states(vec![start]);
+        graph.set_final_weight(target, test_weight(7));
+
+        // root distinguishing class -> target weight 2
+        graph.add_transition(start, dist_class, target, test_weight(2));
+        // remaining 64 classes -> same target weight 1
+        for &c in &foreign_classes {
+            graph.add_transition(start, c, target, test_weight(1));
+        }
+
+        let literal_nwa = expand_to_literal_nwa(&graph, &classes);
+        let empty_classes = PopLabelClasses::new(9).unwrap();
+
+        // Direct compile_positive_dwa
+        let dwa_direct = classes.compile_positive_dwa(nwa_to_dwa(&graph), 100_000).unwrap();
+        let dwa = classes.compile_positive(graph.clone(), 100_000).unwrap();
+
+        // Assert [0] exact 2 and [1] exact 0
+        assert_eq!(full_accepted(&dwa_direct, &[0]), 2);
+        assert_eq!(prefix_accepted(&dwa_direct, &[0]), 2);
+        assert_eq!(full_accepted(&dwa_direct, &[1]), 0);
+        assert_eq!(prefix_accepted(&dwa_direct, &[1]), 0);
+
+        assert_eq!(full_accepted(&dwa, &[0]), 2);
+        assert_eq!(prefix_accepted(&dwa, &[0]), 2);
+        assert_eq!(full_accepted(&dwa, &[1]), 0);
+        assert_eq!(prefix_accepted(&dwa, &[1]), 0);
+
+        // Independent literal NWA compare all words depth 2 alphabet 9 prefix/full
+        for word in all_words(2, 9) {
+            let direct_full = full_accepted(&dwa_direct, &word);
+            let direct_prefix = prefix_accepted(&dwa_direct, &word);
+            let oracle_full = literal_oracle(&graph, &classes, &word, false);
+            let oracle_prefix = literal_oracle(&graph, &classes, &word, true);
+            let literal_full = literal_oracle(&literal_nwa, &empty_classes, &word, false);
+            let literal_prefix = literal_oracle(&literal_nwa, &empty_classes, &word, true);
+
+            assert_eq!(direct_full, oracle_full, "direct full mismatch on word {:?}", word);
+            assert_eq!(direct_prefix, oracle_prefix, "direct prefix mismatch on word {:?}", word);
+            assert_eq!(direct_full, literal_full, "literal full mismatch on word {:?}", word);
+            assert_eq!(direct_prefix, literal_prefix, "literal prefix mismatch on word {:?}", word);
+        }
+
+        // Budget refusal
+        assert!(classes.compile_positive(graph.clone(), 1).is_err(), "edge budget = 1 must be refused");
+        assert!(classes.compile_positive_dwa(nwa_to_dwa(&graph), 1).is_err(), "direct edge budget = 1 must be refused");
+    }
+}
