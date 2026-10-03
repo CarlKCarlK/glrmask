@@ -3512,6 +3512,13 @@ pub(crate) fn runtime_dynamic_vocab_for_vocab(vocab: &Vocab) -> DynamicMaskVocab
     prepared_runtime_dynamic_vocab_for_vocab(vocab).fresh_runtime_instance()
 }
 
+// Recursive parser roots have no ordinary tokenizer-state coordinate. Keep the
+// complete token trie and aliases, without source-state LLG slice accelerators.
+pub(crate) fn runtime_dynamic_vocab_for_recursive_provider(vocab: &Vocab) -> DynamicMaskVocab {
+    let artifacts = get_ordered_vocab_trie_artifacts_for_vocab(vocab).0;
+    prepared_runtime_dynamic_vocab(&artifacts).fresh_runtime_instance()
+}
+
 /// Build the runtime vocabulary used by the partition-optimized dynamic masker.
 ///
 /// The constraint continues to own the complete original model vocabulary. This

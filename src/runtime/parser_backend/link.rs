@@ -181,7 +181,7 @@ pub(crate) fn compose(mut parent: Constraint, children: &[(String, Arc<Constrain
     if let Some(grammar) = parser.link_grammar.as_mut() {
         Arc::make_mut(grammar).root_nullable = nullable;
     }
-    let dynamic_vocab = crate::compiler::constraint_possible_matches::runtime_dynamic_vocab_for_vocab(vocab);
+    let dynamic_vocab = crate::compiler::constraint_possible_matches::runtime_dynamic_vocab_for_recursive_provider(vocab);
     let mut constraint = crate::dynamic_constraint::DynamicConstraint::from_template_runtime_parts_unfinalized(
         (*components[0].tokenizer).clone(), names, None, outer, Arc::new(parser), vocab, dynamic_vocab);
     constraint.late_grammar_slots = remaining_slots;
