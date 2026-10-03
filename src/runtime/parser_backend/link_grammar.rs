@@ -18,6 +18,9 @@ pub(crate) struct LinkGrammar {
     root_has_empty_rule: bool,
     source: Option<Arc<CompositionRecipe>>,
     flat: OnceLock<Arc<FlatLinkGrammar>>,
+    // Fresh dynamic links retain the exact outward-proof recipe. It is forced
+    // by a compiler/query/save consumer, never by current runtime masks.
+    pub(crate) deferred_boundary_summary: OnceLock<Arc<crate::compiler::boundary_candidates::DeferredCompositionSummary>>,
 }
 
 #[cfg(test)]
@@ -140,7 +143,7 @@ impl LinkGrammar {
             nonterminal_count: flat.nonterminal_names.len(),
             rule_count: flat.rules.len(), root_nonterminal: root,
             root_has_empty_rule: flat.rules.iter().any(|rule| rule.lhs == root && rule.rhs.is_empty()),
-            source: None, flat: OnceLock::from(flat),
+            source: None, flat: OnceLock::from(flat), deferred_boundary_summary: OnceLock::new(),
         })
     }
 
@@ -250,6 +253,7 @@ impl LinkGrammar {
             root_has_empty_rule: parent.root_has_empty_rule || parent.root_nullable,
             source: Some(Arc::new(CompositionRecipe { sources, terminal_offsets, slots,
                 state_offsets, state_count, effect_links })), flat: OnceLock::new(),
+            deferred_boundary_summary: OnceLock::new(),
         };
         grammar.validate_manifest()?;
         Ok(grammar)
