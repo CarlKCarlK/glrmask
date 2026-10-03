@@ -95,7 +95,8 @@ impl CompilerEffects {
     ) -> Result<Self,String> {
         if sources.is_empty() || sources.len() != offsets.len() || sources.len() != terminal_offsets.len()
             || offsets[0] != 0 || terminal_offsets[0] != 0 { return Err("invalid effect layout".into()); }
-        let mut effects = BTreeSet::new(); let mut entries = BTreeMap::new();
+        let mut effects = Vec::new(); let mut linked_effects = BTreeSet::new();
+        let mut entries = BTreeMap::new();
         for (i,source) in sources.iter().enumerate() {
             source.validate()?;
             if offsets[i].checked_add(source.states) != Some(offsets.get(i+1).copied().unwrap_or(states))
@@ -103,7 +104,20 @@ impl CompilerEffects {
             { return Err("incomplete compiler effect coordinate".into()); }
             let relocate = |e:&Effect| Effect { source:offsets[i]+e.source,
                 pop:e.pop, pushes:e.pushes.iter().map(|q|offsets[i]+q).collect() };
-            effects.extend(source.effects.iter().map(relocate));
+            // Disjoint source coordinates preserve their sorted order. A
+            // decoded source may be unsorted or duplicated: keep the same
+            // exact set semantics without allocating a tree node per effect.
+            if source.effects.windows(2).all(|pair| pair[0] <= pair[1]) {
+                let mut previous = None;
+                for effect in &source.effects {
+                    if previous != Some(effect) { effects.push(relocate(effect)); }
+                    previous = Some(effect);
+                }
+            } else {
+                let mut local = source.effects.iter().collect::<Vec<_>>();
+                local.sort_unstable(); local.dedup();
+                effects.extend(local.into_iter().map(relocate));
+            }
             for (&terminal,row) in &source.entries {
                 entries.insert(terminal_offsets[i]+terminal,row.iter().map(relocate).collect());
             }
@@ -113,16 +127,20 @@ impl CompilerEffects {
             let c = sources.get(child as usize).ok_or("invalid effect child")?;
             if start >= c.states { return Err("invalid effect child start".into()); }
             for e in p.entries.get(&slot).ok_or("uncertified compiler CALL effect")? {
-                effects.insert(Effect { source:offsets[parent as usize]+e.source, pop:e.pop,
+                linked_effects.insert(Effect { source:offsets[parent as usize]+e.source, pop:e.pop,
                     pushes:vec![offsets[parent as usize]+e.pushes[0],offsets[child as usize]+start] });
             }
             for &q in &c.accepting {
-                effects.insert(Effect { source:offsets[child as usize]+q, pop:pop as usize, pushes:vec![] });
+                linked_effects.insert(Effect { source:offsets[child as usize]+q, pop:pop as usize, pushes:vec![] });
             }
-            if nullable { effects.insert(Effect { source:offsets[child as usize]+start,pop:1,pushes:vec![] }); }
+            if nullable { linked_effects.insert(Effect { source:offsets[child as usize]+start,pop:1,pushes:vec![] }); }
             entries.remove(&(terminal_offsets[parent as usize]+slot));
         }
-        let summary = Self { states,terminals,effects:effects.into_iter().collect(),entries,
+        if !linked_effects.is_empty() {
+            effects.extend(linked_effects);
+            effects.sort_unstable(); effects.dedup();
+        }
+        let summary = Self { states,terminals,effects,entries,
             accepting:sources[0].accepting.clone() };
         summary.validate()?; Ok(summary)
     }
@@ -221,6 +239,12 @@ mod mapper_tests{
         for nullable in [false,true] {
             let links = [(0,1,1,0,1,nullable)];
             let composed = CompilerEffects::compose(&[&p,&c],&[0,3],&[0,2],&links,5,3).unwrap();
+            let mut unsorted=p.clone();
+            unsorted.effects.reverse();
+            unsorted.effects.push(p.effects[0].clone());
+            let repeated=[links[0],links[0]];
+            assert_eq!(CompilerEffects::compose(&[&unsorted,&c],&[0,3],&[0,2],&repeated,5,3).unwrap(),composed,
+                "unsorted source effects and duplicate CALL/RETURN records preserve the exact union");
             let decoded: CompilerEffects = bincode::deserialize(&bincode::serialize(&composed).unwrap()).unwrap();
             assert_eq!(decoded,composed);
             assert_eq!(decoded.effects,read_effects(&[&parent,&child],&[0,3],&links,5).unwrap());

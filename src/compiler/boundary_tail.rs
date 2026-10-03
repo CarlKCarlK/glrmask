@@ -15,6 +15,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::time::Instant;
 
 use rayon::prelude::*;
+use rustc_hash::FxHashMap;
 
 use crate::automata::lexer::ast::Expr;
 use crate::automata::lexer::tokenizer::Lexer;
@@ -392,7 +393,7 @@ fn byte_terminal_summary(
 
 fn byte_rule_summary(
     rule: &Rule,
-    nt: &BTreeMap<NonterminalID, BytePhaseSummary>,
+    nt: &FxHashMap<NonterminalID, BytePhaseSummary>,
     terminal: &[BytePhaseSummary],
 ) -> BytePhaseSummary {
     rule.rhs.iter().fold(BytePhaseSummary::identity(), |acc, symbol| {
@@ -431,7 +432,7 @@ fn summarize_rules_module_r1(
         })
         .collect::<Vec<_>>();
 
-    let mut nts = BTreeMap::<NonterminalID, BytePhaseSummary>::new();
+    let mut nts = FxHashMap::<NonterminalID, BytePhaseSummary>::default();
     for rule in rules {
         nts.entry(rule.lhs).or_insert_with(BytePhaseSummary::bottom);
         for symbol in &rule.rhs {
@@ -445,10 +446,11 @@ fn summarize_rules_module_r1(
     let mut iterations = 0usize;
     for iteration in 0..DEFAULT_FIXED_POINT_LIMIT {
         iterations = iteration + 1;
-        let snapshot = nts.clone();
-        let mut next = snapshot.clone();
+        // Read the unchanged current generation directly. A second snapshot
+        // clone contributes no information to this synchronous fixed point.
+        let mut next = nts.clone();
         for rule in rules {
-            let summary = byte_rule_summary(rule, &snapshot, &terminals);
+            let summary = byte_rule_summary(rule, &nts, &terminals);
             next.entry(rule.lhs)
                 .or_insert_with(BytePhaseSummary::bottom)
                 .union_with(summary);
@@ -779,11 +781,15 @@ fn component_entry_prefix_cover(constraint: &Constraint) -> Option<Vec<Vec<u8>>>
     }
     let rules = constraint.retained_table_rules().ok()?;
     let first_rule = rules.first()?;
-    let mut by_lhs = BTreeMap::<NonterminalID, Vec<&Rule>>::new();
-    for rule in rules {
-        by_lhs.entry(rule.lhs).or_default().push(rule);
+    // FIRST only follows lookup buckets; their iteration order is irrelevant.
+    // Store each rule link in one flat allocation instead of a tree node and
+    // a separately allocated rule vector for every nonterminal.
+    let mut by_lhs = rustc_hash::FxHashMap::<NonterminalID, usize>::default();
+    let mut next_rule = Vec::with_capacity(rules.len());
+    for (index, rule) in rules.iter().enumerate() {
+        next_rule.push(by_lhs.insert(rule.lhs, index));
     }
-    let mut nullable = BTreeSet::new();
+    let mut nullable = rustc_hash::FxHashSet::default();
     loop {
         let previous = nullable.len();
         for rule in rules {
@@ -802,14 +808,16 @@ fn component_entry_prefix_cover(constraint: &Constraint) -> Option<Vec<Vec<u8>>>
         return None;
     }
     let mut pending = vec![first_rule.lhs];
-    let mut seen = BTreeSet::new();
+    let mut seen = rustc_hash::FxHashSet::default();
     let mut first = BTreeSet::new();
     while let Some(nonterminal) = pending.pop() {
         if !seen.insert(nonterminal) {
             continue;
         }
-        for rule in by_lhs.get(&nonterminal)? {
-            for symbol in &rule.rhs {
+        let mut rule_index = Some(*by_lhs.get(&nonterminal)?);
+        while let Some(index) = rule_index {
+            rule_index = next_rule[index];
+            for symbol in &rules[index].rhs {
                 match symbol {
                     Symbol::Terminal(id) => {
                         first.insert(*id);
@@ -1308,7 +1316,7 @@ fn terminal_summary2(
 
 fn rule_summary2(
     rule: &Rule,
-    nt: &BTreeMap<NonterminalID, PhaseSummary2>,
+    nt: &FxHashMap<NonterminalID, PhaseSummary2>,
     terminals: &[PhaseSummary2],
 ) -> PhaseSummary2 {
     rule.rhs.iter().fold(PhaseSummary2::identity(), |acc, symbol| {
@@ -1339,7 +1347,7 @@ fn summarize_rules_module_r2(
     let terminals = (0..constraint.tokenizer.num_terminals())
         .map(|terminal| terminal_summary2(constraint, terminal, &outward, child_overrides))
         .collect::<Vec<_>>();
-    let mut nts = BTreeMap::<NonterminalID, PhaseSummary2>::new();
+    let mut nts = FxHashMap::<NonterminalID, PhaseSummary2>::default();
     for rule in rules {
         nts.entry(rule.lhs).or_insert_with(PhaseSummary2::bottom);
         for symbol in &rule.rhs {
@@ -1351,10 +1359,11 @@ fn summarize_rules_module_r2(
     let mut iterations = 0usize;
     for iteration in 0..DEFAULT_FIXED_POINT_LIMIT {
         iterations = iteration + 1;
-        let snapshot = nts.clone();
-        let mut next = snapshot.clone();
+        // Read the unchanged current generation directly. A second snapshot
+        // clone contributes no information to this synchronous fixed point.
+        let mut next = nts.clone();
         for rule in rules {
-            let summary = rule_summary2(rule, &snapshot, &terminals);
+            let summary = rule_summary2(rule, &nts, &terminals);
             next.entry(rule.lhs)
                 .or_insert_with(PhaseSummary2::bottom)
                 .union_with(&summary);
