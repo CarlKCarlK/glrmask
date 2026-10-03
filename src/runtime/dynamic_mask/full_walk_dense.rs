@@ -1,4 +1,5 @@
 use super::*;
+use super::boundary_cache::FullWalkBoundaryDirectCache;
 use crate::runtime::artifact::{DynamicLazyUnionRow, DynamicMaskTrieFullWalkOp};
 use rustc_hash::FxHashSet;
 
@@ -3286,48 +3287,6 @@ fn full_walk_row_liveness_bound(
     }
 }
 
-/// Bounded replacement cache for the exact physical liveness predicate.
-/// Tags include the complete lexer ID; collisions only discard cached work.
-/// Parser IDs select disjoint rows and remain append-only within one walk.
-struct FullWalkBoundaryDirectCache {
-    rows: Vec<[u64; 16]>,
-}
-
-impl FullWalkBoundaryDirectCache {
-    fn new() -> Self { Self { rows: Vec::new() } }
-
-    fn push_row(&mut self) { self.rows.push([0; 16]); }
-
-    #[inline(always)]
-    fn get(&self, parser: usize, lexer: u32) -> u8 {
-        let cell = self.rows[parser][lexer as usize & 15];
-        if cell >> 2 == u64::from(lexer) { (cell & 3) as u8 } else { 0 }
-    }
-
-    #[inline(always)]
-    fn set(&mut self, parser: usize, lexer: u32, value: u8) {
-        debug_assert!(value == 1 || value == 2);
-        self.rows[parser][lexer as usize & 15] = (u64::from(lexer) << 2) | u64::from(value);
-    }
-
-    /// Called once, before the first externally cached dense row pointer.
-    /// Afterwards the owner discards this cache and uses dense rows forever.
-    fn expand_into(self, rows: &mut [Vec<u8>], width: usize) {
-        assert_eq!(self.rows.len(), rows.len());
-        for (row, cells) in rows.iter_mut().zip(self.rows.iter()) {
-            row.resize(width, 0);
-            for &cell in cells {
-                let value = (cell & 3) as u8;
-                if value != 0 {
-                    let lexer = (cell >> 2) as usize;
-                    assert!(lexer < width, "only cache states in this walk's fixed domain");
-                    row[lexer] = value;
-                }
-            }
-        }
-    }
-}
-
 #[cfg(test)]
 mod boundary_direct_cache_tests {
     use super::FullWalkBoundaryDirectCache;
@@ -3416,8 +3375,8 @@ impl FullWalkParserCache {
         let mut boundary_rows = Vec::new();
         static FIXED_CACHE: OnceLock<bool> = OnceLock::new();
         let compact = *FIXED_CACHE.get_or_init(|| !env_flag("GLRMASK_DISABLE_COMPACT_BOUNDARY_ROWS", false))
-            && lexer_state_count > std::mem::size_of::<[u64; 16]>();
-        let mut direct_boundary_rows = compact.then(FullWalkBoundaryDirectCache::new);
+            && lexer_state_count > FullWalkBoundaryDirectCache::compact_row_bytes();
+        let mut direct_boundary_rows = compact.then(|| FullWalkBoundaryDirectCache::with_width(lexer_state_count));
         let mut root_nodes = SmallVec::<[u32; 4]>::new();
         for branch in root_branches {
             if let Some((index, _)) = nodes
@@ -8464,9 +8423,10 @@ fn try_full_walk_mask_with_table_from_initial_in_output_scope<
     // Diagnostics must not be included in the measured traversal interval.
     let walk_elapsed = walk_started.map(|start| start.elapsed());
     if profile_kernel {
-        eprintln!("[glrmask/profile][physical_boundary_direct] slots={} bytes={}",
+        eprintln!("[glrmask/profile][physical_boundary_direct] slots={} bytes={} adaptive_dense_rows={}",
             parser_cache.direct_boundary_rows.as_ref().map_or(0, |_| 16),
-            parser_cache.direct_boundary_rows.as_ref().map_or(0, |cache| cache.rows.len() * 128));
+            parser_cache.direct_boundary_rows.as_ref().map_or(0, |cache| cache.storage_bytes()),
+            parser_cache.direct_boundary_rows.as_ref().map_or(0, |cache| cache.dense_row_count()));
         eprintln!("[glrmask/profile][physical_boundary_storage] nodes={} allocated_rows={} bytes={} eager_bytes={}",
             parser_cache.nodes.len(),
             parser_cache.boundary_rows.iter().filter(|row| !row.is_empty()).count(),
