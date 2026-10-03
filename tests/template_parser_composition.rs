@@ -520,3 +520,71 @@ fn nullable_child_controls_preserve_empty_body_and_parent_suffix() {
         assert_language(&loaded, &tokens, &[b"xy", b"xay"]);
     }
 }
+
+#[test]
+fn nested_artifact_loads_preserve_exact_language_on_default_rayon_stacks() {
+    use rayon::prelude::*;
+
+    let (vocab, tokens) = vocabulary();
+    let words: &[&[u8]] = &[
+        b"xxpaqpaqyy",
+        b"xxpaqpbqyy",
+        b"xxpbqpaqyy",
+        b"xxpbqpbqyy",
+    ];
+
+    let build = |optimization| {
+        BuildOptions::default()
+            .optimization(optimization)
+            .parser_backend(ParserBackend::TemplateDfa)
+    };
+
+    for optimization in [Optimization::FastRuntime, Optimization::FastBuild] {
+        let leaf = Grammar::from_ebnf(r#"start ::= "a" | "b""#)
+            .compile_with(&vocab, build(optimization))
+            .unwrap();
+        let middle = Grammar::from_glrm(r#"glrm 1; start mid; extern grammar leaf; nt mid = "p" leaf "q";"#)
+            .compile_unlinked(&vocab)
+            .unwrap()
+            .bind("leaf", &leaf)
+            .unwrap()
+            .link_with(build(optimization))
+            .unwrap();
+        let outer = Grammar::from_glrm(r#"glrm 1; start root; extern grammar middle; nt root = "x" middle middle "y";"#)
+            .compile_unlinked(&vocab)
+            .unwrap()
+            .bind("middle", &middle)
+            .unwrap()
+            .link_with(build(optimization))
+            .unwrap();
+        let topwrap = Grammar::from_glrm(HOST)
+            .compile_unlinked(&vocab)
+            .unwrap()
+            .bind("child", &outer)
+            .unwrap()
+            .link_with(build(optimization))
+            .unwrap();
+
+        assert_language(&topwrap, &tokens, words);
+        let saved = topwrap.save();
+
+        for workers in [2, 4] {
+            eprintln!("[template_loader_stress] optimization={optimization:?} workers={workers}");
+            let pool = rayon::ThreadPoolBuilder::new()
+                .num_threads(workers)
+                .thread_name(|id| format!("native-loader-stress-{id}"))
+                .build()
+                .unwrap();
+
+            for _round in 0..8 {
+                pool.install(|| {
+                    (0..16usize).into_par_iter().for_each(|_| {
+                        let loaded = Constraint::load(&saved).unwrap();
+                        assert_language(&loaded, &tokens, words);
+                        assert_eq!(saved, loaded.save());
+                    });
+                });
+            }
+        }
+    }
+}

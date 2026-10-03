@@ -23,7 +23,6 @@ use serde::{Deserialize, Serialize};
 use std::borrow::Cow;
 use rustc_hash::{FxHashMap, FxHashSet};
 use std::collections::BTreeMap;
-use std::io::Read;
 use std::sync::Arc;
 
 const PREVIOUS_ROOT_POLICY_MAGIC: &[u8; 8] = b"GLRROOT1";
@@ -1316,6 +1315,17 @@ fn decode_composition_metadata(input: &[u8]) -> Result<ConstraintCompositionMeta
             boundary_candidate_summary: legacy_boundary_candidate_summary_wire(),
         })
     }
+}
+
+// Decoding finishes before any cache work or recursive component load begins.
+// The heap-owned Constraint also avoids retaining an inline core temporary in
+// each recursive loader frame; it is moved out only after finalization ends.
+struct DecodedNativeArtifactLoad {
+    constraint: Box<Constraint>,
+    runtime: Option<DecodedConstraintRuntime>,
+    token_mask_cache: Option<TokenMaskCacheArtifact>,
+    terminal_exprs: Option<Vec<Expr>>,
+    post_decode_ms: [f64; 4],
 }
 
 struct DecodedConstraintCore {
@@ -7055,6 +7065,1005 @@ impl Constraint {
         Ok(constraint)
     }
 
+    // Keep section decode temporaries off the stack while installing caches
+    // and recursively restoring component artifacts. Rayon waits can execute
+    // other loader jobs on this same worker, so lexical scopes alone do not
+    // release the decode frame before that re-entry.
+    #[inline(never)]
+    fn decode_native_artifact_for_load(
+        version: u16,
+        serialized: &[u8],
+        section_bytes: &[u8],
+        current_backing: &Option<Arc<Vec<u8>>>,
+        external_vocab: Option<&crate::Vocab>,
+        profile: bool,
+        packed_dwa_inventory: &mut Option<crate::automata::weighted::dwa::PackedDwaTokenSetInventory>,
+        prepared_completion_wire: &mut Option<Arc<[u8]>>,
+    ) -> crate::Result<DecodedNativeArtifactLoad> {
+        let (
+            weight,
+            dwa,
+            table,
+            core,
+            runtime,
+            token_bytes,
+            original_map,
+            tokenizer,
+            internal_masks,
+            token_mask_cache,
+            composition_metadata,
+        ) = v30_sections(serialized).map_err(crate::GlrMaskError::Serialization)?;
+        let (
+            weight_section,
+            dwa_section,
+            table_section,
+            core_section,
+            runtime_section,
+            token_bytes_section,
+            original_token_map_section,
+            tokenizer_section,
+            internal_token_buf_masks_section,
+            token_mask_cache_section,
+            composition_metadata_section,
+        ) = (
+            weight,
+            dwa,
+            table,
+            core,
+            Some(runtime),
+            Some(token_bytes),
+            Some(original_map),
+            Some(tokenizer),
+            Some(internal_masks),
+            Some(token_mask_cache),
+            Some(composition_metadata),
+        );
+        let (((dwa_result, (table_result, runtime_result)), ((tokenizer_result, original_token_map_result), (internal_token_buf_masks_result, token_mask_cache_result))), core_result) = rayon::join(
+            || rayon::join(
+                || rayon::join(
+                    || {
+                        let started = profile.then(std::time::Instant::now);
+                        let result = if uses_external_runtime_sections(version)
+                            || version == PREVIOUS_VOCAB_SECTION_CONSTRAINT_VERSION
+                            || version == PREVIOUS_FAST_RUNTIME_CONSTRAINT_VERSION
+                            || version == PREVIOUS_PACKED_RUNTIME_CONSTRAINT_VERSION
+                        {
+                            let decoded = if dwa_section.starts_with(b"DWF3")
+                                || dwa_section.starts_with(b"DWF4")
+                || dwa_section.starts_with(b"DWF5")
+                || dwa_section.starts_with(b"DWF6")
+                || dwa_section.starts_with(b"DWF7")
+                || dwa_section.starts_with(b"DWF8")
+                            {
+                                let backing = current_backing.as_ref().ok_or_else(|| {
+                                    "current backed DWA has no artifact backing".to_owned()
+                                });
+                                match backing {
+                                    Ok(backing) => {
+                                        let base = backing.as_ptr() as usize;
+                                        let section_start = (dwa_section.as_ptr() as usize)
+                                            .checked_sub(base)
+                                            .ok_or_else(|| {
+                                                "DWA section does not belong to artifact backing"
+                                                    .to_owned()
+                                            });
+                                        match section_start {
+                                            Ok(section_start) => crate::automata::weighted::dwa::PackedRuntimeDwa::from_fast_wire_bytes_backed(
+                                                dwa_section,
+                                                std::sync::Arc::clone(backing),
+                                                section_start,
+                                            ),
+                                            Err(err) => Err(err),
+                                        }
+                                    }
+                                    Err(err) => Err(err),
+                                }
+                            } else if dwa_section.starts_with(b"DWF1")
+                                || dwa_section.starts_with(b"DWF2")
+                            {
+                                crate::automata::weighted::dwa::PackedRuntimeDwa::from_fast_wire_bytes(
+                                    dwa_section,
+                                )
+                            } else {
+                                crate::automata::weighted::dwa::PackedRuntimeDwa::from_packed_bytes(
+                                    dwa_section,
+                                )
+                            };
+                            decoded.map(|dwa| {
+                                DecodedParserDwa::Packed(std::sync::Arc::new(dwa))
+                            })
+                        } else {
+                            crate::automata::weighted::dwa::DWA::from_artifact_packed_bytes(
+                                dwa_section,
+                            )
+                            .map(|(dwa, inventory)| {
+                                DecodedParserDwa::Materialized(dwa, inventory)
+                            })
+                        };
+                        if let Some(started) = started {
+                            eprintln!("[glrmask/profile][constraint_section] name=dwa ms={:.3}", started.elapsed().as_secs_f64() * 1000.0);
+                        }
+                        result
+                    },
+                    || {
+                        rayon::join(
+                            || {
+                                let started = profile.then(std::time::Instant::now);
+                                if matches!(version, TEMPLATE_CONSTRAINT_VERSION | EXTERNAL_TEMPLATE_CONSTRAINT_VERSION) {
+                                    let seed = if let Some(vocab) = external_vocab {
+                                        crate::runtime::parser_backend::wire::decode_external(table_section, vocab)
+                                    } else { crate::runtime::parser_backend::wire::decode(table_section) };
+                                    return seed.map(|seed| (crate::runtime::parser_backend::ParserTableStorage::absent(), None, Some(seed)));
+                                }
+                                let result = if uses_external_runtime_sections(version) {
+                                    let backing = current_backing.as_ref().ok_or_else(|| {
+                                        "current GLR table has no artifact backing".to_owned()
+                                    });
+                                    match backing {
+                                        Ok(backing) => {
+                                            let base = backing.as_ptr() as usize;
+                                            let section_start = (table_section.as_ptr() as usize)
+                                                .checked_sub(base)
+                                                .ok_or_else(|| {
+                                                    "GLR table section does not belong to artifact backing"
+                                                        .to_owned()
+                                                });
+                                            match section_start {
+                                                Ok(section_start) => crate::compiler::glr::table::artifact_serde::from_compact_bytes_deferred_backed(
+                                                    table_section,
+                                                    std::sync::Arc::clone(backing),
+                                                    section_start,
+                                                ),
+                                                Err(err) => Err(err),
+                                            }
+                                        }
+                                        Err(err) => Err(err),
+                                    }
+                                } else {
+                                    crate::compiler::glr::table::artifact_serde::from_compact_bytes_deferred(table_section)
+                                };
+                                if let Some(started) = started {
+                                    eprintln!("[glrmask/profile][constraint_section] name=table ms={:.3}", started.elapsed().as_secs_f64() * 1000.0);
+                                }
+                                result.map(|decoded| (decoded.table.into(), decoded.deferred_rules, None))
+                            },
+                            || -> Result<Option<DecodedConstraintRuntime>, String> {
+                                let Some(runtime_section) = runtime_section else {
+                                    return Ok(None);
+                                };
+                                let started = profile.then(std::time::Instant::now);
+                                let result = if matches!(version, CONSTRAINT_VERSION | TEMPLATE_CONSTRAINT_VERSION | EXTERNAL_TEMPLATE_CONSTRAINT_VERSION)
+                                    || version == PREVIOUS_BOUNDARY_SUMMARYLESS_CONSTRAINT_VERSION
+                                {
+                                    current_backing
+                                        .as_ref()
+                                        .ok_or_else(|| bincode::Error::new(bincode::ErrorKind::Custom("current runtime has no artifact backing".to_owned())))
+                                        .and_then(|backing| {
+                                            decode_current_runtime_wire(runtime_section, std::sync::Arc::clone(backing))
+                                                .map_err(|err| bincode::Error::new(bincode::ErrorKind::Custom(err)))
+                                        })
+                                    .and_then(|(runtime, static_virtual_residual_mask)| {
+                                        let packed_dwa_dense_masks = if runtime
+                                            .packed_dwa_dense_mask_ids
+                                            .is_empty()
+                                        {
+                                            if !runtime.packed_dwa_dense_mask_rows.is_empty() {
+                                                return Err(bincode::Error::new(
+                                                    bincode::ErrorKind::Custom(
+                                                        "packed DWA dense-mask slab has rows but no ids"
+                                                            .to_owned(),
+                                                    ),
+                                                ));
+                                            }
+                                            None
+                                        } else {
+                                            Some((
+                                                runtime.packed_dwa_dense_mask_ids,
+                                                runtime.packed_dwa_dense_mask_rows,
+                                            ))
+                                        };
+                                        Ok(DecodedConstraintRuntime {
+                                            template_dynamic_proofs: runtime.template_dynamic_proofs,
+                                            terminal_live_states: runtime.terminal_live_states,
+                                            segmented_runtime_v20: None,
+                                            segmented_runtime_v22: None,
+                                            segmented_runtime_v23: None,
+                                            segmented_runtime_v24: None,
+                                            segmented_runtime_v27: runtime.segmented_runtime,
+                                            dynamic_mask_vocab: runtime.dynamic_mask_vocab,
+                                            virtual_runtimes: runtime.virtual_runtimes,
+                                            static_virtual_residual_mask,
+                                            packed_dwa_dense_masks,
+                                        })
+                                    })
+                                } else if version == PREVIOUS_STATIC_PROJECTION_CONSTRAINT_VERSION {
+                                    bincode::deserialize::<ConstraintArtifactV28Runtime>(runtime_section)
+                                    .and_then(|runtime| {
+                                        let packed_dwa_dense_masks = if runtime
+                                            .packed_dwa_dense_mask_ids
+                                            .is_empty()
+                                        {
+                                            if !runtime.packed_dwa_dense_mask_rows.is_empty() {
+                                                return Err(bincode::Error::new(
+                                                    bincode::ErrorKind::Custom(
+                                                        "packed DWA dense-mask slab has rows but no ids"
+                                                            .to_owned(),
+                                                    ),
+                                                ));
+                                            }
+                                            None
+                                        } else {
+                                            Some((
+                                                runtime.packed_dwa_dense_mask_ids,
+                                                runtime.packed_dwa_dense_mask_rows,
+                                            ))
+                                        };
+                                        Ok(DecodedConstraintRuntime {
+                                            template_dynamic_proofs: None,
+                                            terminal_live_states: runtime.terminal_live_states,
+                                            segmented_runtime_v20: None,
+                                            segmented_runtime_v22: None,
+                                            segmented_runtime_v23: None,
+                                            segmented_runtime_v24: None,
+                                            segmented_runtime_v27: runtime.segmented_runtime,
+                                            dynamic_mask_vocab: runtime.dynamic_mask_vocab,
+                                            virtual_runtimes: runtime.virtual_runtimes,
+                                            static_virtual_residual_mask: runtime
+                                                .static_virtual_residual_mask
+                                                .map(StaticVirtualResidualMaskArtifactV28::into_current)
+                                                .map(DecodedStaticVirtualResidualMask::Owned),
+                                            packed_dwa_dense_masks,
+                                        })
+                                    })
+                                } else if version == PREVIOUS_STATIC_RESIDUAL_CONSTRAINT_VERSION {
+                                    bincode::deserialize::<ConstraintArtifactV27Runtime>(
+                                        runtime_section,
+                                    )
+                                    .and_then(|runtime| {
+                                        let packed_dwa_dense_masks = if runtime
+                                            .packed_dwa_dense_mask_ids
+                                            .is_empty()
+                                        {
+                                            if !runtime.packed_dwa_dense_mask_rows.is_empty() {
+                                                return Err(bincode::Error::new(
+                                                    bincode::ErrorKind::Custom(
+                                                        "packed DWA dense-mask slab has rows but no ids"
+                                                            .to_owned(),
+                                                    ),
+                                                ));
+                                            }
+                                            None
+                                        } else {
+                                            Some((
+                                                runtime.packed_dwa_dense_mask_ids,
+                                                runtime.packed_dwa_dense_mask_rows,
+                                            ))
+                                        };
+                                        Ok(DecodedConstraintRuntime {
+                                            template_dynamic_proofs: None,
+                                            terminal_live_states: runtime.terminal_live_states,
+                                            segmented_runtime_v20: None,
+                                            segmented_runtime_v22: None,
+                                            segmented_runtime_v23: None,
+                                            segmented_runtime_v24: None,
+                                            segmented_runtime_v27: runtime.segmented_runtime,
+                                            dynamic_mask_vocab: runtime.dynamic_mask_vocab,
+                                            virtual_runtimes: runtime.virtual_runtimes,
+                                            static_virtual_residual_mask: None,
+                                            packed_dwa_dense_masks,
+                                        })
+                                    })
+                                } else if version == PREVIOUS_RECURSIVE_PARSER_CONSTRAINT_VERSION {
+                                    bincode::deserialize::<ConstraintArtifactV24Runtime>(
+                                        runtime_section,
+                                    )
+                                    .and_then(|runtime| {
+                                        let packed_dwa_dense_masks = if runtime
+                                            .packed_dwa_dense_mask_ids
+                                            .is_empty()
+                                        {
+                                            if !runtime.packed_dwa_dense_mask_rows.is_empty() {
+                                                return Err(bincode::Error::new(
+                                                    bincode::ErrorKind::Custom(
+                                                        "packed DWA dense-mask slab has rows but no ids"
+                                                            .to_owned(),
+                                                    ),
+                                                ));
+                                            }
+                                            None
+                                        } else {
+                                            Some((
+                                                runtime.packed_dwa_dense_mask_ids,
+                                                runtime.packed_dwa_dense_mask_rows,
+                                            ))
+                                        };
+                                        Ok(DecodedConstraintRuntime {
+                                            template_dynamic_proofs: None,
+                                            terminal_live_states: runtime.terminal_live_states,
+                                            segmented_runtime_v20: None,
+                                            segmented_runtime_v22: None,
+                                            segmented_runtime_v23: None,
+                                            segmented_runtime_v24: runtime.segmented_runtime,
+                                            segmented_runtime_v27: None,
+                                            dynamic_mask_vocab: runtime.dynamic_mask_vocab,
+                                            virtual_runtimes: Vec::new(),
+                                            static_virtual_residual_mask: None,
+                                            packed_dwa_dense_masks,
+                                        })
+                                    })
+                                } else if version == PREVIOUS_BOUNDARY_SHARDED_CONSTRAINT_VERSION {
+                                    bincode::deserialize::<ConstraintArtifactV23Runtime>(
+                                        runtime_section,
+                                    )
+                                    .and_then(|runtime| {
+                                        let packed_dwa_dense_masks = if runtime
+                                            .packed_dwa_dense_mask_ids
+                                            .is_empty()
+                                        {
+                                            if !runtime.packed_dwa_dense_mask_rows.is_empty() {
+                                                return Err(bincode::Error::new(
+                                                    bincode::ErrorKind::Custom(
+                                                        "packed DWA dense-mask slab has rows but no ids"
+                                                            .to_owned(),
+                                                    ),
+                                                ));
+                                            }
+                                            None
+                                        } else {
+                                            Some((
+                                                runtime.packed_dwa_dense_mask_ids,
+                                                runtime.packed_dwa_dense_mask_rows,
+                                            ))
+                                        };
+                                        Ok(DecodedConstraintRuntime {
+                                            template_dynamic_proofs: None,
+                                            terminal_live_states: runtime.terminal_live_states,
+                                            segmented_runtime_v20: None,
+                                            segmented_runtime_v22: None,
+                                            segmented_runtime_v23: runtime.segmented_runtime,
+                                            segmented_runtime_v24: None,
+                                            segmented_runtime_v27: None,
+                                            dynamic_mask_vocab: runtime.dynamic_mask_vocab,
+                                            virtual_runtimes: Vec::new(),
+                                            static_virtual_residual_mask: None,
+                                            packed_dwa_dense_masks,
+                                        })
+                                    })
+                                } else if version == PREVIOUS_BOUNDARY_SHARDLESS_CONSTRAINT_VERSION {
+                                    bincode::deserialize::<ConstraintArtifactV22Runtime>(
+                                        runtime_section,
+                                    )
+                                    .and_then(|runtime| {
+                                        let packed_dwa_dense_masks = if runtime
+                                            .packed_dwa_dense_mask_ids
+                                            .is_empty()
+                                        {
+                                            if !runtime.packed_dwa_dense_mask_rows.is_empty() {
+                                                return Err(bincode::Error::new(
+                                                    bincode::ErrorKind::Custom(
+                                                        "packed DWA dense-mask slab has rows but no ids"
+                                                            .to_owned(),
+                                                    ),
+                                                ));
+                                            }
+                                            None
+                                        } else {
+                                            Some((
+                                                runtime.packed_dwa_dense_mask_ids,
+                                                runtime.packed_dwa_dense_mask_rows,
+                                            ))
+                                        };
+                                        Ok(DecodedConstraintRuntime {
+                                            template_dynamic_proofs: None,
+                                            terminal_live_states: runtime.terminal_live_states,
+                                            segmented_runtime_v20: None,
+                                            segmented_runtime_v22: runtime.segmented_runtime,
+                                            segmented_runtime_v23: None,
+                                            segmented_runtime_v24: None,
+                                            segmented_runtime_v27: None,
+                                            dynamic_mask_vocab: runtime.dynamic_mask_vocab,
+                                            virtual_runtimes: Vec::new(),
+                                            static_virtual_residual_mask: None,
+                                            packed_dwa_dense_masks,
+                                        })
+                                    })
+                                } else if version == PREVIOUS_SEGMENTED_MATERIALIZATION_CONSTRAINT_VERSION {
+                                    bincode::deserialize::<ConstraintArtifactV21Runtime>(
+                                        runtime_section,
+                                    )
+                                    .and_then(|runtime| {
+                                        let packed_dwa_dense_masks = if runtime
+                                            .packed_dwa_dense_mask_ids
+                                            .is_empty()
+                                        {
+                                            if !runtime.packed_dwa_dense_mask_rows.is_empty() {
+                                                return Err(bincode::Error::new(
+                                                    bincode::ErrorKind::Custom(
+                                                        "packed DWA dense-mask slab has rows but no ids"
+                                                            .to_owned(),
+                                                    ),
+                                                ));
+                                            }
+                                            None
+                                        } else {
+                                            Some((
+                                                runtime.packed_dwa_dense_mask_ids,
+                                                runtime.packed_dwa_dense_mask_rows,
+                                            ))
+                                        };
+                                        Ok(DecodedConstraintRuntime {
+                                            template_dynamic_proofs: None,
+                                            terminal_live_states: runtime.terminal_live_states,
+                                            segmented_runtime_v20: runtime.segmented_runtime,
+                                            segmented_runtime_v22: None,
+                                            segmented_runtime_v23: None,
+                                            segmented_runtime_v24: None,
+                                            segmented_runtime_v27: None,
+                                            dynamic_mask_vocab: None,
+                                            virtual_runtimes: Vec::new(),
+                                            static_virtual_residual_mask: None,
+                                            packed_dwa_dense_masks,
+                                        })
+                                    })
+                                } else if version == PREVIOUS_COMBINED_CONSTRAINT_VERSION {
+                                    bincode::deserialize::<ConstraintArtifactV20Runtime>(
+                                        runtime_section,
+                                    )
+                                    .map(|runtime| DecodedConstraintRuntime {
+                                            template_dynamic_proofs: None,
+                                        terminal_live_states: runtime.terminal_live_states,
+                                        segmented_runtime_v20: runtime.segmented_runtime,
+                                        segmented_runtime_v22: None,
+                                        segmented_runtime_v23: None,
+                                        segmented_runtime_v24: None,
+                                        segmented_runtime_v27: None,
+                                        dynamic_mask_vocab: None,
+                                        virtual_runtimes: Vec::new(),
+                                        static_virtual_residual_mask: None,
+                                        packed_dwa_dense_masks: None,
+                                    })
+                                } else {
+                                    bincode::deserialize::<ConstraintArtifactV15Runtime>(
+                                        runtime_section,
+                                    )
+                                    .map(|runtime| DecodedConstraintRuntime {
+                                            template_dynamic_proofs: None,
+                                        terminal_live_states: runtime.terminal_live_states,
+                                        segmented_runtime_v20: None,
+                                        segmented_runtime_v22: None,
+                                        segmented_runtime_v23: None,
+                                        segmented_runtime_v24: None,
+                                        segmented_runtime_v27: None,
+                                        dynamic_mask_vocab: None,
+                                        virtual_runtimes: Vec::new(),
+                                        static_virtual_residual_mask: None,
+                                        packed_dwa_dense_masks: None,
+                                    })
+                                }
+                                .map(Some)
+                                .map_err(|err| err.to_string());
+                                if let Some(started) = started {
+                                    eprintln!("[glrmask/profile][constraint_section] name=runtime ms={:.3}", started.elapsed().as_secs_f64() * 1000.0);
+                                }
+                                result
+                            },
+                        )
+                    },
+                ),
+                || rayon::join(
+                    || rayon::join(
+                        || -> Result<Option<crate::automata::lexer::tokenizer::Tokenizer>, String> {
+                        let Some(section) = tokenizer_section else {
+                            return Ok(None);
+                        };
+                        let started = profile.then(std::time::Instant::now);
+                        let result = if uses_external_runtime_sections(version) {
+                            let backing = current_backing.as_ref().ok_or_else(|| {
+                                "current tokenizer has no artifact backing".to_owned()
+                            })?;
+                            let base = backing.as_ptr() as usize;
+                            let section_start = (section.as_ptr() as usize)
+                                .checked_sub(base)
+                                .ok_or_else(|| {
+                                    "tokenizer section does not belong to artifact backing"
+                                        .to_owned()
+                                })?;
+                            crate::automata::lexer::tokenizer::artifact_serde::from_fast_bytes_backed(
+                                section,
+                                std::sync::Arc::clone(backing),
+                                section_start,
+                            )
+                            .map(Some)
+                        } else {
+                            crate::automata::lexer::tokenizer::artifact_serde::from_fast_bytes(
+                                section,
+                            )
+                            .map(Some)
+                        };
+                        if let Some(started) = started {
+                            eprintln!(
+                                "[glrmask/profile][constraint_section] name=tokenizer ms={:.3}",
+                                started.elapsed().as_secs_f64() * 1000.0,
+                            );
+                        }
+                        result
+                        },
+                        || -> Result<Option<DecodedOriginalTokenMap>, String> {
+                        let Some(section) = original_token_map_section else {
+                            return Ok(None);
+                        };
+                        let started = profile.then(std::time::Instant::now);
+                        let result = if uses_external_runtime_sections(version) {
+                            let backing = current_backing.as_ref().ok_or_else(|| {
+                                "current original-token map has no artifact backing".to_owned()
+                            })?;
+                            let base = backing.as_ptr() as usize;
+                            let section_start = (section.as_ptr() as usize)
+                                .checked_sub(base)
+                                .ok_or_else(|| {
+                                    "original-token map section does not belong to artifact backing"
+                                        .to_owned()
+                                })?;
+                            crate::runtime::artifact::original_token_map_artifact_serde::PackedOriginalTokenMap::parse_backed(
+                                std::sync::Arc::clone(backing),
+                                section_start,
+                                section.len(),
+                            )
+                            .map(|packed| {
+                                Some(DecodedOriginalTokenMap::Packed(std::sync::Arc::new(
+                                    packed,
+                                )))
+                            })
+                        } else {
+                            crate::runtime::artifact::original_token_map_artifact_serde::from_fast_bytes(section)
+                                .map(|map| Some(DecodedOriginalTokenMap::Materialized(map)))
+                        };
+                        if let Some(started) = started {
+                            eprintln!(
+                                "[glrmask/profile][constraint_section] name=original_token_map ms={:.3}",
+                                started.elapsed().as_secs_f64() * 1000.0,
+                            );
+                        }
+                        result
+                        },
+                    ),
+                    || rayon::join(
+                        || -> Result<Option<DecodedInternalTokenBufMasks>, String> {
+                            let Some(section) = internal_token_buf_masks_section else {
+                                return Ok(None);
+                            };
+                            let started = profile.then(std::time::Instant::now);
+                            let backing = current_backing
+                                .as_ref()
+                                .map(|backing| {
+                                    let base = backing.as_ptr() as usize;
+                                    let section_start = (section.as_ptr() as usize)
+                                        .checked_sub(base)
+                                        .ok_or_else(|| {
+                                            "internal-token buffer-mask section does not belong to artifact backing"
+                                                .to_owned()
+                                        })?;
+                                    Ok::<_, String>((
+                                        std::sync::Arc::clone(backing),
+                                        section_start,
+                                    ))
+                                })
+                                .transpose()?;
+                            let result = decode_internal_token_buf_masks(section, backing).map(Some);
+                            if let Some(started) = started {
+                                eprintln!(
+                                    "[glrmask/profile][constraint_section] name=internal_token_buf_masks ms={:.3}",
+                                    started.elapsed().as_secs_f64() * 1000.0,
+                                );
+                            }
+                            result
+                        },
+                        || -> Result<Option<TokenMaskCacheArtifact>, String> {
+                            let Some(section) = token_mask_cache_section else {
+                                return Ok(None);
+                            };
+                            if section.is_empty() {
+                                return Ok(None);
+                            }
+                            let started = profile.then(std::time::Instant::now);
+                            let result = if let Some(backing) = current_backing.as_ref() {
+                                let base = backing.as_ptr() as usize;
+                                let section_start = (section.as_ptr() as usize)
+                                    .checked_sub(base)
+                                    .ok_or_else(|| {
+                                        "token-mask cache section does not belong to artifact backing"
+                                            .to_owned()
+                                    })?;
+                                decode_token_mask_cache_backed(
+                                    section,
+                                    std::sync::Arc::clone(backing),
+                                    section_start,
+                                )
+                                .map(Some)
+                            } else {
+                                decode_token_mask_cache(section).map(Some)
+                            };
+                            if let Some(started) = started {
+                                eprintln!(
+                                    "[glrmask/profile][constraint_section] name=token_mask_cache ms={:.3}",
+                                    started.elapsed().as_secs_f64() * 1000.0,
+                                );
+                            }
+                            result
+                        },
+                    ),
+                ),
+            ),
+            || -> Result<
+                (
+                    DecodedConstraintCore,
+                    Option<std::sync::Arc<crate::runtime::artifact::token_bytes_artifact_serde::PackedTokenBytes>>,
+                    Option<(
+                        std::sync::Arc<crate::ds::weight::PackedRuntimeWeightPool>,
+                        Vec<u32>,
+                    )>,
+                ),
+                String,
+            > {
+                let section_started = profile.then(std::time::Instant::now);
+                let weight_count = if uses_external_runtime_sections(version)
+                    || version == PREVIOUS_VOCAB_SECTION_CONSTRAINT_VERSION
+                    || version == PREVIOUS_FAST_RUNTIME_CONSTRAINT_VERSION
+                    || version == PREVIOUS_PACKED_RUNTIME_CONSTRAINT_VERSION
+                {
+                    Some(crate::ds::weight::PackedRuntimeWeightPool::peek_weight_count(
+                        weight_section,
+                    )?)
+                } else {
+                    None
+                };
+
+                let decode_core = || -> Result<_, String> {
+                    if let Some(weight_count) = weight_count {
+                        crate::ds::weight::begin_pooled_weight_serde_deferred_decode(
+                            weight_count,
+                        );
+                    } else {
+                        let weights_started = profile.then(std::time::Instant::now);
+                        let weights = crate::ds::weight::unpack_pooled_weights(weight_section)?;
+                        if let Some(started) = weights_started {
+                            eprintln!("[glrmask/profile][constraint_section] name=weights ms={:.3}", started.elapsed().as_secs_f64() * 1000.0);
+                        }
+                        crate::ds::weight::begin_pooled_weight_serde_decode(weights);
+                    }
+                    let previous_external =
+                        crate::automata::weighted::dwa::set_external_serde(true);
+                    let previous_external_table =
+                        crate::compiler::glr::table::artifact_serde::set_external_serde(true);
+                    let previous_compact_tokenizer =
+                        crate::automata::lexer::tokenizer::set_compact_artifact_serde(true);
+                    let previous_external_tokenizer =
+                        crate::automata::lexer::tokenizer::set_external_artifact_serde(
+                            uses_external_runtime_sections(version),
+                        );
+                    let previous_omit_inverse =
+                        crate::runtime::artifact::internal_token_inverse_artifact_serde::set_omit(
+                            true,
+                        );
+                    let previous_packed_original_token_map =
+                        crate::runtime::artifact::original_token_map_artifact_serde::set_packed(
+                            true,
+                        );
+                    let previous_external_original_token_map =
+                        crate::runtime::artifact::original_token_map_artifact_serde::set_external(
+                            uses_external_runtime_sections(version),
+                        );
+                    let previous_packed_token_bytes =
+                        crate::runtime::artifact::token_bytes_artifact_serde::set_packed(true);
+                    let previous_external_token_bytes =
+                        crate::runtime::artifact::token_bytes_artifact_serde::set_external(
+                            uses_external_runtime_sections(version)
+                                || version == PREVIOUS_VOCAB_SECTION_CONSTRAINT_VERSION,
+                        );
+                    let previous_defer_token_bytes =
+                        crate::runtime::artifact::token_bytes_artifact_serde::set_defer_unpack(
+                            version == PREVIOUS_FAST_RUNTIME_CONSTRAINT_VERSION
+                                || version == PREVIOUS_PACKED_RUNTIME_CONSTRAINT_VERSION,
+                        );
+                    let core_started = profile.then(std::time::Instant::now);
+                    let decoded = if uses_external_runtime_sections(version) {
+                        if core_section.starts_with(&CURRENT_CORE_MAGIC)
+                            || core_section.starts_with(&PREVIOUS_CURRENT_CORE_MAGIC)
+                            || core_section.starts_with(&PREVIOUS_PREVIOUS_CURRENT_CORE_MAGIC)
+                            || core_section.starts_with(&PREVIOUS_PREVIOUS_PREVIOUS_CURRENT_CORE_MAGIC)
+                        {
+                            let core_backing = current_backing.as_ref().and_then(|backing| {
+                                let base = backing.as_ptr() as usize;
+                                let start = (core_section.as_ptr() as usize).checked_sub(base)?;
+                                Some((std::sync::Arc::clone(backing), start))
+                            });
+                            decode_current_core(core_section, core_backing)
+                            .map(|(artifact, terminal_exprs_blob)| {
+                                let mut constraint = artifact.constraint;
+                                constraint.static_dynamic_overlay = artifact.static_dynamic_overlay;
+                                constraint.late_grammar_slots = artifact.late_grammar_slots;
+                                DecodedConstraintCore {
+                                    constraint,
+                                    ignore_expr: artifact.ignore_expr,
+                                    terminal_exprs: None,
+                                    terminal_exprs_blob,
+                                    parser_state_domain_labels:
+                                        artifact.parser_state_domain_labels,
+                                    internal_token_buf_masks: Vec::new(),
+                                }
+                            })
+                        } else {
+                            bincode::deserialize::<ConstraintArtifactV18Core>(core_section)
+                                .map(|artifact| DecodedConstraintCore {
+                                    constraint: artifact.constraint,
+                                    ignore_expr: artifact.ignore_expr,
+                                    terminal_exprs: artifact.terminal_exprs,
+                                    terminal_exprs_blob: None,
+                                    parser_state_domain_labels: artifact.parser_state_domain_labels,
+                                    internal_token_buf_masks: Vec::new(),
+                                })
+                                .map_err(|err| err.to_string())
+                        }
+                    } else {
+                        bincode::deserialize::<ConstraintArtifactV14Core>(core_section)
+                            .map(|artifact| DecodedConstraintCore {
+                                constraint: artifact.constraint,
+                                ignore_expr: artifact.ignore_expr,
+                                terminal_exprs: artifact.terminal_exprs,
+                                terminal_exprs_blob: None,
+                                parser_state_domain_labels: artifact.parser_state_domain_labels,
+                                internal_token_buf_masks: artifact.internal_token_buf_masks,
+                            })
+                            .map_err(|err| err.to_string())
+                    };
+                    let deferred_token_bytes =
+                        crate::runtime::artifact::token_bytes_artifact_serde::take_deferred();
+                    let deferred_weight_ids = if weight_count.is_some() {
+                        crate::ds::weight::take_pooled_weight_serde_deferred_ids()
+                    } else {
+                        Vec::new()
+                    };
+                    if let Some(started) = core_started {
+                        eprintln!("[glrmask/profile][constraint_section] name=core_bincode ms={:.3}", started.elapsed().as_secs_f64() * 1000.0);
+                    }
+                    crate::automata::lexer::tokenizer::set_compact_artifact_serde(
+                        previous_compact_tokenizer,
+                    );
+                    crate::automata::lexer::tokenizer::set_external_artifact_serde(
+                        previous_external_tokenizer,
+                    );
+                    crate::runtime::artifact::token_bytes_artifact_serde::set_packed(
+                        previous_packed_token_bytes,
+                    );
+                    crate::runtime::artifact::token_bytes_artifact_serde::set_external(
+                        previous_external_token_bytes,
+                    );
+                    crate::runtime::artifact::token_bytes_artifact_serde::set_defer_unpack(
+                        previous_defer_token_bytes,
+                    );
+                    crate::runtime::artifact::internal_token_inverse_artifact_serde::set_omit(
+                        previous_omit_inverse,
+                    );
+                    crate::runtime::artifact::original_token_map_artifact_serde::set_packed(
+                        previous_packed_original_token_map,
+                    );
+                    crate::runtime::artifact::original_token_map_artifact_serde::set_external(
+                        previous_external_original_token_map,
+                    );
+                    crate::compiler::glr::table::artifact_serde::set_external_serde(
+                        previous_external_table,
+                    );
+                    crate::automata::weighted::dwa::set_external_serde(previous_external);
+                    crate::ds::weight::end_pooled_weight_serde_decode();
+                    decoded.map(|artifact| {
+                        (artifact, deferred_token_bytes, deferred_weight_ids)
+                    })
+                };
+
+                let (artifact, deferred_token_bytes, packed_weights) =
+                    if uses_external_runtime_sections(version)
+                        || version == PREVIOUS_VOCAB_SECTION_CONSTRAINT_VERSION
+                        || version == PREVIOUS_FAST_RUNTIME_CONSTRAINT_VERSION
+                        || version == PREVIOUS_PACKED_RUNTIME_CONSTRAINT_VERSION
+                    {
+                        let weights_started = profile.then(std::time::Instant::now);
+                        // WPL3 current-format runtime indexing is now only
+                        // a small linear framing scan + one section copy.
+                        // Running that tiny job as another nested Rayon
+                        // branch competes with the much heavier core/DWA
+                        // decoders and increases wall time on Windows.
+                        let packed_weights =
+                            crate::ds::weight::PackedRuntimeWeightPool::from_packed_bytes(
+                                weight_section,
+                            )?;
+                        if let Some(started) = weights_started {
+                            eprintln!("[glrmask/profile][constraint_section] name=weights_packed ms={:.3}", started.elapsed().as_secs_f64() * 1000.0);
+                        }
+                        let (artifact, deferred_token_bytes, deferred_weight_ids) = decode_core()?;
+                        (
+                            artifact,
+                            deferred_token_bytes,
+                            Some((std::sync::Arc::new(packed_weights), deferred_weight_ids)),
+                        )
+                    } else {
+                        let (artifact, deferred_token_bytes, _) = decode_core()?;
+                        (artifact, deferred_token_bytes, None)
+                    };
+                if let Some(started) = section_started {
+                    eprintln!("[glrmask/profile][constraint_section] name=core_total ms={:.3}", started.elapsed().as_secs_f64() * 1000.0);
+                }
+                Ok((artifact, deferred_token_bytes, packed_weights))
+            },
+        );
+        let parser_dwa = dwa_result.map_err(crate::GlrMaskError::Serialization)?;
+        let (table, deferred_table_rules_blob, template_parser_seed) =
+            table_result.map_err(crate::GlrMaskError::Serialization)?;
+        let runtime = runtime_result.map_err(crate::GlrMaskError::Serialization)?;
+        let tokenizer = tokenizer_result.map_err(crate::GlrMaskError::Serialization)?;
+        let original_token_map =
+            original_token_map_result.map_err(crate::GlrMaskError::Serialization)?;
+        let external_internal_token_buf_masks =
+            internal_token_buf_masks_result.map_err(crate::GlrMaskError::Serialization)?;
+        let token_mask_cache =
+            token_mask_cache_result.map_err(crate::GlrMaskError::Serialization)?;
+        let (artifact, deferred_token_bytes, packed_weights) =
+            core_result.map_err(crate::GlrMaskError::Serialization)?;
+        let token_bytes_started = profile.then(std::time::Instant::now);
+        let external_token_bytes = if external_vocab.is_some() {
+            if !token_bytes_section.is_some_and(<[u8]>::is_empty) {
+                return Err(crate::Error::Serialization("external template artifact unexpectedly contains token bytes".into()));
+            }
+            None
+        } else if let Some(token_bytes_section) = token_bytes_section {
+            let backing = current_backing
+                .as_ref()
+                .expect("current-format token section has artifact backing");
+            let start = (token_bytes_section.as_ptr() as usize)
+                .checked_sub(section_bytes.as_ptr() as usize)
+                .ok_or_else(|| {
+                    crate::GlrMaskError::Serialization(
+                        "token-byte section does not belong to artifact backing".to_owned(),
+                    )
+                })?;
+            Some(std::sync::Arc::new(
+                crate::runtime::artifact::token_bytes_artifact_serde::PackedTokenBytes::parse_backed(
+                    std::sync::Arc::clone(backing),
+                    start,
+                    token_bytes_section.len(),
+                )
+                .map_err(crate::GlrMaskError::Serialization)?,
+            ))
+        } else {
+            None
+        };
+        let token_bytes_ms = token_bytes_started
+            .map_or(0.0, |started| started.elapsed().as_secs_f64() * 1000.0);
+        let mut constraint = artifact.constraint;
+        if let Some(tokenizer) = tokenizer {
+            constraint.tokenizer = tokenizer.into();
+        }
+        if let Some(original_token_map) = original_token_map {
+            match original_token_map {
+                DecodedOriginalTokenMap::Materialized(map) => {
+                    constraint.original_token_to_internal = map;
+                    constraint.packed_original_token_to_internal = None;
+                }
+                DecodedOriginalTokenMap::Packed(map) => {
+                    constraint.original_token_to_internal = Vec::new();
+                    constraint.packed_original_token_to_internal = Some(map);
+                }
+            }
+        }
+        let attach_weights_started = profile.then(std::time::Instant::now);
+        if let Some((pool, ids)) = packed_weights {
+            attach_packed_non_dwa_weights(&mut constraint, pool, ids)
+                .map_err(crate::GlrMaskError::Serialization)?;
+        }
+        let attach_weights_ms = attach_weights_started
+            .map_or(0.0, |started| started.elapsed().as_secs_f64() * 1000.0);
+        let attach_dwa_started = profile.then(std::time::Instant::now);
+        match parser_dwa {
+            DecodedParserDwa::Materialized(parser_dwa, inventory) => {
+                constraint.parser_dwa = parser_dwa;
+                constraint.packed_parser_dwa = None;
+                *packed_dwa_inventory = inventory;
+            }
+            DecodedParserDwa::Packed(parser_dwa) => {
+                constraint.parser_dwa = crate::automata::weighted::dwa::DWA::new(0, 0);
+                constraint.packed_parser_dwa = Some(parser_dwa);
+            }
+        }
+        let attach_dwa_ms = attach_dwa_started
+            .map_or(0.0, |started| started.elapsed().as_secs_f64() * 1000.0);
+        constraint.table = table;
+        if let Some(seed) = template_parser_seed {
+            seed.install(&mut constraint).map_err(crate::GlrMaskError::Serialization)?;
+        }
+        constraint.deferred_table_rules_blob = deferred_table_rules_blob;
+        constraint.deferred_table_rules = Default::default();
+        let invert_started = profile.then(std::time::Instant::now);
+        if !uses_external_runtime_sections(version)
+            && version != PREVIOUS_VOCAB_SECTION_CONSTRAINT_VERSION
+        {
+            constraint.internal_token_to_tokens = invert_original_token_map(
+                &constraint.original_token_to_internal,
+                artifact.internal_token_buf_masks.len(),
+            )
+            .map_err(crate::GlrMaskError::Serialization)?;
+        }
+        let invert_ms = invert_started
+            .map_or(0.0, |started| started.elapsed().as_secs_f64() * 1000.0);
+        constraint.ignore_expr = artifact.ignore_expr;
+        constraint.parser_state_domain_labels = artifact.parser_state_domain_labels;
+        constraint.deferred_terminal_exprs_blob = artifact.terminal_exprs_blob;
+        constraint.deferred_terminal_exprs = Default::default();
+        constraint.deferred_composition_metadata_blob = if let Some(section) = composition_metadata_section {
+            let (_, prepared)=crate::compiler::boundary_precomputed_completion::split_envelope(section)
+                .map_err(crate::GlrMaskError::Serialization)?;
+            *prepared_completion_wire=prepared.map(Arc::from);
+            validate_composition_metadata_wire(section)
+                .map_err(crate::GlrMaskError::Serialization)?;
+            if section.is_empty() {
+                None
+            } else if let Some(backing) = current_backing.as_ref() {
+                let start = (section.as_ptr() as usize)
+                    .checked_sub(backing.as_ptr() as usize)
+                    .ok_or_else(|| {
+                        crate::GlrMaskError::Serialization(
+                            "composition metadata section does not belong to artifact backing"
+                                .to_owned(),
+                        )
+                    })?;
+                let end = start.checked_add(section.len()).ok_or_else(|| {
+                    crate::GlrMaskError::Serialization(
+                        "composition metadata backing range overflow".to_owned(),
+                    )
+                })?;
+                if backing.get(start..end) != Some(section) {
+                    return Err(crate::GlrMaskError::Serialization(
+                        "composition metadata bytes do not match artifact backing".to_owned(),
+                    ));
+                }
+                Some(crate::runtime::artifact::DeferredCompositionMetadataBytes::Backed {
+                    backing: std::sync::Arc::clone(backing),
+                    start,
+                    len: section.len(),
+                })
+            } else {
+                Some(crate::runtime::artifact::DeferredCompositionMetadataBytes::Owned(
+                    std::sync::Arc::from(section.to_vec().into_boxed_slice()),
+                ))
+            }
+        } else {
+            None
+        };
+        constraint.composition_link_metadata_materialized =
+            constraint.deferred_composition_metadata_blob.is_none();
+        if let Some(decoded) = external_internal_token_buf_masks {
+            constraint.internal_token_buf_masks = Vec::new();
+            constraint.internal_token_buf_flat = decoded.flat;
+            constraint.backed_internal_token_buf_flat = decoded.backed;
+            constraint.internal_token_buf_offsets = decoded.offsets;
+        } else {
+            constraint.internal_token_buf_masks = artifact.internal_token_buf_masks;
+            constraint.backed_internal_token_buf_flat = None;
+        }
+        constraint.packed_token_bytes = external_token_bytes.or(deferred_token_bytes);
+        if let Some(vocab) = external_vocab {
+            if constraint.packed_token_bytes.is_some() || !constraint.token_bytes.is_empty() {
+                return Err(crate::Error::Serialization("external template core contains a duplicate vocabulary".into()));
+            }
+            constraint.token_bytes = vocab.entries_arc();
+        }
+        Ok(DecodedNativeArtifactLoad {
+            constraint: Box::new(constraint),
+            runtime,
+            token_mask_cache,
+            terminal_exprs: artifact.terminal_exprs,
+            post_decode_ms: [token_bytes_ms, attach_weights_ms, attach_dwa_ms, invert_ms],
+        })
+    }
+
     fn load_impl(
         bytes: &[u8],
         owned_artifact: Option<std::sync::Arc<Vec<u8>>>,
@@ -7062,7 +8071,7 @@ impl Constraint {
     ) -> crate::Result<Self> {
         let profile = std::env::var_os("GLRMASK_PROFILE_SERIALIZATION").is_some();
         let total_started = profile.then(std::time::Instant::now);
-        let mut decompress_ms = 0.0;
+        let decompress_ms = 0.0;
         if bytes.len() < CONSTRAINT_HEADER_LEN || !bytes.starts_with(&CONSTRAINT_MAGIC) {
             return Err(crate::GlrMaskError::Serialization(
                 "invalid constraint artifact header".to_owned(),
@@ -7097,1238 +8106,38 @@ impl Constraint {
                 "invalid constraint artifact payload length".to_owned(),
             ));
         }
-        // v17 runtime sections may retain zero-copy views into the artifact.
+        // Accepted native versions (v35/v36) both use external runtime sections.
         // If the caller did not transfer ownership, make the one compatibility
         // copy up front so every retained view and the unchanged-resave cache
         // share the same backing allocation.
-        let current_backing = if uses_external_runtime_sections(version)
-            || version == PREVIOUS_VOCAB_SECTION_CONSTRAINT_VERSION
-        {
-            Some(
-                owned_artifact
-                    .clone()
-                    .unwrap_or_else(|| std::sync::Arc::new(bytes.to_vec())),
-            )
-        } else {
-            None
-        };
+        let current_backing = Some(
+            owned_artifact
+                .clone()
+                .unwrap_or_else(|| std::sync::Arc::new(bytes.to_vec())),
+        );
         let section_bytes = current_backing
             .as_ref()
             .map_or(bytes, |backing| backing.as_slice());
         let payload = &section_bytes[CONSTRAINT_HEADER_LEN..];
-        let mut raw;
-        let serialized = if matches!(
-            version,
-            PREVIOUS_COMPRESSED_CONSTRAINT_VERSION
-                | PREVIOUS_EXPRLESS_CONSTRAINT_VERSION
-                | PREVIOUS_TERMINAL_EXPRS_CONSTRAINT_VERSION
-                | PREVIOUS_DOMAIN_LABELS_CONSTRAINT_VERSION
-        ) {
-            let decompress_started = profile.then(std::time::Instant::now);
-            if payload.len() < COMPRESSED_PAYLOAD_HEADER_LEN {
-                return Err(crate::GlrMaskError::Serialization(
-                    "invalid compressed constraint artifact payload".to_owned(),
-                ));
-            }
-            let raw_len = usize::try_from(u64::from_le_bytes(
-                payload[..COMPRESSED_PAYLOAD_HEADER_LEN]
-                    .try_into()
-                    .expect("compressed constraint payload header has fixed width"),
-            ))
-            .map_err(|_| {
-                crate::GlrMaskError::Serialization(
-                    "uncompressed constraint artifact length does not fit this platform".to_owned(),
-                )
-            })?;
-            let compressed = &payload[COMPRESSED_PAYLOAD_HEADER_LEN..];
-            let frame_len = zstd::zstd_safe::get_frame_content_size(compressed)
-                .map_err(|err| crate::GlrMaskError::Serialization(err.to_string()))?;
-            if frame_len.is_some_and(|frame_len| frame_len != raw_len as u64) {
-                return Err(crate::GlrMaskError::Serialization(
-                    "invalid uncompressed constraint artifact length".to_owned(),
-                ));
-            }
-
-            // Do not reserve the untrusted declared size up front. Stream into
-            // a growing buffer and stop after one byte beyond the declared
-            // length, so malformed artifacts cannot trigger an immediate huge
-            // allocation merely by forging the envelope.
-            let output_limit = raw_len.checked_add(1).ok_or_else(|| {
-                crate::GlrMaskError::Serialization(
-                    "uncompressed constraint artifact length is too large".to_owned(),
-                )
-            })?;
-            let decoder = zstd::stream::read::Decoder::with_buffer(compressed)
-                .map_err(|err| crate::GlrMaskError::Serialization(err.to_string()))?;
-            raw = Vec::new();
-            decoder
-                .take(output_limit as u64)
-                .read_to_end(&mut raw)
-                .map_err(|err| crate::GlrMaskError::Serialization(err.to_string()))?;
-            if raw.len() != raw_len {
-                return Err(crate::GlrMaskError::Serialization(
-                    "invalid uncompressed constraint artifact length".to_owned(),
-                ));
-            }
-            decompress_ms = decompress_started
-                .map_or(0.0, |started| started.elapsed().as_secs_f64() * 1000.0);
-            raw.as_slice()
-        } else {
-            payload
-        };
+        // The native-only upfront version guard guarantees that only v35/v36
+        // are loaded, so unsupported historical compressed-envelope decoder
+        // branches cannot occupy recursive loader frames.
+        let serialized = payload;
         let deserialize_started = profile.then(std::time::Instant::now);
         let mut packed_dwa_inventory = None;
         let mut prepared_completion_wire: Option<Arc<[u8]>> = None;
         let mut loaded_packed_dwa_dense_masks = false;
-        let mut constraint = if uses_external_runtime_sections(version)
-            || version == PREVIOUS_VOCAB_SECTION_CONSTRAINT_VERSION
-            || version == PREVIOUS_FAST_RUNTIME_CONSTRAINT_VERSION
-            || version == PREVIOUS_PACKED_RUNTIME_CONSTRAINT_VERSION
-            || version == PREVIOUS_SECTIONED_CONSTRAINT_VERSION
-        {
-            let (
-                weight_section,
-                dwa_section,
-                table_section,
-                core_section,
-                runtime_section,
-                token_bytes_section,
-                original_token_map_section,
-                tokenizer_section,
-                internal_token_buf_masks_section,
-                token_mask_cache_section,
-                composition_metadata_section,
-            ) =
-                if matches!(version, CONSTRAINT_VERSION | TEMPLATE_CONSTRAINT_VERSION | EXTERNAL_TEMPLATE_CONSTRAINT_VERSION) {
-                    let (weight, dwa, table, core, runtime, token_bytes, original_map, tokenizer, internal_masks, token_mask_cache, composition_metadata) = v30_sections(serialized)
-                        .map_err(crate::GlrMaskError::Serialization)?;
-                    (
-                        weight,
-                        dwa,
-                        table,
-                        core,
-                        Some(runtime),
-                        Some(token_bytes),
-                        Some(original_map),
-                        Some(tokenizer),
-                        Some(internal_masks),
-                        Some(token_mask_cache),
-                        Some(composition_metadata),
-                    )
-                } else if version == PREVIOUS_BOUNDARY_SUMMARYLESS_CONSTRAINT_VERSION {
-                    let (weight, dwa, table, core, runtime, token_bytes, original_map, tokenizer, internal_masks, token_mask_cache, composition_metadata) = v29_sections(serialized)
-                        .map_err(crate::GlrMaskError::Serialization)?;
-                    (
-                        weight,
-                        dwa,
-                        table,
-                        core,
-                        Some(runtime),
-                        Some(token_bytes),
-                        Some(original_map),
-                        Some(tokenizer),
-                        Some(internal_masks),
-                        Some(token_mask_cache),
-                        Some(composition_metadata),
-                    )
-                } else if version == PREVIOUS_STATIC_PROJECTION_CONSTRAINT_VERSION {
-                    let (weight, dwa, table, core, runtime, token_bytes, original_map, tokenizer, internal_masks, token_mask_cache, composition_metadata) = v28_sections(serialized)
-                        .map_err(crate::GlrMaskError::Serialization)?;
-                    (
-                        weight,
-                        dwa,
-                        table,
-                        core,
-                        Some(runtime),
-                        Some(token_bytes),
-                        Some(original_map),
-                        Some(tokenizer),
-                        Some(internal_masks),
-                        Some(token_mask_cache),
-                        Some(composition_metadata),
-                    )
-                } else if version == PREVIOUS_STATIC_RESIDUAL_CONSTRAINT_VERSION {
-                    let (weight, dwa, table, core, runtime, token_bytes, original_map, tokenizer, internal_masks, token_mask_cache, composition_metadata) = v27_sections(serialized)
-                        .map_err(crate::GlrMaskError::Serialization)?;
-                    (
-                        weight,
-                        dwa,
-                        table,
-                        core,
-                        Some(runtime),
-                        Some(token_bytes),
-                        Some(original_map),
-                        Some(tokenizer),
-                        Some(internal_masks),
-                        Some(token_mask_cache),
-                        Some(composition_metadata),
-                    )
-                } else if version == PREVIOUS_RECURSIVE_PARSER_CONSTRAINT_VERSION {
-                    let (weight, dwa, table, core, runtime, token_bytes, original_map, tokenizer, internal_masks, token_mask_cache, composition_metadata) = v24_sections(serialized)
-                        .map_err(crate::GlrMaskError::Serialization)?;
-                    (
-                        weight,
-                        dwa,
-                        table,
-                        core,
-                        Some(runtime),
-                        Some(token_bytes),
-                        Some(original_map),
-                        Some(tokenizer),
-                        Some(internal_masks),
-                        Some(token_mask_cache),
-                        Some(composition_metadata),
-                    )
-                } else if version == PREVIOUS_BOUNDARY_SHARDED_CONSTRAINT_VERSION {
-                    let (weight, dwa, table, core, runtime, token_bytes, original_map, tokenizer, internal_masks, token_mask_cache, composition_metadata) = v23_sections(serialized)
-                        .map_err(crate::GlrMaskError::Serialization)?;
-                    (
-                        weight,
-                        dwa,
-                        table,
-                        core,
-                        Some(runtime),
-                        Some(token_bytes),
-                        Some(original_map),
-                        Some(tokenizer),
-                        Some(internal_masks),
-                        Some(token_mask_cache),
-                        Some(composition_metadata),
-                    )
-                } else if version == PREVIOUS_BOUNDARY_SHARDLESS_CONSTRAINT_VERSION {
-                    let (weight, dwa, table, core, runtime, token_bytes, original_map, tokenizer, internal_masks, token_mask_cache, composition_metadata) = v22_sections(serialized)
-                        .map_err(crate::GlrMaskError::Serialization)?;
-                    (
-                        weight,
-                        dwa,
-                        table,
-                        core,
-                        Some(runtime),
-                        Some(token_bytes),
-                        Some(original_map),
-                        Some(tokenizer),
-                        Some(internal_masks),
-                        Some(token_mask_cache),
-                        Some(composition_metadata),
-                    )
-                } else if version == PREVIOUS_SEGMENTED_MATERIALIZATION_CONSTRAINT_VERSION {
-                    let (weight, dwa, table, core, runtime, token_bytes, original_map, tokenizer, internal_masks, token_mask_cache, composition_metadata) = v21_sections(serialized)
-                        .map_err(crate::GlrMaskError::Serialization)?;
-                    (
-                        weight,
-                        dwa,
-                        table,
-                        core,
-                        Some(runtime),
-                        Some(token_bytes),
-                        Some(original_map),
-                        Some(tokenizer),
-                        Some(internal_masks),
-                        Some(token_mask_cache),
-                        Some(composition_metadata),
-                    )
-                } else if version == PREVIOUS_COMBINED_CONSTRAINT_VERSION {
-                    let (weight, dwa, table, core, runtime, token_bytes, original_map, tokenizer, internal_masks, token_mask_cache, composition_metadata) = v20_sections(serialized)
-                        .map_err(crate::GlrMaskError::Serialization)?;
-                    (
-                        weight,
-                        dwa,
-                        table,
-                        core,
-                        Some(runtime),
-                        Some(token_bytes),
-                        Some(original_map),
-                        Some(tokenizer),
-                        Some(internal_masks),
-                        Some(token_mask_cache),
-                        Some(composition_metadata),
-                    )
-                } else if version == PREVIOUS_SERIALIZATION_CURRENT_CONSTRAINT_VERSION {
-                    let (weight, dwa, table, core, runtime, token_bytes, original_map, tokenizer, internal_masks, token_mask_cache) = v19_sections(serialized)
-                        .map_err(crate::GlrMaskError::Serialization)?;
-                    (
-                        weight,
-                        dwa,
-                        table,
-                        core,
-                        Some(runtime),
-                        Some(token_bytes),
-                        Some(original_map),
-                        Some(tokenizer),
-                        Some(internal_masks),
-                        Some(token_mask_cache),
-                        None,
-                    )
-                } else if version == PREVIOUS_EXTERNAL_RUNTIME_CONSTRAINT_VERSION {
-                    let (weight, dwa, table, core, runtime, token_bytes, original_map, tokenizer, internal_masks) = v18_sections(serialized)
-                        .map_err(crate::GlrMaskError::Serialization)?;
-                    (
-                        weight,
-                        dwa,
-                        table,
-                        core,
-                        Some(runtime),
-                        Some(token_bytes),
-                        Some(original_map),
-                        Some(tokenizer),
-                        Some(internal_masks),
-                        None,
-                        None,
-                    )
-                } else if version == PREVIOUS_VOCAB_SECTION_CONSTRAINT_VERSION {
-                    let (weight, dwa, table, core, runtime, token_bytes) = v17_sections(serialized)
-                        .map_err(crate::GlrMaskError::Serialization)?;
-                    (weight, dwa, table, core, Some(runtime), Some(token_bytes), None, None, None, None, None)
-                } else if version == PREVIOUS_FAST_RUNTIME_CONSTRAINT_VERSION {
-                    let (weight, dwa, table, core, runtime) = v16_sections(serialized)
-                        .map_err(crate::GlrMaskError::Serialization)?;
-                    (weight, dwa, table, core, Some(runtime), None, None, None, None, None, None)
-                } else if version == PREVIOUS_PACKED_RUNTIME_CONSTRAINT_VERSION {
-                    let (weight, dwa, table, core, runtime) = v15_sections(serialized)
-                        .map_err(crate::GlrMaskError::Serialization)?;
-                    (weight, dwa, table, core, Some(runtime), None, None, None, None, None, None)
-                } else {
-                    let (weight, dwa, table, core) = v14_sections(serialized)
-                        .map_err(crate::GlrMaskError::Serialization)?;
-                    (weight, dwa, table, core, None, None, None, None, None, None, None)
-                };
-            let (((dwa_result, (table_result, runtime_result)), ((tokenizer_result, original_token_map_result), (internal_token_buf_masks_result, token_mask_cache_result))), core_result) = rayon::join(
-                || rayon::join(
-                    || rayon::join(
-                        || {
-                            let started = profile.then(std::time::Instant::now);
-                            let result = if uses_external_runtime_sections(version)
-                                || version == PREVIOUS_VOCAB_SECTION_CONSTRAINT_VERSION
-                                || version == PREVIOUS_FAST_RUNTIME_CONSTRAINT_VERSION
-                                || version == PREVIOUS_PACKED_RUNTIME_CONSTRAINT_VERSION
-                            {
-                                let decoded = if dwa_section.starts_with(b"DWF3")
-                                    || dwa_section.starts_with(b"DWF4")
-                    || dwa_section.starts_with(b"DWF5")
-                    || dwa_section.starts_with(b"DWF6")
-                    || dwa_section.starts_with(b"DWF7")
-                    || dwa_section.starts_with(b"DWF8")
-                                {
-                                    let backing = current_backing.as_ref().ok_or_else(|| {
-                                        "current backed DWA has no artifact backing".to_owned()
-                                    });
-                                    match backing {
-                                        Ok(backing) => {
-                                            let base = backing.as_ptr() as usize;
-                                            let section_start = (dwa_section.as_ptr() as usize)
-                                                .checked_sub(base)
-                                                .ok_or_else(|| {
-                                                    "DWA section does not belong to artifact backing"
-                                                        .to_owned()
-                                                });
-                                            match section_start {
-                                                Ok(section_start) => crate::automata::weighted::dwa::PackedRuntimeDwa::from_fast_wire_bytes_backed(
-                                                    dwa_section,
-                                                    std::sync::Arc::clone(backing),
-                                                    section_start,
-                                                ),
-                                                Err(err) => Err(err),
-                                            }
-                                        }
-                                        Err(err) => Err(err),
-                                    }
-                                } else if dwa_section.starts_with(b"DWF1")
-                                    || dwa_section.starts_with(b"DWF2")
-                                {
-                                    crate::automata::weighted::dwa::PackedRuntimeDwa::from_fast_wire_bytes(
-                                        dwa_section,
-                                    )
-                                } else {
-                                    crate::automata::weighted::dwa::PackedRuntimeDwa::from_packed_bytes(
-                                        dwa_section,
-                                    )
-                                };
-                                decoded.map(|dwa| {
-                                    DecodedParserDwa::Packed(std::sync::Arc::new(dwa))
-                                })
-                            } else {
-                                crate::automata::weighted::dwa::DWA::from_artifact_packed_bytes(
-                                    dwa_section,
-                                )
-                                .map(|(dwa, inventory)| {
-                                    DecodedParserDwa::Materialized(dwa, inventory)
-                                })
-                            };
-                            if let Some(started) = started {
-                                eprintln!("[glrmask/profile][constraint_section] name=dwa ms={:.3}", started.elapsed().as_secs_f64() * 1000.0);
-                            }
-                            result
-                        },
-                        || {
-                            rayon::join(
-                                || {
-                                    let started = profile.then(std::time::Instant::now);
-                                    if matches!(version, TEMPLATE_CONSTRAINT_VERSION | EXTERNAL_TEMPLATE_CONSTRAINT_VERSION) {
-                                        let seed = if let Some(vocab) = external_vocab {
-                                            crate::runtime::parser_backend::wire::decode_external(table_section, vocab)
-                                        } else { crate::runtime::parser_backend::wire::decode(table_section) };
-                                        return seed.map(|seed| (crate::runtime::parser_backend::ParserTableStorage::absent(), None, Some(seed)));
-                                    }
-                                    let result = if uses_external_runtime_sections(version) {
-                                        let backing = current_backing.as_ref().ok_or_else(|| {
-                                            "current GLR table has no artifact backing".to_owned()
-                                        });
-                                        match backing {
-                                            Ok(backing) => {
-                                                let base = backing.as_ptr() as usize;
-                                                let section_start = (table_section.as_ptr() as usize)
-                                                    .checked_sub(base)
-                                                    .ok_or_else(|| {
-                                                        "GLR table section does not belong to artifact backing"
-                                                            .to_owned()
-                                                    });
-                                                match section_start {
-                                                    Ok(section_start) => crate::compiler::glr::table::artifact_serde::from_compact_bytes_deferred_backed(
-                                                        table_section,
-                                                        std::sync::Arc::clone(backing),
-                                                        section_start,
-                                                    ),
-                                                    Err(err) => Err(err),
-                                                }
-                                            }
-                                            Err(err) => Err(err),
-                                        }
-                                    } else {
-                                        crate::compiler::glr::table::artifact_serde::from_compact_bytes_deferred(table_section)
-                                    };
-                                    if let Some(started) = started {
-                                        eprintln!("[glrmask/profile][constraint_section] name=table ms={:.3}", started.elapsed().as_secs_f64() * 1000.0);
-                                    }
-                                    result.map(|decoded| (decoded.table.into(), decoded.deferred_rules, None))
-                                },
-                                || -> Result<Option<DecodedConstraintRuntime>, String> {
-                                    let Some(runtime_section) = runtime_section else {
-                                        return Ok(None);
-                                    };
-                                    let started = profile.then(std::time::Instant::now);
-                                    let result = if matches!(version, CONSTRAINT_VERSION | TEMPLATE_CONSTRAINT_VERSION | EXTERNAL_TEMPLATE_CONSTRAINT_VERSION)
-                                        || version == PREVIOUS_BOUNDARY_SUMMARYLESS_CONSTRAINT_VERSION
-                                    {
-                                        current_backing
-                                            .as_ref()
-                                            .ok_or_else(|| bincode::Error::new(bincode::ErrorKind::Custom("current runtime has no artifact backing".to_owned())))
-                                            .and_then(|backing| {
-                                                decode_current_runtime_wire(runtime_section, std::sync::Arc::clone(backing))
-                                                    .map_err(|err| bincode::Error::new(bincode::ErrorKind::Custom(err)))
-                                            })
-                                        .and_then(|(runtime, static_virtual_residual_mask)| {
-                                            let packed_dwa_dense_masks = if runtime
-                                                .packed_dwa_dense_mask_ids
-                                                .is_empty()
-                                            {
-                                                if !runtime.packed_dwa_dense_mask_rows.is_empty() {
-                                                    return Err(bincode::Error::new(
-                                                        bincode::ErrorKind::Custom(
-                                                            "packed DWA dense-mask slab has rows but no ids"
-                                                                .to_owned(),
-                                                        ),
-                                                    ));
-                                                }
-                                                None
-                                            } else {
-                                                Some((
-                                                    runtime.packed_dwa_dense_mask_ids,
-                                                    runtime.packed_dwa_dense_mask_rows,
-                                                ))
-                                            };
-                                            Ok(DecodedConstraintRuntime {
-                                                template_dynamic_proofs: runtime.template_dynamic_proofs,
-                                                terminal_live_states: runtime.terminal_live_states,
-                                                segmented_runtime_v20: None,
-                                                segmented_runtime_v22: None,
-                                                segmented_runtime_v23: None,
-                                                segmented_runtime_v24: None,
-                                                segmented_runtime_v27: runtime.segmented_runtime,
-                                                dynamic_mask_vocab: runtime.dynamic_mask_vocab,
-                                                virtual_runtimes: runtime.virtual_runtimes,
-                                                static_virtual_residual_mask,
-                                                packed_dwa_dense_masks,
-                                            })
-                                        })
-                                    } else if version == PREVIOUS_STATIC_PROJECTION_CONSTRAINT_VERSION {
-                                        bincode::deserialize::<ConstraintArtifactV28Runtime>(runtime_section)
-                                        .and_then(|runtime| {
-                                            let packed_dwa_dense_masks = if runtime
-                                                .packed_dwa_dense_mask_ids
-                                                .is_empty()
-                                            {
-                                                if !runtime.packed_dwa_dense_mask_rows.is_empty() {
-                                                    return Err(bincode::Error::new(
-                                                        bincode::ErrorKind::Custom(
-                                                            "packed DWA dense-mask slab has rows but no ids"
-                                                                .to_owned(),
-                                                        ),
-                                                    ));
-                                                }
-                                                None
-                                            } else {
-                                                Some((
-                                                    runtime.packed_dwa_dense_mask_ids,
-                                                    runtime.packed_dwa_dense_mask_rows,
-                                                ))
-                                            };
-                                            Ok(DecodedConstraintRuntime {
-                                                template_dynamic_proofs: None,
-                                                terminal_live_states: runtime.terminal_live_states,
-                                                segmented_runtime_v20: None,
-                                                segmented_runtime_v22: None,
-                                                segmented_runtime_v23: None,
-                                                segmented_runtime_v24: None,
-                                                segmented_runtime_v27: runtime.segmented_runtime,
-                                                dynamic_mask_vocab: runtime.dynamic_mask_vocab,
-                                                virtual_runtimes: runtime.virtual_runtimes,
-                                                static_virtual_residual_mask: runtime
-                                                    .static_virtual_residual_mask
-                                                    .map(StaticVirtualResidualMaskArtifactV28::into_current)
-                                                    .map(DecodedStaticVirtualResidualMask::Owned),
-                                                packed_dwa_dense_masks,
-                                            })
-                                        })
-                                    } else if version == PREVIOUS_STATIC_RESIDUAL_CONSTRAINT_VERSION {
-                                        bincode::deserialize::<ConstraintArtifactV27Runtime>(
-                                            runtime_section,
-                                        )
-                                        .and_then(|runtime| {
-                                            let packed_dwa_dense_masks = if runtime
-                                                .packed_dwa_dense_mask_ids
-                                                .is_empty()
-                                            {
-                                                if !runtime.packed_dwa_dense_mask_rows.is_empty() {
-                                                    return Err(bincode::Error::new(
-                                                        bincode::ErrorKind::Custom(
-                                                            "packed DWA dense-mask slab has rows but no ids"
-                                                                .to_owned(),
-                                                        ),
-                                                    ));
-                                                }
-                                                None
-                                            } else {
-                                                Some((
-                                                    runtime.packed_dwa_dense_mask_ids,
-                                                    runtime.packed_dwa_dense_mask_rows,
-                                                ))
-                                            };
-                                            Ok(DecodedConstraintRuntime {
-                                                template_dynamic_proofs: None,
-                                                terminal_live_states: runtime.terminal_live_states,
-                                                segmented_runtime_v20: None,
-                                                segmented_runtime_v22: None,
-                                                segmented_runtime_v23: None,
-                                                segmented_runtime_v24: None,
-                                                segmented_runtime_v27: runtime.segmented_runtime,
-                                                dynamic_mask_vocab: runtime.dynamic_mask_vocab,
-                                                virtual_runtimes: runtime.virtual_runtimes,
-                                                static_virtual_residual_mask: None,
-                                                packed_dwa_dense_masks,
-                                            })
-                                        })
-                                    } else if version == PREVIOUS_RECURSIVE_PARSER_CONSTRAINT_VERSION {
-                                        bincode::deserialize::<ConstraintArtifactV24Runtime>(
-                                            runtime_section,
-                                        )
-                                        .and_then(|runtime| {
-                                            let packed_dwa_dense_masks = if runtime
-                                                .packed_dwa_dense_mask_ids
-                                                .is_empty()
-                                            {
-                                                if !runtime.packed_dwa_dense_mask_rows.is_empty() {
-                                                    return Err(bincode::Error::new(
-                                                        bincode::ErrorKind::Custom(
-                                                            "packed DWA dense-mask slab has rows but no ids"
-                                                                .to_owned(),
-                                                        ),
-                                                    ));
-                                                }
-                                                None
-                                            } else {
-                                                Some((
-                                                    runtime.packed_dwa_dense_mask_ids,
-                                                    runtime.packed_dwa_dense_mask_rows,
-                                                ))
-                                            };
-                                            Ok(DecodedConstraintRuntime {
-                                                template_dynamic_proofs: None,
-                                                terminal_live_states: runtime.terminal_live_states,
-                                                segmented_runtime_v20: None,
-                                                segmented_runtime_v22: None,
-                                                segmented_runtime_v23: None,
-                                                segmented_runtime_v24: runtime.segmented_runtime,
-                                                segmented_runtime_v27: None,
-                                                dynamic_mask_vocab: runtime.dynamic_mask_vocab,
-                                                virtual_runtimes: Vec::new(),
-                                                static_virtual_residual_mask: None,
-                                                packed_dwa_dense_masks,
-                                            })
-                                        })
-                                    } else if version == PREVIOUS_BOUNDARY_SHARDED_CONSTRAINT_VERSION {
-                                        bincode::deserialize::<ConstraintArtifactV23Runtime>(
-                                            runtime_section,
-                                        )
-                                        .and_then(|runtime| {
-                                            let packed_dwa_dense_masks = if runtime
-                                                .packed_dwa_dense_mask_ids
-                                                .is_empty()
-                                            {
-                                                if !runtime.packed_dwa_dense_mask_rows.is_empty() {
-                                                    return Err(bincode::Error::new(
-                                                        bincode::ErrorKind::Custom(
-                                                            "packed DWA dense-mask slab has rows but no ids"
-                                                                .to_owned(),
-                                                        ),
-                                                    ));
-                                                }
-                                                None
-                                            } else {
-                                                Some((
-                                                    runtime.packed_dwa_dense_mask_ids,
-                                                    runtime.packed_dwa_dense_mask_rows,
-                                                ))
-                                            };
-                                            Ok(DecodedConstraintRuntime {
-                                                template_dynamic_proofs: None,
-                                                terminal_live_states: runtime.terminal_live_states,
-                                                segmented_runtime_v20: None,
-                                                segmented_runtime_v22: None,
-                                                segmented_runtime_v23: runtime.segmented_runtime,
-                                                segmented_runtime_v24: None,
-                                                segmented_runtime_v27: None,
-                                                dynamic_mask_vocab: runtime.dynamic_mask_vocab,
-                                                virtual_runtimes: Vec::new(),
-                                                static_virtual_residual_mask: None,
-                                                packed_dwa_dense_masks,
-                                            })
-                                        })
-                                    } else if version == PREVIOUS_BOUNDARY_SHARDLESS_CONSTRAINT_VERSION {
-                                        bincode::deserialize::<ConstraintArtifactV22Runtime>(
-                                            runtime_section,
-                                        )
-                                        .and_then(|runtime| {
-                                            let packed_dwa_dense_masks = if runtime
-                                                .packed_dwa_dense_mask_ids
-                                                .is_empty()
-                                            {
-                                                if !runtime.packed_dwa_dense_mask_rows.is_empty() {
-                                                    return Err(bincode::Error::new(
-                                                        bincode::ErrorKind::Custom(
-                                                            "packed DWA dense-mask slab has rows but no ids"
-                                                                .to_owned(),
-                                                        ),
-                                                    ));
-                                                }
-                                                None
-                                            } else {
-                                                Some((
-                                                    runtime.packed_dwa_dense_mask_ids,
-                                                    runtime.packed_dwa_dense_mask_rows,
-                                                ))
-                                            };
-                                            Ok(DecodedConstraintRuntime {
-                                                template_dynamic_proofs: None,
-                                                terminal_live_states: runtime.terminal_live_states,
-                                                segmented_runtime_v20: None,
-                                                segmented_runtime_v22: runtime.segmented_runtime,
-                                                segmented_runtime_v23: None,
-                                                segmented_runtime_v24: None,
-                                                segmented_runtime_v27: None,
-                                                dynamic_mask_vocab: runtime.dynamic_mask_vocab,
-                                                virtual_runtimes: Vec::new(),
-                                                static_virtual_residual_mask: None,
-                                                packed_dwa_dense_masks,
-                                            })
-                                        })
-                                    } else if version == PREVIOUS_SEGMENTED_MATERIALIZATION_CONSTRAINT_VERSION {
-                                        bincode::deserialize::<ConstraintArtifactV21Runtime>(
-                                            runtime_section,
-                                        )
-                                        .and_then(|runtime| {
-                                            let packed_dwa_dense_masks = if runtime
-                                                .packed_dwa_dense_mask_ids
-                                                .is_empty()
-                                            {
-                                                if !runtime.packed_dwa_dense_mask_rows.is_empty() {
-                                                    return Err(bincode::Error::new(
-                                                        bincode::ErrorKind::Custom(
-                                                            "packed DWA dense-mask slab has rows but no ids"
-                                                                .to_owned(),
-                                                        ),
-                                                    ));
-                                                }
-                                                None
-                                            } else {
-                                                Some((
-                                                    runtime.packed_dwa_dense_mask_ids,
-                                                    runtime.packed_dwa_dense_mask_rows,
-                                                ))
-                                            };
-                                            Ok(DecodedConstraintRuntime {
-                                                template_dynamic_proofs: None,
-                                                terminal_live_states: runtime.terminal_live_states,
-                                                segmented_runtime_v20: runtime.segmented_runtime,
-                                                segmented_runtime_v22: None,
-                                                segmented_runtime_v23: None,
-                                                segmented_runtime_v24: None,
-                                                segmented_runtime_v27: None,
-                                                dynamic_mask_vocab: None,
-                                                virtual_runtimes: Vec::new(),
-                                                static_virtual_residual_mask: None,
-                                                packed_dwa_dense_masks,
-                                            })
-                                        })
-                                    } else if version == PREVIOUS_COMBINED_CONSTRAINT_VERSION {
-                                        bincode::deserialize::<ConstraintArtifactV20Runtime>(
-                                            runtime_section,
-                                        )
-                                        .map(|runtime| DecodedConstraintRuntime {
-                                                template_dynamic_proofs: None,
-                                            terminal_live_states: runtime.terminal_live_states,
-                                            segmented_runtime_v20: runtime.segmented_runtime,
-                                            segmented_runtime_v22: None,
-                                            segmented_runtime_v23: None,
-                                            segmented_runtime_v24: None,
-                                            segmented_runtime_v27: None,
-                                            dynamic_mask_vocab: None,
-                                            virtual_runtimes: Vec::new(),
-                                            static_virtual_residual_mask: None,
-                                            packed_dwa_dense_masks: None,
-                                        })
-                                    } else {
-                                        bincode::deserialize::<ConstraintArtifactV15Runtime>(
-                                            runtime_section,
-                                        )
-                                        .map(|runtime| DecodedConstraintRuntime {
-                                                template_dynamic_proofs: None,
-                                            terminal_live_states: runtime.terminal_live_states,
-                                            segmented_runtime_v20: None,
-                                            segmented_runtime_v22: None,
-                                            segmented_runtime_v23: None,
-                                            segmented_runtime_v24: None,
-                                            segmented_runtime_v27: None,
-                                            dynamic_mask_vocab: None,
-                                            virtual_runtimes: Vec::new(),
-                                            static_virtual_residual_mask: None,
-                                            packed_dwa_dense_masks: None,
-                                        })
-                                    }
-                                    .map(Some)
-                                    .map_err(|err| err.to_string());
-                                    if let Some(started) = started {
-                                        eprintln!("[glrmask/profile][constraint_section] name=runtime ms={:.3}", started.elapsed().as_secs_f64() * 1000.0);
-                                    }
-                                    result
-                                },
-                            )
-                        },
-                    ),
-                    || rayon::join(
-                        || rayon::join(
-                            || -> Result<Option<crate::automata::lexer::tokenizer::Tokenizer>, String> {
-                            let Some(section) = tokenizer_section else {
-                                return Ok(None);
-                            };
-                            let started = profile.then(std::time::Instant::now);
-                            let result = if uses_external_runtime_sections(version) {
-                                let backing = current_backing.as_ref().ok_or_else(|| {
-                                    "current tokenizer has no artifact backing".to_owned()
-                                })?;
-                                let base = backing.as_ptr() as usize;
-                                let section_start = (section.as_ptr() as usize)
-                                    .checked_sub(base)
-                                    .ok_or_else(|| {
-                                        "tokenizer section does not belong to artifact backing"
-                                            .to_owned()
-                                    })?;
-                                crate::automata::lexer::tokenizer::artifact_serde::from_fast_bytes_backed(
-                                    section,
-                                    std::sync::Arc::clone(backing),
-                                    section_start,
-                                )
-                                .map(Some)
-                            } else {
-                                crate::automata::lexer::tokenizer::artifact_serde::from_fast_bytes(
-                                    section,
-                                )
-                                .map(Some)
-                            };
-                            if let Some(started) = started {
-                                eprintln!(
-                                    "[glrmask/profile][constraint_section] name=tokenizer ms={:.3}",
-                                    started.elapsed().as_secs_f64() * 1000.0,
-                                );
-                            }
-                            result
-                            },
-                            || -> Result<Option<DecodedOriginalTokenMap>, String> {
-                            let Some(section) = original_token_map_section else {
-                                return Ok(None);
-                            };
-                            let started = profile.then(std::time::Instant::now);
-                            let result = if uses_external_runtime_sections(version) {
-                                let backing = current_backing.as_ref().ok_or_else(|| {
-                                    "current original-token map has no artifact backing".to_owned()
-                                })?;
-                                let base = backing.as_ptr() as usize;
-                                let section_start = (section.as_ptr() as usize)
-                                    .checked_sub(base)
-                                    .ok_or_else(|| {
-                                        "original-token map section does not belong to artifact backing"
-                                            .to_owned()
-                                    })?;
-                                crate::runtime::artifact::original_token_map_artifact_serde::PackedOriginalTokenMap::parse_backed(
-                                    std::sync::Arc::clone(backing),
-                                    section_start,
-                                    section.len(),
-                                )
-                                .map(|packed| {
-                                    Some(DecodedOriginalTokenMap::Packed(std::sync::Arc::new(
-                                        packed,
-                                    )))
-                                })
-                            } else {
-                                crate::runtime::artifact::original_token_map_artifact_serde::from_fast_bytes(section)
-                                    .map(|map| Some(DecodedOriginalTokenMap::Materialized(map)))
-                            };
-                            if let Some(started) = started {
-                                eprintln!(
-                                    "[glrmask/profile][constraint_section] name=original_token_map ms={:.3}",
-                                    started.elapsed().as_secs_f64() * 1000.0,
-                                );
-                            }
-                            result
-                            },
-                        ),
-                        || rayon::join(
-                            || -> Result<Option<DecodedInternalTokenBufMasks>, String> {
-                                let Some(section) = internal_token_buf_masks_section else {
-                                    return Ok(None);
-                                };
-                                let started = profile.then(std::time::Instant::now);
-                                let backing = current_backing
-                                    .as_ref()
-                                    .map(|backing| {
-                                        let base = backing.as_ptr() as usize;
-                                        let section_start = (section.as_ptr() as usize)
-                                            .checked_sub(base)
-                                            .ok_or_else(|| {
-                                                "internal-token buffer-mask section does not belong to artifact backing"
-                                                    .to_owned()
-                                            })?;
-                                        Ok::<_, String>((
-                                            std::sync::Arc::clone(backing),
-                                            section_start,
-                                        ))
-                                    })
-                                    .transpose()?;
-                                let result = decode_internal_token_buf_masks(section, backing).map(Some);
-                                if let Some(started) = started {
-                                    eprintln!(
-                                        "[glrmask/profile][constraint_section] name=internal_token_buf_masks ms={:.3}",
-                                        started.elapsed().as_secs_f64() * 1000.0,
-                                    );
-                                }
-                                result
-                            },
-                            || -> Result<Option<TokenMaskCacheArtifact>, String> {
-                                let Some(section) = token_mask_cache_section else {
-                                    return Ok(None);
-                                };
-                                if section.is_empty() {
-                                    return Ok(None);
-                                }
-                                let started = profile.then(std::time::Instant::now);
-                                let result = if let Some(backing) = current_backing.as_ref() {
-                                    let base = backing.as_ptr() as usize;
-                                    let section_start = (section.as_ptr() as usize)
-                                        .checked_sub(base)
-                                        .ok_or_else(|| {
-                                            "token-mask cache section does not belong to artifact backing"
-                                                .to_owned()
-                                        })?;
-                                    decode_token_mask_cache_backed(
-                                        section,
-                                        std::sync::Arc::clone(backing),
-                                        section_start,
-                                    )
-                                    .map(Some)
-                                } else {
-                                    decode_token_mask_cache(section).map(Some)
-                                };
-                                if let Some(started) = started {
-                                    eprintln!(
-                                        "[glrmask/profile][constraint_section] name=token_mask_cache ms={:.3}",
-                                        started.elapsed().as_secs_f64() * 1000.0,
-                                    );
-                                }
-                                result
-                            },
-                        ),
-                    ),
-                ),
-                || -> Result<
-                    (
-                        DecodedConstraintCore,
-                        Option<std::sync::Arc<crate::runtime::artifact::token_bytes_artifact_serde::PackedTokenBytes>>,
-                        Option<(
-                            std::sync::Arc<crate::ds::weight::PackedRuntimeWeightPool>,
-                            Vec<u32>,
-                        )>,
-                    ),
-                    String,
-                > {
-                    let section_started = profile.then(std::time::Instant::now);
-                    let weight_count = if uses_external_runtime_sections(version)
-                        || version == PREVIOUS_VOCAB_SECTION_CONSTRAINT_VERSION
-                        || version == PREVIOUS_FAST_RUNTIME_CONSTRAINT_VERSION
-                        || version == PREVIOUS_PACKED_RUNTIME_CONSTRAINT_VERSION
-                    {
-                        Some(crate::ds::weight::PackedRuntimeWeightPool::peek_weight_count(
-                            weight_section,
-                        )?)
-                    } else {
-                        None
-                    };
-
-                    let decode_core = || -> Result<_, String> {
-                        if let Some(weight_count) = weight_count {
-                            crate::ds::weight::begin_pooled_weight_serde_deferred_decode(
-                                weight_count,
-                            );
-                        } else {
-                            let weights_started = profile.then(std::time::Instant::now);
-                            let weights = crate::ds::weight::unpack_pooled_weights(weight_section)?;
-                            if let Some(started) = weights_started {
-                                eprintln!("[glrmask/profile][constraint_section] name=weights ms={:.3}", started.elapsed().as_secs_f64() * 1000.0);
-                            }
-                            crate::ds::weight::begin_pooled_weight_serde_decode(weights);
-                        }
-                        let previous_external =
-                            crate::automata::weighted::dwa::set_external_serde(true);
-                        let previous_external_table =
-                            crate::compiler::glr::table::artifact_serde::set_external_serde(true);
-                        let previous_compact_tokenizer =
-                            crate::automata::lexer::tokenizer::set_compact_artifact_serde(true);
-                        let previous_external_tokenizer =
-                            crate::automata::lexer::tokenizer::set_external_artifact_serde(
-                                uses_external_runtime_sections(version),
-                            );
-                        let previous_omit_inverse =
-                            crate::runtime::artifact::internal_token_inverse_artifact_serde::set_omit(
-                                true,
-                            );
-                        let previous_packed_original_token_map =
-                            crate::runtime::artifact::original_token_map_artifact_serde::set_packed(
-                                true,
-                            );
-                        let previous_external_original_token_map =
-                            crate::runtime::artifact::original_token_map_artifact_serde::set_external(
-                                uses_external_runtime_sections(version),
-                            );
-                        let previous_packed_token_bytes =
-                            crate::runtime::artifact::token_bytes_artifact_serde::set_packed(true);
-                        let previous_external_token_bytes =
-                            crate::runtime::artifact::token_bytes_artifact_serde::set_external(
-                                uses_external_runtime_sections(version)
-                                    || version == PREVIOUS_VOCAB_SECTION_CONSTRAINT_VERSION,
-                            );
-                        let previous_defer_token_bytes =
-                            crate::runtime::artifact::token_bytes_artifact_serde::set_defer_unpack(
-                                version == PREVIOUS_FAST_RUNTIME_CONSTRAINT_VERSION
-                                    || version == PREVIOUS_PACKED_RUNTIME_CONSTRAINT_VERSION,
-                            );
-                        let core_started = profile.then(std::time::Instant::now);
-                        let decoded = if uses_external_runtime_sections(version) {
-                            if core_section.starts_with(&CURRENT_CORE_MAGIC)
-                                || core_section.starts_with(&PREVIOUS_CURRENT_CORE_MAGIC)
-                                || core_section.starts_with(&PREVIOUS_PREVIOUS_CURRENT_CORE_MAGIC)
-                                || core_section.starts_with(&PREVIOUS_PREVIOUS_PREVIOUS_CURRENT_CORE_MAGIC)
-                            {
-                                let core_backing = current_backing.as_ref().and_then(|backing| {
-                                    let base = backing.as_ptr() as usize;
-                                    let start = (core_section.as_ptr() as usize).checked_sub(base)?;
-                                    Some((std::sync::Arc::clone(backing), start))
-                                });
-                                decode_current_core(core_section, core_backing)
-                                .map(|(artifact, terminal_exprs_blob)| {
-                                    let mut constraint = artifact.constraint;
-                                    constraint.static_dynamic_overlay = artifact.static_dynamic_overlay;
-                                    constraint.late_grammar_slots = artifact.late_grammar_slots;
-                                    DecodedConstraintCore {
-                                        constraint,
-                                        ignore_expr: artifact.ignore_expr,
-                                        terminal_exprs: None,
-                                        terminal_exprs_blob,
-                                        parser_state_domain_labels:
-                                            artifact.parser_state_domain_labels,
-                                        internal_token_buf_masks: Vec::new(),
-                                    }
-                                })
-                            } else {
-                                bincode::deserialize::<ConstraintArtifactV18Core>(core_section)
-                                    .map(|artifact| DecodedConstraintCore {
-                                        constraint: artifact.constraint,
-                                        ignore_expr: artifact.ignore_expr,
-                                        terminal_exprs: artifact.terminal_exprs,
-                                        terminal_exprs_blob: None,
-                                        parser_state_domain_labels: artifact.parser_state_domain_labels,
-                                        internal_token_buf_masks: Vec::new(),
-                                    })
-                                    .map_err(|err| err.to_string())
-                            }
-                        } else {
-                            bincode::deserialize::<ConstraintArtifactV14Core>(core_section)
-                                .map(|artifact| DecodedConstraintCore {
-                                    constraint: artifact.constraint,
-                                    ignore_expr: artifact.ignore_expr,
-                                    terminal_exprs: artifact.terminal_exprs,
-                                    terminal_exprs_blob: None,
-                                    parser_state_domain_labels: artifact.parser_state_domain_labels,
-                                    internal_token_buf_masks: artifact.internal_token_buf_masks,
-                                })
-                                .map_err(|err| err.to_string())
-                        };
-                        let deferred_token_bytes =
-                            crate::runtime::artifact::token_bytes_artifact_serde::take_deferred();
-                        let deferred_weight_ids = if weight_count.is_some() {
-                            crate::ds::weight::take_pooled_weight_serde_deferred_ids()
-                        } else {
-                            Vec::new()
-                        };
-                        if let Some(started) = core_started {
-                            eprintln!("[glrmask/profile][constraint_section] name=core_bincode ms={:.3}", started.elapsed().as_secs_f64() * 1000.0);
-                        }
-                        crate::automata::lexer::tokenizer::set_compact_artifact_serde(
-                            previous_compact_tokenizer,
-                        );
-                        crate::automata::lexer::tokenizer::set_external_artifact_serde(
-                            previous_external_tokenizer,
-                        );
-                        crate::runtime::artifact::token_bytes_artifact_serde::set_packed(
-                            previous_packed_token_bytes,
-                        );
-                        crate::runtime::artifact::token_bytes_artifact_serde::set_external(
-                            previous_external_token_bytes,
-                        );
-                        crate::runtime::artifact::token_bytes_artifact_serde::set_defer_unpack(
-                            previous_defer_token_bytes,
-                        );
-                        crate::runtime::artifact::internal_token_inverse_artifact_serde::set_omit(
-                            previous_omit_inverse,
-                        );
-                        crate::runtime::artifact::original_token_map_artifact_serde::set_packed(
-                            previous_packed_original_token_map,
-                        );
-                        crate::runtime::artifact::original_token_map_artifact_serde::set_external(
-                            previous_external_original_token_map,
-                        );
-                        crate::compiler::glr::table::artifact_serde::set_external_serde(
-                            previous_external_table,
-                        );
-                        crate::automata::weighted::dwa::set_external_serde(previous_external);
-                        crate::ds::weight::end_pooled_weight_serde_decode();
-                        decoded.map(|artifact| {
-                            (artifact, deferred_token_bytes, deferred_weight_ids)
-                        })
-                    };
-
-                    let (artifact, deferred_token_bytes, packed_weights) =
-                        if uses_external_runtime_sections(version)
-                            || version == PREVIOUS_VOCAB_SECTION_CONSTRAINT_VERSION
-                            || version == PREVIOUS_FAST_RUNTIME_CONSTRAINT_VERSION
-                            || version == PREVIOUS_PACKED_RUNTIME_CONSTRAINT_VERSION
-                        {
-                            let weights_started = profile.then(std::time::Instant::now);
-                            // WPL3 current-format runtime indexing is now only
-                            // a small linear framing scan + one section copy.
-                            // Running that tiny job as another nested Rayon
-                            // branch competes with the much heavier core/DWA
-                            // decoders and increases wall time on Windows.
-                            let packed_weights =
-                                crate::ds::weight::PackedRuntimeWeightPool::from_packed_bytes(
-                                    weight_section,
-                                )?;
-                            if let Some(started) = weights_started {
-                                eprintln!("[glrmask/profile][constraint_section] name=weights_packed ms={:.3}", started.elapsed().as_secs_f64() * 1000.0);
-                            }
-                            let (artifact, deferred_token_bytes, deferred_weight_ids) = decode_core()?;
-                            (
-                                artifact,
-                                deferred_token_bytes,
-                                Some((std::sync::Arc::new(packed_weights), deferred_weight_ids)),
-                            )
-                        } else {
-                            let (artifact, deferred_token_bytes, _) = decode_core()?;
-                            (artifact, deferred_token_bytes, None)
-                        };
-                    if let Some(started) = section_started {
-                        eprintln!("[glrmask/profile][constraint_section] name=core_total ms={:.3}", started.elapsed().as_secs_f64() * 1000.0);
-                    }
-                    Ok((artifact, deferred_token_bytes, packed_weights))
-                },
-            );
-            let parser_dwa = dwa_result.map_err(crate::GlrMaskError::Serialization)?;
-            let (table, deferred_table_rules_blob, template_parser_seed) =
-                table_result.map_err(crate::GlrMaskError::Serialization)?;
-            let runtime = runtime_result.map_err(crate::GlrMaskError::Serialization)?;
-            let tokenizer = tokenizer_result.map_err(crate::GlrMaskError::Serialization)?;
-            let original_token_map =
-                original_token_map_result.map_err(crate::GlrMaskError::Serialization)?;
-            let external_internal_token_buf_masks =
-                internal_token_buf_masks_result.map_err(crate::GlrMaskError::Serialization)?;
-            let token_mask_cache =
-                token_mask_cache_result.map_err(crate::GlrMaskError::Serialization)?;
-            let (artifact, deferred_token_bytes, packed_weights) =
-                core_result.map_err(crate::GlrMaskError::Serialization)?;
-            let token_bytes_started = profile.then(std::time::Instant::now);
-            let external_token_bytes = if external_vocab.is_some() {
-                if !token_bytes_section.is_some_and(<[u8]>::is_empty) {
-                    return Err(crate::Error::Serialization("external template artifact unexpectedly contains token bytes".into()));
-                }
-                None
-            } else if let Some(token_bytes_section) = token_bytes_section {
-                let backing = current_backing
-                    .as_ref()
-                    .expect("current-format token section has artifact backing");
-                let start = (token_bytes_section.as_ptr() as usize)
-                    .checked_sub(section_bytes.as_ptr() as usize)
-                    .ok_or_else(|| {
-                        crate::GlrMaskError::Serialization(
-                            "token-byte section does not belong to artifact backing".to_owned(),
-                        )
-                    })?;
-                Some(std::sync::Arc::new(
-                    crate::runtime::artifact::token_bytes_artifact_serde::PackedTokenBytes::parse_backed(
-                        std::sync::Arc::clone(backing),
-                        start,
-                        token_bytes_section.len(),
-                    )
-                    .map_err(crate::GlrMaskError::Serialization)?,
-                ))
-            } else {
-                None
-            };
-            let token_bytes_ms = token_bytes_started
-                .map_or(0.0, |started| started.elapsed().as_secs_f64() * 1000.0);
-            let mut constraint = artifact.constraint;
-            if let Some(tokenizer) = tokenizer {
-                constraint.tokenizer = tokenizer.into();
-            }
-            if let Some(original_token_map) = original_token_map {
-                match original_token_map {
-                    DecodedOriginalTokenMap::Materialized(map) => {
-                        constraint.original_token_to_internal = map;
-                        constraint.packed_original_token_to_internal = None;
-                    }
-                    DecodedOriginalTokenMap::Packed(map) => {
-                        constraint.original_token_to_internal = Vec::new();
-                        constraint.packed_original_token_to_internal = Some(map);
-                    }
-                }
-            }
-            let attach_weights_started = profile.then(std::time::Instant::now);
-            if let Some((pool, ids)) = packed_weights {
-                attach_packed_non_dwa_weights(&mut constraint, pool, ids)
-                    .map_err(crate::GlrMaskError::Serialization)?;
-            }
-            let attach_weights_ms = attach_weights_started
-                .map_or(0.0, |started| started.elapsed().as_secs_f64() * 1000.0);
-            let attach_dwa_started = profile.then(std::time::Instant::now);
-            match parser_dwa {
-                DecodedParserDwa::Materialized(parser_dwa, inventory) => {
-                    constraint.parser_dwa = parser_dwa;
-                    constraint.packed_parser_dwa = None;
-                    packed_dwa_inventory = inventory;
-                }
-                DecodedParserDwa::Packed(parser_dwa) => {
-                    constraint.parser_dwa = crate::automata::weighted::dwa::DWA::new(0, 0);
-                    constraint.packed_parser_dwa = Some(parser_dwa);
-                }
-            }
-            let attach_dwa_ms = attach_dwa_started
-                .map_or(0.0, |started| started.elapsed().as_secs_f64() * 1000.0);
-            constraint.table = table;
-            if let Some(seed) = template_parser_seed {
-                seed.install(&mut constraint).map_err(crate::GlrMaskError::Serialization)?;
-            }
-            constraint.deferred_table_rules_blob = deferred_table_rules_blob;
-            constraint.deferred_table_rules = Default::default();
-            let invert_started = profile.then(std::time::Instant::now);
-            if !uses_external_runtime_sections(version)
-                && version != PREVIOUS_VOCAB_SECTION_CONSTRAINT_VERSION
-            {
-                constraint.internal_token_to_tokens = invert_original_token_map(
-                    &constraint.original_token_to_internal,
-                    artifact.internal_token_buf_masks.len(),
-                )
-                .map_err(crate::GlrMaskError::Serialization)?;
-            }
-            let invert_ms = invert_started
-                .map_or(0.0, |started| started.elapsed().as_secs_f64() * 1000.0);
-            constraint.ignore_expr = artifact.ignore_expr;
-            constraint.parser_state_domain_labels = artifact.parser_state_domain_labels;
-            constraint.deferred_terminal_exprs_blob = artifact.terminal_exprs_blob;
-            constraint.deferred_terminal_exprs = Default::default();
-            constraint.deferred_composition_metadata_blob = if let Some(section) = composition_metadata_section {
-                let (_, prepared)=crate::compiler::boundary_precomputed_completion::split_envelope(section)
-                    .map_err(crate::GlrMaskError::Serialization)?;
-                prepared_completion_wire=prepared.map(Arc::from);
-                validate_composition_metadata_wire(section)
-                    .map_err(crate::GlrMaskError::Serialization)?;
-                if section.is_empty() {
-                    None
-                } else if let Some(backing) = current_backing.as_ref() {
-                    let start = (section.as_ptr() as usize)
-                        .checked_sub(backing.as_ptr() as usize)
-                        .ok_or_else(|| {
-                            crate::GlrMaskError::Serialization(
-                                "composition metadata section does not belong to artifact backing"
-                                    .to_owned(),
-                            )
-                        })?;
-                    let end = start.checked_add(section.len()).ok_or_else(|| {
-                        crate::GlrMaskError::Serialization(
-                            "composition metadata backing range overflow".to_owned(),
-                        )
-                    })?;
-                    if backing.get(start..end) != Some(section) {
-                        return Err(crate::GlrMaskError::Serialization(
-                            "composition metadata bytes do not match artifact backing".to_owned(),
-                        ));
-                    }
-                    Some(crate::runtime::artifact::DeferredCompositionMetadataBytes::Backed {
-                        backing: std::sync::Arc::clone(backing),
-                        start,
-                        len: section.len(),
-                    })
-                } else {
-                    Some(crate::runtime::artifact::DeferredCompositionMetadataBytes::Owned(
-                        std::sync::Arc::from(section.to_vec().into_boxed_slice()),
-                    ))
-                }
-            } else {
-                None
-            };
-            constraint.composition_link_metadata_materialized =
-                constraint.deferred_composition_metadata_blob.is_none();
-            if let Some(decoded) = external_internal_token_buf_masks {
-                constraint.internal_token_buf_masks = Vec::new();
-                constraint.internal_token_buf_flat = decoded.flat;
-                constraint.backed_internal_token_buf_flat = decoded.backed;
-                constraint.internal_token_buf_offsets = decoded.offsets;
-            } else {
-                constraint.internal_token_buf_masks = artifact.internal_token_buf_masks;
-                constraint.backed_internal_token_buf_flat = None;
-            }
-            constraint.packed_token_bytes = external_token_bytes.or(deferred_token_bytes);
-            if let Some(vocab) = external_vocab {
-                if constraint.packed_token_bytes.is_some() || !constraint.token_bytes.is_empty() {
-                    return Err(crate::Error::Serialization("external template core contains a duplicate vocabulary".into()));
-                }
-                constraint.token_bytes = vocab.entries_arc();
-            }
+        let mut constraint = {
+            let decoded = Self::decode_native_artifact_for_load(
+                version, serialized, section_bytes, &current_backing,
+                external_vocab, profile, &mut packed_dwa_inventory,
+                &mut prepared_completion_wire,
+            )?;
+            let mut constraint = decoded.constraint;
+            let runtime = decoded.runtime;
+            let token_mask_cache = decoded.token_mask_cache;
+            let terminal_exprs = decoded.terminal_exprs;
+            let [token_bytes_ms, attach_weights_ms, attach_dwa_ms, invert_ms] = decoded.post_decode_ms;
             if let Some(cache) = token_mask_cache {
                 install_token_mask_cache(&mut constraint, cache)
                     .map_err(crate::GlrMaskError::Serialization)?;
@@ -8384,7 +8193,7 @@ impl Constraint {
             }
             let restore_exprs_started = profile.then(std::time::Instant::now);
             if virtual_runtimes.is_empty() {
-                Arc::make_mut(&mut constraint.tokenizer).restore_terminal_exprs(artifact.terminal_exprs)
+                Arc::make_mut(&mut constraint.tokenizer).restore_terminal_exprs(terminal_exprs)
                     .map_err(crate::GlrMaskError::Serialization)?;
             } else {
                 let compiled_static_residual = static_virtual_residual_mask.as_ref().is_some_and(|static_mask| {
@@ -8397,7 +8206,7 @@ impl Constraint {
                         &virtual_runtimes, static_virtual_residual_mask.as_ref().unwrap().projections(),
                     )
                 } else {
-                    let terminal_exprs = artifact.terminal_exprs.or_else(|| {
+                    let terminal_exprs = terminal_exprs.or_else(|| {
                         constraint.retained_terminal_exprs().map(|exprs| exprs.to_vec())
                     });
                     if constraint.uses_dynamic_runtime() && static_virtual_residual_mask.is_none() {
@@ -8438,50 +8247,6 @@ impl Constraint {
                 );
             }
             constraint
-        } else if version == PREVIOUS_UNCOMPRESSED_CONSTRAINT_VERSION {
-            let previous_dwa_mode = crate::automata::weighted::dwa::set_packed_serde(true);
-            let decoded = bincode::deserialize::<ConstraintArtifactV13>(serialized);
-            crate::automata::weighted::dwa::set_packed_serde(previous_dwa_mode);
-            // The pool activator is the first v13 field and therefore installs
-            // the Weight reference table before Constraint is deserialized.
-            // Always clear it, including after a malformed later field.
-            crate::ds::weight::end_pooled_weight_serde_decode();
-            let artifact = decoded
-                .map_err(|err| crate::GlrMaskError::Serialization(err.to_string()))?;
-            let mut constraint = artifact.constraint;
-            constraint.ignore_expr = artifact.ignore_expr;
-            constraint.parser_state_domain_labels = artifact.parser_state_domain_labels;
-            constraint.internal_token_buf_masks = artifact.internal_token_buf_masks;
-            Arc::make_mut(&mut constraint.tokenizer).restore_terminal_exprs(artifact.terminal_exprs)
-                .map_err(crate::GlrMaskError::Serialization)?;
-            constraint
-        } else if version == PREVIOUS_DOMAIN_LABELS_CONSTRAINT_VERSION {
-            let artifact: ConstraintArtifactV12 = bincode::deserialize(serialized)
-                .map_err(|err| crate::GlrMaskError::Serialization(err.to_string()))?;
-            let mut constraint = artifact.constraint;
-            constraint.ignore_expr = artifact.ignore_expr;
-            constraint.parser_state_domain_labels = artifact.parser_state_domain_labels;
-            Arc::make_mut(&mut constraint.tokenizer).restore_terminal_exprs(artifact.terminal_exprs)
-                .map_err(crate::GlrMaskError::Serialization)?;
-            constraint
-        } else if version == PREVIOUS_TERMINAL_EXPRS_CONSTRAINT_VERSION {
-            let artifact: ConstraintArtifactV11 = bincode::deserialize(serialized)
-                .map_err(|err| crate::GlrMaskError::Serialization(err.to_string()))?;
-            let mut constraint = artifact.constraint;
-            constraint.ignore_expr = artifact.ignore_expr;
-            Arc::make_mut(&mut constraint.tokenizer).restore_terminal_exprs(artifact.terminal_exprs)
-                .map_err(crate::GlrMaskError::Serialization)?;
-            constraint
-        } else if version == PREVIOUS_EXPRLESS_CONSTRAINT_VERSION {
-            let artifact: ConstraintArtifactV10 = bincode::deserialize(serialized)
-                .map_err(|err| crate::GlrMaskError::Serialization(err.to_string()))?;
-            let mut constraint = artifact.constraint;
-            constraint.ignore_expr = artifact.ignore_expr;
-            constraint
-        } else {
-            bincode::deserialize::<DeserializedConstraint>(serialized)
-                .map_err(|err| crate::GlrMaskError::Serialization(err.to_string()))?
-                .0
         };
         let deserialize_ms = deserialize_started
             .map_or(0.0, |started| started.elapsed().as_secs_f64() * 1000.0);
@@ -8584,7 +8349,7 @@ impl Constraint {
                 eprintln!("[glrmask/profile][component_completion_load] certified=true ms={:.3}",started.elapsed().as_secs_f64()*1000.0);
             }
         }
-        Ok(constraint)
+        Ok(*constraint)
     }
 }
 
