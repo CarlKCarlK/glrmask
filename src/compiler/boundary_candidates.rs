@@ -489,14 +489,7 @@ fn fingerprint(
         semantics.update(b"glrmask-boundary-component-semantics-v2-composite\0");
         semantics.update(&(overlay.segmented_parser_components.len() as u64).to_le_bytes());
         for (component_index, component) in overlay.segmented_parser_components.iter().enumerate() {
-            let child_rules = component
-                .constraint
-                .retained_table_rules()
-                .map_err(|_| SummaryUnavailable::MissingGrammarMetadata)?;
-            if child_rules.is_empty() {
-                return Err(SummaryUnavailable::MissingGrammarMetadata);
-            }
-            let child = fingerprint(component.constraint.as_ref(), vocab, child_rules)?;
+            let child = fingerprint_for_constraint(component.constraint.as_ref(), vocab)?;
             semantics.update(&(component_index as u64).to_le_bytes());
             semantics.update(&child.component_semantics);
             semantics.update(&child.public_interface);
@@ -871,17 +864,30 @@ fn compute_summary(
     )
 }
 
+fn fingerprint_for_constraint(
+    constraint: &Constraint, vocab: &crate::Vocab,
+) -> Result<BoundaryCandidateFingerprint, SummaryUnavailable> {
+    if constraint.static_dynamic_overlay.as_ref()
+        .is_some_and(|overlay| !overlay.segmented_parser_components.is_empty()) {
+        // The composite digest is defined by validated immediate components and
+        // typed links. Its branch does not consume flattened wrapper rules.
+        if constraint.template_parser.as_ref().is_some_and(|parser| parser.link_grammar.is_some()) {
+            return fingerprint(constraint, vocab, &[]);
+        }
+    }
+    let rules = constraint.retained_table_rules()
+        .map_err(|_| SummaryUnavailable::MissingGrammarMetadata)?;
+    if rules.is_empty() { return Err(SummaryUnavailable::MissingGrammarMetadata); }
+    fingerprint(constraint, vocab, rules)
+}
+
 pub(crate) fn install_precomputed_boundary_candidate_ids(
     constraint: &mut Constraint,
     vocab: &crate::Vocab,
     ids: &[u32],
     widened: bool,
 ) -> Result<(), String> {
-    let rules = constraint.retained_table_rules()?;
-    if rules.is_empty() {
-        return Err("cannot install boundary candidate summary without retained grammar rules".to_owned());
-    }
-    let fp = fingerprint(constraint, vocab, rules)
+    let fp = fingerprint_for_constraint(constraint, vocab)
         .map_err(|reason| format!("cannot fingerprint precomputed boundary summary: {reason:?}"))?;
     let mut ids = ids.to_vec();
     ids.sort_unstable();

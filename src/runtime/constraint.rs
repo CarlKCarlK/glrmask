@@ -1396,7 +1396,7 @@ impl Constraint {
     /// when a later composition actually needs grammar structure.
     pub(crate) fn retained_table_rules(&self) -> Result<&[crate::grammar::flat::Rule], String> {
         if let Some(parser) = &self.template_parser {
-            return parser.link_grammar.as_ref().map(|grammar| grammar.rules.as_ref())
+            return parser.link_grammar.as_ref().map(|grammar| grammar.rules())
                 .ok_or_else(|| "template parser has no source grammar metadata".to_owned());
         }
         if self.deferred_table_rules_blob.is_none() {
