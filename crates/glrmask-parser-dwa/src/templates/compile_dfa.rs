@@ -392,6 +392,56 @@ fn find_default_specialization_mismatch(
     original: &UnweightedDfa,
     specialized: &UnweightedDfa,
 ) -> Option<Vec<i32>> {
+    if original.states.iter().chain(&specialized.states)
+        .all(|state| !state.transitions.contains_key(&DEFAULT_LABEL))
+    {
+        return find_default_free_specialization_mismatch(original, specialized);
+    }
+    find_default_specialization_mismatch_with_wildcards(original, specialized)
+}
+
+/// Full product equivalence for DEFAULT-free deterministic graphs. Reachable
+/// source subsets are singletons, so scalar states preserve the complete proof.
+/// The fresh DEFAULT representative is a common rejecting sink here and cannot
+/// witness a mismatch. Sorted labels and parent links preserve exact BFS words.
+fn find_default_free_specialization_mismatch(
+    original: &UnweightedDfa,
+    specialized: &UnweightedDfa,
+) -> Option<Vec<i32>> {
+    let start = (Some(original.start_state), Some(specialized.start_state));
+    let mut seen = std::collections::HashSet::from([start]);
+    let mut nodes = vec![(start, None::<(usize, i32)>)];
+    let mut index = 0;
+    while index < nodes.len() {
+        let ((left, right), _) = nodes[index];
+        if dfa_accepts_at(original, left) != dfa_accepts_at(specialized, right) {
+            let mut witness = Vec::new();
+            let mut node = index;
+            while let Some((parent, label)) = nodes[node].1 {
+                witness.push(label);
+                node = parent;
+            }
+            witness.reverse();
+            return Some(witness);
+        }
+        let mut labels = BTreeSet::new();
+        add_outgoing_labels(original, left, &mut labels);
+        add_outgoing_labels(specialized, right, &mut labels);
+        for label in labels {
+            let pair = (dfa_target(original, left, label), dfa_target(specialized, right, label));
+            if seen.insert(pair) {
+                nodes.push((pair, Some((index, label))));
+            }
+        }
+        index += 1;
+    }
+    None
+}
+
+fn find_default_specialization_mismatch_with_wildcards(
+    original: &UnweightedDfa,
+    specialized: &UnweightedDfa,
+) -> Option<Vec<i32>> {
     let original_start = BTreeSet::from([original.start_state]);
     let specialized_start = Some(specialized.start_state);
     let mut seen = BTreeSet::from([(original_start.clone(), specialized_start)]);
@@ -426,6 +476,48 @@ fn find_default_specialization_mismatch(
 }
 
 fn specialize_template_dfa_defaults_for_commit_determinized(dfa: &UnweightedDfa) -> UnweightedDfa {
+    if let Some(specialized) = specialize_default_free_template_dfa(dfa) {
+        if template_quotient_validation_enabled()
+            && let Some(witness) = find_default_specialization_mismatch(dfa, &specialized)
+        {
+            panic!("commit DEFAULT specialization changed concrete action semantics; witness: {witness:?}");
+        }
+        return specialized;
+    }
+    specialize_template_dfa_defaults_with_subsets(dfa)
+}
+
+/// Preserve the subset constructor's exact reachable BFS state numbering while
+/// avoiding singleton BTreeSet keys. DEFAULT or malformed graphs retain the
+/// original constructor and its full validation, including conservative sinks.
+fn specialize_default_free_template_dfa(dfa: &UnweightedDfa) -> Option<UnweightedDfa> {
+    if dfa.start_state as usize >= dfa.states.len()
+        || dfa.states.iter().any(|state| state.transitions.contains_key(&DEFAULT_LABEL)
+            || state.transitions.values().any(|&target| target as usize >= dfa.states.len()))
+    {
+        return None;
+    }
+    let mut specialized = UnweightedDfa::new();
+    let mut ids = vec![None; dfa.states.len()];
+    ids[dfa.start_state as usize] = Some(specialized.start_state);
+    let mut pending = VecDeque::from([dfa.start_state]);
+    while let Some(old) = pending.pop_front() {
+        let from = ids[old as usize].expect("reachable source state has a BFS id");
+        specialized.states[from as usize].is_accepting = dfa.states[old as usize].is_accepting;
+        for (&label, &target) in &dfa.states[old as usize].transitions {
+            let to = if let Some(id) = ids[target as usize] { id } else {
+                let id = specialized.add_state();
+                ids[target as usize] = Some(id);
+                pending.push_back(target);
+                id
+            };
+            specialized.add_transition(from, label, to);
+        }
+    }
+    Some(specialized)
+}
+
+fn specialize_template_dfa_defaults_with_subsets(dfa: &UnweightedDfa) -> UnweightedDfa {
     // DEFAULT in the source is a wildcard *union*, whereas the runtime's
     // deterministic lookup uses DEFAULT only if an explicit edge is absent.
     // This must be resolved on whole reachable subsets, not on each original
@@ -1591,6 +1683,70 @@ mod tests {
     use crate::compiler::glr::labels::{
         DEFAULT_LABEL, encode_negative_label,
     };
+
+    #[test]
+    fn default_free_specialization_preserves_exact_graphs_and_corruption_witnesses() {
+        fn random(seed: &mut u64) -> u64 {
+            *seed ^= *seed << 13;
+            *seed ^= *seed >> 7;
+            *seed ^= *seed << 17;
+            *seed
+        }
+        let mut seed = 0x619cab95d30ef147;
+        for case in 0..256 {
+            let mut source = UnweightedDfa::new();
+            for _ in 1..17 { source.add_state(); }
+            source.start_state = (random(&mut seed) % 17) as u32;
+            for state in 0..17 {
+                source.states[state].is_accepting = random(&mut seed) % 3 == 0;
+                for label in [i32::MIN, i32::MIN + 1, -3, 0, 1, 7, 19] {
+                    if random(&mut seed) % 3 != 0 {
+                        source.add_transition(state as u32, label, (random(&mut seed) % 17) as u32);
+                    }
+                }
+            }
+            let old = super::specialize_template_dfa_defaults_with_subsets(&source);
+            let new = super::specialize_template_dfa_defaults_for_commit_determinized(&source);
+            assert_eq!(old, new, "exact BFS graph case {case}");
+            for mutation in 0..6 {
+                let mut changed = new.clone();
+                let count = changed.states.len() as u64;
+                let state = (random(&mut seed) % count) as usize;
+                match mutation {
+                    0 => changed.states[state].is_accepting ^= true,
+                    1 => { changed.states[state].transitions.remove(&0); },
+                    2 => { changed.states[state].transitions.insert(31, (random(&mut seed) % count) as u32); },
+                    3 => changed.start_state = (random(&mut seed) % count) as u32,
+                    4 => { changed.states[state].transitions.insert(-17, u32::MAX); },
+                    _ => { changed.states[state].transitions.insert(7, state as u32); },
+                }
+                assert_eq!(
+                    super::find_default_specialization_mismatch(&source, &changed),
+                    super::find_default_specialization_mismatch_with_wildcards(&source, &changed),
+                    "exact corruption witness {case}/{mutation}",
+                );
+            }
+            if case % 4 == 0 {
+                source.states[0].transitions.insert(DEFAULT_LABEL, 1);
+                assert!(super::specialize_default_free_template_dfa(&source).is_none());
+                assert_eq!(
+                    super::specialize_template_dfa_defaults_for_commit_determinized(&source),
+                    super::specialize_template_dfa_defaults_with_subsets(&source),
+                );
+            }
+        }
+        for source in [UnweightedDfa::default(), {
+            let mut source = UnweightedDfa::new();
+            source.add_transition(0, 7, u32::MAX);
+            source
+        }] {
+            assert!(super::specialize_default_free_template_dfa(&source).is_none());
+            assert_eq!(
+                super::specialize_template_dfa_defaults_for_commit_determinized(&source),
+                super::specialize_template_dfa_defaults_with_subsets(&source),
+            );
+        }
+    }
 
     #[test]
     fn dfa_only_output_matches_complete_template_construction() {
