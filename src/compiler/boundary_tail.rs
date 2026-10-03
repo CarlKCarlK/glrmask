@@ -633,25 +633,44 @@ pub(crate) struct FlatBoundaryTailR1 {
     nullable: bool,
     terminal_count: u32,
     summary: (BytePhaseSummary, usize, bool),
+    candidate_ids: std::sync::OnceLock<std::sync::Arc<[u32]>>,
+}
+
+impl FlatBoundaryTailR1 {
+    fn matches(&self, fingerprint: crate::runtime::BoundaryCandidateFingerprint,
+        nullable: bool, terminal_count: u32) -> bool {
+        self.fingerprint == fingerprint && self.nullable == nullable
+            && self.terminal_count == terminal_count
+    }
+}
+
+fn flat_r1_identity<'a>(
+    constraint: &'a Constraint, vocab: &crate::Vocab,
+    checked_fingerprint: Option<crate::compiler::boundary_candidates::BoundaryFingerprintForQuery<'_>>,
+) -> Option<(&'a crate::runtime::parser_backend::link_grammar::LinkGrammar,
+    crate::runtime::BoundaryCandidateFingerprint, bool, u32)> {
+    if constraint.static_dynamic_overlay.as_ref()
+        .is_some_and(|overlay| !overlay.segmented_parser_components.is_empty()) {
+        return None;
+    }
+    let grammar = constraint.template_parser.as_ref()?.link_grammar.as_deref()?;
+    // The leaf fingerprint must cover every lexical input to this proof.
+    constraint.retained_terminal_exprs()?;
+    let fingerprint = checked_fingerprint.and_then(|checked| checked.for_inputs(constraint, vocab))
+        .or_else(|| crate::compiler::boundary_candidates::fingerprint_for_constraint(
+            constraint, vocab).ok())?;
+    let nullable = constraint.composition_start_nullable().ok()?;
+    Some((grammar, fingerprint, nullable, constraint.tokenizer.num_terminals()))
 }
 
 fn summarize_flat_module_r1_reusing_proof(
     constraint: &Constraint, vocab: &crate::Vocab,
+    checked_fingerprint: Option<crate::compiler::boundary_candidates::BoundaryFingerprintForQuery<'_>>,
 ) -> Result<(BytePhaseSummary, usize, bool), String> {
-    let grammar = constraint.template_parser.as_ref()
-        .and_then(|parser| parser.link_grammar.as_ref());
-    let identity = grammar.and_then(|grammar| {
-        // The leaf fingerprint must cover every lexical input to this proof.
-        constraint.retained_terminal_exprs()?;
-        let fingerprint = crate::compiler::boundary_candidates::fingerprint_for_constraint(
-            constraint, vocab).ok()?;
-        let nullable = constraint.composition_start_nullable().ok()?;
-        Some((grammar, fingerprint, nullable, constraint.tokenizer.num_terminals()))
-    });
-    if let Some((grammar, fingerprint, nullable, terminal_count)) = &identity {
+    let identity = flat_r1_identity(constraint, vocab, checked_fingerprint);
+    if let Some((grammar, fingerprint, nullable, terminal_count)) = identity {
         if let Some(proof) = grammar.flat_boundary_tail_r1.get() {
-            if proof.fingerprint == *fingerprint && proof.nullable == *nullable
-                && proof.terminal_count == *terminal_count {
+            if proof.matches(fingerprint, nullable, terminal_count) {
                 return Ok(proof.summary);
             }
         }
@@ -660,17 +679,38 @@ fn summarize_flat_module_r1_reusing_proof(
     if let Some((grammar, fingerprint, nullable, terminal_count)) = identity {
         let _ = grammar.flat_boundary_tail_r1.set(FlatBoundaryTailR1 {
             fingerprint, nullable, terminal_count, summary,
+            candidate_ids: std::sync::OnceLock::new(),
         });
     }
     Ok(summary)
 }
 
-fn summarize_root_r1(constraint: &Constraint, vocab: &crate::Vocab) -> Result<(ByteLanguage, usize, bool), String> {
+fn candidate_ids_for_r1_reusing_proof(
+    constraint: &Constraint, vocab: &crate::Vocab, language: ByteLanguage,
+    checked_fingerprint: Option<crate::compiler::boundary_candidates::BoundaryFingerprintForQuery<'_>>,
+) -> Vec<u32> {
+    if let Some((grammar, fingerprint, nullable, terminal_count)) =
+        flat_r1_identity(constraint, vocab, checked_fingerprint) {
+        if let Some(proof) = grammar.flat_boundary_tail_r1.get() {
+            if proof.matches(fingerprint, nullable, terminal_count) {
+                // Cache only the original component's vocabulary mapping. The
+                // root-CALL intersection and child-entry proof remain link-local.
+                return proof.candidate_ids.get_or_init(||
+                    std::sync::Arc::from(candidate_ids_for_r1(vocab, language))).to_vec();
+            }
+        }
+    }
+    candidate_ids_for_r1(vocab, language)
+}
+
+fn summarize_root_r1(constraint: &Constraint, vocab: &crate::Vocab,
+    checked_fingerprint: Option<crate::compiler::boundary_candidates::BoundaryFingerprintForQuery<'_>>,
+) -> Result<(ByteLanguage, usize, bool), String> {
     let (module, iterations, widened) = if constraint.static_dynamic_overlay.as_ref()
         .is_some_and(|overlay| !overlay.segmented_parser_components.is_empty()) {
         summarize_constraint_module_r1(constraint)?
     } else {
-        summarize_flat_module_r1_reusing_proof(constraint, vocab)?
+        summarize_flat_module_r1_reusing_proof(constraint, vocab, checked_fingerprint)?
     };
     let mut exits = module.tail_to_return;
     exits.union_with(module.tail_to_event);
@@ -760,11 +800,21 @@ pub(crate) fn build_boundary_tail_r1(
     constraint: &Constraint,
     vocab: &crate::Vocab,
 ) -> Result<BoundaryTailR1Result, String> {
+    build_boundary_tail_r1_with_fingerprint(constraint, vocab, None)
+}
+
+/// The optional identity has just been computed for these exact immutable
+/// inputs by the boundary-summary query; other callers compute it here.
+pub(crate) fn build_boundary_tail_r1_with_fingerprint(
+    constraint: &Constraint, vocab: &crate::Vocab,
+    checked_fingerprint: Option<crate::compiler::boundary_candidates::BoundaryFingerprintForQuery<'_>>,
+) -> Result<BoundaryTailR1Result, String> {
     let summary_started = Instant::now();
-    let (language, fixed_point_iterations, fixed_point_widened) = summarize_root_r1(constraint, vocab)?;
+    let (language, fixed_point_iterations, fixed_point_widened) =
+        summarize_root_r1(constraint, vocab, checked_fingerprint)?;
     let summary_ms = summary_started.elapsed().as_secs_f64() * 1000.0;
     let map_started = Instant::now();
-    let candidate_ids = candidate_ids_for_r1(vocab, language);
+    let candidate_ids = candidate_ids_for_r1_reusing_proof(constraint, vocab, language, checked_fingerprint);
     let map_ms = map_started.elapsed().as_secs_f64() * 1000.0;
     Ok(BoundaryTailR1Result {
         candidate_ids,
@@ -1129,7 +1179,7 @@ pub(crate) fn build_root_call_candidates(
     // is outward; byte-backed special bindings still run the original algebra.
     let outward = outward_terminals(parent);
     let (module, _, _) = if call_terminals.iter().all(|terminal| outward.contains(terminal)) {
-        summarize_flat_module_r1_reusing_proof(parent, vocab)?
+        summarize_flat_module_r1_reusing_proof(parent, vocab, None)?
     } else {
         summarize_rules_module_r1(parent, &calls, &BTreeSet::new())?
     };
@@ -1661,7 +1711,7 @@ mod tests {
             r#"start document; t SUB ::= @token(999); nt document ::= "a" SUB "b";"#,
             &vocabulary).unwrap();
         let expected = summarize_rules_module_r1(&parent, &BTreeMap::new(), &BTreeSet::new()).unwrap();
-        assert_eq!(summarize_flat_module_r1_reusing_proof(&parent, &vocabulary).unwrap(), expected);
+        assert_eq!(summarize_flat_module_r1_reusing_proof(&parent, &vocabulary, None).unwrap(), expected);
         assert!(parent.template_parser.as_ref().unwrap().link_grammar.as_ref().unwrap()
             .flat_boundary_tail_r1.get().is_some());
         let changed_vocab = vocab(&[(0, b"xx"), (9, b"zz"), (999, b"?")]);
@@ -1669,7 +1719,7 @@ mod tests {
             let mut modified = Constraint::from_glrm_grammar(
                 r#"start document; t SUB ::= @token(999); nt document ::= "a" SUB "b";"#,
                 &vocabulary).unwrap();
-            summarize_flat_module_r1_reusing_proof(&modified, &vocabulary).unwrap();
+            summarize_flat_module_r1_reusing_proof(&modified, &vocabulary, None).unwrap();
             match variant {
                 0 => { modified.special_token_terminals.clear(); }
                 1 => { modified.ignore_terminal = Some(0); }
@@ -1684,13 +1734,19 @@ mod tests {
                     let mut proof = grammar.flat_boundary_tail_r1.take().unwrap();
                     proof.fingerprint.algorithm_version += 1;
                     proof.summary = (BytePhaseSummary::bottom(), 0, false);
+                    proof.candidate_ids = std::sync::OnceLock::from(std::sync::Arc::from(vec![12345u32]));
                     grammar.flat_boundary_tail_r1.set(proof).unwrap();
                 }
             }
             for vocab in [&vocabulary, &changed_vocab] {
-                assert_eq!(summarize_flat_module_r1_reusing_proof(&modified, vocab),
+                assert_eq!(summarize_flat_module_r1_reusing_proof(&modified, vocab, None),
                     summarize_rules_module_r1(&modified, &BTreeMap::new(), &BTreeSet::new()),
                     "variant={variant}");
+                let original = summarize_rules_module_r1(&modified, &BTreeMap::new(), &BTreeSet::new()).unwrap().0;
+                let mut language = original.tail_to_return;
+                language.union_with(original.tail_to_event);
+                assert_eq!(build_boundary_tail_r1(&modified, vocab).unwrap().candidate_ids,
+                    candidate_ids_for_r1(vocab, language), "mapped variant={variant}");
             }
         }
         let mut disabled = parent.clone();
@@ -1698,6 +1754,38 @@ mod tests {
         disabled.boundary_candidate_summary.set(crate::runtime::BoundaryCandidateSummary::Unknown {
             reason: crate::runtime::SummaryUnavailable::Disabled }).unwrap();
         assert!(crate::compiler::boundary_candidates::boundary_candidate_ids(&disabled, &vocabulary).0.is_none());
+    }
+
+    #[test]
+    fn flat_r1_original_vocab_mapping_is_shared_and_keeps_distinct_sparse_ids() {
+        let vocabulary = vocab(&[(0, b"a"), (4, b"ab"), (19, b"ab"), (900, b"acatb"), (1001, b"bc")]);
+        let parent = Constraint::from_glrm_grammar(
+            r#"start document; t SUB ::= @token(999); nt document ::= "a" SUB "b";"#,
+            &vocabulary).unwrap();
+        let expected = build_boundary_tail_r1(&parent, &vocabulary).unwrap();
+        let grammar = parent.template_parser.as_ref().unwrap().link_grammar.as_ref().unwrap();
+        let mapped = grammar.flat_boundary_tail_r1.get().unwrap().candidate_ids.get().unwrap().clone();
+        assert!(expected.candidate_ids.contains(&4) && expected.candidate_ids.contains(&19));
+        for _ in 0..3 {
+            let current = build_boundary_tail_r1(&parent.clone(), &vocabulary).unwrap();
+            assert_eq!(current.candidate_ids, expected.candidate_ids);
+            assert_eq!(current.fixed_point_iterations, expected.fixed_point_iterations);
+            assert_eq!(current.fixed_point_widened, expected.fixed_point_widened);
+            assert!(std::sync::Arc::ptr_eq(&mapped,
+                grammar.flat_boundary_tail_r1.get().unwrap().candidate_ids.get().unwrap()));
+        }
+        let checked = crate::compiler::boundary_candidates::fingerprint_for_query_for_test(&parent, &vocabulary).unwrap();
+        assert_eq!(build_boundary_tail_r1_with_fingerprint(&parent, &vocabulary, Some(checked)).unwrap().candidate_ids,
+            expected.candidate_ids);
+        let other_vocab = vocab(&[(0, b"zz"), (4, b"bz"), (19, b"ax")]);
+        let wrong_vocab_token = crate::compiler::boundary_candidates::fingerprint_for_query_for_test(&parent, &other_vocab).unwrap();
+        assert_eq!(build_boundary_tail_r1_with_fingerprint(&parent, &vocabulary, Some(wrong_vocab_token)).unwrap().candidate_ids,
+            expected.candidate_ids);
+        let other_parent = Constraint::from_glrm_grammar(
+            r#"start document; nt document ::= "z";"#, &vocabulary).unwrap();
+        let wrong_component_token = crate::compiler::boundary_candidates::fingerprint_for_query_for_test(&other_parent, &vocabulary).unwrap();
+        assert_eq!(build_boundary_tail_r1_with_fingerprint(&parent, &vocabulary, Some(wrong_component_token)).unwrap().candidate_ids,
+            expected.candidate_ids);
     }
 
     #[test]
