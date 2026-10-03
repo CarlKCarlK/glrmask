@@ -411,7 +411,7 @@ pub(super) fn decode(bytes:&[u8])->Result<ParserSeed,String> {
             input.offset = end;
             grammar.validate()?;
             if grammar.terminal_count != terminal_count { return Err("template grammar terminal coordinate mismatch".into()); }
-            if grammar.stack_effects.as_ref().is_some_and(|effects| effects.states != state_count) {
+            if grammar.stack_effects().is_some_and(|effects| effects.states != state_count) {
                 return Err("compiler stack-effect parser coordinate mismatch".into());
             }
             Some(Arc::new(grammar))

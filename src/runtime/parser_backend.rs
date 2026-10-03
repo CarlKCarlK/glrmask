@@ -300,7 +300,7 @@ impl PreparedTemplateParser {
             };
             // A budget/unsupported-shape refusal leaves this proof absent;
             // later composition keeps its complete template fallback.
-            Arc::make_mut(grammar).stack_effects = summary.ok();
+            Arc::make_mut(grammar).set_stack_effects(summary.ok());
         }
         Ok(PreparedTemplateParser {
             source_state_count: table.num_states,
@@ -925,7 +925,7 @@ impl Constraint {
                     admissions:AtomicU64::new(source.admissions.load(Ordering::Relaxed)),
                     completions:AtomicU64::new(source.completions.load(Ordering::Relaxed)),
                 };
-                if let Some(grammar)=replacement.link_grammar.as_mut() {Arc::make_mut(grammar).stack_effects=None;}
+                if let Some(grammar)=replacement.link_grammar.as_mut() {Arc::make_mut(grammar).set_stack_effects(None);}
                 *parser=Arc::new(replacement);
             }
             constraint.serialized_artifact_cache=None;
@@ -943,7 +943,7 @@ impl Constraint {
             Some(parser) => {
                 assert!(!self.table.is_present(), "template-only constraint retained an LR table");
                 let mut report = parser.report();
-                if let Some(summary)=parser.link_grammar.as_ref().and_then(|grammar|grammar.stack_effects.as_ref()) {
+                if let Some(summary)=parser.link_grammar.as_ref().and_then(|grammar|grammar.stack_effects()) {
                     let entry_effects=summary.entries.values().map(Vec::len).sum::<usize>();
                     let pushes=summary.effects.iter().chain(summary.entries.values().flatten()).map(|effect|effect.pushes.len()).sum::<usize>();
                     let vector_bytes=std::mem::size_of_val(summary)
@@ -1199,13 +1199,13 @@ mod tests {
             r#"start root; nt root ::= "a" | "(" root ")";"#] {
             let component = Constraint::compile(crate::Grammar::glrm(source),&vocab).unwrap();
             let parser = component.template_parser.as_ref().unwrap();
-            let summary = parser.link_grammar.as_ref().unwrap().stack_effects.as_ref().unwrap();
+            let summary = parser.link_grammar.as_ref().unwrap().stack_effects().unwrap();
             assert_eq!(summary.states,parser.state_count);
             assert!(!summary.effects.is_empty());
             let loaded = Constraint::load(&component.save()).unwrap();
             assert!(!loaded.table.is_present());
             assert_eq!(loaded.template_parser.as_ref().unwrap().link_grammar.as_ref().unwrap()
-                .stack_effects.as_ref().unwrap(),summary);
+                .stack_effects().unwrap(),summary);
             // A later link needs only the retained scalar effects and validated
             // entry records. Its nested child offsets remain complete.
             let slot = *summary.entries.iter().find(|(_,row)| !row.is_empty()).unwrap().0;

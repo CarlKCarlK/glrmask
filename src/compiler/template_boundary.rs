@@ -263,7 +263,7 @@ pub(crate) fn install(constraint: &mut Constraint, vocab: &Vocab) -> Result<()> 
     let scoped_adjacent = if !global_ignores
         && super::boundary_env::enabled("GLRMASK_BOUNDARY_SCOPED_ADJACENCY") {
         metadata.and_then(|grammar| super::boundary_scoped_follow::optimized_scoped_follow_relation(
-            &context, &grammar.component_nonterminals, &grammar.scoped_ignores))
+            &context, grammar.component_nonterminals(), grammar.scoped_ignores()))
     } else { None };
     let prepared_first = (!projected).then(|| leaves.iter().enumerate().map(|(index, leaf)|
         super::boundary_precomputed_completion::PreparedSourceSpan::for_component(leaf,
@@ -352,7 +352,7 @@ pub(crate) fn install(constraint: &mut Constraint, vocab: &Vocab) -> Result<()> 
         &composition.views, parser.state_count, &selected)?;
     let admissions=crate::template_parser::static_compile::prepare_scoped_boundary_admissions(
         &composition.views,&ending_selected,&mut classes)?;
-    let predecessor=metadata.and_then(|metadata|metadata.stack_effects.as_ref()).filter(|summary|summary.states==parser.state_count)
+    let predecessor=metadata.and_then(|metadata|metadata.stack_effects()).filter(|summary|summary.states==parser.state_count)
         .and_then(|summary|super::boundary_stack_support::from_compiler_effects(summary).ok());
     let read_context=predecessor.as_ref().and_then(|certificate|certificate.native_context())
         .filter(|_|std::env::var_os("GLRMASK_PROFILE_BOUNDARY_NO_READ_SUPPORT").is_none());

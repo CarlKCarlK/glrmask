@@ -176,10 +176,16 @@ pub(crate) fn compose(mut parent: Constraint, children: &[(String, Arc<Constrain
             .map_err(fail)?;
     }
     parser.embedding = Some(Arc::new(embedding));
+    let metadata_started = std::time::Instant::now();
     parser.link_grammar = super::link_grammar::LinkGrammar::compose(&components, &terminal_offsets, &slots)
         .map_err(fail)?;
     if let Some(grammar) = parser.link_grammar.as_mut() {
         Arc::make_mut(grammar).root_nullable = nullable;
+    }
+    if std::env::var_os("GLRMASK_PROFILE_COMPOSE").is_some() {
+        eprintln!("[glrmask/profile][native_link_metadata] phase=descriptor elapsed_ms={:.3} materialized={}",
+            metadata_started.elapsed().as_secs_f64()*1000.0,
+            parser.link_grammar.as_ref().is_some_and(|grammar| grammar.is_materialized()));
     }
     let dynamic_vocab = crate::compiler::constraint_possible_matches::runtime_dynamic_vocab_for_recursive_provider(vocab);
     let mut constraint = crate::dynamic_constraint::DynamicConstraint::from_template_runtime_parts_unfinalized(
@@ -251,6 +257,11 @@ pub(crate) fn compose(mut parent: Constraint, children: &[(String, Arc<Constrain
         crate::compiler::boundary_candidates::install_precomputed_boundary_candidate_ids(
             &mut constraint, vocab, &ids, widened,
         ).map_err(fail)?;
+    }
+    if std::env::var_os("GLRMASK_PROFILE_COMPOSE").is_some() {
+        eprintln!("[glrmask/profile][native_link_metadata] phase=complete materialized={}",
+            constraint.template_parser.as_ref().and_then(|parser| parser.link_grammar.as_ref())
+                .is_some_and(|grammar| grammar.is_materialized()));
     }
     Ok(constraint)
 }

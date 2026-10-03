@@ -3725,7 +3725,7 @@ mod tests {
             .chain(children.iter().map(|child| child.constraint)).collect::<Vec<_>>();
         if components.iter().any(|component| {
             let grammar = component.template_parser.as_ref().unwrap().link_grammar.as_ref().unwrap();
-            grammar.scoped_ignores.iter().flatten()
+            grammar.scoped_ignores().iter().flatten()
                 .any(|terminal| Some(*terminal) != component.ignore_terminal)
         }) { return false; }
         let expression = |component: &Constraint| component.ignore_terminal.and_then(|terminal|
