@@ -26175,6 +26175,30 @@ table: &child_table,
         }
     }
 
+    // Keep large by-value construction temporaries out of the test runner's
+    // frame. No stack-size override, new thread, or reduced oracle coverage.
+    #[inline(never)]
+    fn scoped_oracle_test_source(grammar: &str, vocab: &Vocab) -> Box<Constraint> {
+        Box::new(Constraint::from_glrm_grammar(grammar, vocab).unwrap())
+    }
+
+    #[inline(never)]
+    fn scoped_oracle_test_link(
+        parent: &Constraint, slot: &str, child: &Constraint, vocab: &Vocab, dynamic: bool,
+    ) -> Box<Constraint> {
+        let composition = if dynamic {
+            parent.compose_linked_children_for_test_dynamic(&[(slot, child)], vocab)
+        } else {
+            parent.compose_linked_children_for_test(&[(slot, child)], vocab)
+        };
+        Box::new(composition.unwrap())
+    }
+
+    #[inline(never)]
+    fn scoped_oracle_test_reload(source: &Constraint) -> Box<Constraint> {
+        Box::new(Constraint::load(&source.save()).unwrap())
+    }
+
     #[test]
     fn scoped_ignore_oracle_survives_reload_and_nested_recomposition() {
         let vocab = Vocab::new(vec![
@@ -26203,7 +26227,7 @@ table: &child_table,
             (22, b"X a!".to_vec()),
             (23, b"<X\t a!>".to_vec()),
         ]);
-        let parent = Constraint::from_glrm_grammar(
+        let parent = scoped_oracle_test_source(
             r#"
                 start document;
                 ignore PARENT_WS;
@@ -26212,9 +26236,8 @@ table: &child_table,
                 nt document ::= "X" SUB "!";
             "#,
             &vocab,
-        )
-        .unwrap();
-        let child = Constraint::from_glrm_grammar(
+        );
+        let child = scoped_oracle_test_source(
             r#"
                 start child;
                 ignore CHILD_WS;
@@ -26222,9 +26245,8 @@ table: &child_table,
                 nt child ::= "a";
             "#,
             &vocab,
-        )
-        .unwrap();
-        let monolithic = Constraint::from_glrm_grammar(
+        );
+        let monolithic = scoped_oracle_test_source(
             r#"
                 start document;
                 ignore PARENT_WS;
@@ -26238,15 +26260,10 @@ table: &child_table,
                 nt document ::= "X" child "!";
             "#,
             &vocab,
-        )
-        .unwrap();
-        let composed = parent
-            .compose_linked_children_for_test(&[("SUB", &child)], &vocab)
-            .unwrap();
-        let composed_dynamic = parent
-            .compose_linked_children_for_test_dynamic(&[("SUB", &child)], &vocab)
-            .unwrap();
-        let loaded = Constraint::load(&composed.save()).unwrap();
+        );
+        let composed = scoped_oracle_test_link(&parent, "SUB", &child, &vocab, false);
+        let composed_dynamic = scoped_oracle_test_link(&parent, "SUB", &child, &vocab, true);
+        let loaded = scoped_oracle_test_reload(&composed);
         let make_states = || {
             let mut states = Vec::with_capacity(4);
             states.push(composed.start());
@@ -26348,22 +26365,17 @@ table: &child_table,
         // This is the inherited-skip case: CHILD_WS is no longer a top-level
         // ignore of `loaded`, but its scoped phase behavior must survive the
         // next call/return boundary exactly.
-        let outer_parent = Constraint::from_glrm_grammar(
+        let outer_parent = scoped_oracle_test_source(
             r#"
                 start outer;
                 t INNER ::= @token(1000);
                 nt outer ::= "<" INNER ">";
             "#,
             &vocab,
-        )
-        .unwrap();
-        let outer = outer_parent
-            .compose_linked_children_for_test(&[("INNER", &loaded)], &vocab)
-            .unwrap();
-        let outer_dynamic = outer_parent
-            .compose_linked_children_for_test_dynamic(&[("INNER", &loaded)], &vocab)
-            .unwrap();
-        let outer_monolithic = Constraint::from_glrm_grammar(
+        );
+        let outer = scoped_oracle_test_link(&outer_parent, "INNER", &loaded, &vocab, false);
+        let outer_dynamic = scoped_oracle_test_link(&outer_parent, "INNER", &loaded, &vocab, true);
+        let outer_monolithic = scoped_oracle_test_source(
             r#"
                 start outer;
                 g inner ::= {
@@ -26381,8 +26393,7 @@ table: &child_table,
                 nt outer ::= "<" inner ">";
             "#,
             &vocab,
-        )
-        .unwrap();
+        );
 
         assert_constraints_mask_equivalent_on_reachable_prefixes_labeled(
             &outer,
