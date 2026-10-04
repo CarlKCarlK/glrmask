@@ -24,6 +24,8 @@ pub(crate) struct LinkGrammar {
     // Transient flat proof only, validated against the complete component
     // identity at every use. It does not enter artifact bytes or runtime state.
     pub(crate) flat_boundary_tail_r1: OnceLock<crate::compiler::boundary_tail::FlatBoundaryTailR1>,
+    // Original flat entry-prefix fact only; identity-validated on every use.
+    pub(crate) entry_prefix_cover: OnceLock<crate::compiler::boundary_tail::EntryPrefixCoverProof>,
 }
 
 #[cfg(test)]
@@ -148,6 +150,7 @@ impl LinkGrammar {
             root_has_empty_rule: flat.rules.iter().any(|rule| rule.lhs == root && rule.rhs.is_empty()),
             source: None, flat: OnceLock::from(flat), deferred_boundary_summary: OnceLock::new(),
             flat_boundary_tail_r1: OnceLock::new(),
+            entry_prefix_cover: OnceLock::new(),
         })
     }
 
@@ -259,6 +262,7 @@ impl LinkGrammar {
                 state_offsets, state_count, effect_links })), flat: OnceLock::new(),
             deferred_boundary_summary: OnceLock::new(),
             flat_boundary_tail_r1: OnceLock::new(),
+            entry_prefix_cover: OnceLock::new(),
         };
         grammar.validate_manifest()?;
         Ok(grammar)

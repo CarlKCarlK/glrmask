@@ -43,11 +43,16 @@ impl BoundaryFingerprintForQuery<'_> {
     }
 }
 
-#[cfg(test)]
-pub(crate) fn fingerprint_for_query_for_test<'a>(constraint: &'a Constraint, vocab: &'a crate::Vocab)
+pub(crate) fn fingerprint_for_query<'a>(constraint: &'a Constraint, vocab: &'a crate::Vocab)
     -> Result<BoundaryFingerprintForQuery<'a>, SummaryUnavailable> {
     Ok(BoundaryFingerprintForQuery { constraint, vocab,
         fingerprint: fingerprint_for_constraint(constraint, vocab)? })
+}
+
+#[cfg(test)]
+pub(crate) fn fingerprint_for_query_for_test<'a>(constraint: &'a Constraint, vocab: &'a crate::Vocab)
+    -> Result<BoundaryFingerprintForQuery<'a>, SummaryUnavailable> {
+    fingerprint_for_query(constraint, vocab)
 }
 
 #[derive(Debug, Clone, Copy, Default)]
@@ -492,9 +497,14 @@ impl<'a> CandidateMachine<'a> {
 }
 
 fn fingerprint(
-    constraint: &Constraint,
-    vocab: &crate::Vocab,
-    rules: &[Rule],
+    constraint: &Constraint, vocab: &crate::Vocab, rules: &[Rule],
+) -> Result<BoundaryCandidateFingerprint, SummaryUnavailable> {
+    fingerprint_with_component_queries(constraint, vocab, rules, &[])
+}
+
+fn fingerprint_with_component_queries(
+    constraint: &Constraint, vocab: &crate::Vocab, rules: &[Rule],
+    checked: &[Option<BoundaryFingerprintForQuery<'_>>],
 ) -> Result<BoundaryCandidateFingerprint, SummaryUnavailable> {
     let vocabulary = crate::compiler::compile::vocab_content_digest(vocab);
 
@@ -513,7 +523,10 @@ fn fingerprint(
         semantics.update(b"glrmask-boundary-component-semantics-v2-composite\0");
         semantics.update(&(overlay.segmented_parser_components.len() as u64).to_le_bytes());
         for (component_index, component) in overlay.segmented_parser_components.iter().enumerate() {
-            let child = fingerprint_for_constraint(component.constraint.as_ref(), vocab)?;
+            let child = if let Some(fingerprint) = checked.get(component_index).copied().flatten()
+                .and_then(|query| query.for_inputs(component.constraint.as_ref(), vocab)) {
+                fingerprint
+            } else { fingerprint_for_constraint(component.constraint.as_ref(), vocab)? };
             semantics.update(&(component_index as u64).to_le_bytes());
             semantics.update(&child.component_semantics);
             semantics.update(&child.public_interface);
@@ -893,12 +906,19 @@ fn compute_summary(
 pub(crate) fn fingerprint_for_constraint(
     constraint: &Constraint, vocab: &crate::Vocab,
 ) -> Result<BoundaryCandidateFingerprint, SummaryUnavailable> {
+    fingerprint_for_constraint_with_component_queries(constraint, vocab, &[])
+}
+
+fn fingerprint_for_constraint_with_component_queries(
+    constraint: &Constraint, vocab: &crate::Vocab,
+    checked: &[Option<BoundaryFingerprintForQuery<'_>>],
+) -> Result<BoundaryCandidateFingerprint, SummaryUnavailable> {
     if constraint.static_dynamic_overlay.as_ref()
         .is_some_and(|overlay| !overlay.segmented_parser_components.is_empty()) {
         // The composite digest is defined by validated immediate components and
         // typed links. Its branch does not consume flattened wrapper rules.
         if constraint.template_parser.as_ref().is_some_and(|parser| parser.link_grammar.is_some()) {
-            return fingerprint(constraint, vocab, &[]);
+            return fingerprint_with_component_queries(constraint, vocab, &[], checked);
         }
     }
     let rules = constraint.retained_table_rules()
@@ -956,7 +976,16 @@ pub(crate) fn defer_composition_boundary_candidate_summary(
     constraint: &mut Constraint, vocab: &crate::Vocab,
     components: &[std::sync::Arc<Constraint>], slots: &[Vec<u32>],
 ) -> bool {
-    let Ok(fingerprint) = fingerprint_for_constraint(constraint, vocab) else { return false; };
+    defer_composition_boundary_candidate_summary_with_queries(constraint, vocab, components, slots, &[])
+}
+
+pub(crate) fn defer_composition_boundary_candidate_summary_with_queries(
+    constraint: &mut Constraint, vocab: &crate::Vocab,
+    components: &[std::sync::Arc<Constraint>], slots: &[Vec<u32>],
+    checked: &[Option<BoundaryFingerprintForQuery<'_>>],
+) -> bool {
+    let Ok(fingerprint) = fingerprint_for_constraint_with_component_queries(constraint, vocab, checked)
+        else { return false; };
     let Some(grammar) = constraint.template_parser.as_ref()
         .and_then(|parser| parser.link_grammar.as_ref()) else { return false; };
     grammar.deferred_boundary_summary.set(std::sync::Arc::new(
@@ -1215,6 +1244,32 @@ pub(crate) fn persisted_boundary_candidate_ids(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn composite_fingerprint_uses_only_matching_fresh_component_queries() {
+        use crate::{BuildOptions, Grammar, Optimization, ParserBackend};
+        let vocabulary = crate::Vocab::new(vec![(0, b"acatb".to_vec()), (4, b"cat".to_vec()),
+            (19, b"ac".to_vec()), (999, b"z".to_vec())]);
+        let options = || BuildOptions::default().optimization(Optimization::FastBuild)
+            .parser_backend(ParserBackend::TemplateDfa);
+        let child = Grammar::from_glrm(r#"glrm 1; start value; nt value = "cat";"#)
+            .compile_with(&vocabulary, options()).unwrap();
+        let parent = Grammar::from_glrm(r#"glrm 1; start doc; extern grammar child; nt doc = "a" child "b";"#)
+            .compile_unlinked(&vocabulary).unwrap();
+        let linked = parent.bind("child", &child).unwrap().link_with(options()).unwrap();
+        let components = &linked.static_dynamic_overlay.as_ref().unwrap().segmented_parser_components;
+        let expected = fingerprint_for_constraint(&linked, &vocabulary).unwrap();
+        let queries = components.iter().map(|component|
+            fingerprint_for_query(component.constraint.as_ref(), &vocabulary).ok()).collect::<Vec<_>>();
+        assert_eq!(fingerprint_for_constraint_with_component_queries(&linked, &vocabulary, &queries).unwrap(), expected);
+        let mut reversed = queries.clone(); reversed.reverse();
+        assert_eq!(fingerprint_for_constraint_with_component_queries(&linked, &vocabulary, &reversed).unwrap(), expected);
+        let changed_vocab = crate::Vocab::new(vec![(0, b"zz".to_vec()), (4, b"xc".to_vec())]);
+        assert_eq!(fingerprint_for_constraint_with_component_queries(&linked, &changed_vocab, &queries),
+            fingerprint_for_constraint(&linked, &changed_vocab));
+        assert_eq!(fingerprint_for_constraint_with_component_queries(&linked, &vocabulary, &[None]),
+            fingerprint_for_constraint(&linked, &vocabulary));
+    }
 
     fn assert_indexed_initial_seed_matches_bruteforce(constraint: &Constraint) {
         let rules = constraint.retained_table_rules().unwrap();

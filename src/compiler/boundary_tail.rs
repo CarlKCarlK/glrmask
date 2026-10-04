@@ -871,6 +871,36 @@ fn nonempty_entry_prefix_cover(expr: &Expr) -> Option<Vec<Vec<u8>>> {
 /// so it cannot hide a subsequent first byte. All descendant ignores are
 /// included even when local policy would disallow them at this entry: extra
 /// candidates are safe, whereas forgetting an inherited/global ignore is not.
+#[derive(Debug, Clone)]
+pub(crate) struct EntryPrefixCoverProof {
+    fingerprint: crate::runtime::BoundaryCandidateFingerprint,
+    nullable: bool,
+    terminal_count: u32,
+    prefixes: Option<Vec<Vec<u8>>>,
+}
+
+fn component_entry_prefix_cover_reusing_proof(
+    constraint: &Constraint, vocab: &crate::Vocab,
+    checked: Option<crate::compiler::boundary_candidates::BoundaryFingerprintForQuery<'_>>,
+) -> Option<Vec<Vec<u8>>> {
+    let identity = flat_r1_identity(constraint, vocab, checked);
+    if let Some((grammar, fingerprint, nullable, terminal_count)) = identity {
+        if let Some(proof) = grammar.entry_prefix_cover.get() {
+            if proof.fingerprint == fingerprint && proof.nullable == nullable
+                && proof.terminal_count == terminal_count {
+                return proof.prefixes.clone();
+            }
+        }
+    }
+    let prefixes = component_entry_prefix_cover(constraint);
+    if let Some((grammar, fingerprint, nullable, terminal_count)) = identity {
+        let _ = grammar.entry_prefix_cover.set(EntryPrefixCoverProof {
+            fingerprint, nullable, terminal_count, prefixes: prefixes.clone(),
+        });
+    }
+    prefixes
+}
+
 fn component_entry_prefix_cover(constraint: &Constraint) -> Option<Vec<Vec<u8>>> {
     if constraint.composition_start_nullable().ok()? {
         return None;
@@ -1153,10 +1183,15 @@ fn root_call_candidate_ids_indexed(
 /// in the widening direction. Full exact L2P equivalence still runs for every
 /// retained vocabulary entry; no approximate equivalence is substituted.
 pub(crate) fn build_root_call_candidates(
-    parent: &Constraint,
-    children: &[&Constraint],
-    call_terminals: &[TerminalID],
-    vocab: &crate::Vocab,
+    parent: &Constraint, children: &[&Constraint], call_terminals: &[TerminalID], vocab: &crate::Vocab,
+) -> Result<RootCallCandidateResult, String> {
+    build_root_call_candidates_with_queries(parent, children, call_terminals, vocab, None, &[])
+}
+
+pub(crate) fn build_root_call_candidates_with_queries(
+    parent: &Constraint, children: &[&Constraint], call_terminals: &[TerminalID], vocab: &crate::Vocab,
+    parent_query: Option<crate::compiler::boundary_candidates::BoundaryFingerprintForQuery<'_>>,
+    child_queries: &[Option<crate::compiler::boundary_candidates::BoundaryFingerprintForQuery<'_>>],
 ) -> Result<RootCallCandidateResult, String> {
     if parent.static_dynamic_overlay.as_ref().is_some_and(|overlay| {
         !overlay.segmented_parser_components.is_empty()
@@ -1179,14 +1214,15 @@ pub(crate) fn build_root_call_candidates(
     // is outward; byte-backed special bindings still run the original algebra.
     let outward = outward_terminals(parent);
     let (module, _, _) = if call_terminals.iter().all(|terminal| outward.contains(terminal)) {
-        summarize_flat_module_r1_reusing_proof(parent, vocab, None)?
+        summarize_flat_module_r1_reusing_proof(parent, vocab, parent_query)?
     } else {
         summarize_rules_module_r1(parent, &calls, &BTreeSet::new())?
     };
     let language = module.tail_to_event;
     let mut entries = Some(Vec::new());
-    for child in children {
-        let Some(prefixes) = component_entry_prefix_cover(child) else {
+    for (index, child) in children.iter().enumerate() {
+        let Some(prefixes) = component_entry_prefix_cover_reusing_proof(child, vocab,
+            child_queries.get(index).copied().flatten()) else {
             entries = None;
             break;
         };
@@ -1754,6 +1790,74 @@ mod tests {
         disabled.boundary_candidate_summary.set(crate::runtime::BoundaryCandidateSummary::Unknown {
             reason: crate::runtime::SummaryUnavailable::Disabled }).unwrap();
         assert!(crate::compiler::boundary_candidates::boundary_candidate_ids(&disabled, &vocabulary).0.is_none());
+    }
+
+    #[test]
+    fn entry_prefix_fact_is_transient_and_rejects_stale_nullable_or_interface_inputs() {
+        let vocabulary = vocab(&[(0, b"ac"), (4, b"cat"), (19, b"z")]);
+        for variant in 0..4 {
+            let mut child = Constraint::from_glrm_grammar(
+                r#"start document; nt document ::= "cat";"#, &vocabulary).unwrap();
+            let before = bincode::serialize(child.template_parser.as_ref().unwrap().link_grammar.as_ref().unwrap()).unwrap();
+            let expected = component_entry_prefix_cover(&child);
+            assert_eq!(component_entry_prefix_cover_reusing_proof(&child, &vocabulary, None), expected);
+            let grammar = child.template_parser.as_ref().unwrap().link_grammar.as_ref().unwrap();
+            assert!(grammar.entry_prefix_cover.get().is_some());
+            assert_eq!(bincode::serialize(grammar).unwrap(), before);
+            let loaded: crate::runtime::parser_backend::link_grammar::LinkGrammar = bincode::deserialize(&before).unwrap();
+            assert!(loaded.entry_prefix_cover.get().is_none());
+            assert_eq!(&loaded, grammar.as_ref());
+            match variant {
+                0 => {
+                    let parser = std::sync::Arc::get_mut(child.template_parser.as_mut().unwrap()).unwrap();
+                    let grammar = std::sync::Arc::make_mut(parser.link_grammar.as_mut().unwrap());
+                    let mut proof = grammar.entry_prefix_cover.take().unwrap();
+                    proof.fingerprint.algorithm_version += 1;
+                    proof.prefixes = Some(vec![vec![255]]);
+                    grammar.entry_prefix_cover.set(proof).unwrap();
+                }
+                1 => {
+                    let parser = std::sync::Arc::get_mut(child.template_parser.as_mut().unwrap()).unwrap();
+                    std::sync::Arc::make_mut(parser.embedding.as_mut().unwrap()).nullable = true;
+                    assert!(component_entry_prefix_cover(&child).is_none());
+                }
+                2 => { child.unbound_grammar_placeholders.insert("later".into(), 0); }
+                3 => {
+                    let parser = std::sync::Arc::get_mut(child.template_parser.as_mut().unwrap()).unwrap();
+                    let grammar = std::sync::Arc::make_mut(parser.link_grammar.as_mut().unwrap());
+                    let mut proof = grammar.entry_prefix_cover.take().unwrap();
+                    proof.prefixes = Some(vec![vec![255]]);
+                    grammar.entry_prefix_cover.set(proof).unwrap();
+                    let other_vocab = vocab(&[(7, b"xx"), (91, b"yy")]);
+                    assert_eq!(component_entry_prefix_cover_reusing_proof(&child, &other_vocab, None),
+                        component_entry_prefix_cover(&child));
+                    continue;
+                }
+                _ => unreachable!(),
+            }
+            assert_eq!(component_entry_prefix_cover_reusing_proof(&child, &vocabulary, None),
+                component_entry_prefix_cover(&child), "variant={variant}");
+        }
+    }
+
+    #[test]
+    fn root_call_query_tokens_and_cached_entry_keep_original_candidates() {
+        let vocabulary = vocab(&[(0, b"ac"), (4, b"acatb"), (19, b"ax"), (900, b"cat")]);
+        let parent = Constraint::from_glrm_grammar(
+            r#"start document; t SUB ::= @token(999); nt document ::= "a" SUB "b";"#, &vocabulary).unwrap();
+        let child = Constraint::from_glrm_grammar(r#"start document; nt document ::= "cat";"#, &vocabulary).unwrap();
+        let slot = parent.terminal_display_names.iter().position(|name| name == "SUB").unwrap() as u32;
+        let expected = build_root_call_candidates(&parent, &[&child], &[slot], &vocabulary).unwrap().candidate_ids;
+        let parent_query = crate::compiler::boundary_candidates::fingerprint_for_query(&parent, &vocabulary).unwrap();
+        let child_query = crate::compiler::boundary_candidates::fingerprint_for_query(&child, &vocabulary).unwrap();
+        for _ in 0..3 {
+            assert_eq!(build_root_call_candidates_with_queries(&parent, &[&child], &[slot], &vocabulary,
+                Some(parent_query), &[Some(child_query)]).unwrap().candidate_ids, expected);
+            assert_eq!(build_root_call_candidates_with_queries(&parent, &[&child], &[slot], &vocabulary,
+                Some(child_query), &[Some(parent_query)]).unwrap().candidate_ids, expected);
+        }
+        assert_eq!(component_entry_prefix_cover_reusing_proof(&child, &vocabulary, Some(parent_query)),
+            component_entry_prefix_cover(&child));
     }
 
     #[test]
