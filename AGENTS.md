@@ -41,3 +41,8 @@ Final correctness qualification and matched build/link/TBM performance acceptanc
 are separate gates. Targeted tests alone do not qualify the full replacement.
 Publishing packages, pushing, merging main or changing defaults requires current
 user authorization.
+
+For the Mac composition lane, follow the measured cached optimized development
+recipe in [docs/mac-composition-fast-development.md](docs/mac-composition-fast-development.md).
+Keep its stable warm target between variants; batch expensive production and
+canonical validation at selected checkpoints, ordinarily once or twice daily.
