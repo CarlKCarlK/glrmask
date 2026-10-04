@@ -26,6 +26,30 @@ const DEFAULT_MAX_FRONTIER_PAIRS: usize = 250_000;
 // composition pay seconds to save a modest fraction of the vocabulary.
 const DEFAULT_MAX_BYTE_STEPS: usize = 10_000;
 
+/// A fresh identity for exactly these immutable query inputs. The borrowed
+/// token is local to a query and never retained in grammar or vocabulary caches.
+#[derive(Clone, Copy)]
+pub(crate) struct BoundaryFingerprintForQuery<'a> {
+    constraint: &'a Constraint,
+    vocab: &'a crate::Vocab,
+    fingerprint: BoundaryCandidateFingerprint,
+}
+
+impl BoundaryFingerprintForQuery<'_> {
+    pub(crate) fn for_inputs(self, constraint: &Constraint, vocab: &crate::Vocab)
+        -> Option<BoundaryCandidateFingerprint> {
+        (std::ptr::eq(self.constraint, constraint) && std::ptr::eq(self.vocab, vocab))
+            .then_some(self.fingerprint)
+    }
+}
+
+#[cfg(test)]
+pub(crate) fn fingerprint_for_query_for_test<'a>(constraint: &'a Constraint, vocab: &'a crate::Vocab)
+    -> Result<BoundaryFingerprintForQuery<'a>, SummaryUnavailable> {
+    Ok(BoundaryFingerprintForQuery { constraint, vocab,
+        fingerprint: fingerprint_for_constraint(constraint, vocab)? })
+}
+
 #[derive(Debug, Clone, Copy, Default)]
 pub(crate) struct BoundaryCandidateStats {
     pub(crate) input_tokens: usize,
@@ -733,7 +757,9 @@ fn compute_summary(
     // such bytes while preserving known parent postambles through opaque
     // interiors.  It is both dramatically smaller and cheaper than the old
     // raw-state × grammar-position frontier on composed constraints.
-    if let Ok(probe) = crate::compiler::boundary_tail::build_boundary_tail_r1(constraint, vocab) {
+    if let Ok(probe) = crate::compiler::boundary_tail::build_boundary_tail_r1_with_fingerprint(
+        constraint, vocab, Some(BoundaryFingerprintForQuery { constraint, vocab, fingerprint: fp }),
+    ) {
         let ids = probe.candidate_ids;
         stats.candidate_tokens = ids.len();
         stats.widened_subtrees = usize::from(probe.fixed_point_widened);
@@ -981,11 +1007,12 @@ pub(crate) fn boundary_candidate_summary(
     vocab: &crate::Vocab,
 ) -> (BoundaryCandidateSummary, BoundaryCandidateStats) {
     materialize_deferred_composition_boundary_summary(constraint);
-    let wanted = fingerprint_for_constraint(constraint, vocab).ok();
     if let Some(existing) = constraint.boundary_candidate_summary.get() {
-        if wanted
-            .as_ref()
-            .is_some_and(|fp| existing.known_tokens_for(fp).is_some())
+        // Unknown/Disabled entries cannot consume a wanted fingerprint. A
+        // recomputation below derives the same identity once for its own proof.
+        if matches!(existing, BoundaryCandidateSummary::Known { .. })
+            && fingerprint_for_constraint(constraint, vocab).ok().as_ref()
+                .is_some_and(|fp| existing.known_tokens_for(fp).is_some())
         {
             let count = match existing {
                 BoundaryCandidateSummary::Known { tokens, .. } => tokens
