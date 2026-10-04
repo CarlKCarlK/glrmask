@@ -331,6 +331,41 @@ pub(crate) fn validate_slot_entry_shape(
     Ok(())
 }
 
+/// Batch the same slot-entry predicate while the construction-only table is
+/// available. Absent cells need no work; expanded row iteration includes DEFAULT
+/// cells and preserves the full logical action relation. No table is retained.
+pub(crate) fn valid_slot_entry_terminals(table: &GLRTable) -> BTreeSet<TerminalID> {
+    let mut valid = vec![true; table.num_terminals as usize];
+    for &(_, terminal) in &table.forwarded_shifts {
+        if let Some(valid) = valid.get_mut(terminal as usize) { *valid = false; }
+    }
+    for row in table.action.iter().take(table.num_states as usize) {
+        for (terminal, action) in row.iter() {
+            let Some(valid) = valid.get_mut(terminal as usize) else { continue; };
+            if !*valid { continue; }
+            *valid = match action {
+                Action::Shift(..) | Action::Reduce(..) => true,
+                Action::Split { shift: Some(_), reduces, accept: false } => reduces.is_empty(),
+                Action::Split { shift: None, reduces, accept: false } => !reduces.is_empty(),
+                _ => false,
+            };
+        }
+    }
+    valid.into_iter().enumerate().filter_map(|(terminal, valid)|
+        valid.then_some(terminal as TerminalID)).collect()
+}
+
+/// Keep the original first-error wording/order for selected slots, without
+/// rescanning every state separately for every successful terminal.
+pub(crate) fn validate_slot_entry_shapes(table: &GLRTable, slots: &BTreeSet<TerminalID>) -> Result<(), String> {
+    if slots.is_empty() { return Ok(()); }
+    let valid = valid_slot_entry_terminals(table);
+    for &slot in slots.iter().filter(|slot| !valid.contains(slot)) {
+        validate_slot_entry_shape(table, slot)?;
+    }
+    Ok(())
+}
+
 /// Instantiate Entry by attaching the scoped child start to every successful
 /// escape push list of the (already scoped) local slot characterization.
 ///
@@ -3478,6 +3513,41 @@ pub(crate) fn eof_terminal() -> TerminalID {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn batched_slot_entries_match_every_original_predicate_and_first_error() {
+        use super::*;
+        use crate::compiler::glr::table::testing::build_test_table;
+        use crate::compiler::glr::table::StackShift;
+        let actions = [Action::Shift(0,false), Action::Shift(1,true), Action::Reduce(0,1),
+            Action::Split {shift:Some((0,false)),reduces:vec![],accept:false},
+            Action::Split {shift:None,reduces:vec![(0,1)],accept:false},
+            Action::Split {shift:Some((0,false)),reduces:vec![(0,1)],accept:false},
+            Action::Split {shift:None,reduces:vec![],accept:false},
+            Action::Split {shift:Some((0,false)),reduces:vec![],accept:true},
+            Action::Accept,Action::Skip,Action::ReplaceShifts(vec![0,1].into()),
+            Action::StackShifts(vec![StackShift {pop:1,pushes:vec![0]}])];
+        for case in 0..48usize {
+            let mut table = build_test_table(4,17,&[&[],&[],&[],&[]],&[&[],&[],&[],&[]]);
+            for state in 0..4usize {
+                for terminal in 0..17u32 {
+                    if (state+terminal as usize+case)%5 != 0 {
+                        let action = if case%3==0 {Action::Reduce(0,1)} else {
+                            actions[(state*19+terminal as usize+case)%actions.len()].clone()};
+                        table.action[state].insert(terminal,action);
+                    }
+                }
+                if case%3==0 {table.action[state].compress_default(17);}
+            }
+            if case%2==0 {table.forwarded_shifts.insert((3,case as u32%17));}
+            let expected = (0..17u32).filter(|&t| validate_slot_entry_shape(&table,t).is_ok())
+                .collect::<BTreeSet<_>>();
+            assert_eq!(valid_slot_entry_terminals(&table),expected,"case {case}");
+            for slots in [expected, (0..17u32).collect(),BTreeSet::from([17,18,0,16])] {
+                let original = slots.iter().try_for_each(|&t| validate_slot_entry_shape(&table,t));
+                assert_eq!(validate_slot_entry_shapes(&table,&slots),original,"case {case}");
+            }
+        }
+    }
     // Compiler analysis fixtures own these tables directly. They never enter
     // a Constraint or participate in its native runtime.
     fn compiler_table_fixture(constraint: &crate::runtime::Constraint) -> GLRTable {

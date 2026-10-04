@@ -1267,6 +1267,134 @@ fn characterize_nt_continuations_for_terminal(
     }
 }
 
+#[cfg(test)]
+mod seed_index_tests {
+    use super::*;
+
+    #[test]
+    fn exact_single_unit_seed_memo_preserves_chains_cycles_and_replacing_gotos() {
+        for trial in 0..96u32 {
+            let table=GLRTable {
+                action:(0..13u32).map(|state|{
+                    let action=if trial%8==0 || state<10 {Action::Reduce(10+state%4,1)}
+                        else if state==10 {Action::Shift(12,trial%2==0)}
+                        else if state==11 {Action::Split{shift:Some((12,false)),reduces:vec![(10,1),(13,2)],accept:true}}
+                        else {match trial%3 {0=>Action::Accept,1=>Action::Skip,_=>Action::Reduce(11,2)}};
+                    vec![(0,action)].into_iter().collect()
+                }).collect(),
+                goto:(0..13u32).map(|state|(0..16u32).map(|lhs|{
+                    let target=if trial%8==0 {(lhs+state)%10} else {(lhs+state+trial)%13};
+                    (lhs,(target,trial%8!=0 && (lhs+state+trial)%11==0))
+                }).collect()).collect(),
+                num_states:13,num_terminals:1,num_rules:0,rules:Vec::new(),
+                nonterminal_display_names:Vec::new(),construction:Default::default(),
+                admission_policy:Default::default(),advance:Vec::new(),unconditional_advance:Vec::new(),
+                forwarded_shifts:FxHashSet::default(),control_terminals:BTreeSet::new(),
+                skip_terminals:BTreeSet::new(),guarded_shift_index:Vec::new(),
+                direct_regular_wide_frontiers:Vec::new(),
+            };
+            let index=build_characterization_index_for_terminal_count(&table,1);
+            let tops=(0..13).collect::<Vec<_>>();
+            let mut reference=CharacterizationOutput::default();
+            let mut optimized=CharacterizationOutput::default();
+            characterize_nt_continuations_for_top_states_with_seed_index(&table,&index,0,&tops,&mut reference,false);
+            characterize_nt_continuations_for_top_states_with_seed_index(&table,&index,0,&tops,&mut optimized,true);
+            assert_eq!(reference.escapes,optimized.escapes,"trial={trial}");
+            assert_eq!(reference.reduces,optimized.reduces,"trial={trial}");
+            assert_eq!(reference.nt_escapes,optimized.nt_escapes,"trial={trial}");
+            assert_eq!(reference.nt_rereduces,optimized.nt_rereduces,"trial={trial}");
+            let mut bounded_cache=FxHashMap::default();
+            for state in 100..16_484 {bounded_cache.insert((99,state),UnitSeedResolution::Resolved(None));}
+            assert_eq!(resolve_single_unit_seed(&table,0,0,0,&mut bounded_cache),Some((0,false)));
+        }
+    }
+
+    #[test]
+    fn sparse_unit_seed_index_preserves_full_ordered_characterization_relation() {
+        for trial in 0..96u32 {
+            let mut reduces=(0..64u32).map(|lhs|(lhs,if lhs%17==0 {0} else if lhs%11==0 {2} else {1})).collect::<Vec<_>>();
+            if trial%2!=0 {reduces.reverse();}
+            reduces.push((32,1));
+            let action=match trial%12 {
+                0..=3 => Action::Reduce(trial%64,trial%4),
+                4 => Action::Accept,
+                5 => Action::Skip,
+                6 => Action::Shift(1,trial%2!=0),
+                _ => Action::Split{shift:(trial%3!=0).then_some((1,trial%2!=0)),reduces,accept:trial%3==0},
+            };
+            let table=GLRTable {
+                action:(0..6).map(|state|if state==0 {vec![(0,action.clone())].into_iter().collect()}
+                    else {std::iter::empty::<(u32,Action)>().collect()}).collect(),
+                goto:(0..6u32).map(|state|{
+                    if state==0 {vec![(0,(1,false)),(17,(1,false)),(34,(1,false)),(51,(1,false))].into_iter().collect()}
+                    else if state%2!=0 {(0..64u32).filter(|lhs|(lhs+state+trial)%5==0)
+                        .map(|lhs|(lhs,(0,(lhs+trial)%7==0))).collect()}
+                    else {std::iter::empty::<(u32,(u32,bool))>().collect()}
+                }).collect(),
+                num_states:6,num_terminals:1,num_rules:0,rules:Vec::new(),
+                nonterminal_display_names:Vec::new(),construction:Default::default(),
+                admission_policy:Default::default(),advance:Vec::new(),unconditional_advance:Vec::new(),
+                forwarded_shifts:FxHashSet::default(),control_terminals:BTreeSet::new(),
+                skip_terminals:BTreeSet::new(),guarded_shift_index:Vec::new(),
+                direct_regular_wide_frontiers:Vec::new(),
+            };
+            let index=build_characterization_index_for_terminal_count(&table,1);
+            let mut reference=CharacterizationOutput::default();
+            let mut optimized=CharacterizationOutput::default();
+            characterize_nt_continuations_for_top_states_with_seed_index(&table,&index,0,&[0],&mut reference,false);
+            characterize_nt_continuations_for_top_states_with_seed_index(&table,&index,0,&[0],&mut optimized,true);
+            assert_eq!(reference.escapes,optimized.escapes);
+            assert_eq!(reference.reduces,optimized.reduces);
+            assert_eq!(reference.nt_escapes,optimized.nt_escapes);
+            assert_eq!(reference.nt_rereduces,optimized.nt_rereduces);
+        }
+    }
+}
+
+struct UnitReductionSeedIndex<'a> {
+    shift: Option<(u32,bool)>,
+    accept: bool,
+    reduces: &'a [(NonterminalID,u32)],
+    unit_positions: FxHashMap<NonterminalID,Vec<usize>>,
+    other_positions: Vec<usize>,
+}
+
+impl<'a> UnitReductionSeedIndex<'a> {
+    fn new(action: &'a Action) -> Option<Self> {
+        let Action::Split{shift,reduces,accept}=action else {return None;};
+        if reduces.len()<16 {return None;}
+        let unit_count=reduces.iter().filter(|(_,len)|*len==1).count();
+        if unit_count<16 || unit_count<reduces.len()-reduces.len()/4 {return None;}
+        let mut unit_positions=FxHashMap::<NonterminalID,Vec<usize>>::default();
+        let mut other_positions=Vec::new();
+        for (position,&(lhs,len)) in reduces.iter().enumerate() {
+            if len==1 {unit_positions.entry(lhs).or_default().push(position);}
+            else {other_positions.push(position);}
+        }
+        if reduces.len()-other_positions.len()<16 {return None;}
+        Some(Self{shift:*shift,accept:*accept,reduces,unit_positions,other_positions})
+    }
+
+    fn action_for_nonreplace_seed(&self,table:&GLRTable,revealed_state:u32) -> Action {
+        // At a non-replacing goto seed the known segment is [revealed,goto].
+        // A length-one reduction must consult goto(revealed,lhs). A missing
+        // cell emits nothing and queues nothing in the original relation.
+        // Intersect those unit branches with the sparse row once, retaining
+        // every zero-length/crossing branch and original reduction order.
+        let mut positions=self.other_positions.clone();
+        if let Some(row)=table.goto.get(revealed_state as usize) {
+            for (&lhs,_) in row.iter() {
+                if let Some(unit_positions)=self.unit_positions.get(&lhs) {
+                    positions.extend_from_slice(unit_positions);
+                }
+            }
+        }
+        positions.sort_unstable();
+        Action::Split{shift:self.shift,accept:self.accept,
+            reduces:positions.into_iter().map(|position|self.reduces[position]).collect()}
+    }
+}
+
 fn characterize_nt_continuations_for_top_states(
     table: &GLRTable,
     index: &CharacterizationIndex,
@@ -1274,16 +1402,119 @@ fn characterize_nt_continuations_for_top_states(
     top_states: &[u32],
     output: &mut CharacterizationOutput,
 ) {
+    characterize_nt_continuations_for_top_states_with_seed_index(table,index,terminal,top_states,output,true)
+}
+
+fn goto_seed_can_emit_or_continue(
+    table: &GLRTable,
+    action: Option<&Action>,
+    revealed_state: u32,
+    top_state: u32,
+    goto_replace: bool,
+) -> bool {
+    // This is exactly the first step of process_reduce_from_config, before
+    // allocating the seed's relation/worklist. A replacing goto has one known
+    // stack state, otherwise two. Crossing reductions must always be retained.
+    // A shorter reduction with a missing goto emits nothing and queues nothing.
+    let reduction_has_effect = |lhs, len| {
+        if len >= if goto_replace { 1 } else { 2 } {
+            true
+        } else {
+            let revealed = if len == 0 { top_state } else { revealed_state };
+            table.goto_target(revealed, lhs).is_some()
+        }
+    };
+    match action {
+        None | Some(Action::Accept) => false,
+        Some(Action::Reduce(lhs, len)) => reduction_has_effect(*lhs, *len),
+        Some(Action::Split { shift, reduces, .. }) => {
+            shift.is_some() || reduces.iter().any(|&(lhs,len)| reduction_has_effect(lhs,len))
+        }
+        // All other stack/guarded/skip actions retain their original handling.
+        _ => true,
+    }
+}
+
+#[derive(Clone,Copy)]
+enum UnitSeedResolution {
+    Pending,
+    Resolved(Option<(u32,bool)>),
+}
+
+fn resolve_single_unit_seed(
+    table:&GLRTable,terminal:TerminalID,revealed:u32,top:u32,
+    cache:&mut FxHashMap<(u32,u32),UnitSeedResolution>,
+) -> Option<(u32,bool)> {
+    // On [revealed,top], a single unit reduction emits no relation edge:
+    // it becomes [revealed,goto(revealed,lhs)], or [goto] for a replacing
+    // goto. The input remains exactly State(revealed). Collapse ONLY these
+    // pure first steps. A closed single-unit cycle has no emitting branch.
+    // Other reductions/splits/stack actions retain the complete worklist.
+    // This cache is local to one terminal/chunk and keeps no runtime table.
+    const MAX_MEMO_ENTRIES:usize=16_384;
+    let mut trail=Vec::new();
+    let mut current=top;
+    let result=loop {
+        match cache.get(&(revealed,current)).copied() {
+            Some(UnitSeedResolution::Resolved(result)) => break result,
+            Some(UnitSeedResolution::Pending) => break None,
+            None => {},
+        }
+        // A resource-only memo bound: continue with the original traversal
+        // at the current exact configuration, never refuse or truncate.
+        if cache.len()>=MAX_MEMO_ENTRIES {break Some((current,false));}
+        cache.insert((revealed,current),UnitSeedResolution::Pending);
+        trail.push(current);
+        let Some(Action::Reduce(lhs,1))=table.action(current,terminal) else {
+            break Some((current,false));
+        };
+        match table.goto_target(revealed,*lhs) {
+            Some((next,false)) => current=next,
+            Some((next,true)) => break Some((next,true)),
+            None => break None,
+        }
+    };
+    for visited in trail {cache.insert((revealed,visited),UnitSeedResolution::Resolved(result));}
+    result
+}
+
+fn characterize_nt_continuations_for_top_states_with_seed_index(
+    table:&GLRTable,index:&CharacterizationIndex,terminal:TerminalID,
+    top_states:&[u32],output:&mut CharacterizationOutput,use_seed_index:bool,
+) {
+    let mut unit_seeds=FxHashMap::default();
     for &top_state in top_states {
         let Some(predecessors) = index.goto_predecessors_by_target.get(top_state as usize) else {
             continue;
         };
 
+        let seed_action=table.action(top_state,terminal);
+        let seed_index=(use_seed_index && predecessors.len()>=4).then_some(seed_action)
+            .flatten().and_then(UnitReductionSeedIndex::new);
         for &(revealed_state, nonterminal, goto_replace) in predecessors {
-            let config = start_relation_after_goto(revealed_state, top_state, goto_replace);
+            let (seed_top,seed_replace)=if use_seed_index && !goto_replace
+                && matches!(seed_action,Some(Action::Reduce(_,1))) {
+                let Some(resolved)=resolve_single_unit_seed(table,terminal,revealed_state,top_state,&mut unit_seeds) else {continue;};
+                resolved
+            } else {(top_state,goto_replace)};
+            let resolved_action=if seed_top==top_state && seed_replace==goto_replace {seed_action}
+                else {table.action(seed_top,terminal)};
+            if use_seed_index && !goto_seed_can_emit_or_continue(
+                table,resolved_action,revealed_state,seed_top,seed_replace,
+            ) {
+                continue;
+            }
+            let config = start_relation_after_goto(revealed_state, seed_top, seed_replace);
             let mut seen = FxHashSet::default();
             seen.insert(config.clone());
-            let mut worklist = VecDeque::from([config]);
+            let mut worklist = VecDeque::new();
+            if seed_top==top_state && !seed_replace && let Some(seed_index)=&seed_index {
+                let action=seed_index.action_for_nonreplace_seed(table,revealed_state);
+                process_action_from_config(table,CharacterizationSource::Nonterminal(nonterminal),
+                    &config,&action,0,output,&mut seen,&mut worklist);
+            } else {
+                worklist.push_back(config);
+            }
 
             drain_nonconsuming_worklist(
                 table,

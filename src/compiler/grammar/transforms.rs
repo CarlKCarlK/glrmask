@@ -484,6 +484,7 @@ impl SingleUseInlineIndexes {
 pub(crate) fn inline_single_use_nonterminals(
     rules: &mut Vec<Rule>,
     protected_nonterminals: &BTreeSet<NonterminalID>,
+    start: NonterminalID,
 ) {
     let inline_protected_nonterminals = env_var_enabled(INLINE_PROTECTED_NONTERMINALS_ENV, true);
 
@@ -492,6 +493,12 @@ pub(crate) fn inline_single_use_nonterminals(
         let mut inline_candidates = BTreeMap::<NonterminalID, (usize, Vec<Symbol>)>::new();
 
         for nonterminal in indexes.nonterminals() {
+            // Entry identity is an external use, not an RHS use counted by the
+            // index. Even when named-symbol inlining is enabled, removing this
+            // production would leave GrammarDef.start naming a dead symbol.
+            if nonterminal == start {
+                continue;
+            }
             let Some(production_index) = indexes.single_production(nonterminal) else {
                 continue;
             };
@@ -787,6 +794,7 @@ fn inline_post_bound_single_use_nonterminals(
     rules: &mut Vec<Rule>,
     protected_nonterminals: &BTreeSet<NonterminalID>,
     max_rhs_len: usize,
+    start: NonterminalID,
 ) -> bool {
     let inline_protected_nonterminals = env_var_enabled(INLINE_PROTECTED_NONTERMINALS_ENV, true);
     let mut changed = false;
@@ -796,6 +804,9 @@ fn inline_post_bound_single_use_nonterminals(
         let mut candidate = None;
 
         for nonterminal in indexes.nonterminals() {
+            if nonterminal == start {
+                continue;
+            }
             let Some(candidate_rule_index) = indexes.single_production(nonterminal) else {
                 continue;
             };
@@ -1048,7 +1059,7 @@ pub(crate) fn prepare_dynamic_glr_transforms_only(grammar: GrammarDef) -> Gramma
     }
 
     let protected_nonterminals = collect_protected_nonterminals(&normalized);
-    inline_single_use_nonterminals(&mut normalized.rules, &protected_nonterminals);
+    inline_single_use_nonterminals(&mut normalized.rules, &protected_nonterminals, normalized.start);
     let max_reduction_len = std::env::var("GLRMASK_MAX_RUNTIME_REDUCTION_LEN")
         .ok()
         .and_then(|v| v.parse().ok())
@@ -1058,6 +1069,7 @@ pub(crate) fn prepare_dynamic_glr_transforms_only(grammar: GrammarDef) -> Gramma
         &mut normalized.rules,
         &protected_nonterminals,
         max_reduction_len,
+        normalized.start,
     );
     compact_unused_terminals(&mut normalized);
     normalized
@@ -1080,7 +1092,7 @@ pub(crate) fn prepare_dynamic_parser_after_terminal_domain(
 ) -> (GrammarDef, bool) {
     normalize_dynamic_glr_grammar(&mut normalized.rules, normalized.start);
     let protected_nonterminals = collect_protected_nonterminals(&normalized);
-    inline_single_use_nonterminals(&mut normalized.rules, &protected_nonterminals);
+    inline_single_use_nonterminals(&mut normalized.rules, &protected_nonterminals, normalized.start);
     let max_reduction_len = std::env::var("GLRMASK_MAX_RUNTIME_REDUCTION_LEN")
         .ok()
         .and_then(|v| v.parse().ok())
@@ -1090,6 +1102,7 @@ pub(crate) fn prepare_dynamic_parser_after_terminal_domain(
         &mut normalized.rules,
         &protected_nonterminals,
         max_reduction_len,
+        normalized.start,
     );
     let terminal_domain_changed = compact_unused_terminals(&mut normalized);
     (normalized, terminal_domain_changed)
@@ -1217,7 +1230,7 @@ fn prepare_grammar_transforms_impl(
 
     let inline_rules_before = normalized.rules.len();
     let inline_started_at = profiling.then(Instant::now);
-    inline_single_use_nonterminals(&mut normalized.rules, &protected_nonterminals);
+    inline_single_use_nonterminals(&mut normalized.rules, &protected_nonterminals, normalized.start);
     if let Some(started_at) = inline_started_at {
         emit_grammar_transform_profile(
             "inline_single_use_nonterminals",
@@ -1277,6 +1290,7 @@ fn prepare_grammar_transforms_impl(
         &mut normalized.rules,
         &protected_nonterminals,
         max_reduction_len,
+        normalized.start,
     );
     if let Some(started_at) = post_inline_started_at {
         emit_grammar_transform_profile(
@@ -1673,6 +1687,46 @@ mod tests {
     }
 
     #[test]
+    fn inlining_preserves_recursively_referenced_entry_alias() {
+        // The external entry is also referenced by an inner recursive branch.
+        // It must not be discarded merely because its single alias production
+        // can be substituted into that branch: GrammarDef.start still names it.
+        let original = vec![
+            Rule { lhs: 0, rhs: vec![nt(1)] },
+            Rule { lhs: 1, rhs: vec![t(0), nt(0), t(1)] },
+            Rule { lhs: 1, rhs: vec![t(2)] },
+        ];
+        let mut ordinary = original.clone();
+        inline_single_use_nonterminals(&mut ordinary, &BTreeSet::from([0]), 0);
+        assert!(ordinary.iter().any(|rule| rule.lhs == 0), "entry lost by ordinary inlining");
+        let mut bounded = original;
+        inline_post_bound_single_use_nonterminals(&mut bounded, &BTreeSet::from([0]), 5, 0);
+        assert!(bounded.iter().any(|rule| rule.lhs == 0), "entry lost by post-bound inlining");
+    }
+
+    #[test]
+    fn static_preparation_retains_recursive_entry_identity() {
+        let source = GrammarDef {
+            start: 0,
+            rules: vec![
+                Rule { lhs: 0, rhs: vec![nt(1)] },
+                Rule { lhs: 1, rhs: vec![t(0), nt(0), t(1)] },
+                Rule { lhs: 1, rhs: vec![t(2)] },
+            ],
+            terminals: (0..3).map(|id| Terminal::Literal { id, bytes: vec![b'a'+id as u8] }).collect(),
+            nonterminal_names: BTreeMap::from([(0,"entry".into()),(1,"body".into())]),
+            ..GrammarDef::default()
+        };
+        let prepared = prepare_grammar_transforms_only(source);
+        assert_eq!(prepared.start, 0);
+        assert!(prepared.rules.iter().any(|rule| rule.lhs == prepared.start));
+        let shared = prepare_dynamic_shared_terminal_domain(prepared);
+        let (dynamic, _) = prepare_dynamic_parser_after_terminal_domain(shared);
+        assert!(!dynamic.rules.is_empty());
+        assert!(dynamic.rules.iter().any(|rule| rule.lhs == dynamic.start));
+    }
+
+    #[test]
     fn inline_single_use_nonterminals_skips_candidate_cycles() {
         let mut rules = vec![
             Rule {
@@ -1689,7 +1743,7 @@ mod tests {
             },
         ];
 
-        inline_single_use_nonterminals(&mut rules, &BTreeSet::new());
+        inline_single_use_nonterminals(&mut rules, &BTreeSet::new(), 0);
 
         assert_eq!(
             rules,
@@ -1727,7 +1781,7 @@ mod tests {
             },
         ];
 
-        inline_single_use_nonterminals(&mut rules, &BTreeSet::new());
+        inline_single_use_nonterminals(&mut rules, &BTreeSet::new(), 0);
 
         assert_eq!(
             rules,
