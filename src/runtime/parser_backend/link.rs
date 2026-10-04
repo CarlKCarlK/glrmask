@@ -81,6 +81,12 @@ pub(crate) fn compose(mut parent: Constraint, children: &[(String, Arc<Constrain
         tokenizer_count = tokenizer_count.checked_add(span).ok_or_else(|| fail("tokenizer coordinate overflow"))?;
         names.extend(component.terminal_display_names.iter().cloned());
     }
+    // These temporary tokens borrow the stable original component Arcs. Compute
+    // identity inside this link, once per input; root-CALL and wrapper consumers
+    // validate each token against both exact inputs before sharing its digest.
+    let component_queries = tail_components.iter().map(|component|
+        crate::compiler::boundary_candidates::fingerprint_for_query(component.as_ref(), vocab).ok())
+        .collect::<Vec<_>>();
     // Components retain their bounded local certificates. Scoped composition
     // does not construct dense certificates for the global Cartesian product;
     // its control inventory enforces its own resource budget in from_views.
@@ -202,7 +208,8 @@ pub(crate) fn compose(mut parent: Constraint, children: &[(String, Arc<Constrain
             let children = leaves.iter().skip(1).copied().collect::<Vec<_>>();
             let calls = links.iter().filter(|link| link.parent_component == 0)
                 .map(|link| link.slot_terminal).collect::<Vec<_>>();
-            if let Ok(refined) = crate::compiler::boundary_tail::build_root_call_candidates(leaves[0], &children, &calls, vocab) {
+            if let Ok(refined) = crate::compiler::boundary_tail::build_root_call_candidates_with_queries(
+                leaves[0], &children, &calls, vocab, component_queries[0], &component_queries[1..]) {
                 let ids = existing.iter().copied().filter(|id| refined.candidate_ids.binary_search(id).is_ok()).collect::<Vec<_>>();
                 if std::env::var_os("GLRMASK_PROFILE_COMPILE_SUMMARY").is_some() {
                     eprintln!("[glrmask/profile][native_link_root_call_proof] reusable={} filtered={} summary_ms={:.3} map_ms={:.3}",
@@ -243,8 +250,8 @@ pub(crate) fn compose(mut parent: Constraint, children: &[(String, Arc<Constrain
     // source grammar rules. Its reusable fingerprint is then unavailable;
     // retain the ordinary conservative candidate query for that component.
     if constraint.template_parser.as_ref().is_some_and(|parser| parser.link_grammar.is_some())
-        && !crate::compiler::boundary_candidates::defer_composition_boundary_candidate_summary(
-            &mut constraint, vocab, &tail_components, &slots) {
+        && !crate::compiler::boundary_candidates::defer_composition_boundary_candidate_summary_with_queries(
+            &mut constraint, vocab, &tail_components, &slots, &component_queries) {
         // A component whose source cannot be fingerprinted keeps the previous
         // eager behavior, including its conservative refusal/error semantics.
         let tail_sources = &tail_components;
