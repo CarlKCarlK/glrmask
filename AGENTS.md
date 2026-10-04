@@ -37,12 +37,19 @@ only for that development harness when necessary. Keep production release
 settings for qualified performance comparisons. Preserve other workers' source
 and target ownership. Do not run repository-wide formatting.
 
+For the verified Windows root-unit fast loop, portable isolated-manifest
+preparation, timing/coverage evidence, and narrow recoverable cache diagnosis,
+read [docs/windows-development-builds.md](docs/windows-development-builds.md)
+before starting Windows development builds. The unit-only recipe must not
+replace canonical integration coverage or production performance profiles.
+
+Final correctness qualification and matched build/link/TBM performance acceptance
+must use consolidated, batched canonical builds about once or twice per day,
+not multi-minute production rebuilds for each experiment. Follow the Windows
+guide's user-required iteration budget and separate optimized development
+performance discrimination from eventual release acceptance.
+
 Final correctness qualification and matched build/link/TBM performance acceptance
 are separate gates. Targeted tests alone do not qualify the full replacement.
 Publishing packages, pushing, merging main or changing defaults requires current
 user authorization.
-
-For the Mac composition lane, follow the measured cached optimized development
-recipe in [docs/mac-composition-fast-development.md](docs/mac-composition-fast-development.md).
-Keep its stable warm target between variants; batch expensive production and
-canonical validation at selected checkpoints, ordinarily once or twice daily.

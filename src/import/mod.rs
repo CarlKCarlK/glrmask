@@ -19,6 +19,7 @@ use crate::compiler::pipeline::{
     compile_dynamic_owned_with_table_construction,
     compile_dynamic_owned_with_vocab_partition_unfinalized_with_table_construction,
     compile_dynamic_owned_with_vocab_partition_with_table_construction,
+    compile_dynamic_owned_with_vocab_partition_for_parser_replacement,
 };
 use crate::grammar::factoring::factor_named_grammar;
 use crate::grammar::flat::GrammarDef;
@@ -479,23 +480,37 @@ fn compile_bounded_template_from_source(
             // Standalone normalization removes the empty start alternative.
             // A later component linker still needs its original body-language
             // nullability, just as the ordinary static and dynamic frontends do.
+            let source_nullable_started = emit_import_phase_start("bounded_source_start_nullable");
             let source_start_nullable = grammar.start_is_nullable();
+            emit_import_phase_end("bounded_source_start_nullable", source_nullable_started);
             let prepared = crate::compiler::grammar::transforms::prepare_grammar_transforms_only(grammar);
-            let mut component = compile_dynamic_owned_with_vocab_partition_with_table_construction(
+            // This frontend returns native Constraints, not Dynamic transfer
+            // artifacts. Keep complete runtime finalization, but do not build
+            // a Dynamic-only snapshot that constraints_mut() immediately
+            // invalidates below and into_constraints() subsequently discards.
+            let mut component = compile_dynamic_owned_with_vocab_partition_for_parser_replacement(
                 prepared, vocab, table_construction,
             )?;
+            let set_nullable_started = emit_import_phase_start("bounded_set_start_nullable");
             for body in component.constraints_mut() {
                 body.set_composition_start_nullable(source_start_nullable);
             }
+            emit_import_phase_end("bounded_set_start_nullable", set_nullable_started);
             compiled.push(component);
         }
+        let join_started = emit_import_phase_start("bounded_join_alternatives");
         let mut constraint = DynamicConstraint::from_alternatives(compiled);
+        emit_import_phase_end("bounded_join_alternatives", join_started);
         for component in constraint.constraints_mut() {
+            let boundary_started = emit_import_phase_start("bounded_persist_boundary_summary");
             crate::compiler::boundary_candidates::persist_boundary_candidate_summary(
                 component,
                 vocab,
             );
+            emit_import_phase_end("bounded_persist_boundary_summary", boundary_started);
+            let install_started = emit_import_phase_start("bounded_install_template_parser");
             component.install_template_parser()?;
+            emit_import_phase_end("bounded_install_template_parser", install_started);
         }
         Ok(constraint)
     })
