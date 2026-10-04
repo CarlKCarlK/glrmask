@@ -24,7 +24,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use glrmask_parser_dwa::__private::templates::admissibility::{DomainProbe, TemplateDomain, TopAdmission};
 use glrmask_parser_dwa::__private::templates::characterize::try_characterize_selected_terminals_for_terminal_count;
 use glrmask_parser_dwa::__private::templates::compile_dfa::{
-    Templates, specialize_template_dfa_defaults_for_commit_split_input, try_split_commit_template_dfas,
+    TemplateDfaGroup, Templates, specialize_template_dfa_defaults_for_commit_split_input, try_split_commit_template_dfas,
 };
 use crate::automata::unweighted_u32::dfa::DFA;
 use crate::compiler::glr::analysis::EOF;
@@ -53,6 +53,7 @@ fn compile_terminal_template(
     Ok(Arc::new(split))
 }
 
+#[cfg(test)]
 fn compile_terminal_template_rows(
     raw: BTreeMap<TerminalID, DFA>,
     terminal_count: u32,
@@ -72,6 +73,7 @@ fn compile_terminal_template_rows(
     }
 }
 
+#[cfg(test)]
 fn compile_terminal_template_rows_with_parallelism(
     raw: BTreeMap<TerminalID, DFA>,
     terminal_count: u32,
@@ -97,6 +99,73 @@ fn compile_terminal_template_rows_with_parallelism(
         .map(|(terminal, dfa)| compile_terminal_template(terminal, dfa))
         .collect::<Vec<_>>();
     results.into_iter().map(|result| result.map(Some)).collect()
+}
+
+fn compile_terminal_template_groups(
+    groups: Vec<TemplateDfaGroup>,
+    terminal_count: u32,
+) -> crate::Result<crate::runtime::artifact::TemplateDfasByTerminal> {
+    // Count the same virtual per-terminal raw states as the previous fanout,
+    // so avoiding clones does not change the existing worker-pool threshold.
+    const PARALLEL_MIN_RAW_STATES: usize = 1_024;
+    let states = groups.iter().map(|group| {
+        group.dfa.states.len().saturating_mul(group.terminals.len())
+    }).fold(0usize, usize::saturating_add);
+    let parallel = terminal_count > 1 && states >= PARALLEL_MIN_RAW_STATES
+        && !crate::compiler::macro_parallelism_disabled();
+    if parallel {
+        crate::compiler::pipeline::run_with_compile_thread_pool(|| {
+            compile_terminal_template_groups_with_parallelism(groups, terminal_count, true)
+        })
+    } else {
+        compile_terminal_template_groups_with_parallelism(groups, terminal_count, false)
+    }
+}
+
+fn compile_terminal_template_groups_with_parallelism(
+    mut groups: Vec<TemplateDfaGroup>,
+    terminal_count: u32,
+    parallel: bool,
+) -> crate::Result<crate::runtime::artifact::TemplateDfasByTerminal> {
+    let invalid_inventory = || crate::Error::Compilation(
+        "terminal template inventory must cover the complete terminal domain".into()
+    );
+    let mut covered = vec![false; terminal_count as usize];
+    for group in &groups {
+        if group.terminals.is_empty() || group.terminals.windows(2).any(|pair| pair[0] >= pair[1]) {
+            return Err(invalid_inventory());
+        }
+        for &terminal in &group.terminals {
+            let Some(slot) = covered.get_mut(terminal as usize) else {
+                return Err(invalid_inventory());
+            };
+            if std::mem::replace(slot, true) { return Err(invalid_inventory()); }
+        }
+    }
+    if covered.iter().any(|&present| !present) { return Err(invalid_inventory()); }
+    // Characterization order differs from terminal order. Compare ordered
+    // group results so the smallest failing terminal remains the first error.
+    groups.sort_unstable_by_key(|group| group.terminals[0]);
+    let mut output = vec![None; terminal_count as usize];
+    let transform = |group: TemplateDfaGroup| {
+        let result = compile_terminal_template(group.terminals[0], group.dfa);
+        (group.terminals, result)
+    };
+    if parallel && rayon::current_num_threads() > 1 {
+        use rayon::prelude::*;
+        let results = groups.into_par_iter().map(transform).collect::<Vec<_>>();
+        for (terminals, result) in results {
+            let template = result?;
+            for terminal in terminals { output[terminal as usize] = Some(Arc::clone(&template)); }
+        }
+    } else {
+        for group in groups {
+            let (terminals, result) = transform(group);
+            let template = result?;
+            for terminal in terminals { output[terminal as usize] = Some(Arc::clone(&template)); }
+        }
+    }
+    Ok(output)
 }
 
 /// Compile-time / ordinary-LR storage. None really means no table remains.
@@ -219,20 +288,21 @@ impl PreparedTemplateParser {
             let selected = (0..terminal_count as usize)
                 .map(|terminal| retained.get(terminal).is_none_or(Option::is_none))
                 .collect::<Vec<_>>();
-            let raw = if selected.iter().any(|&missing| missing) {
-                let characterizations = try_characterize_selected_terminals_for_terminal_count(
+            let characterizations = if selected.iter().any(|&missing| missing) {
+                try_characterize_selected_terminals_for_terminal_count(
                     &table, terminal_count, &selected,
-                ).map_err(crate::Error::Compilation)?;
-                Templates::dfas_from_characterizations(&characterizations)
+                ).map_err(crate::Error::Compilation)?
             } else {
                 std::collections::BTreeMap::new()
             };
             let templates = if dynamic {
-                // Dynamic preparation owns the full raw inventory. Each
-                // terminal can be transformed independently on the compile
-                // pool; complete equivalence checks still run for every row.
-                compile_terminal_template_rows(raw, terminal_count)?
+                // The existing exact characterization quotient owns one raw
+                // graph per group. Specialization and the complete split proof
+                // run once on that graph; immutable results retain every slot.
+                let (groups, _) = Templates::grouped_dfas_from_characterizations(&characterizations);
+                compile_terminal_template_groups(groups, terminal_count)?
             } else {
+                let raw = Templates::dfas_from_characterizations(&characterizations);
                 let mut rebuilt = raw.into_iter();
                 let mut templates = vec![None; terminal_count as usize];
                 for terminal in 0..terminal_count {
@@ -1255,6 +1325,136 @@ mod tests {
             assert_eq!(a.pop_to_read, b.pop_to_read);
             assert_eq!(a.pop_to_push, b.pop_to_push);
             assert_eq!(a.read_to_push, b.read_to_push);
+        }
+    }
+
+    #[test]
+    fn exact_characterization_groups_match_independent_templates_domains_and_views() {
+        use glrmask_parser_dwa::__private::templates::characterize::{
+            InitialEscape, StackMatcher, TerminalCharacterization,
+        };
+        let characterizations = (0..8u32).map(|terminal| {
+            let top = terminal % 2;
+            (terminal, TerminalCharacterization {
+                escapes: vec![
+                    InitialEscape { pop: vec![StackMatcher::State(top)], pushes: vec![top, 17] },
+                    InitialEscape { pop: vec![StackMatcher::Any], pushes: vec![19] },
+                    InitialEscape { pop: Vec::new(), pushes: vec![20] },
+                ],
+                reduces: Vec::new(), nt_escapes: Vec::new(), nt_rereduces: Vec::new(),
+                all_nts: BTreeSet::new(),
+            })
+        }).collect::<BTreeMap<_, _>>();
+        let reference = Templates::dfas_from_characterizations(&characterizations).into_iter()
+            .map(|(terminal, raw)| Some(compile_terminal_template(terminal, raw).unwrap()))
+            .collect::<Vec<_>>();
+        let (groups, profile) = Templates::grouped_dfas_from_characterizations(&characterizations);
+        assert_eq!(profile.unique_characterizations, 2);
+        assert_eq!(profile.quotient_hits, 6);
+        let (reference_domains, reference_views) = prepare_terminal_inventory(&reference, 32, true, false).unwrap();
+        for threads in [1, 4] {
+            let pool = rayon::ThreadPoolBuilder::new().num_threads(threads).build().unwrap();
+            for parallel in [false, true] {
+                let actual = pool.install(|| {
+                    compile_terminal_template_groups_with_parallelism(groups.clone(), 8, parallel)
+                }).unwrap();
+                assert_identical_phase_rows(&reference, &actual);
+                for terminal in 2..8 {
+                    assert!(Arc::ptr_eq(actual[terminal].as_ref().unwrap(), actual[terminal % 2].as_ref().unwrap()));
+                }
+                assert!(!Arc::ptr_eq(actual[0].as_ref().unwrap(), actual[1].as_ref().unwrap()));
+                let (domains, views) = prepare_terminal_inventory(&actual, 32, true, false).unwrap();
+                assert_eq!(format!("{views:?}"), format!("{reference_views:?}"));
+                for (expected, domain) in reference_domains.iter().zip(&domains) {
+                    assert_eq!(expected.to_bytes().unwrap(), domain.to_bytes().unwrap());
+                    for top in 0..32 {
+                        for suffix in [vec![top], vec![top, 3], vec![top, 7, 2]] {
+                            assert_eq!(expected.matches_top_first(suffix.iter().copied()),
+                                       domain.matches_top_first(suffix.iter().copied()));
+                        }
+                    }
+                }
+            }
+        }
+        let automatic = compile_terminal_template_groups(groups, 8).unwrap();
+        assert_identical_phase_rows(&reference, &automatic);
+    }
+
+    #[test]
+    fn grouped_phase_transform_preserves_default_shadow_and_empty_relations() {
+        use crate::compiler::glr::labels::DEFAULT_LABEL;
+        let mut identity = DFA::new();
+        identity.set_accepting(0, true);
+        let mut shadow = DFA::new();
+        let pushed = shadow.add_state();
+        let accepted = shadow.add_state();
+        shadow.add_transition(0, 7, pushed);
+        shadow.add_transition(0, DEFAULT_LABEL, pushed);
+        shadow.add_transition(pushed, encode_negative_label(7), accepted);
+        shadow.set_accepting(accepted, true);
+        let groups = vec![
+            TemplateDfaGroup { terminals: vec![1, 4], dfa: shadow },
+            TemplateDfaGroup { terminals: vec![6, 7], dfa: identity },
+            TemplateDfaGroup { terminals: vec![0, 3], dfa: phase_parallel_fixture(0) },
+            TemplateDfaGroup { terminals: vec![2, 5], dfa: DFA::new() },
+        ];
+        let raw = groups.iter().flat_map(|group| group.terminals.iter()
+            .map(move |&terminal| (terminal, group.dfa.clone()))).collect::<BTreeMap<_, _>>();
+        let reference = compile_terminal_template_rows_with_parallelism(raw, 8, false).unwrap();
+        let pool = rayon::ThreadPoolBuilder::new().num_threads(4).build().unwrap();
+        for parallel in [false, true] {
+            let actual = pool.install(|| {
+                compile_terminal_template_groups_with_parallelism(groups.clone(), 8, parallel)
+            }).unwrap();
+            assert_identical_phase_rows(&reference, &actual);
+            assert!(Arc::ptr_eq(actual[0].as_ref().unwrap(), actual[3].as_ref().unwrap()));
+            let template = actual[1].as_ref().unwrap();
+            let root = &template.pop.states[template.pop.start_state as usize];
+            assert!(root.transitions.contains_key(&DEFAULT_LABEL));
+            let dead = root.transitions[&7] as usize;
+            assert!(!template.pop.states[dead].is_accepting);
+            assert!(template.pop.states[dead].transitions.is_empty());
+            assert!(template.pop_to_read[dead].is_none());
+            assert!(template.pop_to_push[dead].is_none());
+        }
+    }
+
+    #[test]
+    fn grouped_phase_transform_preserves_smallest_error_and_rejects_invalid_inventory() {
+        let mut unsupported = DFA::new();
+        let pushed = unsupported.add_state();
+        let after = unsupported.add_state();
+        unsupported.add_transition(0, encode_negative_label(3), pushed);
+        unsupported.add_transition(pushed, 9, after);
+        unsupported.set_accepting(after, true);
+        // Failed groups deliberately arrive in reverse terminal order.
+        let groups = vec![
+            TemplateDfaGroup { terminals: vec![6], dfa: unsupported.clone() },
+            TemplateDfaGroup { terminals: vec![0, 1, 3, 4, 5, 7], dfa: phase_parallel_fixture(0) },
+            TemplateDfaGroup { terminals: vec![2], dfa: unsupported },
+        ];
+        let raw = groups.iter().flat_map(|group| group.terminals.iter()
+            .map(move |&terminal| (terminal, group.dfa.clone()))).collect::<BTreeMap<_, _>>();
+        let reference = compile_terminal_template_rows_with_parallelism(raw, 8, false)
+            .unwrap_err().to_string();
+        assert!(reference.contains("terminal 2"));
+        let pool = rayon::ThreadPoolBuilder::new().num_threads(4).build().unwrap();
+        for parallel in [false, true] {
+            let actual = pool.install(|| {
+                compile_terminal_template_groups_with_parallelism(groups.clone(), 8, parallel)
+            }).unwrap_err().to_string();
+            assert_eq!(actual, reference);
+            for terminals in [vec![], vec![0], vec![0, 0], vec![0, 2], vec![1, 0]] {
+                let invalid = vec![TemplateDfaGroup { terminals, dfa: phase_parallel_fixture(0) }];
+                assert!(compile_terminal_template_groups_with_parallelism(invalid, 2, parallel).is_err());
+            }
+            let duplicate = vec![
+                TemplateDfaGroup { terminals: vec![0, 1], dfa: phase_parallel_fixture(0) },
+                TemplateDfaGroup { terminals: vec![1], dfa: phase_parallel_fixture(1) },
+            ];
+            assert!(compile_terminal_template_groups_with_parallelism(duplicate, 2, parallel).is_err());
+            assert!(compile_terminal_template_groups_with_parallelism(Vec::new(), 1, parallel).is_err());
+            assert!(compile_terminal_template_groups_with_parallelism(Vec::new(), 0, parallel).unwrap().is_empty());
         }
     }
 
