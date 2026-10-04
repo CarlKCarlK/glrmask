@@ -2686,8 +2686,31 @@ struct SegmentedRuntimeArtifactV24 {
     boundary_shards: Vec<SegmentedBoundaryShardV23>,
 }
 
+mod composition_artifact_bytes {
+    use serde::{Deserializer, Serializer, de::{Visitor, SeqAccess}};
+    pub fn serialize<S: Serializer>(bytes: &[u8], serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.serialize_bytes(bytes)
+    }
+    pub fn deserialize<'de, D: Deserializer<'de>>(deserializer: D) -> Result<Vec<u8>, D::Error> {
+        struct Bytes;
+        impl<'de> Visitor<'de> for Bytes {
+            type Value = Vec<u8>;
+            fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result { f.write_str("component artifact bytes") }
+            fn visit_bytes<E: serde::de::Error>(self, v: &[u8]) -> Result<Vec<u8>, E> { Ok(v.to_vec()) }
+            fn visit_byte_buf<E: serde::de::Error>(self, v: Vec<u8>) -> Result<Vec<u8>, E> { Ok(v) }
+            fn visit_seq<A: SeqAccess<'de>>(self, mut seq: A) -> Result<Vec<u8>, A::Error> {
+                let mut bytes = Vec::new();
+                while let Some(byte) = seq.next_element()? { bytes.push(byte); }
+                Ok(bytes)
+            }
+        }
+        deserializer.deserialize_byte_buf(Bytes)
+    }
+}
+
 #[derive(Serialize)]
 struct RecursiveSegmentedParserComponentV27Ref<'a> {
+    #[serde(with = "composition_artifact_bytes")]
     constraint_artifact: Vec<u8>,
     tokenizer_state_offset: u32,
     terminal_offset: u32,
@@ -2699,6 +2722,7 @@ struct RecursiveSegmentedParserComponentV27Ref<'a> {
 
 #[derive(Deserialize)]
 struct RecursiveSegmentedParserComponentV27 {
+    #[serde(with = "composition_artifact_bytes")]
     constraint_artifact: Vec<u8>,
     tokenizer_state_offset: u32,
     terminal_offset: u32,
