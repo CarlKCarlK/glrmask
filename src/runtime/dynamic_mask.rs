@@ -30,6 +30,7 @@ use super::artifact::{
 };
 use super::state::ConstraintState;
 
+mod boundary_cache;
 mod full_walk_dense;
 mod recursive_provider;
 
