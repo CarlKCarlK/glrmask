@@ -21,7 +21,9 @@ const SMALL_OUTPUT_PATHS: usize = 64;
 #[derive(Clone, Debug)]
 struct State {
     accepting: bool,
-    /// Concrete pushed label and the target's topological rank.
+    /// Concrete pushed label and the target's topological rank. Edges sharing
+    /// a target are adjacent, so sibling languages can use the existing exact
+    /// bulk GSS constructor rather than repeatedly copying a growing union.
     edges: Box<[(u32, u32)]>,
 }
 
@@ -86,12 +88,16 @@ impl PreparedPushDag {
             }
         }
         if entries.iter().all(Option::is_none) { return None; }
-        let states = order.iter().copied().map(|source| State {
-            accepting: graph.states[source].is_accepting,
-            edges: graph.states[source].transitions.iter()
+        let states = order.iter().copied().map(|source| {
+            let mut edges: Vec<_> = graph.states[source].transitions.iter()
                 .filter(|(_, target)| counts[**target as usize] != 0)
                 .map(|(&label, &target)| (negative_to_positive_label(label) as u32, rank[target as usize]))
-                .collect(),
+                .collect();
+            edges.sort_unstable_by_key(|&(_, target)| target);
+            State {
+                accepting: graph.states[source].is_accepting,
+                edges: edges.into_boxed_slice(),
+            }
         }).collect();
         Some(Self { states, entries: entries.into_boxed_slice() })
     }
@@ -110,9 +116,28 @@ impl PreparedPushDag {
             let input = frontier.remove(&rank).expect("each pending PUSH state owns its incoming language");
             let state = &self.states[rank as usize];
             if state.accepting { output = output.merge(&input); }
-            for &(label, target) in &state.edges {
+            let mut first = 0;
+            while first < state.edges.len() {
+                let target = state.edges[first].1;
+                let mut end = first + 1;
+                while end < state.edges.len() && state.edges[end].1 == target { end += 1; }
+                let siblings = &state.edges[first..end];
                 debug_assert!(target > rank, "validated PUSH graph must be acyclic");
-                let pushed = input.push(label);
+                let pushed = if siblings.len() == 1 {
+                    input.push(siblings[0].0)
+                } else {
+                    // This evaluator already requires one shared annotation.
+                    // Append distributes over union. The bulk primitive retains
+                    // the same prefix and all concrete labels; an unsupported
+                    // intermediate GSS layout keeps the original exact fold.
+                    input.apply_shared_pop_push_single_branches(
+                        0, siblings.iter().map(|(label, _)| label),
+                    ).unwrap_or_else(|| {
+                        let mut language = ParserGSS::empty();
+                        for &(label, _) in siblings { language = language.merge(&input.push(label)); }
+                        language
+                    })
+                };
                 match frontier.entry(target) {
                     std::collections::hash_map::Entry::Occupied(mut slot) => {
                         let merged = slot.get().merge(&pushed); slot.insert(merged);
@@ -121,6 +146,7 @@ impl PreparedPushDag {
                         slot.insert(pushed); pending.push(Reverse(target));
                     }
                 }
+                first = end;
             }
         }
         Some(output)
@@ -151,6 +177,25 @@ mod tests {
             }
         }
         ParserGSS::from_stacks(&out)
+    }
+
+    #[test]
+    fn large_sibling_fanout_batches_each_target_without_losing_words() {
+        for count in [65u32, 200, 400] {
+            let mut graph = DFA::new();
+            let left = graph.add_state(); let right = graph.add_state();
+            graph.set_accepting(left, true); graph.set_accepting(right, true);
+            for label in 0..count {
+                graph.add_transition(0, encode_negative_label(label), if label % 2 == 0 { left } else { right });
+            }
+            let t = template(graph, 0);
+            let plan = PreparedPushDag::prepare(&t).unwrap();
+            let input = ParserGSS::from_single_stack(vec![0, 1], TerminalsDisallowed::new());
+            let actual = plan.apply(0, &input).unwrap();
+            let expected = literal(&t.push, 0, &input);
+            assert_eq!(actual.semantically_eq(&expected, 65_536), Some(true));
+            assert_eq!(actual.top_value_count(), count as usize);
+        }
     }
 
     #[test]

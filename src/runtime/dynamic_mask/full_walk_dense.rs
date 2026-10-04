@@ -1,4 +1,5 @@
 use super::*;
+use super::boundary_cache::FullWalkBoundaryDirectCache;
 use crate::runtime::artifact::{DynamicLazyUnionRow, DynamicMaskTrieFullWalkOp};
 use rustc_hash::FxHashSet;
 
@@ -1863,7 +1864,10 @@ pub(super) fn try_scalar_dispatch(
     if root_branches
         .iter()
         .any(|branch| !branch.initial_prune_guard.is_passed())
-        && !joint_initial_guard_walk_enabled(root_branches)
+        && !joint_initial_guard_walk_enabled(
+            root_branches,
+            state.constraint.tokenizer.initial_state(),
+        )
     {
         let mut merged = vec![0u32; buf.len()];
         let mut scratch = vec![0u32; buf.len()];
@@ -2280,7 +2284,10 @@ pub(super) fn try_flat16<const HOT_SINGLE_ROOT: bool>(
     if root_branches
         .iter()
         .any(|branch| !branch.initial_prune_guard.is_passed())
-        && !joint_initial_guard_walk_enabled(root_branches)
+        && !joint_initial_guard_walk_enabled(
+            root_branches,
+            state.constraint.tokenizer.initial_state(),
+        )
     {
         let profile = dynamic_mask_profile_enabled(state.generation);
         let mut merged = vec![0u32; buf.len()];
@@ -3238,6 +3245,15 @@ fn full_walk_identity_context_profitable(
     roots >= 2 || parser_nodes >= 32
 }
 
+#[inline(always)]
+fn full_walk_executed_root_count(roots: usize, scalar_lane: bool) -> usize {
+    if scalar_lane {
+        usize::from(roots != 0)
+    } else {
+        roots
+    }
+}
+
 /// An alphabet of exact self-loops is closed under concatenation. When every
 /// byte in a vocabulary subtree belongs to it, all descendant token endpoints
 /// see exactly the current full parser/lexer/guard state. Unseen bytes never
@@ -3268,48 +3284,6 @@ fn full_walk_row_liveness_bound(
         Some(false)
     } else {
         None
-    }
-}
-
-/// Bounded replacement cache for the exact physical liveness predicate.
-/// Tags include the complete lexer ID; collisions only discard cached work.
-/// Parser IDs select disjoint rows and remain append-only within one walk.
-struct FullWalkBoundaryDirectCache {
-    rows: Vec<[u64; 16]>,
-}
-
-impl FullWalkBoundaryDirectCache {
-    fn new() -> Self { Self { rows: Vec::new() } }
-
-    fn push_row(&mut self) { self.rows.push([0; 16]); }
-
-    #[inline(always)]
-    fn get(&self, parser: usize, lexer: u32) -> u8 {
-        let cell = self.rows[parser][lexer as usize & 15];
-        if cell >> 2 == u64::from(lexer) { (cell & 3) as u8 } else { 0 }
-    }
-
-    #[inline(always)]
-    fn set(&mut self, parser: usize, lexer: u32, value: u8) {
-        debug_assert!(value == 1 || value == 2);
-        self.rows[parser][lexer as usize & 15] = (u64::from(lexer) << 2) | u64::from(value);
-    }
-
-    /// Called once, before the first externally cached dense row pointer.
-    /// Afterwards the owner discards this cache and uses dense rows forever.
-    fn expand_into(self, rows: &mut [Vec<u8>], width: usize) {
-        assert_eq!(self.rows.len(), rows.len());
-        for (row, cells) in rows.iter_mut().zip(self.rows.iter()) {
-            row.resize(width, 0);
-            for &cell in cells {
-                let value = (cell & 3) as u8;
-                if value != 0 {
-                    let lexer = (cell >> 2) as usize;
-                    assert!(lexer < width, "only cache states in this walk's fixed domain");
-                    row[lexer] = value;
-                }
-            }
-        }
     }
 }
 
@@ -3401,8 +3375,8 @@ impl FullWalkParserCache {
         let mut boundary_rows = Vec::new();
         static FIXED_CACHE: OnceLock<bool> = OnceLock::new();
         let compact = *FIXED_CACHE.get_or_init(|| !env_flag("GLRMASK_DISABLE_COMPACT_BOUNDARY_ROWS", false))
-            && lexer_state_count > std::mem::size_of::<[u64; 16]>();
-        let mut direct_boundary_rows = compact.then(FullWalkBoundaryDirectCache::new);
+            && lexer_state_count > FullWalkBoundaryDirectCache::compact_row_bytes();
+        let mut direct_boundary_rows = compact.then(|| FullWalkBoundaryDirectCache::with_width(lexer_state_count));
         let mut root_nodes = SmallVec::<[u32; 4]>::new();
         for branch in root_branches {
             if let Some((index, _)) = nodes
@@ -3675,7 +3649,9 @@ impl FullWalkParserCache {
         let node = parser_node as usize;
         let lexer = lexer_state as usize;
         let cached = if let Some(cache) = self.direct_boundary_rows.as_ref() {
-            cache.get(node, lexer_state)
+            // Nodes are append-only and this transition domain is fixed for
+            // the walk. Use the same proved indices as the dense branch below.
+            unsafe { cache.get_physical(node, lexer_state) }
         } else {
             unsafe { *self.boundary_rows.get_unchecked(node).get_unchecked(lexer) }
         };
@@ -7156,6 +7132,17 @@ fn try_full_walk_mask_with_table_from_initial_in_output_scope<
         }
     }
 
+    // Select proof bookkeeping from the executed root frontier. Several exact
+    // lexer roots can merge behind one parser into the ordinary scalar lane;
+    // counting their original alternatives enables costly identity probes even
+    // though the resulting walk has the same shape as a single-root fallback.
+    // Parser-node growth still enables the existing monotone policy below.
+    let executed_root_count = full_walk_executed_root_count(
+        root_branches.len(), stack_lexer[0] < FULL_WALK_LEXER_TWO_DISTINCT,
+    );
+    parser_cache.identity_proofs_enabled = accelerated
+        && full_walk_identity_context_profitable(executed_root_count, parser_cache.nodes.len());
+
     let walk_ops = trie.full_walk_ops();
     let token_markers = vocab.full_walk_token_markers_for(trie);
     let mut token_marker_index = 0usize;
@@ -8438,9 +8425,10 @@ fn try_full_walk_mask_with_table_from_initial_in_output_scope<
     // Diagnostics must not be included in the measured traversal interval.
     let walk_elapsed = walk_started.map(|start| start.elapsed());
     if profile_kernel {
-        eprintln!("[glrmask/profile][physical_boundary_direct] slots={} bytes={}",
+        eprintln!("[glrmask/profile][physical_boundary_direct] slots={} bytes={} adaptive_dense_rows={}",
             parser_cache.direct_boundary_rows.as_ref().map_or(0, |_| 16),
-            parser_cache.direct_boundary_rows.as_ref().map_or(0, |cache| cache.rows.len() * 128));
+            parser_cache.direct_boundary_rows.as_ref().map_or(0, |cache| cache.storage_bytes()),
+            parser_cache.direct_boundary_rows.as_ref().map_or(0, |cache| cache.dense_row_count()));
         eprintln!("[glrmask/profile][physical_boundary_storage] nodes={} allocated_rows={} bytes={} eager_bytes={}",
             parser_cache.nodes.len(),
             parser_cache.boundary_rows.iter().filter(|row| !row.is_empty()).count(),
@@ -8971,6 +8959,17 @@ mod full_walk_acceleration_tests {
                 assert!(!admitted || now);
                 admitted |= now;
             }
+        }
+    }
+
+    #[test]
+    fn identity_context_counts_executed_scalar_root_after_exact_union() {
+        for roots in 0..16 {
+            let executed = full_walk_executed_root_count(roots, true);
+            assert_eq!(executed, usize::from(roots != 0));
+            assert!(!full_walk_identity_context_profitable(executed, 31));
+            assert!(full_walk_identity_context_profitable(executed, 32));
+            assert_eq!(full_walk_executed_root_count(roots, false), roots);
         }
     }
 
