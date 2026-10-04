@@ -743,6 +743,7 @@ fn compute_summary(
     constraint: &Constraint,
     vocab: &crate::Vocab,
 ) -> (BoundaryCandidateSummary, BoundaryCandidateStats) {
+    let profiling = crate::compiler::compile::compile_profile_enabled();
     let mut stats = BoundaryCandidateStats {
         input_tokens: vocab.len(),
         ..BoundaryCandidateStats::default()
@@ -758,10 +759,15 @@ fn compute_summary(
             );
         }
     };
+    let fingerprint_started = profiling.then(std::time::Instant::now);
     let fp = match fingerprint(constraint, vocab, rules) {
         Ok(fp) => fp,
         Err(reason) => return (BoundaryCandidateSummary::Unknown { reason }, stats),
     };
+    if let Some(started) = fingerprint_started {
+        eprintln!("[glrmask/profile][boundary_summary_fingerprint] elapsed_ms={:.3}",
+            started.elapsed().as_secs_f64() * 1000.0);
+    }
 
     // First-principles interface-tail envelope.  This deliberately quantifies
     // away parser history and raw residual lexer identity: a real positive
@@ -773,6 +779,11 @@ fn compute_summary(
     if let Ok(probe) = crate::compiler::boundary_tail::build_boundary_tail_r1_with_fingerprint(
         constraint, vocab, Some(BoundaryFingerprintForQuery { constraint, vocab, fingerprint: fp }),
     ) {
+        if profiling {
+            eprintln!("[glrmask/profile][boundary_summary_r1] summary_ms={:.3} map_ms={:.3} iterations={} widened={} candidates={}",
+                probe.summary_ms, probe.map_ms, probe.fixed_point_iterations,
+                probe.fixed_point_widened, probe.candidate_ids.len());
+        }
         let ids = probe.candidate_ids;
         stats.candidate_tokens = ids.len();
         stats.widened_subtrees = usize::from(probe.fixed_point_widened);
@@ -791,6 +802,7 @@ fn compute_summary(
         );
     }
 
+    if profiling { eprintln!("[glrmask/profile][boundary_summary_fallback] selected=true"); }
     if constraint.uses_compact_segmented_parser_runtime() {
         match constraint.recursive_parser_layout() {
             Ok(Some(layout))

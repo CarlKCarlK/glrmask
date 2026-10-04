@@ -197,7 +197,6 @@ fn dfa_to_nwa_skeleton(dfa: &UnweightedDfa) -> NWA {
 }
 
 
-#[cfg(test)]
 fn nfa_epsilon_closure(nfa: &NFA, seeds: impl IntoIterator<Item = u32>) -> BTreeSet<u32> {
     let mut closure = BTreeSet::new();
     let mut worklist = VecDeque::new();
@@ -219,12 +218,10 @@ fn nfa_epsilon_closure(nfa: &NFA, seeds: impl IntoIterator<Item = u32>) -> BTree
     closure
 }
 
-#[cfg(test)]
 fn nfa_accepts_at(nfa: &NFA, states: &BTreeSet<u32>) -> bool {
     states.iter().any(|&state| nfa.is_accepting(state))
 }
 
-#[cfg(test)]
 fn nfa_outgoing_labels(nfa: &NFA, states: &BTreeSet<u32>, labels: &mut BTreeSet<i32>) {
     for &state in states {
         if let Some(node) = nfa.states.get(state as usize) {
@@ -233,7 +230,6 @@ fn nfa_outgoing_labels(nfa: &NFA, states: &BTreeSet<u32>, labels: &mut BTreeSet<
     }
 }
 
-#[cfg(test)]
 fn nfa_advance(nfa: &NFA, states: &BTreeSet<u32>, label: i32) -> BTreeSet<u32> {
     let targets = states.iter().flat_map(|&state| {
         nfa.states
@@ -246,139 +242,30 @@ fn nfa_advance(nfa: &NFA, states: &BTreeSet<u32>, label: i32) -> BTreeSet<u32> {
     nfa_epsilon_closure(nfa, targets)
 }
 
-/// Reused for one complete product comparison. Each closure uses dense epoch
-/// marks and a vector worklist, then sorts the unique result for product keys.
-/// Invalid IDs remain members, just as in the original set-based closure;
-/// their sparse fallback never indexes marks or follows nonexistent nodes.
-struct NfaClosureScratch {
-    marks: Vec<u32>,
-    epoch: u32,
-    states: Vec<u32>,
-    invalid: BTreeSet<u32>,
-}
-
-impl NfaClosureScratch {
-    fn new(nfa: &NFA) -> Self {
-        Self {
-            marks: vec![0; nfa.states.len()],
-            epoch: 0,
-            states: Vec::new(),
-            invalid: BTreeSet::new(),
-        }
-    }
-
-    fn insert(&mut self, state: u32) {
-        let fresh = if let Some(mark) = self.marks.get_mut(state as usize) {
-            if *mark == self.epoch {
-                false
-            } else {
-                *mark = self.epoch;
-                true
-            }
-        } else {
-            self.invalid.insert(state)
-        };
-        if fresh {
-            self.states.push(state);
-        }
-    }
-
-    fn closure(&mut self, nfa: &NFA, seeds: impl IntoIterator<Item = u32>) -> Vec<u32> {
-        self.epoch = self.epoch.wrapping_add(1);
-        if self.epoch == 0 {
-            self.marks.fill(0);
-            self.epoch = 1;
-        }
-        self.states.clear();
-        self.invalid.clear();
-        for state in seeds {
-            self.insert(state);
-        }
-        let mut cursor = 0;
-        while cursor < self.states.len() {
-            if let Some(node) = nfa.states.get(self.states[cursor] as usize) {
-                for &target in &node.epsilons {
-                    self.insert(target);
-                }
-            }
-            cursor += 1;
-        }
-        self.states.sort_unstable();
-        self.states.clone()
-    }
-}
-
 /// Exact NFA-vs-DFA language comparison, including epsilon closure. The
 /// product state is finite: `(epsilon-closed NFA subset, optional DFA state)`.
 fn find_nfa_dfa_language_mismatch(nfa: &NFA, dfa: &UnweightedDfa) -> Option<Vec<i32>> {
-    find_nfa_dfa_language_mismatch_with_batched_targets(nfa, dfa)
-}
-
-fn reconstruct_equivalence_witness(parents: &[Option<(usize,i32)>], mut node: usize) -> Vec<i32> {
-    let mut witness=Vec::new();
-    while let Some((parent,label))=parents[node] {
-        witness.push(label);
-        node=parent;
-    }
-    witness.reverse();
-    witness
-}
-
-/// Every edge from the current epsilon-closed subset is visited once. The
-/// previous checker rediscovered it by probing every member for every label.
-/// Keep the identical sorted alphabet, epsilon closures, finite product and
-/// first BFS witness; batch the sparse targets and reuse closure scratch.
-fn find_nfa_dfa_language_mismatch_with_batched_targets(nfa: &NFA, dfa: &UnweightedDfa) -> Option<Vec<i32>> {
-    let mut closure = NfaClosureScratch::new(nfa);
-    let nfa_start = closure.closure(nfa, nfa.start_states.iter().copied());
+    let nfa_start = nfa_epsilon_closure(nfa, nfa.start_states.iter().copied());
     let dfa_start = Some(dfa.start_state);
     let mut seen = BTreeSet::from([(nfa_start.clone(), dfa_start)]);
-    let mut parents = vec![None];
-    let mut worklist = VecDeque::from([(nfa_start, dfa_start, 0usize)]);
+    let mut worklist = VecDeque::from([(nfa_start, dfa_start, Vec::new())]);
 
     while let Some((nfa_states, dfa_state, witness)) = worklist.pop_front() {
-        if nfa_states.iter().any(|&state| nfa.is_accepting(state)) != dfa_accepts_at(dfa, dfa_state) {
-            return Some(reconstruct_equivalence_witness(&parents,witness));
+        if nfa_accepts_at(nfa, &nfa_states) != dfa_accepts_at(dfa, dfa_state) {
+            return Some(witness);
         }
-        let mut targets_by_label = BTreeMap::<i32, Vec<u32>>::new();
-        // Tiny subsets do not benefit from a second materialized edge map.
-        let batch = nfa_states.len()>4;
-        let mut labels=BTreeSet::new();
-        if batch {
-            for &state in &nfa_states {
-                if let Some(node) = nfa.states.get(state as usize) {
-                    for (&label, targets) in &node.transitions {
-                        targets_by_label.entry(label).or_default().extend(targets.iter().copied());
-                    }
-                }
-            }
-            labels.extend(targets_by_label.keys().copied());
-        } else {
-            for &state in &nfa_states {
-                if let Some(node) = nfa.states.get(state as usize) {
-                    labels.extend(node.transitions.keys().copied());
-                }
-            }
-        }
+        let mut labels = BTreeSet::new();
+        nfa_outgoing_labels(nfa, &nfa_states, &mut labels);
         add_outgoing_labels(dfa, dfa_state, &mut labels);
         for label in labels {
             let next = (
-                if batch {
-                    closure.closure(nfa, targets_by_label.remove(&label).unwrap_or_default())
-                } else {
-                    let targets = nfa_states.iter().flat_map(|&state| {
-                        nfa.states.get(state as usize)
-                            .and_then(|node| node.transitions.get(&label))
-                            .into_iter().flatten().copied()
-                    });
-                    closure.closure(nfa, targets)
-                },
+                nfa_advance(nfa, &nfa_states, label),
                 dfa_target(dfa, dfa_state, label),
             );
             if seen.insert(next.clone()) {
-                let child=parents.len();
-                parents.push(Some((witness,label)));
-                worklist.push_back((next.0,next.1,child));
+                let mut next_witness = witness.clone();
+                next_witness.push(label);
+                worklist.push_back((next.0, next.1, next_witness));
             }
         }
     }
@@ -471,56 +358,6 @@ fn find_default_specialization_mismatch(
     original: &UnweightedDfa,
     specialized: &UnweightedDfa,
 ) -> Option<Vec<i32>> {
-    if original.states.iter().chain(&specialized.states)
-        .all(|state| !state.transitions.contains_key(&DEFAULT_LABEL))
-    {
-        return find_default_free_specialization_mismatch(original, specialized);
-    }
-    find_default_specialization_mismatch_with_wildcards(original, specialized)
-}
-
-/// Full product equivalence for DEFAULT-free deterministic graphs. Reachable
-/// source subsets are singletons, so scalar states preserve the complete proof.
-/// The fresh DEFAULT representative is a common rejecting sink here and cannot
-/// witness a mismatch. Sorted labels and parent links preserve exact BFS words.
-fn find_default_free_specialization_mismatch(
-    original: &UnweightedDfa,
-    specialized: &UnweightedDfa,
-) -> Option<Vec<i32>> {
-    let start = (Some(original.start_state), Some(specialized.start_state));
-    let mut seen = std::collections::HashSet::from([start]);
-    let mut nodes = vec![(start, None::<(usize, i32)>)];
-    let mut index = 0;
-    while index < nodes.len() {
-        let ((left, right), _) = nodes[index];
-        if dfa_accepts_at(original, left) != dfa_accepts_at(specialized, right) {
-            let mut witness = Vec::new();
-            let mut node = index;
-            while let Some((parent, label)) = nodes[node].1 {
-                witness.push(label);
-                node = parent;
-            }
-            witness.reverse();
-            return Some(witness);
-        }
-        let mut labels = BTreeSet::new();
-        add_outgoing_labels(original, left, &mut labels);
-        add_outgoing_labels(specialized, right, &mut labels);
-        for label in labels {
-            let pair = (dfa_target(original, left, label), dfa_target(specialized, right, label));
-            if seen.insert(pair) {
-                nodes.push((pair, Some((index, label))));
-            }
-        }
-        index += 1;
-    }
-    None
-}
-
-fn find_default_specialization_mismatch_with_wildcards(
-    original: &UnweightedDfa,
-    specialized: &UnweightedDfa,
-) -> Option<Vec<i32>> {
     let original_start = BTreeSet::from([original.start_state]);
     let specialized_start = Some(specialized.start_state);
     let mut seen = BTreeSet::from([(original_start.clone(), specialized_start)]);
@@ -555,48 +392,6 @@ fn find_default_specialization_mismatch_with_wildcards(
 }
 
 fn specialize_template_dfa_defaults_for_commit_determinized(dfa: &UnweightedDfa) -> UnweightedDfa {
-    if let Some(specialized) = specialize_default_free_template_dfa(dfa) {
-        if template_quotient_validation_enabled()
-            && let Some(witness) = find_default_specialization_mismatch(dfa, &specialized)
-        {
-            panic!("commit DEFAULT specialization changed concrete action semantics; witness: {witness:?}");
-        }
-        return specialized;
-    }
-    specialize_template_dfa_defaults_with_subsets(dfa)
-}
-
-/// Preserve the subset constructor's exact reachable BFS state numbering while
-/// avoiding singleton BTreeSet keys. DEFAULT or malformed graphs retain the
-/// original constructor and its full validation, including conservative sinks.
-fn specialize_default_free_template_dfa(dfa: &UnweightedDfa) -> Option<UnweightedDfa> {
-    if dfa.start_state as usize >= dfa.states.len()
-        || dfa.states.iter().any(|state| state.transitions.contains_key(&DEFAULT_LABEL)
-            || state.transitions.values().any(|&target| target as usize >= dfa.states.len()))
-    {
-        return None;
-    }
-    let mut specialized = UnweightedDfa::new();
-    let mut ids = vec![None; dfa.states.len()];
-    ids[dfa.start_state as usize] = Some(specialized.start_state);
-    let mut pending = VecDeque::from([dfa.start_state]);
-    while let Some(old) = pending.pop_front() {
-        let from = ids[old as usize].expect("reachable source state has a BFS id");
-        specialized.states[from as usize].is_accepting = dfa.states[old as usize].is_accepting;
-        for (&label, &target) in &dfa.states[old as usize].transitions {
-            let to = if let Some(id) = ids[target as usize] { id } else {
-                let id = specialized.add_state();
-                ids[target as usize] = Some(id);
-                pending.push_back(target);
-                id
-            };
-            specialized.add_transition(from, label, to);
-        }
-    }
-    Some(specialized)
-}
-
-fn specialize_template_dfa_defaults_with_subsets(dfa: &UnweightedDfa) -> UnweightedDfa {
     // DEFAULT in the source is a wildcard *union*, whereas the runtime's
     // deterministic lookup uses DEFAULT only if an explicit edge is absent.
     // This must be resolved on whole reachable subsets, not on each original
@@ -1067,51 +862,6 @@ pub struct Templates {
     pub by_terminal_nwa: BTreeMap<TerminalID, NWA>,
 }
 
-/// One raw graph for an existing exact characterization class. Consumers keep
-/// terminal coordinates separate while transforming this owned graph once.
-#[derive(Debug, Clone)]
-pub struct TemplateDfaGroup {
-    pub terminals: Vec<TerminalID>,
-    pub dfa: UnweightedDfa,
-}
-
-type CompiledCharacterization = (Vec<TerminalID>, UnweightedDfa, Option<NWA>, TemplateCompilationSample);
-
-fn compile_characterization_groups<'a>(
-    characterizations: &'a BTreeMap<TerminalID, TerminalCharacterization>,
-    include_skeletons: bool,
-) -> (Vec<(&'a TerminalCharacterization, Vec<TerminalID>)>, Vec<CompiledCharacterization>, TemplateCompileProfile) {
-    use rayon::prelude::*;
-    let skip_minimize = skip_template_minimization_enabled();
-    let mut grouped = BTreeMap::<&TerminalCharacterization, Vec<TerminalID>>::new();
-    for (&terminal, characterization) in characterizations {
-        grouped.entry(characterization).or_default().push(terminal);
-    }
-    let groups: Vec<_> = grouped.into_iter().collect();
-    let build = |(characterization, terminals): &(&TerminalCharacterization, Vec<TerminalID>)| {
-        let (dfa, sample) = compile_template_dfa_with_profile(*characterization, skip_minimize);
-        let skeleton = include_skeletons.then(|| dfa_to_nwa_skeleton(&dfa));
-        (terminals.clone(), dfa, skeleton, sample)
-    };
-    let compiled: Vec<CompiledCharacterization> = if super::macro_parallelism_disabled() {
-        groups.iter().map(build).collect()
-    } else {
-        groups.par_iter().map(build).collect()
-    };
-    super::report_macro_item_timings(
-        "template_compile_characterizations",
-        &compiled.iter().map(|(_, _, _, sample)| sample.total_ms()).collect::<Vec<_>>(),
-    );
-    let profile = TemplateCompileProfile {
-        unique_characterizations: groups.len(),
-        max_characterization_multiplicity: groups.iter().map(|(_, terminals)| terminals.len()).max().unwrap_or(0),
-        quotient_hits: characterizations.len().saturating_sub(groups.len()),
-        minimize_skipped: skip_minimize,
-        ..TemplateCompileProfile::default()
-    };
-    (groups, compiled, profile)
-}
-
 impl Templates {
     pub fn from_terminal_dfas(
         by_terminal: BTreeMap<TerminalID, UnweightedDfa>,
@@ -1221,41 +971,51 @@ impl Templates {
         Self::from_characterizations_with_outputs(characterizations, false).0.by_terminal
     }
 
-    /// Preserve the existing exact quotient without cloning raw graphs for
-    /// terminal fanout. All raw compilation and debug validation still run.
-    pub fn grouped_dfas_from_characterizations(
-        characterizations: &BTreeMap<TerminalID, TerminalCharacterization>,
-    ) -> (Vec<TemplateDfaGroup>, TemplateCompileProfile) {
-        let started_at = Instant::now();
-        let (groups, compiled, mut profile) = compile_characterization_groups(characterizations, false);
-        let fanout_started_at = Instant::now();
-        let output = compiled.into_iter().map(|(terminals, dfa, skeleton, sample)| {
-            profile.observe_compilation(&sample, terminals.len());
-            debug_assert!(skeleton.is_none());
-            TemplateDfaGroup { terminals, dfa }
-        }).collect::<Vec<_>>();
-        profile.fanout_ms = elapsed_ms(fanout_started_at);
-        profile.total_ms += profile.fanout_ms;
-        let validation_started_at = Instant::now();
-        if template_quotient_validation_enabled() {
-            assert_eq!(groups.len(), output.len());
-            for ((characterization, terminals), group) in groups.iter().zip(&output) {
-                assert_eq!(terminals, &group.terminals, "template quotient terminal fanout mismatch");
-                validate_template_quotient_representative(characterization, &group.dfa, terminals[0]);
-            }
-        }
-        profile.validation_ms = elapsed_ms(validation_started_at);
-        profile.total_ms += profile.validation_ms;
-        profile.wall_ms = elapsed_ms(started_at);
-        (output, profile)
-    }
-
     fn from_characterizations_with_outputs(
         characterizations: &BTreeMap<TerminalID, TerminalCharacterization>,
         include_skeletons: bool,
     ) -> (Self, TemplateCompileProfile) {
+        use rayon::prelude::*;
+
         let total_started_at = Instant::now();
-        let (groups, compiled, mut profile) = compile_characterization_groups(characterizations, include_skeletons);
+        let skip_minimize = skip_template_minimization_enabled();
+
+        let mut grouped = BTreeMap::<&TerminalCharacterization, Vec<TerminalID>>::new();
+        for (&terminal, characterization) in characterizations {
+            grouped.entry(characterization).or_default().push(terminal);
+        }
+        let groups: Vec<(&TerminalCharacterization, Vec<TerminalID>)> = grouped.into_iter().collect();
+
+        let build = |(characterization, terminals): &(&TerminalCharacterization, Vec<TerminalID>)| {
+            let (dfa, sample) = compile_template_dfa_with_profile(*characterization, skip_minimize);
+            let skeleton = include_skeletons.then(|| dfa_to_nwa_skeleton(&dfa));
+            (terminals.clone(), dfa, skeleton, sample)
+        };
+        let compiled: Vec<(Vec<TerminalID>, UnweightedDfa, Option<NWA>, TemplateCompilationSample)> =
+            if super::macro_parallelism_disabled() {
+                groups.iter().map(build).collect()
+            } else {
+                groups.par_iter().map(build).collect()
+            };
+        super::report_macro_item_timings(
+            "template_compile_characterizations",
+            &compiled
+                .iter()
+                .map(|(_, _, _, sample)| sample.total_ms())
+                .collect::<Vec<_>>(),
+        );
+
+        let mut profile = TemplateCompileProfile {
+            unique_characterizations: groups.len(),
+            max_characterization_multiplicity: groups
+                .iter()
+                .map(|(_, terminals)| terminals.len())
+                .max()
+                .unwrap_or(0),
+            quotient_hits: characterizations.len().saturating_sub(groups.len()),
+            minimize_skipped: skip_minimize,
+            ..TemplateCompileProfile::default()
+        };
 
         let mut by_terminal = BTreeMap::new();
         let mut by_terminal_nwa = BTreeMap::new();
@@ -1358,6 +1118,7 @@ fn validate_template_quotient(
     if !include_skeletons {
         assert!(by_terminal_nwa.is_empty(), "DFA-only construction emitted an unused skeleton");
     }
+    let skip_minimize = skip_template_minimization_enabled();
     for (characterization, terminals) in groups {
         let representative = terminals[0];
         let representative_dfa = by_terminal.get(&representative).unwrap_or_else(|| {
@@ -1383,22 +1144,15 @@ fn validate_template_quotient(
             }
         }
 
-        validate_template_quotient_representative(characterization, representative_dfa, representative);
-    }
-}
-
-fn validate_template_quotient_representative(
-    characterization: &TerminalCharacterization,
-    representative_dfa: &UnweightedDfa,
-    representative: TerminalID,
-) {
-    if skip_template_minimization_enabled() {
-        let (old_minimized, _, _) = compile_template_with_profile_and_minimize(characterization, false);
-        if let Some(witness) = find_dfa_language_mismatch(representative_dfa, &old_minimized) {
-            panic!(
-                "template minimization-skip mismatch for representative terminal {representative}; witness label path: {:?}",
-                witness
-            );
+        if skip_minimize {
+            let (old_minimized, _, _) =
+                compile_template_with_profile_and_minimize(characterization, false);
+            if let Some(witness) = find_dfa_language_mismatch(representative_dfa, &old_minimized) {
+                panic!(
+                    "template minimization-skip mismatch for representative terminal {representative}; witness label path: {:?}",
+                    witness
+                );
+            }
         }
     }
 }
@@ -1732,176 +1486,6 @@ fn build_template_nfa(characterization: &TerminalCharacterization) -> NFA {
 
 #[cfg(test)]
 mod tests {
-    #[test]
-    fn dense_closure_preserves_generated_subsets_and_exact_witnesses() {
-        let mut random = 0xb13642c9u32;
-        let mut next = || {
-            random = random.wrapping_mul(1664525).wrapping_add(1013904223);
-            random ^ (random >> 16)
-        };
-        for case in 0..192 {
-            let mut nfa = super::NFA::new();
-            for _ in 1..8 { nfa.add_state(); }
-            nfa.start_states = vec![0, 0, next() % 8];
-            let mut dfa = super::UnweightedDfa::new();
-            for _ in 1..5 { dfa.add_state(); }
-            for state in 0..8u32 {
-                nfa.states[state as usize].is_accepting = next() % 3 == 0;
-                for _ in 0..2 {
-                    if next() & 3 == 0 {
-                        let target = next() % 8;
-                        nfa.add_epsilon(state, target);
-                        nfa.add_epsilon(state, target);
-                    }
-                }
-                for label in [i32::MIN, -3, 0, 1, 9] {
-                    if next() & 3 != 0 {
-                        let target = next() % 8;
-                        nfa.add_transition(state, label, target);
-                        nfa.add_transition(state, label, target);
-                        nfa.add_transition(state, label, next() % 8);
-                    }
-                }
-            }
-            // Force cycles and reconvergence, including the batched >4 path.
-            nfa.states[0].epsilons.extend([1, 2, 3, 4, 5]);
-            nfa.states[1].epsilons.extend([0, 6]);
-            nfa.states[2].epsilons.push(6);
-            nfa.add_transition(6, 0, 0);
-            for state in 0..5u32 {
-                dfa.states[state as usize].is_accepting = next() % 3 == 0;
-                for label in [i32::MIN, -3, 0, 1, 9, 17] {
-                    if next() & 3 != 0 {
-                        dfa.add_transition(state, label, next() % 5);
-                    }
-                }
-            }
-            if case % 4 == 0 {
-                nfa.start_states.extend([u32::MAX, 19, u32::MAX]);
-                nfa.states[3].epsilons.extend([u32::MAX, 19, 19]);
-                nfa.add_transition(4, -3, u32::MAX);
-                nfa.add_transition(4, -3, 19);
-                dfa.states[0].transitions.insert(0, u32::MAX);
-            }
-            let mut scratch = super::NfaClosureScratch::new(&nfa);
-            for seeds in [vec![], nfa.start_states.clone(), vec![6, 6, 7], vec![u32::MAX, 19, 19]] {
-                assert_eq!(scratch.closure(&nfa, seeds.clone()),
-                    super::nfa_epsilon_closure(&nfa, seeds).into_iter().collect::<Vec<_>>(),
-                    "closure case {case}");
-            }
-            assert_eq!(super::find_nfa_dfa_language_mismatch(&nfa, &dfa),
-                reference_nfa_dfa_mismatch(&nfa, &dfa), "witness case {case}");
-            // Prevent early empty-word mismatches from hiding the graph walk.
-            for state in &mut nfa.states { state.is_accepting = false; }
-            for state in &mut dfa.states { state.is_accepting = false; }
-            assert_eq!(super::find_nfa_dfa_language_mismatch(&nfa, &dfa), None);
-            dfa.states[4].is_accepting = true;
-            assert_eq!(super::find_nfa_dfa_language_mismatch(&nfa, &dfa),
-                reference_nfa_dfa_mismatch(&nfa, &dfa), "deep witness case {case}");
-        }
-    }
-
-    #[test]
-    fn dense_closure_wrap_and_empty_malformed_graphs_match_reference() {
-        let mut nfa = super::NFA::new();
-        nfa.add_state();
-        nfa.add_epsilon(0, 1);
-        nfa.add_epsilon(1, 0);
-        let mut scratch = super::NfaClosureScratch::new(&nfa);
-        assert_eq!(scratch.closure(&nfa, [0]), vec![0, 1]);
-        scratch.epoch = u32::MAX;
-        // Stale marks for epoch one must not survive wrap.
-        scratch.marks.fill(1);
-        assert_eq!(scratch.closure(&nfa, [1, u32::MAX, u32::MAX]), vec![0, 1, u32::MAX]);
-        assert_eq!(scratch.epoch, 1);
-        assert!(scratch.closure(&nfa, []).is_empty());
-        for mut empty in [super::NFA::new_empty(), super::NFA::default()] {
-            empty.start_states = vec![u32::MAX, 7, 7];
-            for mut dfa in [super::UnweightedDfa::new(), super::UnweightedDfa::default()] {
-                assert_eq!(super::find_nfa_dfa_language_mismatch(&empty, &dfa),
-                    reference_nfa_dfa_mismatch(&empty, &dfa));
-                if let Some(state) = dfa.states.first_mut() { state.is_accepting = true; }
-                assert_eq!(super::find_nfa_dfa_language_mismatch(&empty, &dfa),
-                    reference_nfa_dfa_mismatch(&empty, &dfa));
-            }
-        }
-    }
-
-    #[test]
-    fn dense_closure_keeps_signed_fifo_shortest_witness_and_empty_word() {
-        let mut nfa = super::NFA::new();
-        let accept = nfa.add_state();
-        nfa.set_accepting(accept);
-        for label in [0, -3, i32::MIN] { nfa.add_transition(0, label, accept); }
-        let mut dfa = super::UnweightedDfa::new();
-        assert_eq!(super::find_nfa_dfa_language_mismatch(&nfa, &dfa), Some(vec![i32::MIN]));
-        nfa.states[0].transitions.remove(&i32::MIN);
-        assert_eq!(super::find_nfa_dfa_language_mismatch(&nfa, &dfa), Some(vec![-3]));
-        nfa.states[0].transitions.remove(&-3);
-        assert_eq!(super::find_nfa_dfa_language_mismatch(&nfa, &dfa), Some(vec![0]));
-        dfa.states[0].is_accepting = true;
-        assert_eq!(super::find_nfa_dfa_language_mismatch(&nfa, &dfa), Some(vec![]));
-    }
-
-    fn reference_nfa_dfa_mismatch(nfa: &super::NFA, dfa: &super::UnweightedDfa) -> Option<Vec<i32>> {
-        use std::collections::{BTreeSet,VecDeque};
-        let start=(super::nfa_epsilon_closure(nfa,nfa.start_states.iter().copied()),Some(dfa.start_state));
-        let mut seen=BTreeSet::from([start.clone()]);
-        let mut pending=VecDeque::from([(start.0,start.1,Vec::new())]);
-        while let Some((subset,state,witness))=pending.pop_front() {
-            if super::nfa_accepts_at(nfa,&subset)!=super::dfa_accepts_at(dfa,state) {return Some(witness);}
-            let mut labels=BTreeSet::new();
-            super::nfa_outgoing_labels(nfa,&subset,&mut labels);
-            super::add_outgoing_labels(dfa,state,&mut labels);
-            for label in labels {
-                let next=(super::nfa_advance(nfa,&subset,label),super::dfa_target(dfa,state,label));
-                if seen.insert(next.clone()) {
-                    let mut path=witness.clone();path.push(label);
-                    pending.push_back((next.0,next.1,path));
-                }
-            }
-        }
-        None
-    }
-
-    #[test]
-    fn batched_equivalence_targets_preserve_complete_product_and_first_witness() {
-        // Include epsilon cycles, nondeterministic same-label edges, negative
-        // labels, missing successors, and acceptance/edge corruptions.
-        let mut seed=0x7351c2a4u32;
-        for _ in 0..96 {
-            let mut nfa=super::NFA::new();
-            for _ in 1..6 {nfa.add_state();}
-            for from in 0..6 {
-                seed=seed.wrapping_mul(1664525).wrapping_add(1013904223);
-                if seed&1!=0 {nfa.set_accepting(from);}
-                if from<5 {nfa.add_epsilon(from,from+1);}
-                for label in [-3,0,1,4,11] {
-                    seed=seed.wrapping_mul(1664525).wrapping_add(1013904223);
-                    if from<5 && seed&3!=0 {nfa.add_transition(from,label,from+1+(seed>>8)%(5-from));}
-                    if from<5 && seed&7==3 {nfa.add_transition(from,label,from+1+(seed>>16)%(5-from));}
-                }
-            }
-            // Break some of the epsilon ring to exercise multiple subsets.
-            nfa.states[1].epsilons.clear();
-            nfa.states[4].epsilons.clear();
-            let dfa=super::determinize(&nfa);
-            assert_eq!(super::find_nfa_dfa_language_mismatch(&nfa,&dfa),None);
-            for index in 0..dfa.states.len() {
-                let mut changed=dfa.clone();
-                changed.states[index].is_accepting=!changed.states[index].is_accepting;
-                assert_eq!(super::find_nfa_dfa_language_mismatch(&nfa,&changed),reference_nfa_dfa_mismatch(&nfa,&changed));
-                changed.states[index].transitions.remove(&1);
-                assert_eq!(super::find_nfa_dfa_language_mismatch(&nfa,&changed),reference_nfa_dfa_mismatch(&nfa,&changed));
-            }
-            // The compiler's determinizer intentionally rejects cyclic input,
-            // but the equivalence checker still has a finite subset product.
-            nfa.add_epsilon(2,1);
-            nfa.add_transition(4,4,0);
-            assert_eq!(super::find_nfa_dfa_language_mismatch(&nfa,&dfa),reference_nfa_dfa_mismatch(&nfa,&dfa));
-        }
-    }
-
     use super::{
         specialize_template_dfa_defaults_for_commit_determinized,
         find_nfa_dfa_language_mismatch,
@@ -1914,70 +1498,6 @@ mod tests {
     use crate::compiler::glr::labels::{
         DEFAULT_LABEL, encode_negative_label,
     };
-
-    #[test]
-    fn default_free_specialization_preserves_exact_graphs_and_corruption_witnesses() {
-        fn random(seed: &mut u64) -> u64 {
-            *seed ^= *seed << 13;
-            *seed ^= *seed >> 7;
-            *seed ^= *seed << 17;
-            *seed
-        }
-        let mut seed = 0x619cab95d30ef147;
-        for case in 0..256 {
-            let mut source = UnweightedDfa::new();
-            for _ in 1..17 { source.add_state(); }
-            source.start_state = (random(&mut seed) % 17) as u32;
-            for state in 0..17 {
-                source.states[state].is_accepting = random(&mut seed) % 3 == 0;
-                for label in [i32::MIN, i32::MIN + 1, -3, 0, 1, 7, 19] {
-                    if random(&mut seed) % 3 != 0 {
-                        source.add_transition(state as u32, label, (random(&mut seed) % 17) as u32);
-                    }
-                }
-            }
-            let old = super::specialize_template_dfa_defaults_with_subsets(&source);
-            let new = super::specialize_template_dfa_defaults_for_commit_determinized(&source);
-            assert_eq!(old, new, "exact BFS graph case {case}");
-            for mutation in 0..6 {
-                let mut changed = new.clone();
-                let count = changed.states.len() as u64;
-                let state = (random(&mut seed) % count) as usize;
-                match mutation {
-                    0 => changed.states[state].is_accepting ^= true,
-                    1 => { changed.states[state].transitions.remove(&0); },
-                    2 => { changed.states[state].transitions.insert(31, (random(&mut seed) % count) as u32); },
-                    3 => changed.start_state = (random(&mut seed) % count) as u32,
-                    4 => { changed.states[state].transitions.insert(-17, u32::MAX); },
-                    _ => { changed.states[state].transitions.insert(7, state as u32); },
-                }
-                assert_eq!(
-                    super::find_default_specialization_mismatch(&source, &changed),
-                    super::find_default_specialization_mismatch_with_wildcards(&source, &changed),
-                    "exact corruption witness {case}/{mutation}",
-                );
-            }
-            if case % 4 == 0 {
-                source.states[0].transitions.insert(DEFAULT_LABEL, 1);
-                assert!(super::specialize_default_free_template_dfa(&source).is_none());
-                assert_eq!(
-                    super::specialize_template_dfa_defaults_for_commit_determinized(&source),
-                    super::specialize_template_dfa_defaults_with_subsets(&source),
-                );
-            }
-        }
-        for source in [UnweightedDfa::default(), {
-            let mut source = UnweightedDfa::new();
-            source.add_transition(0, 7, u32::MAX);
-            source
-        }] {
-            assert!(super::specialize_default_free_template_dfa(&source).is_none());
-            assert_eq!(
-                super::specialize_template_dfa_defaults_for_commit_determinized(&source),
-                super::specialize_template_dfa_defaults_with_subsets(&source),
-            );
-        }
-    }
 
     #[test]
     fn dfa_only_output_matches_complete_template_construction() {
@@ -2036,23 +1556,6 @@ mod tests {
             assert_eq!(Templates::dfas_from_characterizations(&input), complete.by_terminal);
             assert_eq!(profile.unique_characterizations, 2);
             assert_eq!(profile.max_characterization_multiplicity, 3);
-            let (raw_groups, grouped_profile) = Templates::grouped_dfas_from_characterizations(&input);
-            assert_eq!(raw_groups.len(), 2);
-            assert_eq!(grouped_profile.num_terminals, profile.num_terminals);
-            assert_eq!(grouped_profile.unique_characterizations, profile.unique_characterizations);
-            assert_eq!(grouped_profile.compiled_characterizations, profile.compiled_characterizations);
-            assert_eq!(grouped_profile.quotient_hits, profile.quotient_hits);
-            assert_eq!(grouped_profile.max_characterization_multiplicity, profile.max_characterization_multiplicity);
-            assert_eq!(grouped_profile.total_nfa_states, profile.total_nfa_states);
-            assert_eq!(grouped_profile.total_dfa_states, profile.total_dfa_states);
-            assert_eq!(grouped_profile.total_dfa_transitions, profile.total_dfa_transitions);
-            let mut expanded = BTreeMap::new();
-            for group in raw_groups {
-                for terminal in group.terminals {
-                    assert!(expanded.insert(terminal, group.dfa.clone()).is_none());
-                }
-            }
-            assert_eq!(expanded, complete.by_terminal);
             let mut grouped = BTreeMap::<&TerminalCharacterization, Vec<u32>>::new();
             for (&terminal, characterization) in &input {
                 grouped.entry(characterization).or_default().push(terminal);
@@ -2073,11 +1576,6 @@ mod tests {
         assert!(full.by_terminal.is_empty());
         assert!(full.by_terminal_nwa.is_empty());
         assert_eq!(only, full.by_terminal);
-        let (groups, profile) = super::Templates::grouped_dfas_from_characterizations(&input);
-        assert!(groups.is_empty());
-        assert_eq!(profile.num_terminals, 0);
-        assert_eq!(profile.unique_characterizations, 0);
-        assert_eq!(profile.quotient_hits, 0);
     }
 
     fn mixed_phase_commit_dfa() -> UnweightedDfa {

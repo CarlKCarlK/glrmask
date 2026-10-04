@@ -11340,19 +11340,6 @@ impl Tokenizer {
             .direct_coordinate_finite_mask_dense_key(source, max_token_len)
     }
 
-    /// Result-cache-only exact finite-vocabulary quotient. Recognition,
-    /// compiled projections and byte-transition caches keep the global stencil.
-    #[doc(hidden)]
-    pub fn virtual_residual_direct_coordinate_mask_result_dense_key(
-        &self,
-        source: VirtualResidualDirectCoordinate,
-        max_token_len: usize,
-    ) -> Option<(u32, u32)> {
-        self.virtual_residuals
-            .get(source.runtime_index as usize)?
-            .direct_coordinate_mask_result_dense_key(source, max_token_len)
-    }
-
     #[doc(hidden)]
     pub fn virtual_residual_direct_coordinate_parser_transparent_byte_dfa(
         &self,

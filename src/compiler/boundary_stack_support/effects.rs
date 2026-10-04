@@ -37,18 +37,17 @@ impl CompilerEffects {
 
     pub(crate) fn from_table(table: &GLRTable, slots: &BTreeSet<u32>) -> Result<Self,String> {
         let effects = read_effects(&[table], &[0], &[], table.num_states)?;
-        crate::compiler::boundary_transfer::validate_slot_entry_shapes(table, slots)?;
-        let mut entries = slots.iter().map(|&slot| (slot, Vec::new())).collect::<BTreeMap<_,_>>();
-        // Visit present logical actions once. Ascending source order matches the
-        // old per-slot sweep exactly, including empty entries and DEFAULT rows.
-        for (source, actions) in table.action.iter().take(table.num_states as usize).enumerate() {
-            for (slot, action) in actions.iter() {
-                if let Some(row) = entries.get_mut(&slot)
-                    && let Action::Shift(target,replace)
-                        | Action::Split { shift: Some((target,replace)), .. } = action {
-                    row.push(Effect { source: source as u32, pop: usize::from(*replace), pushes: vec![*target] });
+        let mut entries = BTreeMap::new();
+        for &slot in slots {
+            crate::compiler::boundary_transfer::validate_slot_entry_shape(table,slot)?;
+            let mut row = Vec::new();
+            for source in 0..table.num_states {
+                if let Some(Action::Shift(target,replace)
+                    | Action::Split { shift: Some((target,replace)), .. }) = table.action(source,slot) {
+                    row.push(Effect { source, pop: usize::from(*replace), pushes: vec![*target] });
                 }
             }
+            entries.insert(slot,row);
         }
         let accepting = (0..table.num_states).filter(|&q|
             matches!(table.action(q,EOF),Some(Action::Accept)|Some(Action::Split{accept:true,..}))).collect();
@@ -209,35 +208,6 @@ pub(super) fn read_effects(tables:&[&GLRTable],offsets:&[u32],links:&[Link],alph
 #[cfg(test)]
 mod mapper_tests{
     use super::*;
-    #[test]
-    fn batched_entry_effect_rows_preserve_per_slot_source_order_and_default_cells() {
-        use crate::compiler::glr::table::testing::build_test_table;
-        for case in 0..32usize {
-            let mut table = build_test_table(4,19,&[&[],&[],&[],&[]],&[&[],&[],&[],&[]]);
-            for state in 0..4usize {
-                for terminal in 0..19u32 {
-                    let action = match (state+terminal as usize+case)%4 {
-                        0=>Action::Shift(((state+1)%4) as u32,false),
-                        1=>Action::Split {shift:Some((((state+2)%4) as u32,true)),reduces:vec![],accept:false},
-                        _=>Action::Reduce(0,1),
-                    };
-                    table.action[state].insert(terminal,action);
-                }
-                table.action[state].compress_default(19);
-            }
-            let slots = (0..19u32).collect::<BTreeSet<_>>();
-            let actual = CompilerEffects::from_table(&table,&slots).unwrap();
-            let expected = slots.iter().map(|&slot| {
-                let row=(0..table.num_states).filter_map(|source| match table.action(source,slot) {
-                    Some(Action::Shift(target,replace)|Action::Split {shift:Some((target,replace)),..})=>
-                        Some(Effect {source,pop:usize::from(*replace),pushes:vec![*target]}),
-                    _=>None,
-                }).collect::<Vec<_>>(); (slot,row)
-            }).collect::<BTreeMap<_,_>>();
-            assert_eq!(actual.entries,expected,"case {case}");
-            assert_eq!(actual.effects,read_effects(&[&table],&[0],&[],table.num_states).unwrap());
-        }
-    }
     use glrmask_glr::__private::glr::table::action::{StackShift,GuardedStackShift,StackShiftGuard};
     #[test]
     fn maps_every_consuming_action_and_forwards_conservatively(){

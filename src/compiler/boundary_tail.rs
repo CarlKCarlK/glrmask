@@ -413,6 +413,7 @@ fn summarize_rules_module_r1(
     child_overrides: &BTreeMap<TerminalID, BytePhaseSummary>,
     bound_slots: &BTreeSet<TerminalID>,
 ) -> Result<(BytePhaseSummary, usize, bool), String> {
+    let profiling = crate::compiler::compile::compile_profile_enabled();
     let rules = constraint.retained_table_rules()?;
     if rules.is_empty() {
         return Err("r1 interface-tail summary requires retained grammar rules".to_owned());
@@ -421,6 +422,7 @@ fn summarize_rules_module_r1(
     for terminal in bound_slots {
         outward.remove(terminal);
     }
+    let terminal_started = profiling.then(Instant::now);
     let terminals = (0..constraint.tokenizer.num_terminals())
         .map(|terminal| {
             byte_terminal_summary(
@@ -431,6 +433,7 @@ fn summarize_rules_module_r1(
             )
         })
         .collect::<Vec<_>>();
+    let terminal_ms = terminal_started.map_or(0.0, |started| started.elapsed().as_secs_f64()*1000.0);
 
     let mut nts = FxHashMap::<NonterminalID, BytePhaseSummary>::default();
     for rule in rules {
@@ -442,6 +445,22 @@ fn summarize_rules_module_r1(
         }
     }
 
+    // Evaluate only rules whose RHS inputs changed in the preceding generation.
+    // Values still read the unchanged generation, and the original 256-round
+    // cap/convergence/widening rules remain exactly the same.
+    let mut dependents = FxHashMap::<NonterminalID, Vec<usize>>::default();
+    for (index, rule) in rules.iter().enumerate() {
+        for symbol in &rule.rhs {
+            if let Symbol::Nonterminal(id) = symbol {
+                dependents.entry(*id).or_default().push(index);
+            }
+        }
+    }
+    let mut pending = (0..rules.len()).collect::<Vec<_>>();
+    let mut queued = vec![false; rules.len()];
+    let validate = std::env::var_os("GLRMASK_VALIDATE_BOUNDARY_R1_FRONTIER").is_some();
+    let mut rule_evaluations = 0usize;
+    let fixed_point_started = profiling.then(Instant::now);
     let mut converged = false;
     let mut iterations = 0usize;
     for iteration in 0..DEFAULT_FIXED_POINT_LIMIT {
@@ -449,17 +468,41 @@ fn summarize_rules_module_r1(
         // Read the unchanged current generation directly. A second snapshot
         // clone contributes no information to this synchronous fixed point.
         let mut next = nts.clone();
-        for rule in rules {
+        for &index in &pending {
+            let rule = &rules[index];
             let summary = byte_rule_summary(rule, &nts, &terminals);
             next.entry(rule.lhs)
                 .or_insert_with(BytePhaseSummary::bottom)
                 .union_with(summary);
         }
+        rule_evaluations += pending.len();
+        if validate {
+            let mut reference = nts.clone();
+            for rule in rules {
+                reference.entry(rule.lhs).or_insert_with(BytePhaseSummary::bottom)
+                    .union_with(byte_rule_summary(rule, &nts, &terminals));
+            }
+            assert_eq!(next, reference, "R1 generation {} differs from the original full-rule evaluator", iteration + 1);
+        }
         if next == nts {
             converged = true;
             break;
         }
+        pending.clear();
+        queued.fill(false);
+        for (id, value) in &next {
+            if nts.get(id) == Some(value) { continue; }
+            if let Some(users) = dependents.get(id) {
+                for &index in users {
+                    if !queued[index] { queued[index] = true; pending.push(index); }
+                }
+            }
+        }
         nts = next;
+    }
+    if let Some(started) = fixed_point_started {
+        eprintln!("[glrmask/profile][boundary_r1_fixed_point] terminal_ms={:.3} fixed_point_ms={:.3} rules={} nonterminals={} iterations={} converged={} rule_evaluations={} generation_reference_checked={}",
+            terminal_ms, started.elapsed().as_secs_f64()*1000.0, rules.len(), nts.len(), iterations, converged, rule_evaluations, validate);
     }
     if !converged {
         let top = ByteLanguage::top();

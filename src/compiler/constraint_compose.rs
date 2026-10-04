@@ -26175,35 +26175,6 @@ table: &child_table,
         }
     }
 
-    // Keep large by-value construction temporaries out of the test runner's
-    // frame. No stack-size override, new thread, or reduced oracle coverage.
-    #[inline(never)]
-    fn scoped_oracle_test_source(grammar: &str, vocab: &Vocab) -> Box<Constraint> {
-        Box::new(Constraint::from_glrm_grammar(grammar, vocab).unwrap())
-    }
-
-    #[inline(never)]
-    fn scoped_oracle_test_link(
-        parent: &Constraint, slot: &str, child: &Constraint, vocab: &Vocab, dynamic: bool,
-    ) -> Box<Constraint> {
-        let composition = if dynamic {
-            parent.compose_linked_children_for_test_dynamic(&[(slot, child)], vocab)
-        } else {
-            parent.compose_linked_children_for_test(&[(slot, child)], vocab)
-        };
-        Box::new(composition.unwrap())
-    }
-
-    #[inline(never)]
-    fn scoped_oracle_test_reload(source: &Constraint) -> Box<Constraint> {
-        Box::new(Constraint::load(&source.save()).unwrap())
-    }
-
-    #[inline(never)]
-    fn scoped_oracle_test_start(source: &Constraint) -> Box<crate::ConstraintState<'_>> {
-        Box::new(source.start())
-    }
-
     #[test]
     fn scoped_ignore_oracle_survives_reload_and_nested_recomposition() {
         let vocab = Vocab::new(vec![
@@ -26232,7 +26203,7 @@ table: &child_table,
             (22, b"X a!".to_vec()),
             (23, b"<X\t a!>".to_vec()),
         ]);
-        let parent = scoped_oracle_test_source(
+        let parent = Constraint::from_glrm_grammar(
             r#"
                 start document;
                 ignore PARENT_WS;
@@ -26241,8 +26212,9 @@ table: &child_table,
                 nt document ::= "X" SUB "!";
             "#,
             &vocab,
-        );
-        let child = scoped_oracle_test_source(
+        )
+        .unwrap();
+        let child = Constraint::from_glrm_grammar(
             r#"
                 start child;
                 ignore CHILD_WS;
@@ -26250,8 +26222,9 @@ table: &child_table,
                 nt child ::= "a";
             "#,
             &vocab,
-        );
-        let monolithic = scoped_oracle_test_source(
+        )
+        .unwrap();
+        let monolithic = Constraint::from_glrm_grammar(
             r#"
                 start document;
                 ignore PARENT_WS;
@@ -26265,10 +26238,15 @@ table: &child_table,
                 nt document ::= "X" child "!";
             "#,
             &vocab,
-        );
-        let composed = scoped_oracle_test_link(&parent, "SUB", &child, &vocab, false);
-        let composed_dynamic = scoped_oracle_test_link(&parent, "SUB", &child, &vocab, true);
-        let loaded = scoped_oracle_test_reload(&composed);
+        )
+        .unwrap();
+        let composed = parent
+            .compose_linked_children_for_test(&[("SUB", &child)], &vocab)
+            .unwrap();
+        let composed_dynamic = parent
+            .compose_linked_children_for_test_dynamic(&[("SUB", &child)], &vocab)
+            .unwrap();
+        let loaded = Constraint::load(&composed.save()).unwrap();
         let make_states = || {
             let mut states = Vec::with_capacity(4);
             states.push(composed.start());
@@ -26325,10 +26303,10 @@ table: &child_table,
             &[22],
         ];
         for &sequence in valid_sequences {
-            let mut actual = scoped_oracle_test_start(&composed);
-            let mut dynamic = scoped_oracle_test_start(&composed_dynamic);
-            let mut restored = scoped_oracle_test_start(&loaded);
-            let mut expected = scoped_oracle_test_start(&monolithic);
+            let mut actual = composed.start();
+            let mut dynamic = composed_dynamic.start();
+            let mut restored = loaded.start();
+            let mut expected = monolithic.start();
             for &token in sequence {
                 assert_eq!(actual.mask(), expected.mask(), "mask before {sequence:?} token {token}");
                 assert_eq!(dynamic.mask(), expected.mask(), "dynamic mask before {sequence:?} token {token}");
@@ -26348,10 +26326,10 @@ table: &child_table,
         // parsing, and child trivia must not leak back into the parent after
         // the child has returned.
         for sequence in [&[2u32, 13][..], &[19][..], &[21][..]] {
-            let mut actual = scoped_oracle_test_start(&composed);
-            let mut dynamic = scoped_oracle_test_start(&composed_dynamic);
-            let mut restored = scoped_oracle_test_start(&loaded);
-            let mut expected = scoped_oracle_test_start(&monolithic);
+            let mut actual = composed.start();
+            let mut dynamic = composed_dynamic.start();
+            let mut restored = loaded.start();
+            let mut expected = monolithic.start();
             for &token in &sequence[..sequence.len() - 1] {
                 actual.commit_token(token).unwrap();
                 dynamic.commit_token(token).unwrap();
@@ -26370,17 +26348,22 @@ table: &child_table,
         // This is the inherited-skip case: CHILD_WS is no longer a top-level
         // ignore of `loaded`, but its scoped phase behavior must survive the
         // next call/return boundary exactly.
-        let outer_parent = scoped_oracle_test_source(
+        let outer_parent = Constraint::from_glrm_grammar(
             r#"
                 start outer;
                 t INNER ::= @token(1000);
                 nt outer ::= "<" INNER ">";
             "#,
             &vocab,
-        );
-        let outer = scoped_oracle_test_link(&outer_parent, "INNER", &loaded, &vocab, false);
-        let outer_dynamic = scoped_oracle_test_link(&outer_parent, "INNER", &loaded, &vocab, true);
-        let outer_monolithic = scoped_oracle_test_source(
+        )
+        .unwrap();
+        let outer = outer_parent
+            .compose_linked_children_for_test(&[("INNER", &loaded)], &vocab)
+            .unwrap();
+        let outer_dynamic = outer_parent
+            .compose_linked_children_for_test_dynamic(&[("INNER", &loaded)], &vocab)
+            .unwrap();
+        let outer_monolithic = Constraint::from_glrm_grammar(
             r#"
                 start outer;
                 g inner ::= {
@@ -26398,7 +26381,8 @@ table: &child_table,
                 nt outer ::= "<" inner ">";
             "#,
             &vocab,
-        );
+        )
+        .unwrap();
 
         assert_constraints_mask_equivalent_on_reachable_prefixes_labeled(
             &outer,
@@ -26415,9 +26399,9 @@ table: &child_table,
             "outer-dynamic-vs-outer-monolithic",
         );
         for sequence in [&[0u32, 16, 1][..], &[14, 6, 15][..], &[17][..]] {
-            let mut actual = scoped_oracle_test_start(&outer);
-            let mut dynamic = scoped_oracle_test_start(&outer_dynamic);
-            let mut expected = scoped_oracle_test_start(&outer_monolithic);
+            let mut actual = outer.start();
+            let mut dynamic = outer_dynamic.start();
+            let mut expected = outer_monolithic.start();
             for &token in sequence {
                 assert_eq!(actual.mask(), expected.mask(), "outer mask before {sequence:?} token {token}");
                 assert_eq!(dynamic.mask(), expected.mask(), "outer dynamic mask before {sequence:?} token {token}");
@@ -26430,9 +26414,9 @@ table: &child_table,
             assert!(expected.is_accepting(), "outer reference incomplete for {sequence:?}");
         }
 
-        let mut actual = scoped_oracle_test_start(&outer);
-        let mut dynamic = scoped_oracle_test_start(&outer_dynamic);
-        let mut expected = scoped_oracle_test_start(&outer_monolithic);
+        let mut actual = outer.start();
+        let mut dynamic = outer_dynamic.start();
+        let mut expected = outer_monolithic.start();
         assert_eq!(actual.commit_token(23).is_ok(), expected.commit_token(23).is_ok());
         assert_eq!(dynamic.commit_token(23).is_ok(), expected.commit_token(23).is_ok());
         assert!(!expected.is_accepting());

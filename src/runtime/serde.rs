@@ -2686,8 +2686,31 @@ struct SegmentedRuntimeArtifactV24 {
     boundary_shards: Vec<SegmentedBoundaryShardV23>,
 }
 
+mod composition_artifact_bytes {
+    use serde::{Deserializer, Serializer, de::{Visitor, SeqAccess}};
+    pub fn serialize<S: Serializer>(bytes: &[u8], serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.serialize_bytes(bytes)
+    }
+    pub fn deserialize<'de, D: Deserializer<'de>>(deserializer: D) -> Result<Vec<u8>, D::Error> {
+        struct Bytes;
+        impl<'de> Visitor<'de> for Bytes {
+            type Value = Vec<u8>;
+            fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result { f.write_str("component artifact bytes") }
+            fn visit_bytes<E: serde::de::Error>(self, v: &[u8]) -> Result<Vec<u8>, E> { Ok(v.to_vec()) }
+            fn visit_byte_buf<E: serde::de::Error>(self, v: Vec<u8>) -> Result<Vec<u8>, E> { Ok(v) }
+            fn visit_seq<A: SeqAccess<'de>>(self, mut seq: A) -> Result<Vec<u8>, A::Error> {
+                let mut bytes = Vec::new();
+                while let Some(byte) = seq.next_element()? { bytes.push(byte); }
+                Ok(bytes)
+            }
+        }
+        deserializer.deserialize_byte_buf(Bytes)
+    }
+}
+
 #[derive(Serialize)]
 struct RecursiveSegmentedParserComponentV27Ref<'a> {
+    #[serde(with = "composition_artifact_bytes")]
     constraint_artifact: Vec<u8>,
     tokenizer_state_offset: u32,
     terminal_offset: u32,
@@ -2699,6 +2722,7 @@ struct RecursiveSegmentedParserComponentV27Ref<'a> {
 
 #[derive(Deserialize)]
 struct RecursiveSegmentedParserComponentV27 {
+    #[serde(with = "composition_artifact_bytes")]
     constraint_artifact: Vec<u8>,
     tokenizer_state_offset: u32,
     terminal_offset: u32,
@@ -3276,6 +3300,33 @@ struct DecodedConstraintRuntime {
     virtual_runtimes: Vec<crate::automata::lexer::tokenizer::VirtualTokenizerRuntimeMetadata>,
     static_virtual_residual_mask: Option<DecodedStaticVirtualResidualMask>,
     packed_dwa_dense_masks: Option<(Vec<u32>, Vec<u64>)>,
+}
+
+// Only the current external, ordinary full-vocabulary Dynamic path may reuse
+// Vocab-only data. Keep quotient, scoped/segmented and virtual coordinates on
+// their established load paths, and install before source-specific proofs.
+fn can_reuse_omitted_external_dynamic_vocab(
+    constraint: &Constraint,
+    runtime: &DecodedConstraintRuntime,
+    external_vocab: Option<&crate::Vocab>,
+) -> bool {
+    external_vocab.is_some()
+        && constraint.uses_dynamic_runtime()
+        && constraint.has_template_parser()
+        && constraint.template_parser.as_ref().is_some_and(|parser| parser.composition.is_none())
+        && constraint.static_dynamic_overlay.is_none()
+        && constraint.direct_regular_automaton.is_none()
+        && !constraint.tokenizer.has_any_virtual_runtime()
+        && !constraint.dynamic_mask_vocab.is_initialized()
+        && runtime.dynamic_mask_vocab.is_none()
+        && runtime.template_dynamic_proofs.is_some()
+        && runtime.virtual_runtimes.is_empty()
+        && runtime.static_virtual_residual_mask.is_none()
+        && runtime.segmented_runtime_v20.is_none()
+        && runtime.segmented_runtime_v22.is_none()
+        && runtime.segmented_runtime_v23.is_none()
+        && runtime.segmented_runtime_v24.is_none()
+        && runtime.segmented_runtime_v27.is_none()
 }
 
 fn boundary_parser_artifact_ref(
@@ -3972,15 +4023,27 @@ fn restore_recursive_boundary_parser_v27(
             "serialized recursive boundary parser has an invalid start state".to_owned(),
         ));
     }
-    let weight_in_domain = |weight: &Weight| {
-        weight.is_empty()
+    // The boundary owns every weight for this traversal, so Arc identities
+    // cannot be reused. Cache only successful checks within this shard: its
+    // TSID and token domains can differ from those of another shard.
+    let mut validated_weights = FxHashSet::<usize>::default();
+    let mut weight_in_domain = |weight: &Weight| {
+        let key = weight.ptr_key();
+        if validated_weights.contains(&key) {
+            return true;
+        }
+        let valid = weight.is_empty()
             || weight.is_full()
             || weight.raw_range_values().all(|(range, tokens)| {
                 *range.end() < tsid_count as u32
                     && tokens
                         .ranges()
                         .all(|token_range| *token_range.end() < token_count as u32)
-            })
+            });
+        if valid {
+            validated_weights.insert(key);
+        }
+        valid
     };
     for (state_index, state) in boundary.parser_dwa.states().iter().enumerate() {
         if state
@@ -8161,6 +8224,9 @@ impl Constraint {
             let mut static_virtual_residual_mask = None;
             let mut template_dynamic_proofs = None;
             if let Some(runtime) = runtime {
+                let reuse_omitted_vocab = can_reuse_omitted_external_dynamic_vocab(
+                    &constraint, &runtime, external_vocab,
+                );
                 template_dynamic_proofs = runtime.template_dynamic_proofs;
                 virtual_runtimes = runtime.virtual_runtimes;
                 static_virtual_residual_mask = runtime.static_virtual_residual_mask;
@@ -8189,6 +8255,15 @@ impl Constraint {
                         crate::runtime::artifact::DynamicMaskVocab::from_artifact(dynamic_mask_vocab)
                             .map_err(crate::GlrMaskError::Serialization)?
                     };
+                } else if reuse_omitted_vocab {
+                    // This is the existing exact full-Vocab constructor, not
+                    // a quotient or a trusted serialized proof. Cold cache
+                    // preparation remains charged to this load. Fresh caches
+                    // are private; template proofs are restored below.
+                    constraint.dynamic_mask_vocab =
+                        crate::dynamic_constraint::DynamicConstraint::dynamic_vocab_from_transfer_artifact(
+                            None, external_vocab.expect("checked external Vocab"),
+                        )?;
                 }
                 if let Some(segmented_runtime) = runtime.segmented_runtime_v20 {
                     restore_segmented_runtime_v20(&mut constraint, segmented_runtime)?;
@@ -8374,6 +8449,135 @@ mod tests {
     use crate::Vocab;
     use std::sync::Arc;
 
+    fn omitted_dynamic_vocab_fixture() -> (crate::DynamicConstraint, Vocab) {
+        // A push/pop grammar, not a direct-regular provider. IDs are sparse,
+        // bytes have aliases, and empty/non-ASCII tokens exercise Vocab binding.
+        let vocab = Vocab::new(vec![
+            (1, b"a".to_vec()), (7, b"a".to_vec()), (11, b"b".to_vec()),
+            (19, b"ab".to_vec()), (23, Vec::new()), (29, vec![0xc3, 0xa9]),
+        ]);
+        let original = crate::DynamicConstraint::from_ebnf(
+            "start ::= 'a' start? 'b'", &vocab,
+        ).unwrap();
+        assert!(original.inner.uses_dynamic_runtime());
+        assert!(original.inner.has_template_parser());
+        assert!(original.inner.direct_regular_automaton.is_none());
+        (original, vocab)
+    }
+
+    fn omitted_dynamic_runtime(constraint: &Constraint) -> DecodedConstraintRuntime {
+        DecodedConstraintRuntime {
+            template_dynamic_proofs: Some(crate::dynamic_constraint::TemplateDynamicProofs::from_constraint(constraint)),
+            terminal_live_states: Vec::new(),
+            segmented_runtime_v20: None, segmented_runtime_v22: None,
+            segmented_runtime_v23: None, segmented_runtime_v24: None,
+            segmented_runtime_v27: None, dynamic_mask_vocab: None,
+            virtual_runtimes: Vec::new(), static_virtual_residual_mask: None,
+            packed_dwa_dense_masks: None,
+        }
+    }
+
+    #[test]
+    fn omitted_external_dynamic_vocab_guard_is_coordinate_specific() {
+        let (original, vocab) = omitted_dynamic_vocab_fixture();
+        let mut decoded = original.inner.clone();
+        decoded.dynamic_mask_vocab = Default::default();
+        let mut runtime = omitted_dynamic_runtime(&original.inner);
+        assert!(can_reuse_omitted_external_dynamic_vocab(&decoded, &runtime, Some(&vocab)));
+        assert!(!can_reuse_omitted_external_dynamic_vocab(&decoded, &runtime, None));
+        runtime.dynamic_mask_vocab = original.inner.dynamic_mask_vocab.to_artifact();
+        assert!(runtime.dynamic_mask_vocab.is_some());
+        assert!(!can_reuse_omitted_external_dynamic_vocab(&decoded, &runtime, Some(&vocab)));
+        runtime.dynamic_mask_vocab = None;
+        runtime.template_dynamic_proofs = None;
+        assert!(!can_reuse_omitted_external_dynamic_vocab(&decoded, &runtime, Some(&vocab)));
+        runtime.template_dynamic_proofs = Some(crate::dynamic_constraint::TemplateDynamicProofs::from_constraint(&original.inner));
+        decoded.runtime_backend = crate::runtime::artifact::ConstraintRuntimeBackend::Static;
+        assert!(!can_reuse_omitted_external_dynamic_vocab(&decoded, &runtime, Some(&vocab)));
+        decoded.runtime_backend = crate::runtime::artifact::ConstraintRuntimeBackend::Dynamic;
+        decoded.dynamic_mask_vocab = original.inner.dynamic_mask_vocab.clone();
+        assert!(!can_reuse_omitted_external_dynamic_vocab(&decoded, &runtime, Some(&vocab)));
+    }
+
+    #[test]
+    fn omitted_external_dynamic_vocab_matches_independent_full_rebuild() {
+        let (original, vocab) = omitted_dynamic_vocab_fixture();
+        assert!(!original.inner.dynamic_mask_vocab.is_grammar_quotiented());
+        assert!(original.inner.dynamic_mask_vocab.to_template_external_vocab_artifact().is_none());
+        let transfer = original.save_with_external_vocab();
+        let loaded = crate::DynamicConstraint::load_with_vocab(&transfer, &vocab).unwrap();
+        let prepared = crate::compiler::constraint_possible_matches::prepared_runtime_dynamic_vocab_for_vocab(&vocab);
+        assert!(Arc::ptr_eq(&prepared.trie, &loaded.inner.dynamic_mask_vocab.trie),
+            "real external load must take the prepared Vocab handoff, not rebuild a new trie");
+        // Independent old construction: rebuild from authoritative token bytes,
+        // preserving the source-specific proof restore order.
+        let mut reference = original.inner.clone();
+        reference.dynamic_mask_vocab = Default::default();
+        reference.lazy_dynamic_mask_vocab = Default::default();
+        assert!(reference.lazy_dynamic_mask_vocab.get().is_none());
+        crate::dynamic_constraint::TemplateDynamicProofs::from_constraint(&original.inner)
+            .restore(&mut reference).unwrap();
+        reference.rebuild_dynamic_runtime_caches();
+        let mut expected = reference.start();
+        let mut actual = loaded.start();
+        assert_eq!(expected.mask(), actual.mask());
+        assert_eq!(expected.is_accepting(), actual.is_accepting());
+        assert!(!actual.is_accepting());
+        for token in [1, 7, 11, 11] {
+            expected.commit_token(token).unwrap();
+            actual.commit_token(token).unwrap();
+            assert_eq!(expected.mask(), actual.mask());
+            assert_eq!(expected.is_accepting(), actual.is_accepting());
+        }
+        assert!(actual.is_accepting());
+        assert_eq!(loaded.save_with_external_vocab(), transfer);
+        let reloaded = crate::DynamicConstraint::load_with_vocab(&loaded.save(), &vocab).unwrap();
+        assert_eq!(loaded.start().mask(), reloaded.start().mask());
+        let mismatch = Vocab::new(vec![(1, b"x".to_vec()), (7, b"a".to_vec()), (11, b"b".to_vec())]);
+        assert!(crate::DynamicConstraint::load_with_vocab(&transfer, &mismatch).is_err());
+        assert!(!loaded.inner.table.is_present());
+        assert!(loaded.inner.has_template_parser());
+    }
+
+    #[test]
+    fn omitted_external_dynamic_vocab_restores_nonempty_exact_source_proofs() {
+        let (mut original, vocab) = omitted_dynamic_vocab_fixture();
+        let rows = original.inner.tokenizer.build_terminal_projected_quotients_for_containment();
+        assert!(!rows.is_empty(), "fixture must carry a nonempty exact state proof");
+        original.inner.dynamic_mask_vocab.set_projected_terminal_quotients(rows);
+        original.inner.serialized_artifact_cache = None;
+        // Use Constraint body saves, avoiding DynamicConstraint's unchanged
+        // wrapper cache when deliberately mutating internal proof fixtures.
+        let valid = original.inner.save_with_external_vocab().unwrap();
+        let loaded = Constraint::load_with_vocab(&valid, &vocab).unwrap();
+        assert!(loaded.dynamic_mask_vocab.projected_terminal_quotients_prepared());
+        assert!(loaded.dynamic_mask_vocab.has_projected_terminal_quotients());
+        assert_eq!(original.inner.start().mask(), loaded.start().mask());
+        let mut invalid = original.inner.clone();
+        invalid.serialized_artifact_cache = None;
+        let mut bad_rows = invalid.tokenizer.build_terminal_projected_quotients_for_containment();
+        bad_rows[0].0 = invalid.tokenizer.num_terminals();
+        invalid.dynamic_mask_vocab.set_projected_terminal_quotients(bad_rows);
+        let invalid_wire = invalid.save_with_external_vocab().unwrap();
+        assert!(Constraint::load_with_vocab(&invalid_wire, &vocab).is_err(),
+            "the cached Vocab must not authorize an invalid source-state proof");
+    }
+
+    #[test]
+    fn prepared_vocab_handoff_has_fresh_mutable_caches_and_no_source_proofs() {
+        let (_, vocab) = omitted_dynamic_vocab_fixture();
+        let left = crate::dynamic_constraint::DynamicConstraint::dynamic_vocab_from_transfer_artifact(None, &vocab).unwrap();
+        let right = crate::dynamic_constraint::DynamicConstraint::dynamic_vocab_from_transfer_artifact(None, &vocab).unwrap();
+        assert!(left.is_initialized() && right.is_initialized());
+        assert!(!left.is_grammar_quotiented() && !right.is_grammar_quotiented());
+        assert!(!left.projected_terminal_quotients_prepared());
+        assert!(!right.projected_terminal_quotients_prepared());
+        let lock = left.lock_lazy_union_cache();
+        assert!(right.try_lock_lazy_union_cache().is_some(), "mutable union cache must not alias");
+        drop(lock);
+        assert!(left.try_lock_lazy_union_cache().is_some());
+    }
+
     #[test]
     fn loaded_partitioned_bounded_strings_keep_first_key_prefix_live() {
         use crate::automata::lexer::Lexer;
@@ -8467,6 +8671,85 @@ mod tests {
             ]),
         )
         .unwrap()
+    }
+
+
+    fn recursive_boundary_validation_fixture(
+        dwa: crate::automata::weighted_u32::dwa::DWA,
+        tsid_count: u32,
+        token_count: usize,
+    ) -> RecursiveSegmentedBoundaryParserV27 {
+        RecursiveSegmentedBoundaryParserV27 {
+            parser_dwa: dwa,
+            uses_composed_tsid_coordinate: false,
+            tokenizer_state_to_tsid: vec![tsid_count - 1],
+            internal_token_to_originals: vec![Vec::new(); token_count],
+        }
+    }
+
+    #[test]
+    fn recursive_boundary_validation_refuses_weight_domain_endpoints() {
+        use crate::automata::weighted_u32::dwa::DWA;
+        let constraint = tiny_constraint();
+        for weight in [
+            Weight::from_uniform(1..=1, range_set_blaze::RangeSetBlaze::from_iter([0])),
+            Weight::from_uniform(0..=0, range_set_blaze::RangeSetBlaze::from_iter([1])),
+        ] {
+            let mut dwa = DWA::new(1, 1);
+            dwa.add_state();
+            dwa.set_final_weight(0, weight);
+            let error = restore_recursive_boundary_parser_v27(
+                &constraint, recursive_boundary_validation_fixture(dwa, 1, 1), 1, 1,
+            ).unwrap_err().to_string();
+            assert!(error.contains("state 0 has an out-of-domain final weight"), "{error}");
+        }
+    }
+
+    #[test]
+    fn recursive_boundary_validation_rechecks_edges_after_shared_valid_weight() {
+        use crate::automata::weighted_u32::dwa::{DWA, DWAState};
+        let constraint = tiny_constraint();
+        let weight = Weight::from_uniform(
+            0..=0, range_set_blaze::RangeSetBlaze::from_iter([0]),
+        );
+        // The final weight is checked first. Its shared identity must not
+        // suppress either transition-target or parser-label refusal.
+        for (label, target, expected) in [
+            (1, 1, "state 0 has an invalid transition"),
+            (1, 0, "references parser state 1 outside the recursive domain"),
+            (-2, 0, "references parser state -2 outside the recursive domain"),
+        ] {
+            let state = DWAState {
+                transitions: [(label, (target, weight.clone()))].into_iter().collect(),
+                final_weight: Some(weight.clone()),
+            };
+            let error = restore_recursive_boundary_parser_v27(
+                &constraint,
+                recursive_boundary_validation_fixture(DWA::from_parts(vec![state], 0), 1, 1),
+                1, 1,
+            ).unwrap_err().to_string();
+            assert!(error.contains(expected), "{error}");
+        }
+    }
+
+    #[test]
+    fn recursive_boundary_validation_cache_is_local_to_each_shard() {
+        use crate::automata::weighted_u32::dwa::DWA;
+        let constraint = tiny_constraint();
+        let weight = Weight::from_uniform(
+            1..=1, range_set_blaze::RangeSetBlaze::from_iter([1]),
+        );
+        for (tsids, tokens, succeeds) in [(2, 2, true), (1, 2, false), (2, 1, false)] {
+            let mut dwa = DWA::new(tsids, tokens as u32);
+            dwa.add_state();
+            dwa.set_final_weight(0, weight.clone());
+            let result = restore_recursive_boundary_parser_v27(
+                &constraint,
+                recursive_boundary_validation_fixture(dwa, tsids, tokens),
+                1, 1,
+            );
+            assert_eq!(result.is_ok(), succeeds, "TSIDs={tsids}, tokens={tokens}");
+        }
     }
 
     fn sample_boundary_fingerprint() -> crate::runtime::BoundaryCandidateFingerprint {
