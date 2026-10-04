@@ -1863,7 +1863,10 @@ pub(super) fn try_scalar_dispatch(
     if root_branches
         .iter()
         .any(|branch| !branch.initial_prune_guard.is_passed())
-        && !joint_initial_guard_walk_enabled(root_branches)
+        && !joint_initial_guard_walk_enabled(
+            root_branches,
+            state.constraint.tokenizer.initial_state(),
+        )
     {
         let mut merged = vec![0u32; buf.len()];
         let mut scratch = vec![0u32; buf.len()];
@@ -2280,7 +2283,10 @@ pub(super) fn try_flat16<const HOT_SINGLE_ROOT: bool>(
     if root_branches
         .iter()
         .any(|branch| !branch.initial_prune_guard.is_passed())
-        && !joint_initial_guard_walk_enabled(root_branches)
+        && !joint_initial_guard_walk_enabled(
+            root_branches,
+            state.constraint.tokenizer.initial_state(),
+        )
     {
         let profile = dynamic_mask_profile_enabled(state.generation);
         let mut merged = vec![0u32; buf.len()];
@@ -3236,6 +3242,15 @@ fn full_walk_identity_context_profitable(
     roots: usize, parser_nodes: usize,
 ) -> bool {
     roots >= 2 || parser_nodes >= 32
+}
+
+#[inline(always)]
+fn full_walk_executed_root_count(roots: usize, scalar_lane: bool) -> usize {
+    if scalar_lane {
+        usize::from(roots != 0)
+    } else {
+        roots
+    }
 }
 
 /// An alphabet of exact self-loops is closed under concatenation. When every
@@ -7156,6 +7171,17 @@ fn try_full_walk_mask_with_table_from_initial_in_output_scope<
         }
     }
 
+    // Select proof bookkeeping from the executed root frontier. Several exact
+    // lexer roots can merge behind one parser into the ordinary scalar lane;
+    // counting their original alternatives enables costly identity probes even
+    // though the resulting walk has the same shape as a single-root fallback.
+    // Parser-node growth still enables the existing monotone policy below.
+    let executed_root_count = full_walk_executed_root_count(
+        root_branches.len(), stack_lexer[0] < FULL_WALK_LEXER_TWO_DISTINCT,
+    );
+    parser_cache.identity_proofs_enabled = accelerated
+        && full_walk_identity_context_profitable(executed_root_count, parser_cache.nodes.len());
+
     let walk_ops = trie.full_walk_ops();
     let token_markers = vocab.full_walk_token_markers_for(trie);
     let mut token_marker_index = 0usize;
@@ -8971,6 +8997,17 @@ mod full_walk_acceleration_tests {
                 assert!(!admitted || now);
                 admitted |= now;
             }
+        }
+    }
+
+    #[test]
+    fn identity_context_counts_executed_scalar_root_after_exact_union() {
+        for roots in 0..16 {
+            let executed = full_walk_executed_root_count(roots, true);
+            assert_eq!(executed, usize::from(roots != 0));
+            assert!(!full_walk_identity_context_profitable(executed, 31));
+            assert!(full_walk_identity_context_profitable(executed, 32));
+            assert_eq!(full_walk_executed_root_count(roots, false), roots);
         }
     }
 
