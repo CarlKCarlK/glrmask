@@ -6,7 +6,7 @@ use rustc_hash::FxHashSet;
 use crate::automata::regex::Expr;
 use crate::compiler::glr::analysis::{
     eliminate_right_recursion, has_indirect_left_recursion, merge_identical_nonterminals,
-    inline_null_productions, normalize_dynamic_glr_grammar, normalize_grammar,
+    inline_null_productions, normalize_grammar,
 };
 use crate::grammar::flat::{GrammarDef, NonterminalID, Terminal};
 use crate::grammar::flat::{Rule, Symbol, TerminalID};
@@ -1033,8 +1033,9 @@ pub(crate) fn prepare_dynamic_grammar_transforms_only(grammar: GrammarDef) -> Gr
     normalized
 }
 
-/// Dynamic-runtime preparation that preserves CFG recursion and performs only
-/// the normalization required by the GLR execution table.
+/// Dynamic-runtime preparation for the mandatory native template parser.
+/// Right-recursive reductions can consume an arbitrarily long concrete stack;
+/// normalize them exactly before requiring an acyclic action characterization.
 pub(crate) fn prepare_dynamic_glr_transforms_only(grammar: GrammarDef) -> GrammarDef {
     let profiling = compile_profile_enabled();
     let nullable_terminals = nullable_terminals_for_grammar(&grammar);
@@ -1047,10 +1048,10 @@ pub(crate) fn prepare_dynamic_glr_transforms_only(grammar: GrammarDef) -> Gramma
 
     let started = profiling.then(Instant::now);
     let before = normalized.rules.len();
-    normalize_dynamic_glr_grammar(&mut normalized.rules, normalized.start);
+    normalize_grammar(&mut normalized.rules, normalized.start);
     if let Some(started) = started {
         emit_grammar_transform_profile(
-            "normalize_dynamic_glr_grammar",
+            "normalize_grammar",
             elapsed_ms(started),
             before,
             normalized.rules.len(),
@@ -1090,7 +1091,7 @@ pub(crate) fn prepare_dynamic_shared_terminal_domain(mut grammar: GrammarDef) ->
 pub(crate) fn prepare_dynamic_parser_after_terminal_domain(
     mut normalized: GrammarDef,
 ) -> (GrammarDef, bool) {
-    normalize_dynamic_glr_grammar(&mut normalized.rules, normalized.start);
+    normalize_grammar(&mut normalized.rules, normalized.start);
     let protected_nonterminals = collect_protected_nonterminals(&normalized);
     inline_single_use_nonterminals(&mut normalized.rules, &protected_nonterminals, normalized.start);
     let max_reduction_len = std::env::var("GLRMASK_MAX_RUNTIME_REDUCTION_LEN")
@@ -1426,6 +1427,67 @@ mod tests {
             serde_json::to_vec(&split).unwrap(),
             serde_json::to_vec(&monolithic).unwrap()
         );
+    }
+
+    #[test]
+    fn dynamic_native_preparation_normalizes_recursive_unary_in_both_schedules() {
+        let grammar = GrammarDef {
+            start: 0,
+            rules: vec![
+                Rule { lhs: 0, rhs: vec![nt(1), t(2)] },
+                Rule { lhs: 1, rhs: vec![t(0), nt(1)] },
+                Rule { lhs: 1, rhs: vec![t(1)] },
+            ],
+            terminals: vec![
+                Terminal::Literal { id: 0, bytes: b"!".to_vec() },
+                Terminal::Literal { id: 1, bytes: b"x".to_vec() },
+                Terminal::Literal { id: 2, bytes: b";".to_vec() },
+            ],
+            ..GrammarDef::default()
+        };
+        let monolithic = prepare_dynamic_glr_transforms_only(grammar.clone());
+        let shared = prepare_dynamic_shared_terminal_domain(grammar);
+        let (split, domain_changed) = prepare_dynamic_parser_after_terminal_domain(shared);
+        assert!(!domain_changed);
+        assert_eq!(serde_json::to_vec(&monolithic).unwrap(), serde_json::to_vec(&split).unwrap());
+        let analyzed = crate::compiler::glr::analysis::AnalyzedGrammar::from_grammar_def(&monolithic);
+        analyzed.check_recursion_boundedness().unwrap();
+    }
+
+    #[test]
+    fn dynamic_native_recursive_unary_preserves_full_masks_and_unbounded_completion() {
+        let vocab = crate::Vocab::new((0..=255).map(|id| (id, vec![id as u8])).collect());
+        let grammar = "start p; nt p ::= unary ';'; nt unary ::= 'x' | '!' unary;";
+        let constraint = crate::DynamicConstraint::compile(crate::Grammar::glrm(grammar), &vocab).unwrap();
+        let backend = crate::__private::dynamic_parser_backend_report(&constraint);
+        assert!(backend.as_array().unwrap().iter().all(|v|
+            v["backend"] == "acyclic-template-dfa" && v["lr_table_present"] == false));
+        for depth in [0, 1, 2, 17, 257, 1024] {
+            let mut state = constraint.start();
+            let mut mask = vec![0; constraint.mask_len()];
+            let mut expected = vec![0; constraint.mask_len()];
+            for token in [b'!', b'x'] { expected[token as usize / 32] |= 1 << (token % 32); }
+            for _ in 0..depth {
+                state.fill_mask(&mut mask);
+                assert_eq!(mask, expected, "depth={depth}: unary prefix");
+                assert!(!state.is_accepting());
+                state.commit_token(b'!' as u32).unwrap();
+            }
+            state.fill_mask(&mut mask);
+            assert_eq!(mask, expected, "depth={depth}: atom");
+            state.commit_token(b'x' as u32).unwrap();
+            expected.fill(0);
+            expected[b';' as usize / 32] |= 1 << (b';' % 32);
+            state.fill_mask(&mut mask);
+            assert_eq!(mask, expected, "depth={depth}: terminator");
+            assert!(!state.is_accepting());
+            let mut rejected = state.clone();
+            assert!(rejected.commit_token(b'!' as u32).is_err());
+            state.commit_token(b';' as u32).unwrap();
+            assert!(state.is_accepting());
+            state.fill_mask(&mut mask);
+            assert!(mask.iter().all(|&word| word == 0), "depth={depth}: complete");
+        }
     }
 
     #[test]
