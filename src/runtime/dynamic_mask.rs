@@ -8960,7 +8960,7 @@ fn dynamic_mask_lookup_query_for_vocab(
             && let Some((runtime, projected_state)) = state
                 .constraint
                 .tokenizer
-                .virtual_residual_direct_coordinate_finite_mask_dense_key(
+                .virtual_residual_direct_coordinate_mask_result_dense_key(
                     coordinate,
                     max_token_byte_len.unwrap_or(0),
                 )
