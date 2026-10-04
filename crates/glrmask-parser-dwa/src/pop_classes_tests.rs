@@ -345,3 +345,99 @@ fn direct_dwa_publication_rejects_negative_push_unknown_labels_and_budget_refusa
     source.add_transition(0,1,1,weight(3));source.set_final_weight(1,weight(3));
     assert!(classes.compile_positive_dwa(source,0).is_err());
 }
+
+fn compare_row_publication_modes(source: &DWA, classes: &PopLabelClasses, budget: usize) -> Option<DWA> {
+    use crate::parser_dwa::determinize_pop_classes_with_row_publication_for_test;
+    let expected = determinize_pop_classes_with_row_publication_for_test(source, classes, budget, false);
+    let actual = determinize_pop_classes_with_row_publication_for_test(source, classes, budget, true);
+    match (expected, actual) {
+        (Err(expected), Err(actual)) => { assert_eq!(expected, actual, "budget={budget}"); None }
+        (Ok(expected), Ok(actual)) => {
+            assert_eq!(expected.start_state(), actual.start_state(), "budget={budget}");
+            assert_eq!(expected.states().len(), actual.states().len(), "budget={budget}");
+            for (index, (expected, actual)) in expected.states().iter().zip(actual.states()).enumerate() {
+                assert_eq!(expected.final_weight, actual.final_weight, "row={index} budget={budget}");
+                assert_eq!(expected.transitions, actual.transitions, "row={index} budget={budget}");
+            }
+            Some(actual)
+        }
+        _ => panic!("publication result mismatch at budget={budget}"),
+    }
+}
+
+#[test]
+fn bulk_class_row_publication_preserves_discovery_order_weights_cycles_and_refusals() {
+    for seed in 0..12u32 {
+        let mut classes = PopLabelClasses::new(4).unwrap();
+        let a = classes.intern_scoped_complement(0..3, [1]).unwrap().unwrap();
+        let b = classes.intern_scoped_complement(0..3, [2]).unwrap().unwrap();
+        let c = classes.intern_scoped_complement(1..3, []).unwrap().unwrap();
+        let mut source = DWA::from_parts(vec![Default::default(); 5], 0);
+        source.add_transition(0, a, 1, weight(3));
+        source.add_transition(0, b, 2, weight(1 + (seed % 3) as u8));
+        // The overlapping classes discover a multi-state subset. Its first
+        // source row exposes high literal labels before the next row's low
+        // label, exercising row construction independently of discovery order.
+        source.add_transition(1, 2, 3, weight(3));
+        source.add_transition(1, 3, 4, Weight::empty());
+        source.add_transition(2, 0, 4, weight(2));
+        source.add_transition(1, c, 0, weight(1));
+        source.add_transition(2, c, 3, weight(3));
+        source.add_transition(3, 1, 0, weight(3));
+        source.add_transition(4, 2, 4, weight(2));
+        source.set_final_weight(3, weight(1 + (seed % 3) as u8));
+        source.set_final_weight(4, weight(2));
+        for budget in [0, 1, 3, 8, 16, 32, 64, 512, 10_000] {
+            let _ = compare_row_publication_modes(&source, &classes, budget);
+        }
+        let result = compare_row_publication_modes(&source, &classes, 10_000).unwrap();
+        let raw = source.to_nwa();
+        for stack in all_stacks(4).into_iter().chain([vec![3], vec![3,0], vec![0,3], vec![3,2]]) {
+            assert_eq!(accepted(&result, &stack), literal(&raw, &classes, &stack), "seed={seed} stack={stack:?}");
+        }
+        let reference = crate::parser_dwa::determinize_pop_classes_with_row_publication_for_test(
+            &source, &classes, 10_000, false).unwrap();
+        let comparison = crate::parser_equivalence::compare_parser_mask_prefix_languages(
+            &reference, &result, 4, 10_000).unwrap();
+        assert!(comparison.difference.is_none(), "seed={seed}: {:?}", comparison.difference);
+    }
+}
+
+#[test]
+fn bulk_class_row_publication_preserves_large_class_inventory_and_singleton_rows() {
+    let mut classes = PopLabelClasses::new(80).unwrap();
+    let labels = (0..70).map(|symbol| classes.intern_scoped_complement(0..72, [symbol]).unwrap().unwrap())
+        .collect::<Vec<_>>();
+    assert!(classes.len() > 64, "exercise the original non-bitset membership path");
+    let mut source = DWA::from_parts(vec![Default::default(); 4], 0);
+    for (index, &label) in labels.iter().enumerate() {
+        source.add_transition(0, label, 1 + index as u32 % 2, weight(1 + (index % 3) as u8));
+    }
+    source.add_transition(1, labels[3], 0, weight(1));
+    source.add_transition(2, 71, 3, weight(3));
+    source.add_transition(3, 0, 3, weight(3));
+    source.set_final_weight(2, weight(2));
+    source.set_final_weight(3, weight(3));
+    for budget in [0, 1, 70, 80, 160, 512, 100_000] {
+        let _ = compare_row_publication_modes(&source, &classes, budget);
+    }
+    let result = compare_row_publication_modes(&source, &classes, 100_000).unwrap();
+    let raw = source.to_nwa();
+    for stack in [vec![], vec![0], vec![71], vec![72], vec![79], vec![71, 0], vec![0, 71], vec![3, 0, 71]] {
+        assert_eq!(accepted(&result, &stack), literal(&raw, &classes, &stack), "stack={stack:?}");
+    }
+}
+
+#[test]
+fn bulk_class_row_publication_charges_edges_before_default_pruning() {
+    let classes = PopLabelClasses::new(4).unwrap();
+    let mut source = DWA::from_parts(vec![Default::default(); 2], 0);
+    source.add_transition(0, 0, 1, weight(3));
+    source.add_transition(0, DEFAULT_LABEL, 1, weight(3));
+    source.set_final_weight(1, weight(3));
+    assert!(compare_row_publication_modes(&source, &classes, 0).is_none());
+    assert!(compare_row_publication_modes(&source, &classes, 1).is_none());
+    let result = compare_row_publication_modes(&source, &classes, 2).unwrap();
+    assert_eq!(result.num_transitions(), 1, "the explicit edge is pruned only after its original charge");
+    assert!(result.states()[0].transitions.contains_key(&DEFAULT_LABEL));
+}

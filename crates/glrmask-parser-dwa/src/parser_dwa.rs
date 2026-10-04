@@ -6871,6 +6871,47 @@ fn determinize_parser_dwa_with_fallbacks_and_classes_reuse(
     edge_budget: usize,
     reuse_last_class_derivative: bool,
 ) -> Result<DWA, String> {
+    determinize_parser_dwa_with_fallbacks_and_classes_publication(
+        dwa, possible_by_state, num_parser_states, normalize_singletons,
+        pop_classes, edge_budget, reuse_last_class_derivative, true,
+    )
+}
+
+#[cfg(test)]
+pub(crate) fn determinize_pop_classes_with_row_publication_for_test(
+    dwa: &DWA,
+    classes: &crate::pop_classes::PopLabelClasses,
+    edge_budget: usize,
+    bulk_row_publication: bool,
+) -> Result<DWA, String> {
+    determinize_parser_dwa_with_fallbacks_and_classes_publication(
+        dwa, &[], classes.symbol_count(), true, Some(classes), edge_budget,
+        true, bulk_row_publication,
+    )
+}
+
+fn determinize_parser_dwa_with_fallbacks_and_classes_publication(
+    dwa: &DWA,
+    possible_by_state: &[PossibleOutgoingIds],
+    num_parser_states: u32,
+    normalize_singletons: bool,
+    pop_classes: Option<&crate::pop_classes::PopLabelClasses>,
+    edge_budget: usize,
+    reuse_last_class_derivative: bool,
+    bulk_row_publication: bool,
+) -> Result<DWA, String> {
+    fn emit_transition(
+        result: &mut DWA,
+        row_edges: &mut Option<Vec<(i32, (u32, Weight))>>,
+        from: u32, label: i32, to: u32, weight: Weight,
+    ) {
+        if let Some(edges) = row_edges {
+            edges.push((label, (to, weight)));
+        } else {
+            result.add_transition(from, label, to, weight);
+        }
+    }
+
     fn subset_key(entries: &[(u32, Weight)]) -> Vec<(u32, usize)> {
         entries.iter().map(|(sid, w)| (*sid, w.ptr_key())).collect()
     }
@@ -6941,6 +6982,11 @@ fn determinize_parser_dwa_with_fallbacks_and_classes_reuse(
     let mut row_group_hits = 0usize;
     let mut row_group_misses = 0usize;
     let mut row_group_symbols = 0usize;
+    let row_publication_profile = pop_classes.is_some() && compile_profile_enabled();
+    let mut staged_rows = 0usize;
+    let mut staged_edges = 0usize;
+    let mut max_staged_edges = 0usize;
+    let mut max_staged_capacity_bytes = 0usize;
 
     // Membership is a property of the finite class alphabet, independent of
     // each derivative row. A single-word class inventory can reuse those exact
@@ -7343,6 +7389,13 @@ fn determinize_parser_dwa_with_fallbacks_and_classes_reuse(
         // no explicit contribution. The already-completed derivative also
         // records the original per-symbol membership and merged-work charges.
         let mut last_class_derivative: Option<(u64, usize, u32, Weight, usize)> = None;
+        // Keep derivative discovery, state IDs and every budget charge in
+        // their original order. Only the completed row's tree construction
+        // is deferred; no result row is consulted while processing labels.
+        let mut row_edges = (bulk_row_publication && pop_classes.is_some()).then(|| {
+            Vec::with_capacity((touched_dense_labels.len() + usize::from(default_touched)
+                + sparse_raw_targets.len()).min(edge_budget.saturating_sub(class_edges)))
+        });
         let mut process_label = |label: i32, mut contribs: TargetContribs, is_concrete_dense: bool| -> Result<(), String> {
             let global_empty = if reuse_last_class_derivative && is_concrete_dense
                 && contribs.is_empty() && !class_raw_targets.is_empty() {
@@ -7359,7 +7412,7 @@ fn determinize_parser_dwa_with_fallbacks_and_classes_reuse(
                 }
                 row_group_hits += 1;
                 row_group_symbols += 1;
-                result.add_transition(from_state, label, *to_state, edge_weight.clone());
+                emit_transition(&mut result, &mut row_edges, from_state, label, *to_state, edge_weight.clone());
                 return Ok(());
             }
             let mut global_work = None;
@@ -7420,7 +7473,7 @@ fn determinize_parser_dwa_with_fallbacks_and_classes_reuse(
                             last_class_derivative = Some((global, work, cached.to_state,
                                 cached.edge_weight.clone(), cached.merged_len));
                         }
-                        result.add_transition(from_state, label, cached.to_state, cached.edge_weight.clone());
+                        emit_transition(&mut result, &mut row_edges, from_state, label, cached.to_state, cached.edge_weight.clone());
                         return Ok(());
                     }
                 }
@@ -7451,7 +7504,7 @@ fn determinize_parser_dwa_with_fallbacks_and_classes_reuse(
             if contribs.is_empty() {
                 if class_default_present && label != DEFAULT_LABEL {
                     let dead = *class_dead_state.get_or_insert_with(|| result.add_state());
-                    result.add_transition(from_state, label, dead, Weight::all());
+                    emit_transition(&mut result, &mut row_edges, from_state, label, dead, Weight::all());
                 }
                 return Ok(());
             }
@@ -7554,7 +7607,7 @@ fn determinize_parser_dwa_with_fallbacks_and_classes_reuse(
                 );
             }
 
-            result.add_transition(from_state, label, to_state, edge_weight);
+            emit_transition(&mut result, &mut row_edges, from_state, label, to_state, edge_weight);
             Ok(())
         };
 
@@ -7580,6 +7633,16 @@ fn determinize_parser_dwa_with_fallbacks_and_classes_reuse(
             process_label(label, contribs, false)?;
         }
         drop(process_label);
+        if let Some(edges) = row_edges {
+            if row_publication_profile {
+                staged_rows += 1;
+                staged_edges += edges.len();
+                max_staged_edges = max_staged_edges.max(edges.len());
+                max_staged_capacity_bytes = max_staged_capacity_bytes.max(
+                    edges.capacity() * std::mem::size_of::<(i32, (u32, Weight))>());
+            }
+            result.states_mut()[from_state as usize].transitions = edges.into_iter().collect();
+        }
         class_raw_targets.clear();
         if pop_classes.is_some() {
             let row = &mut result.states_mut()[from_state as usize].transitions;
@@ -7597,6 +7660,7 @@ fn determinize_parser_dwa_with_fallbacks_and_classes_reuse(
             "[pop_class_row_derivative_groups] hits={} misses={} symbols={}",
             row_group_hits, row_group_misses, row_group_symbols
         );
+        eprintln!("[pop_class_row_publication] bulk={bulk_row_publication} staged_rows={staged_rows} staged_edges={staged_edges} max_staged_edges={max_staged_edges} max_staged_capacity_bytes={max_staged_capacity_bytes}");
     }
 
     if let Some(started) = fallback_started {
