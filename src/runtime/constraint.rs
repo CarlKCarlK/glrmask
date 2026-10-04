@@ -1979,11 +1979,14 @@ impl Constraint {
     }
 
     /// Preserve source nullability after compiler-only normalization. This
-    /// updates interface metadata and the finite nullable return relation;
-    /// it never reconstructs or materializes an LR table.
+    /// updates the executable EOF relation, interface metadata and the finite
+    /// nullable return relation; it never reconstructs or materializes an LR table.
     pub(crate) fn set_composition_start_nullable(&mut self, nullable: bool) {
         let parser = self.template_parser.as_mut()
             .and_then(Arc::get_mut).expect("source nullability must be set before sharing the native parser");
+        if nullable {
+            parser.preserve_start_nullable();
+        }
         if let Some(grammar) = parser.link_grammar.as_mut() {
             Arc::make_mut(grammar).root_nullable = nullable;
         }

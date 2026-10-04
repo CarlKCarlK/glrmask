@@ -2748,6 +2748,10 @@ pub fn normalize_grammar(rules: &mut Vec<Rule>, start: NonterminalID) {
         let inline_rules_before = rules.len();
         let inline_started_at = profiling.then(Instant::now);
         replace_rules_with_resync(rules, &next_nt, inline_null_productions);
+        // A -> A contributes no terminal derivation. Epsilon elimination can
+        // expose it, and rewriting it as right recursion would manufacture a
+        // fresh nullable self-cycle on every subsequent iteration.
+        rules.retain(|rule| !is_reflexive_unit_rule(rule));
         let inline_unchanged = *rules == snap;
         if let Some(started_at) = inline_started_at {
             emit_normalize_profile(
@@ -2760,8 +2764,6 @@ pub fn normalize_grammar(rules: &mut Vec<Rule>, start: NonterminalID) {
             );
         }
 
-        let no_nullable_nonterminals =
-            compute_nullable(rules, max_nt_id(rules) + 1).is_empty();
         let rr_rules_before = rules.len();
         let rr_started_at = profiling.then(Instant::now);
         let right_recursion_completed = with_resynced_next_nonterminal(rules, &next_nt, |rules| {
@@ -2847,13 +2849,13 @@ pub fn normalize_grammar(rules: &mut Vec<Rule>, start: NonterminalID) {
             );
         }
 
-        if no_nullable_nonterminals
+        if compute_nullable(rules, max_nt_id(rules) + 1).is_empty()
             && right_recursion_completed
             && !hidden_left_recursion_changed
         {
-            // Subsequent normalization passes cannot create nullability or
-            // indirect right recursion. Post-merge transforms perform their
-            // own indirect-left-recursion recovery.
+            // Check the rewritten grammar: right-recursion elimination can
+            // introduce nullable helpers even when its input had none.
+            // Post-merge transforms perform their own indirect-LR recovery.
             nullable_eliminated_before_exit = true;
             break;
         }
@@ -2869,6 +2871,7 @@ pub fn normalize_grammar(rules: &mut Vec<Rule>, start: NonterminalID) {
     let post_inline_started_at = profiling.then(Instant::now);
     if !nullable_eliminated_before_exit {
         replace_rules_with_resync(rules, &next_nt, inline_null_productions);
+        rules.retain(|rule| !is_reflexive_unit_rule(rule));
     }
     let post_inline_changed = post_inline_snapshot
         .as_ref()

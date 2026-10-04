@@ -1491,6 +1491,109 @@ mod tests {
     }
 
     #[test]
+    fn native_preparation_cleans_nullable_helpers_created_by_recursion_rewrites() {
+        let mut errors = Vec::new();
+        for source in [
+            "start s; nt s ::= s | 'x';",
+            "start s; nt s ::= n s | 'x'; nt n ::= '' | '!';",
+            "start s; nt s ::= s s | 'x' | '';",
+        ] {
+            let named = crate::grammar::glrm::from_glrm(source).unwrap();
+            let grammar = crate::grammar::ast::lower(&crate::grammar::factoring::factor_named_grammar(named)).unwrap();
+            let serial = prepare_dynamic_glr_transforms_only(grammar.clone());
+            let (split, _) = prepare_dynamic_parser_after_terminal_domain(prepare_dynamic_shared_terminal_domain(grammar));
+            for (schedule, prepared) in [("serial", serial), ("split", split)] {
+                let analyzed = crate::compiler::glr::analysis::AnalyzedGrammar::from_grammar_def(&prepared);
+                if let Err(error) = analyzed.check_dynamic_table_build_normal_form() {
+                    errors.push(format!("{source} {schedule}: {error}"));
+                }
+                if let Err(error) = analyzed.check_recursion_boundedness() {
+                    errors.push(format!("{source} {schedule}: {error}"));
+                }
+            }
+        }
+        assert!(errors.is_empty(), "{}", errors.join("\n"));
+    }
+
+    #[test]
+    fn native_empty_unary_start_completion_survives_public_and_dynamic_artifacts() {
+        let vocab = crate::Vocab::new((0..256).map(|id| (id, vec![id as u8])).collect());
+        let source = "start s; nt s ::= '!' s | '';";
+        let mut expected = vec![0; 8];
+        expected[b'!' as usize / 32] = 1 << (b'!' % 32);
+        let mut errors = Vec::new();
+        for optimization in [crate::Optimization::Auto, crate::Optimization::FastBuild] {
+            let compiled = crate::Grammar::glrm(source).compile_with(&vocab, crate::BuildOptions::default().optimization(optimization)).unwrap();
+            let loaded = crate::Constraint::load(compiled.save()).unwrap();
+            let external = crate::Constraint::load_with_vocab(compiled.save_with_external_vocab().unwrap(), &vocab).unwrap();
+            for (representation, constraint) in [("direct", compiled), ("self", loaded), ("external", external)] {
+                for depth in [0, 1, 17, 257] {
+                    let mut state = constraint.start();
+                    for _ in 0..depth { state.commit_token(b'!' as u32).unwrap(); }
+                    let mut mask = vec![0; 8]; state.fill_mask(&mut mask);
+                    assert_eq!(mask, expected, "{optimization:?} {representation} depth={depth}");
+                    if !state.is_accepting() { errors.push(format!("{optimization:?} {representation} depth={depth}: should accept")); }
+                }
+            }
+        }
+        let compiled = crate::DynamicConstraint::compile(crate::Grammar::glrm(source), &vocab).unwrap();
+        let loaded = crate::DynamicConstraint::load(&compiled.save()).unwrap();
+        let external = crate::DynamicConstraint::load_with_vocab(&compiled.save_with_external_vocab(), &vocab).unwrap();
+        for (representation, constraint) in [("direct", compiled), ("self", loaded), ("external", external)] {
+            for depth in [0, 1, 17, 257] {
+                let mut state = constraint.start();
+                for _ in 0..depth { state.commit_token(b'!' as u32).unwrap(); }
+                let mut mask = vec![0; 8]; state.fill_mask(&mut mask);
+                assert_eq!(mask, expected, "dynamic {representation} depth={depth}");
+                if !state.is_accepting() { errors.push(format!("dynamic {representation} depth={depth}: should accept")); }
+            }
+        }
+        assert!(errors.is_empty(), "{}", errors.join("\n"));
+    }
+
+    #[test]
+    fn native_nullable_start_rejects_incomplete_nonempty_prefixes() {
+        let vocab = crate::Vocab::new((0..256).map(|id| (id, vec![id as u8])).collect());
+        let source = "start s; nt s ::= '' | '!' 'x';";
+        let mut initial = vec![0; 8];
+        initial[b'!' as usize / 32] = 1 << (b'!' % 32);
+        let mut after_bang = vec![0; 8];
+        after_bang[b'x' as usize / 32] = 1 << (b'x' % 32);
+        for optimization in [crate::Optimization::Auto, crate::Optimization::FastBuild] {
+            let compiled = crate::Grammar::glrm(source).compile_with(&vocab, crate::BuildOptions::default().optimization(optimization)).unwrap();
+            let loaded = crate::Constraint::load(compiled.save()).unwrap();
+            let external = crate::Constraint::load_with_vocab(compiled.save_with_external_vocab().unwrap(), &vocab).unwrap();
+            for constraint in [compiled, loaded, external] {
+                let mut state = constraint.start();
+                let mut mask = vec![0; 8];
+                state.fill_mask(&mut mask); assert_eq!(mask, initial);
+                assert!(state.is_accepting());
+                state.commit_token(b'!' as u32).unwrap();
+                state.fill_mask(&mut mask); assert_eq!(mask, after_bang);
+                assert!(!state.is_accepting());
+                state.commit_token(b'x' as u32).unwrap();
+                assert!(state.is_accepting());
+                state.fill_mask(&mut mask); assert!(mask.iter().all(|&word| word == 0));
+            }
+        }
+        let compiled = crate::DynamicConstraint::compile(crate::Grammar::glrm(source), &vocab).unwrap();
+        let loaded = crate::DynamicConstraint::load(&compiled.save()).unwrap();
+        let external = crate::DynamicConstraint::load_with_vocab(&compiled.save_with_external_vocab(), &vocab).unwrap();
+        for constraint in [compiled, loaded, external] {
+            let mut state = constraint.start();
+            let mut mask = vec![0; 8];
+            state.fill_mask(&mut mask); assert_eq!(mask, initial);
+            assert!(state.is_accepting());
+            state.commit_token(b'!' as u32).unwrap();
+            state.fill_mask(&mut mask); assert_eq!(mask, after_bang);
+            assert!(!state.is_accepting());
+            state.commit_token(b'x' as u32).unwrap();
+            assert!(state.is_accepting());
+            state.fill_mask(&mut mask); assert!(mask.iter().all(|&word| word == 0));
+        }
+    }
+
+    #[test]
     fn nullable_terminal_expansion_allocates_above_sparse_start_id() {
         let mut rules = vec![Rule {
             lhs: 0,

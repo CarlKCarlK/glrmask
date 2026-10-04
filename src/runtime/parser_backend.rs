@@ -700,6 +700,23 @@ impl TemplateParser {
         false
     }
 
+    /// Restore the nullable source start removed by compiler normalization in
+    /// the executable EOF relation as well as its derived domain certificates.
+    /// Stack symbol zero is the native parser's initial grammar frontier.
+    pub(crate) fn preserve_start_nullable(&mut self) {
+        if self.completion.matches_top_first([0]) { return; }
+        let completion = link_program::compile(&[
+            link_program::action_nfa(&self.completion_template)
+                .expect("validated finite completion relation"),
+            link_program::nullable_return(0),
+        ]).expect("nullable completion must remain finite");
+        self.completion = Arc::new(compile_domain(&completion)
+            .expect("validated nullable completion domain"));
+        self.completion_template = Arc::new(completion);
+        (self.possible, self.unconditional) =
+            top_certificate_rows(self.state_count, &self.domains, &self.completion);
+    }
+
     pub(crate) fn finished(&self, stack: &ParserGSS) -> bool {
         if self.profile { self.completions.fetch_add(1, Ordering::Relaxed); }
         self.admits(stack, EOF)
