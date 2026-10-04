@@ -521,6 +521,69 @@ fn find_default_specialization_mismatch_with_wildcards(
     original: &UnweightedDfa,
     specialized: &UnweightedDfa,
 ) -> Option<Vec<i32>> {
+    // Wildcard union is still a scalar transition if every concrete POP
+    // shadow in a DEFAULT row points to that same DEFAULT target. This is a
+    // structural certificate over every row, not an assumption about the
+    // sampled words. Keep the complete product and local fresh representative.
+    if template_has_scalar_default_semantics(original) {
+        return find_scalar_default_specialization_mismatch(original, specialized);
+    }
+    find_default_specialization_mismatch_with_wildcards_reference(original, specialized)
+}
+
+fn template_has_scalar_default_semantics(dfa: &UnweightedDfa) -> bool {
+    dfa.states.iter().all(|state| {
+        state.transitions.get(&DEFAULT_LABEL).is_none_or(|default| {
+            state.transitions.iter().all(|(&label, target)|
+                label == DEFAULT_LABEL || label < 0 || target == default)
+        })
+    })
+}
+
+fn find_scalar_default_specialization_mismatch(
+    original: &UnweightedDfa,
+    specialized: &UnweightedDfa,
+) -> Option<Vec<i32>> {
+    let start = (Some(original.start_state), Some(specialized.start_state));
+    let mut seen = std::collections::HashSet::from([start]);
+    let mut nodes = vec![(start, None::<(usize, i32)>)];
+    let mut index = 0;
+    while index < nodes.len() {
+        let ((left, right), _) = nodes[index];
+        if dfa_accepts_at(original, left) != dfa_accepts_at(specialized, right) {
+            let mut witness = Vec::new();
+            let mut node = index;
+            while let Some((parent, label)) = nodes[node].1 {
+                witness.push(label);
+                node = parent;
+            }
+            witness.reverse();
+            return Some(witness);
+        }
+        let mut labels = BTreeSet::new();
+        add_outgoing_labels(original, left, &mut labels);
+        add_outgoing_labels(specialized, right, &mut labels);
+        labels.remove(&DEFAULT_LABEL);
+        let mut other = 0i32;
+        while labels.contains(&other) {
+            other = other.checked_add(1)
+                .expect("finite local template alphabet must leave a stack label unused");
+        }
+        labels.insert(other);
+        for label in labels {
+            let pair = (specialized_default_semantic_advance(original, left, label),
+                specialized_default_semantic_advance(specialized, right, label));
+            if seen.insert(pair) { nodes.push((pair, Some((index, label)))); }
+        }
+        index += 1;
+    }
+    None
+}
+
+fn find_default_specialization_mismatch_with_wildcards_reference(
+    original: &UnweightedDfa,
+    specialized: &UnweightedDfa,
+) -> Option<Vec<i32>> {
     let original_start = BTreeSet::from([original.start_state]);
     let specialized_start = Some(specialized.start_state);
     let mut seen = BTreeSet::from([(original_start.clone(), specialized_start)]);
@@ -555,7 +618,7 @@ fn find_default_specialization_mismatch_with_wildcards(
 }
 
 fn specialize_template_dfa_defaults_for_commit_determinized(dfa: &UnweightedDfa) -> UnweightedDfa {
-    if let Some(specialized) = specialize_default_free_template_dfa(dfa) {
+    if let Some(specialized) = specialize_scalar_template_dfa(dfa) {
         if template_quotient_validation_enabled()
             && let Some(witness) = find_default_specialization_mismatch(dfa, &specialized)
         {
@@ -567,12 +630,14 @@ fn specialize_template_dfa_defaults_for_commit_determinized(dfa: &UnweightedDfa)
 }
 
 /// Preserve the subset constructor's exact reachable BFS state numbering while
-/// avoiding singleton BTreeSet keys. DEFAULT or malformed graphs retain the
-/// original constructor and its full validation, including conservative sinks.
-fn specialize_default_free_template_dfa(dfa: &UnweightedDfa) -> Option<UnweightedDfa> {
+/// avoiding singleton BTreeSet keys. DEFAULT rows use this path only when the
+/// full structural certificate proves every wildcard union is a singleton.
+/// Genuine union or malformed graphs retain the original subset constructor.
+fn specialize_scalar_template_dfa(dfa: &UnweightedDfa) -> Option<UnweightedDfa> {
     if dfa.start_state as usize >= dfa.states.len()
-        || dfa.states.iter().any(|state| state.transitions.contains_key(&DEFAULT_LABEL)
-            || state.transitions.values().any(|&target| target as usize >= dfa.states.len()))
+        || !template_has_scalar_default_semantics(dfa)
+        || dfa.states.iter().any(|state|
+            state.transitions.values().any(|&target| target as usize >= dfa.states.len()))
     {
         return None;
     }
@@ -1733,6 +1798,70 @@ fn build_template_nfa(characterization: &TerminalCharacterization) -> NFA {
 #[cfg(test)]
 mod tests {
     #[test]
+    fn scalar_default_product_preserves_full_reference_and_exact_witnesses() {
+        let mut random = 0x81dc349bu32;
+        let mut next = || {
+            random = random.wrapping_mul(1664525).wrapping_add(1013904223);
+            random ^ (random >> 16)
+        };
+        for case in 0..192 {
+            let mut original = super::UnweightedDfa::new();
+            let mut specialized = super::UnweightedDfa::new();
+            for _ in 1..5 { original.add_state(); specialized.add_state(); }
+            for state in 0..5u32 {
+                let default = next() % 5;
+                original.add_transition(state, super::DEFAULT_LABEL, default);
+                for label in [-9, -2, 0, 1, 7, 19] {
+                    if next() & 1 != 0 {
+                        original.add_transition(state, label,
+                            if label >= 0 { default } else { next() % 5 });
+                    }
+                    if next() & 1 != 0 { specialized.add_transition(state, label, next() % 5); }
+                }
+                if next() & 1 != 0 { specialized.add_transition(state, super::DEFAULT_LABEL, next() % 5); }
+                original.states[state as usize].is_accepting = next() % 3 == 0;
+                specialized.states[state as usize].is_accepting = next() % 3 == 0;
+            }
+            if case % 4 == 0 {
+                original.states[2].transitions.insert(super::DEFAULT_LABEL, u32::MAX);
+                original.states[2].transitions.insert(7, u32::MAX);
+                original.states[2].transitions.insert(0, u32::MAX);
+                original.states[2].transitions.insert(1, u32::MAX);
+                original.states[2].transitions.insert(19, u32::MAX);
+                specialized.states[3].transitions.insert(1, u32::MAX);
+            }
+            let check = |left: &super::UnweightedDfa, right: &super::UnweightedDfa| {
+                assert_eq!(super::find_scalar_default_specialization_mismatch(left, right),
+                    super::find_default_specialization_mismatch_with_wildcards_reference(left, right),
+                    "scalar exact witness case {case}");
+                assert_eq!(super::find_default_specialization_mismatch_with_wildcards(left, right),
+                    super::find_default_specialization_mismatch_with_wildcards_reference(left, right),
+                    "dispatched exact witness case {case}");
+            };
+            check(&original, &specialized);
+            if case % 4 != 0 {
+                assert_eq!(super::specialize_scalar_template_dfa(&original).unwrap(),
+                    super::specialize_template_dfa_defaults_with_subsets(&original),
+                    "exact reachable BFS graph case {case}");
+            } else {
+                assert!(super::specialize_scalar_template_dfa(&original).is_none());
+            }
+            for state in &mut original.states { state.is_accepting = false; }
+            for state in &mut specialized.states { state.is_accepting = false; }
+            check(&original, &specialized);
+            specialized.states[4].is_accepting = true;
+            check(&original, &specialized);
+            // A genuine union row must retain the original subset proof.
+            original.states[0].transitions.insert(0, 2);
+            original.states[0].transitions.insert(super::DEFAULT_LABEL, 3);
+            assert!(super::specialize_scalar_template_dfa(&original).is_none());
+            assert_eq!(super::find_default_specialization_mismatch_with_wildcards(&original, &specialized),
+                super::find_default_specialization_mismatch_with_wildcards_reference(&original, &specialized),
+                "union fallback case {case}");
+        }
+    }
+
+    #[test]
     fn dense_closure_preserves_generated_subsets_and_exact_witnesses() {
         let mut random = 0xb13642c9u32;
         let mut next = || {
@@ -1959,7 +2088,12 @@ mod tests {
             }
             if case % 4 == 0 {
                 source.states[0].transitions.insert(DEFAULT_LABEL, 1);
-                assert!(super::specialize_default_free_template_dfa(&source).is_none());
+                assert_eq!(
+                    super::specialize_template_dfa_defaults_for_commit_determinized(&source),
+                    super::specialize_template_dfa_defaults_with_subsets(&source),
+                );
+                source.states[0].transitions.insert(7, 2);
+                assert!(super::specialize_scalar_template_dfa(&source).is_none());
                 assert_eq!(
                     super::specialize_template_dfa_defaults_for_commit_determinized(&source),
                     super::specialize_template_dfa_defaults_with_subsets(&source),
@@ -1971,7 +2105,7 @@ mod tests {
             source.add_transition(0, 7, u32::MAX);
             source
         }] {
-            assert!(super::specialize_default_free_template_dfa(&source).is_none());
+            assert!(super::specialize_scalar_template_dfa(&source).is_none());
             assert_eq!(
                 super::specialize_template_dfa_defaults_for_commit_determinized(&source),
                 super::specialize_template_dfa_defaults_with_subsets(&source),
