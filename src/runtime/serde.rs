@@ -3996,15 +3996,27 @@ fn restore_recursive_boundary_parser_v27(
             "serialized recursive boundary parser has an invalid start state".to_owned(),
         ));
     }
-    let weight_in_domain = |weight: &Weight| {
-        weight.is_empty()
+    // The boundary owns every weight for this traversal, so Arc identities
+    // cannot be reused. Cache only successful checks within this shard: its
+    // TSID and token domains can differ from those of another shard.
+    let mut validated_weights = FxHashSet::<usize>::default();
+    let mut weight_in_domain = |weight: &Weight| {
+        let key = weight.ptr_key();
+        if validated_weights.contains(&key) {
+            return true;
+        }
+        let valid = weight.is_empty()
             || weight.is_full()
             || weight.raw_range_values().all(|(range, tokens)| {
                 *range.end() < tsid_count as u32
                     && tokens
                         .ranges()
                         .all(|token_range| *token_range.end() < token_count as u32)
-            })
+            });
+        if valid {
+            validated_weights.insert(key);
+        }
+        valid
     };
     for (state_index, state) in boundary.parser_dwa.states().iter().enumerate() {
         if state
@@ -8491,6 +8503,85 @@ mod tests {
             ]),
         )
         .unwrap()
+    }
+
+
+    fn recursive_boundary_validation_fixture(
+        dwa: crate::automata::weighted_u32::dwa::DWA,
+        tsid_count: u32,
+        token_count: usize,
+    ) -> RecursiveSegmentedBoundaryParserV27 {
+        RecursiveSegmentedBoundaryParserV27 {
+            parser_dwa: dwa,
+            uses_composed_tsid_coordinate: false,
+            tokenizer_state_to_tsid: vec![tsid_count - 1],
+            internal_token_to_originals: vec![Vec::new(); token_count],
+        }
+    }
+
+    #[test]
+    fn recursive_boundary_validation_refuses_weight_domain_endpoints() {
+        use crate::automata::weighted_u32::dwa::DWA;
+        let constraint = tiny_constraint();
+        for weight in [
+            Weight::from_uniform(1..=1, range_set_blaze::RangeSetBlaze::from_iter([0])),
+            Weight::from_uniform(0..=0, range_set_blaze::RangeSetBlaze::from_iter([1])),
+        ] {
+            let mut dwa = DWA::new(1, 1);
+            dwa.add_state();
+            dwa.set_final_weight(0, weight);
+            let error = restore_recursive_boundary_parser_v27(
+                &constraint, recursive_boundary_validation_fixture(dwa, 1, 1), 1, 1,
+            ).unwrap_err().to_string();
+            assert!(error.contains("state 0 has an out-of-domain final weight"), "{error}");
+        }
+    }
+
+    #[test]
+    fn recursive_boundary_validation_rechecks_edges_after_shared_valid_weight() {
+        use crate::automata::weighted_u32::dwa::{DWA, DWAState};
+        let constraint = tiny_constraint();
+        let weight = Weight::from_uniform(
+            0..=0, range_set_blaze::RangeSetBlaze::from_iter([0]),
+        );
+        // The final weight is checked first. Its shared identity must not
+        // suppress either transition-target or parser-label refusal.
+        for (label, target, expected) in [
+            (1, 1, "state 0 has an invalid transition"),
+            (1, 0, "references parser state 1 outside the recursive domain"),
+            (-2, 0, "references parser state -2 outside the recursive domain"),
+        ] {
+            let state = DWAState {
+                transitions: [(label, (target, weight.clone()))].into_iter().collect(),
+                final_weight: Some(weight.clone()),
+            };
+            let error = restore_recursive_boundary_parser_v27(
+                &constraint,
+                recursive_boundary_validation_fixture(DWA::from_parts(vec![state], 0), 1, 1),
+                1, 1,
+            ).unwrap_err().to_string();
+            assert!(error.contains(expected), "{error}");
+        }
+    }
+
+    #[test]
+    fn recursive_boundary_validation_cache_is_local_to_each_shard() {
+        use crate::automata::weighted_u32::dwa::DWA;
+        let constraint = tiny_constraint();
+        let weight = Weight::from_uniform(
+            1..=1, range_set_blaze::RangeSetBlaze::from_iter([1]),
+        );
+        for (tsids, tokens, succeeds) in [(2, 2, true), (1, 2, false), (2, 1, false)] {
+            let mut dwa = DWA::new(tsids, tokens as u32);
+            dwa.add_state();
+            dwa.set_final_weight(0, weight.clone());
+            let result = restore_recursive_boundary_parser_v27(
+                &constraint,
+                recursive_boundary_validation_fixture(dwa, tsids, tokens),
+                1, 1,
+            );
+            assert_eq!(result.is_ok(), succeeds, "TSIDs={tsids}, tokens={tokens}");
+        }
     }
 
     fn sample_boundary_fingerprint() -> crate::runtime::BoundaryCandidateFingerprint {
