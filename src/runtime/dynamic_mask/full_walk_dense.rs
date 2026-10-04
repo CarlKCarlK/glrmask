@@ -3275,24 +3275,24 @@ fn full_walk_row_liveness_bound(
 /// Tags include the complete lexer ID; collisions only discard cached work.
 /// Parser IDs select disjoint rows and remain append-only within one walk.
 struct FullWalkBoundaryDirectCache {
-    rows: Vec<[u64; 16]>,
+    rows: Vec<[u64; 64]>,
 }
 
 impl FullWalkBoundaryDirectCache {
     fn new() -> Self { Self { rows: Vec::new() } }
 
-    fn push_row(&mut self) { self.rows.push([0; 16]); }
+    fn push_row(&mut self) { self.rows.push([0; 64]); }
 
     #[inline(always)]
     fn get(&self, parser: usize, lexer: u32) -> u8 {
-        let cell = self.rows[parser][lexer as usize & 15];
+        let cell = self.rows[parser][lexer as usize & 63];
         if cell >> 2 == u64::from(lexer) { (cell & 3) as u8 } else { 0 }
     }
 
     #[inline(always)]
     fn set(&mut self, parser: usize, lexer: u32, value: u8) {
         debug_assert!(value == 1 || value == 2);
-        self.rows[parser][lexer as usize & 15] = (u64::from(lexer) << 2) | u64::from(value);
+        self.rows[parser][lexer as usize & 63] = (u64::from(lexer) << 2) | u64::from(value);
     }
 
     /// Called once, before the first externally cached dense row pointer.
@@ -3324,12 +3324,12 @@ mod boundary_direct_cache_tests {
         assert_eq!(cache.get(0, 0), 0);
         cache.set(0, 0, 2); cache.set(1, 0, 1);
         assert_eq!(cache.get(0, 0), 2); assert_eq!(cache.get(1, 0), 1);
-        cache.set(0, 16, 1);
-        assert_eq!(cache.get(0, 0), 0); assert_eq!(cache.get(0, 16), 1);
+        cache.set(0, 64, 1);
+        assert_eq!(cache.get(0, 0), 0); assert_eq!(cache.get(0, 64), 1);
         assert_eq!(cache.get(1, 0), 1);
         cache.set(0, u32::MAX, 2);
         assert_eq!(cache.get(0, u32::MAX), 2);
-        assert_eq!(cache.get(0, 15), 0);
+        assert_eq!(cache.get(0, 63), 0);
     }
 
     #[test]
