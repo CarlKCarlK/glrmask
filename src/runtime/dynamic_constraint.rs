@@ -1054,7 +1054,7 @@ impl DynamicConstraint {
         parser: Arc<crate::runtime::parser_backend::TemplateParser>,
         vocab: &Vocab,
         dynamic_vocab: DynamicMaskVocab,
-        prepared_views: Option<crate::runtime::artifact::FastTemplateDfasByTerminal>,
+        prepared_views: Option<Vec<Option<Arc<crate::runtime::FastCommitTemplateDfas>>>>,
     ) -> Constraint {
         let ignore_expr = ignore_terminal.and_then(|t|tokenizer.terminal_expr(t).cloned());
         let terminal_exprs = tokenizer.terminal_exprs().map(ToOwned::to_owned);

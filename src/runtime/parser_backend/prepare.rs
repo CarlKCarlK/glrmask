@@ -542,7 +542,7 @@ pub(super) fn from_compiler_parts(
         );
         parser.embedding = metadata.embedding;
         parser.link_grammar = metadata.grammar;
-        Ok((parser, templates, runtime, signature_groups, exact_groups))
+        Ok::<_, crate::Error>((parser, templates, runtime, signature_groups, exact_groups))
     };
 
     let use_pool = !crate::compiler::macro_parallelism_disabled()
