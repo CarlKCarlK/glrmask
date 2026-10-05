@@ -40,6 +40,11 @@ pub mod __private {
         }
         pub mod analysis {
             pub use crate::glr::analysis::*;
+            // Explicit imports take precedence over the reference module's
+            // glob imports. All other analysis APIs remain unchanged.
+            pub use crate::glr::normalization::{
+                eliminate_right_recursion, has_indirect_left_recursion, normalize_grammar,
+            };
         }
         pub mod labels {
             pub use crate::glr::labels::*;

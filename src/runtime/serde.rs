@@ -25,6 +25,10 @@ use rustc_hash::{FxHashMap, FxHashSet};
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
+#[cfg(test)]
+#[path = "serde_remainder_tests.rs"]
+mod remainder_tests;
+
 const PREVIOUS_ROOT_POLICY_MAGIC: &[u8; 8] = b"GLRROOT1";
 const ROOT_POLICY_MAGIC: &[u8; 8] = b"GLRROOT2";
 
@@ -1056,8 +1060,13 @@ fn encode_composition_metadata_for_save(constraint: &Constraint) -> Vec<u8> {
         crate::compiler::boundary_precomputed_completion::wrap_envelope(bytes,wire)
             .expect("certified component index fits its bounded envelope")
     } else {
-        crate::compiler::boundary_precomputed_completion::split_envelope(&bytes)
-            .expect("retained composition envelope validated at load").0.to_vec()
+        let body = crate::compiler::boundary_precomputed_completion::split_envelope(&bytes)
+            .expect("retained composition envelope validated at load").0;
+        if body.len() == bytes.len() {
+            bytes
+        } else {
+            body.to_vec()
+        }
     }
 }
 fn encode_composition_metadata_base_for_save(constraint: &Constraint) -> Vec<u8> {
@@ -3170,13 +3179,19 @@ fn encode_current_runtime_wire(
     metadata: &ConstraintArtifactCurrentRuntimeRef<'_>,
     static_residual: &[u8],
 ) -> Vec<u8> {
-    let mut meta = Vec::with_capacity(256 * 1024);
-    bincode::serialize_into(&mut meta, metadata).expect("constraint runtime metadata serialization should succeed");
-    let mut out = Vec::with_capacity(CURRENT_RUNTIME_HEADER_LEN + meta.len() + static_residual.len());
+    let capacity = CURRENT_RUNTIME_HEADER_LEN
+        .checked_add(256 * 1024)
+        .and_then(|length| length.checked_add(static_residual.len()))
+        .expect("constraint runtime section capacity overflow");
+    let mut out = Vec::with_capacity(capacity);
     out.extend_from_slice(&CURRENT_RUNTIME_MAGIC);
-    out.extend_from_slice(&(meta.len() as u64).to_le_bytes());
+    out.extend_from_slice(&0u64.to_le_bytes());
     out.extend_from_slice(&(static_residual.len() as u64).to_le_bytes());
-    out.extend_from_slice(&meta);
+    let metadata_start = out.len();
+    bincode::serialize_into(&mut out, metadata)
+        .expect("constraint runtime metadata serialization should succeed");
+    let metadata_len = out.len() - metadata_start;
+    out[4..12].copy_from_slice(&(metadata_len as u64).to_le_bytes());
     out.extend_from_slice(static_residual);
     out
 }
@@ -6100,6 +6115,8 @@ impl Constraint {
     }
 
     fn save_body_with_vocab_policy(&self, external_vocab: bool) -> Vec<u8> {
+        let _remainder_trace =
+            crate::dynamic_constraint::remainder_trace::Session::new("constraint.snapshot_body");
         let artifact_version = if external_vocab { EXTERNAL_TEMPLATE_CONSTRAINT_VERSION }
             else if self.has_template_parser() { TEMPLATE_CONSTRAINT_VERSION } else { CONSTRAINT_VERSION };
         if let Some(bytes) = &self.serialized_artifact_cache {

@@ -11,6 +11,12 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 
+#[path = "build_remainder_trace.rs"]
+pub(crate) mod remainder_trace;
+#[cfg(test)]
+#[path = "dynamic_constraint_remainder_tests.rs"]
+mod remainder_tests;
+
 use crate::automata::lexer::Lexer;
 use crate::automata::lexer::tokenizer::{
     TerminalProjectedQuotient, Tokenizer, VirtualTokenizerRuntimeMetadata,
@@ -1852,8 +1858,12 @@ impl DynamicConstraint {
         self.build_external_vocab_artifact_bytes()
     }
 
-    pub(crate) fn into_saved(self) -> Vec<u8> {
-        self.save_with_external_vocab()
+    pub(crate) fn into_saved(mut self) -> Vec<u8> {
+        match self.external_vocab_artifact_cache.take() {
+            Some(bytes) => Arc::try_unwrap(bytes)
+                .unwrap_or_else(|bytes| bytes.as_ref().clone()),
+            None => self.build_external_vocab_artifact_bytes(),
+        }
     }
 
     fn load_transfer_v11(bytes: &[u8], vocab: &Vocab) -> crate::Result<Self> {

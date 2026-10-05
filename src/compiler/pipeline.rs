@@ -6339,6 +6339,9 @@ fn compile_dynamic_owned_with_vocab_partition_impl(
     default_table_construction: GlrTableConstruction,
     finalization: DynamicPartitionFinalization,
 ) -> crate::Result<DynamicConstraint> {
+    let remainder_trace =
+        crate::dynamic_constraint::remainder_trace::Session::new("o2.outer");
+    let remainder_parent = remainder_trace.id();
     let finalize_runtime = finalization != DynamicPartitionFinalization::Deferred;
     let profile = compile_profile_enabled();
     let total_started = profile.then(Instant::now);
@@ -6353,6 +6356,8 @@ fn compile_dynamic_owned_with_vocab_partition_impl(
             crate::compiler::macro_join(
                 "dynamic_vocab_partition_core_quotient",
                 || {
+                    let _span = crate::dynamic_constraint::remainder_trace::Span::new(
+                        "o2.core.worker", remainder_parent);
                     let started = Instant::now();
                     let constraint = compile_dynamic_owned_impl(
                         grammar,
@@ -6375,6 +6380,8 @@ fn compile_dynamic_owned_with_vocab_partition_impl(
                     (constraint, elapsed_ms(started))
                 },
                 || {
+                    let _span = crate::dynamic_constraint::remainder_trace::Span::new(
+                        "o2.quotient.worker", remainder_parent);
                     let partition_started = Instant::now();
                     let partition = crate::compiler::vocab_partition::compile_vocab_partition_owned(
                         partition_grammar,
@@ -6396,6 +6403,8 @@ fn compile_dynamic_owned_with_vocab_partition_impl(
                 },
             )
         });
+    crate::dynamic_constraint::remainder_trace::mark(
+        "o2.join.return", remainder_parent);
     let (mut constraint, prepared_parsers) = constraint?;
     let mut quotient = quotient?;
     let quotient_tokens = quotient.canonical_token_count();
@@ -6410,7 +6419,11 @@ fn compile_dynamic_owned_with_vocab_partition_impl(
     constraint.inner.lazy_dynamic_mask_vocab = std::sync::OnceLock::new();
     let rebuild_started = profile.then(Instant::now);
     if finalize_runtime {
-        constraint.inner.rebuild_dynamic_runtime_caches();
+        {
+            let _span = crate::dynamic_constraint::remainder_trace::Span::new(
+                "o2.runtime_caches", remainder_parent);
+            constraint.inner.rebuild_dynamic_runtime_caches();
+        }
         // O2 build time and persistence time are measured independently. For
         // genuinely tiny runtimes, eagerly serializing the transfer artifact is
         // a material fraction of compile latency while the first on-demand save
@@ -6584,6 +6597,9 @@ fn compile_dynamic_owned_early_overlap(
     finalize_runtime: bool,
     start_nullable: bool,
 ) -> crate::Result<DynamicConstraint> {
+    let remainder_trace =
+        crate::dynamic_constraint::remainder_trace::Session::new("dynamic.early_overlap");
+    let remainder_parent = remainder_trace.id();
     let profile = compile_profile_enabled();
     let total_started = profile.then(Instant::now);
     let shared_started = profile.then(Instant::now);
@@ -6598,6 +6614,8 @@ fn compile_dynamic_owned_early_overlap(
             true,
             "dynamic_early_tokenizer_and_parser",
             || -> crate::Result<(DynamicTokenizerLaneResult, f64, f64)> {
+                let _span = crate::dynamic_constraint::remainder_trace::Span::new(
+                    "dynamic.early_tokenizer.worker", remainder_parent);
                 let factor_started = profile.then(Instant::now);
                 let prepared_expressions = prepare_factored_terminal_expressions(&lexer_grammar);
                 let factor_ms = factor_started.map_or(0.0, elapsed_ms);
@@ -6615,6 +6633,8 @@ fn compile_dynamic_owned_early_overlap(
                 Ok((result, factor_ms, tokenizer_ms))
             },
             || -> crate::Result<(GrammarDef, GLRTable, bool, f64, f64, f64)> {
+                let _span = crate::dynamic_constraint::remainder_trace::Span::new(
+                    "dynamic.early_parser.worker", remainder_parent);
                 let prepare_started = profile.then(Instant::now);
                 let (prepared_grammar, terminal_domain_changed) =
                     prepare_dynamic_parser_after_terminal_domain(shared_grammar);
@@ -6631,6 +6651,11 @@ fn compile_dynamic_owned_early_overlap(
                     default_table_construction,
                 );
                 let table_ms = elapsed_ms(table_started);
+                {
+                    let _span = crate::dynamic_constraint::remainder_trace::Span::new(
+                        "temporary_grammar_analysis.destroy", remainder_parent);
+                    drop(analyzed);
+                }
                 Ok((
                     prepared_grammar,
                     table,
@@ -6641,6 +6666,8 @@ fn compile_dynamic_owned_early_overlap(
                 ))
             },
         );
+        crate::dynamic_constraint::remainder_trace::mark(
+            "dynamic.early_join.return", remainder_parent);
         let (
             (mut tokenizer, mut mask_tokenizer_quotient, mut prebuilt_virtual_residual_projection),
             mut factor_ms,
@@ -6706,10 +6733,16 @@ fn compile_dynamic_owned_early_overlap(
                 .set_virtual_residuals_mask_projection(mask_tokenizer, projections);
         }
         if finalize_runtime {
+            let _span = crate::dynamic_constraint::remainder_trace::Span::new(
+                "dynamic.runtime_caches", remainder_parent);
             constraint.inner.rebuild_dynamic_runtime_caches();
         }
-        constraint.inner.set_composition_start_nullable(start_nullable);
-        constraint.set_composition_grammar(prepared_grammar);
+        {
+            let _span = crate::dynamic_constraint::remainder_trace::Span::new(
+                "dynamic.source_and_composition_metadata", remainder_parent);
+            constraint.inner.set_composition_start_nullable(start_nullable);
+            constraint.set_composition_grammar(prepared_grammar);
+        }
         if finalize_runtime {
             constraint.cache_external_vocab_artifact_for_save();
         }
@@ -6730,7 +6763,14 @@ fn compile_dynamic_owned_impl(
     default_table_construction: GlrTableConstruction,
     finalize_runtime: bool,
 ) -> crate::Result<DynamicConstraint> {
-    let start_nullable = grammar.start_is_nullable();
+    let remainder_trace =
+        crate::dynamic_constraint::remainder_trace::Session::new("dynamic.core");
+    let remainder_parent = remainder_trace.id();
+    let start_nullable = {
+        let _span = crate::dynamic_constraint::remainder_trace::Span::new(
+            "grammar.source_nullability", remainder_parent);
+        grammar.start_is_nullable()
+    };
     // Ordinary non-tiny grammars can start terminal factoring/tokenizer construction
     // after a small shared terminal-domain prefix, while parser-only normalization,
     // analysis, and table construction continue on the sibling lane. Very large
@@ -6981,7 +7021,13 @@ fn compile_dynamic_owned_impl(
                         default_table_construction,
                     )
                 };
-                    (table, elapsed_ms(started_at), analysis_ms)
+                    let table_ms = elapsed_ms(started_at);
+                    {
+                        let _span = crate::dynamic_constraint::remainder_trace::Span::new(
+                            "temporary_grammar_analysis.destroy", remainder_parent);
+                        drop(analyzed_grammar);
+                    }
+                    (table, table_ms, analysis_ms)
                 },
                 || {
                     let started_at = Instant::now();
@@ -7029,10 +7075,16 @@ fn compile_dynamic_owned_impl(
                 .set_virtual_residuals_mask_projection(mask_tokenizer, projections);
         }
         if finalize_runtime {
+            let _span = crate::dynamic_constraint::remainder_trace::Span::new(
+                "dynamic.runtime_caches", remainder_parent);
             constraint.inner.rebuild_dynamic_runtime_caches();
         }
-        constraint.inner.set_composition_start_nullable(start_nullable);
-        constraint.set_composition_grammar(prepared_grammar);
+        {
+            let _span = crate::dynamic_constraint::remainder_trace::Span::new(
+                "dynamic.source_and_composition_metadata", remainder_parent);
+            constraint.inner.set_composition_start_nullable(start_nullable);
+            constraint.set_composition_grammar(prepared_grammar);
+        }
         if finalize_runtime {
             constraint.cache_external_vocab_artifact_for_save();
         }
