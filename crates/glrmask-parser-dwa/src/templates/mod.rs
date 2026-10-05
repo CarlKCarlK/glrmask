@@ -53,6 +53,29 @@ pub fn commit_template_dfas_enabled() -> bool {
     env_flag("GLRMASK_ENABLE_COMMIT_TEMPLATE_DFAS").unwrap_or(false)
 }
 
+/// Expensive compiler algorithm equivalence checks are validation work, not
+/// template construction. Unit tests always run them; integration tests/CI
+/// opt in explicitly. Runtime admission and input validation are independent.
+pub(crate) fn compiler_template_validation_enabled() -> bool {
+    compiler_template_validation_policy(cfg!(test), env_flag("GLRMASK_VALIDATE_COMPILER_TEMPLATES"))
+}
+
+fn compiler_template_validation_policy(unit_test: bool, requested: Option<bool>) -> bool {
+    unit_test || requested.unwrap_or(false)
+}
+
+#[cfg(test)]
+mod validation_policy_tests {
+    #[test]
+    fn production_default_off_explicit_on_tests_cannot_disable() {
+        use super::compiler_template_validation_policy as enabled;
+        assert!(!enabled(false, None));
+        assert!(!enabled(false, Some(false)));
+        assert!(enabled(false, Some(true)));
+        for flag in [None, Some(false), Some(true)] { assert!(enabled(true, flag)); }
+    }
+}
+
 pub(crate) mod admissibility;
 pub(crate) mod characterize;
 pub(crate) mod compile_bundle;

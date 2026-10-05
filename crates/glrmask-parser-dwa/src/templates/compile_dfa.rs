@@ -20,7 +20,7 @@ use crate::compiler::glr::labels::{
 };
 use crate::compiler::glr::table::{Action, GLRTable};
 use crate::compiler::stages::templates::characterize::{StackMatcher, TerminalCharacterization};
-use crate::compiler::stages::templates::commit_template_dfas_enabled;
+use super::compiler_template_validation_enabled;
 use crate::ds::weight::Weight;
 use crate::grammar::flat::TerminalID;
 use crate::runtime::CommitTemplateDfas;
@@ -147,7 +147,7 @@ fn skip_template_minimization_enabled() -> bool {
 }
 
 fn template_quotient_validation_enabled() -> bool {
-    commit_template_dfas_enabled() || env_flag_enabled("GLRMASK_VALIDATE_TEMPLATE_QUOTIENT")
+    compiler_template_validation_enabled() || env_flag_enabled("GLRMASK_VALIDATE_TEMPLATE_QUOTIENT")
 }
 
 fn nfa_size(nfa: &NFA) -> (usize, usize) {
@@ -1048,7 +1048,9 @@ pub fn try_split_commit_template_dfas(
         pop_to_push,
         read_to_push,
     };
-    if find_split_commit_language_mismatch(dfa, &split).is_some() {
+    if template_quotient_validation_enabled()
+        && find_split_commit_language_mismatch(dfa, &split).is_some()
+    {
         return None;
     }
     Some(split)
