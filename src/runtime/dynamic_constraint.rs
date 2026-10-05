@@ -4162,10 +4162,11 @@ mod tests {
     }
 
     fn compile_compressed_dynamic(source: &str, vocab: &Vocab) -> DynamicConstraint {
-        crate::compiler::pipeline::compile_dynamic_owned_with_table_construction(
+        crate::compiler::pipeline::compile_dynamic_owned_with_backend(
             compressed_lark_grammar(source),
             vocab,
             crate::compiler::glr::table::GlrTableConstruction::ExperimentalCoreMerged,
+            crate::runtime::parser_backend::DynamicParserBackend::Native,
         )
         .unwrap()
     }
@@ -4768,14 +4769,14 @@ mod tests {
     #[test]
     fn dynamic_v20_persists_vocab_and_validates_shared_vocab() {
         let vocab = Vocab::new(vec![(0,b"a".to_vec()),(1,b"ab".to_vec()),(2,b"b".to_vec())]);
-        let constraint = DynamicConstraint::from_ebnf("start ::= 'a'+", &vocab).unwrap();
+        let constraint = DynamicConstraint::from_ebnf_with_bounded_template_parser("start ::= 'a'+", &vocab).unwrap();
         let current = constraint.save();
         assert_eq!(u16::from_le_bytes([current[8],current[9]]), TEMPLATE_DYNAMIC_CONSTRAINT_VERSION);
         let loaded = DynamicConstraint::load(&current).unwrap();
         assert!(loaded.inner.dynamic_mask_vocab.to_artifact().is_some());
         assert_eq!(loaded.start().mask(), constraint.start().mask());
         let other_vocab = Vocab::new(vec![(0,b"z".to_vec())]);
-        let other = DynamicConstraint::from_ebnf("start ::= 'z'+", &other_vocab).unwrap();
+        let other = DynamicConstraint::from_ebnf_with_bounded_template_parser("start ::= 'z'+", &other_vocab).unwrap();
         let malformed = DynamicConstraint::from_constraints(vec![constraint.into_constraint(), other.into_constraint()]).save();
         let error = DynamicConstraint::load(&malformed).unwrap_err();
         assert!(error.to_string().contains("alternatives have different token bytes"));
@@ -4836,7 +4837,7 @@ mod tests {
             (3, b"bb".to_vec()),
             (4, b"x".to_vec()),
         ]);
-        let constraint = DynamicConstraint::from_glrm_grammar(
+        let constraint = DynamicConstraint::from_glrm_with_bounded_template_parser(
             r#"
                 start start;
                 t A ::= /a{0,10000}/;
@@ -4902,7 +4903,7 @@ mod tests {
             "minLength": 2,
             "maxLength": 5000
         }"#;
-        let constraint = DynamicConstraint::from_json_schema(schema, &vocab).unwrap();
+        let constraint = DynamicConstraint::from_json_schema_with_bounded_template_parser(schema, &vocab).unwrap();
         assert!(constraint.inner.tokenizer.has_any_virtual_runtime());
 
         // Test current V13 save and load.
@@ -5028,7 +5029,7 @@ mod tests {
             (2, b"aaa".to_vec()),
             (3, b"x".to_vec()),
         ]);
-        let constraint = DynamicConstraint::from_glrm_grammar(
+        let constraint = DynamicConstraint::from_glrm_with_bounded_template_parser(
             r#"
                 start start;
                 t A ::= /a{0,10000}/;
@@ -5072,13 +5073,14 @@ mod tests {
     #[test]
     fn dynamic_v20_combines_composition_and_residual_runtime_metadata() {
         let vocab = Vocab::new(vec![(0, b"a".to_vec()), (1, b"aa".to_vec())]);
-        let mut constraint = DynamicConstraint::from_glrm_grammar(
+        let mut constraint = crate::import::compile_dynamic_glrm_fixture(
             r#"
                 start start;
                 t A ::= /a{0,10000}/;
                 nt start ::= A;
             "#,
             &vocab,
+            crate::runtime::parser_backend::DynamicParserBackend::Native,
         )
         .unwrap();
         constraint.inner.late_grammar_slots = vec![crate::runtime::LateGrammarSlot {
@@ -7380,9 +7382,15 @@ mod tests {
             (5, b"f".to_vec()),
             (6, b"g".to_vec()),
         ]);
-        let mut constraint = DynamicConstraint::from_glrm_grammar(
-            "start start; t A ::= \"abcdef\"; t B ::= \"abcdeg\"; nt start ::= A | B;",
+        let mut constraint = crate::compiler::pipeline::compile_dynamic_owned_with_backend(
+            crate::grammar::ast::lower(&crate::grammar::factoring::factor_named_grammar(
+                crate::import::parse_glrm_to_named(
+                    "start start; t A ::= \"abcdef\"; t B ::= \"abcdeg\"; nt start ::= A | B;",
+                ).unwrap(),
+            )).unwrap(),
             &vocab,
+            crate::compiler::glr::table::GlrTableConstruction::ExperimentalCoreMerged,
+            crate::runtime::parser_backend::DynamicParserBackend::Native,
         )
         .unwrap();
         let twin = constraint.clone();
@@ -7622,10 +7630,11 @@ mod tests {
         let mut factored = crate::grammar::factoring::factor_named_grammar(named);
         crate::import::json_schema::prepare_named_grammar(&mut factored).unwrap();
         let grammar = crate::grammar::ast::lower(&factored).unwrap();
-        let mut constraint = crate::compiler::pipeline::compile_dynamic_owned_with_table_construction(
+        let mut constraint = crate::compiler::pipeline::compile_dynamic_owned_with_backend(
             grammar,
             &vocab,
             crate::compiler::glr::table::GlrTableConstruction::LegacyRowBisim,
+            crate::runtime::parser_backend::DynamicParserBackend::Native,
         )
         .unwrap();
         let quotients = constraint

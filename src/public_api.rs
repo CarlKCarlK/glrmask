@@ -1438,8 +1438,11 @@ impl GrammarBinding<'_> {
 /// Every compiled component must already own its native parser; linking
 /// cannot materialize an LR-backed Constraint as an intermediate.
 fn require_composable_parser(constraint: &RuntimeConstraint) -> Result<()> {
-    assert!(constraint.has_template_parser() && !constraint.table.is_present(),
-        "LR-BACKED CONSTRAINT COMPOSITION IS FORBIDDEN");
+    if !constraint.has_template_parser() || constraint.table.is_present() {
+        return Err(Error::Compilation(
+            "compiled grammar composition requires native template components; LR-backed components are unsupported".into(),
+        ));
+    }
     Ok(())
 }
 
@@ -2624,6 +2627,57 @@ where
 }
 
 #[cfg(test)]
+fn native_dynamic_fixture(grammar: Grammar<'_>, vocab: &Vocab) -> Result<DynamicConstraint> {
+    assert!(grammar.bindings.is_empty(), "fixture supplies compiled bindings separately");
+    let constraint = match grammar.source {
+        // Keep the ordinary full-vocabulary lane in EBNF comparison fixtures,
+        // while selecting its parser representation explicitly.
+        GrammarSource::Ebnf(source) => {
+            let named = crate::import::parse_ebnf_to_named(source)?;
+            let factored = crate::grammar::factoring::factor_named_grammar(named);
+            crate::compiler::pipeline::compile_dynamic_owned_with_backend(
+                crate::grammar::ast::lower(&factored)?, vocab,
+                crate::compiler::glr::table::GlrTableConstruction::ExperimentalCoreMerged,
+                crate::runtime::parser_backend::DynamicParserBackend::Native,
+            )?
+        }
+        GrammarSource::Glrm(source) => crate::import::compile_dynamic_glrm_fixture(
+            source, vocab, crate::runtime::parser_backend::DynamicParserBackend::Native,
+        )?,
+        GrammarSource::Lark(source) => DynamicConstraint::from_lark_with_bounded_template_parser(source, vocab)?,
+        GrammarSource::JsonSchema(source) => DynamicConstraint::from_json_schema_with_bounded_template_parser(source, vocab)?,
+    };
+    assert!(constraint.clone_constraints().iter().all(|body|
+        body.has_template_parser() && !body.table.is_present() && body.uses_dynamic_runtime()));
+    Ok(constraint)
+}
+
+#[cfg(test)]
+impl ConstraintSpec<'_> {
+    /// These fixtures exercise native composition, independent of the ordinary
+    /// Dynamic development override. Children must already be compiled native
+    /// fixtures; source-child compilation is covered by the public API gates.
+    fn compile_native_dynamic_fixture(&self) -> Result<DynamicConstraint> {
+        assert!(self.token_bindings.is_empty());
+        let parents = native_dynamic_fixture(self.grammar.clone(), self.vocab)?;
+        let mut constraint = if self.grammar_bindings.is_empty() {
+            parents
+        } else {
+            let children = prepare_compiled_children(
+                self.compile_children(ChildCompileMode::Dynamic)?, self.vocab,
+                SegmentedBoundaryBackend::Dynamic,
+            )?;
+            *compose_boxed_dynamic_parents(Box::new(parents), &children, self.vocab)?
+        };
+        for body in constraint.constraints_mut() {
+            let _ = body.late_bind_vocab.set(self.vocab.clone());
+            body.build_boundary_trigger(self.boundary_trigger_detail).map_err(Error::Compilation)?;
+        }
+        Ok(constraint)
+    }
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use crate::automata::lexer::tokenizer::Lexer;
@@ -3188,7 +3242,7 @@ mod tests {
         assert_eq!(child_partition.class_of(2), child_partition.class_of(3));
         assert_eq!(child_partition.class_of(4), child_partition.class_of(5));
 
-        let ordinary_child = DynamicConstraint::compile(child_grammar.clone(), &vocab).unwrap();
+        let ordinary_child = native_dynamic_fixture(child_grammar.clone(), &vocab).unwrap();
         let optimized_child =
             DynamicConstraint::compile_with_vocab_partition(child_grammar, &vocab).unwrap();
         assert_eq!(optimized_child.inner.token_bytes_count(), vocab.len());
@@ -3202,7 +3256,7 @@ mod tests {
             .unwrap()
             .build()
             .unwrap()
-            .compile_dynamic()
+            .compile_native_dynamic_fixture()
             .unwrap();
         let optimized = ConstraintSpec::builder(parent, &vocab)
             .unwrap()
@@ -3210,7 +3264,7 @@ mod tests {
             .unwrap()
             .build()
             .unwrap()
-            .compile_dynamic()
+            .compile_native_dynamic_fixture()
             .unwrap();
 
         let ordinary_mask = ordinary.start().mask();
@@ -3316,6 +3370,37 @@ mod tests {
     }
 
     #[test]
+    fn lr_component_composition_returns_compilation_error() {
+        let vocab = Vocab::new(vec![(0, b"x".to_vec()), (1, b"y".to_vec()), (2, b"xy".to_vec())]);
+        let lr = |source: &str| crate::import::compile_dynamic_glrm_fixture(
+            source, &vocab, crate::runtime::parser_backend::DynamicParserBackend::LrTable,
+        ).unwrap();
+        let source = "start start; extern grammar child; nt start ::= 'x' child;";
+        let parent = RuntimeConstraint::compile(Grammar::glrm(source), &vocab).unwrap();
+        let child = lr("start start; nt start ::= 'y';");
+        assert!(child.inner.table.is_present());
+        assert!(!child.inner.has_template_parser());
+        let spec = ConstraintSpec::builder(Grammar::glrm(source), &vocab).unwrap()
+            .bind_grammar("child", &child).unwrap().build().unwrap();
+        for error in [spec.compile().unwrap_err(), spec.compile_dynamic().unwrap_err(),
+            parent.bind_grammar("child", &child).unwrap_err(),
+            parent.bind_grammar_dynamic_boundary("child", &child).unwrap_err()] {
+            assert!(matches!(error, Error::Compilation(_)));
+            assert!(error.to_string().contains("LR-backed components are unsupported"));
+        }
+        let lr_parent = lr(source);
+        let native_child = RuntimeConstraint::compile(Grammar::ebnf("start ::= 'y'"), &vocab).unwrap();
+        for error in [lr_parent.bind_grammar("child", &native_child).unwrap_err(),
+            lr_parent.bind_grammar_dynamic_boundary("child", &native_child).unwrap_err()] {
+            assert!(matches!(error, Error::Compilation(_)));
+            assert!(error.to_string().contains("LR-backed components are unsupported"));
+        }
+        // Failed linking must leave the retained LR object usable.
+        assert_eq!(child.start().mask()[0] & 2, 2);
+        assert!(child.inner.table.is_present());
+    }
+
+    #[test]
     fn segmented_composition_preserves_supplied_component_backends() {
         let vocab = Vocab::new(vec![
             (0, b"x".to_vec()),
@@ -3329,7 +3414,7 @@ mod tests {
         let static_child = RuntimeConstraint::compile(Grammar::ebnf(r#"start ::= "y""#), &vocab)
             .unwrap();
         let dynamic_child =
-            DynamicConstraint::compile(Grammar::ebnf(r#"start ::= "y""#), &vocab).unwrap();
+            native_dynamic_fixture(Grammar::ebnf(r#"start ::= "y""#), &vocab).unwrap();
 
         let static_with_dynamic = ConstraintSpec::builder(parent.clone(), &vocab)
             .unwrap()
@@ -3352,7 +3437,7 @@ mod tests {
             .unwrap()
             .build()
             .unwrap()
-            .compile_dynamic()
+            .compile_native_dynamic_fixture()
             .unwrap();
         for alternative in dynamic_with_static.clone_constraints() {
             assert_eq!(component_backend_flags(&alternative), vec![true, false]);
@@ -3371,7 +3456,7 @@ mod tests {
             .unwrap()
             .build()
             .unwrap()
-            .compile_dynamic()
+            .compile_native_dynamic_fixture()
             .unwrap();
         for alternative in dynamic_with_dynamic.clone_constraints() {
             assert_eq!(component_backend_flags(&alternative), vec![true, true]);
@@ -3392,11 +3477,11 @@ mod tests {
             "glrm 1; start start; extern grammar child; nt start = \"x\" child;",
         );
         let static_parent = RuntimeConstraint::compile(one_slot.clone(), &vocab).unwrap();
-        let dynamic_parent = DynamicConstraint::compile(one_slot, &vocab).unwrap();
+        let dynamic_parent = native_dynamic_fixture(one_slot, &vocab).unwrap();
         let static_child = RuntimeConstraint::compile(Grammar::ebnf(r#"start ::= "y""#), &vocab)
             .unwrap();
         let dynamic_child =
-            DynamicConstraint::compile(Grammar::ebnf(r#"start ::= "y""#), &vocab).unwrap();
+            native_dynamic_fixture(Grammar::ebnf(r#"start ::= "y""#), &vocab).unwrap();
 
         let bound = static_parent.bind_grammar("child", &static_child).unwrap();
         assert_eq!(leaf_backend_flags(&bound), vec![false, false]);
@@ -3471,7 +3556,7 @@ mod tests {
         let fully_bound = partially_bound
             .bind_grammar(
                 "right",
-                DynamicConstraint::compile(Grammar::ebnf(r#"start ::= "z""#), &vocab).unwrap(),
+                native_dynamic_fixture(Grammar::ebnf(r#"start ::= "z""#), &vocab).unwrap(),
             )
             .unwrap();
         assert!(fully_bound.late_grammar_slots.is_empty());
@@ -3481,14 +3566,14 @@ mod tests {
         let fully_bound = partially_bound
             .bind_grammar_dynamic_boundary(
                 "right",
-                DynamicConstraint::compile(Grammar::ebnf(r#"start ::= "z""#), &vocab).unwrap(),
+                native_dynamic_fixture(Grammar::ebnf(r#"start ::= "z""#), &vocab).unwrap(),
             )
             .unwrap();
         assert!(fully_bound.late_grammar_slots.is_empty());
         assert_eq!(leaf_backend_flags(&fully_bound), vec![false, false, true]);
         assert_dynamic_boundary(&fully_bound);
 
-        let open = DynamicConstraint::compile(
+        let open = native_dynamic_fixture(
             Grammar::glrm(
                 "glrm 1; start start; extern grammar left; extern grammar right; \
                  nt start = \"x\" left right;",
@@ -3498,7 +3583,7 @@ mod tests {
         .unwrap();
         let partially_bound = open.bind_grammar("left", &static_child).unwrap();
         let dynamic_right =
-            DynamicConstraint::compile(Grammar::ebnf(r#"start ::= "z""#), &vocab).unwrap();
+            native_dynamic_fixture(Grammar::ebnf(r#"start ::= "z""#), &vocab).unwrap();
         let fully_bound = partially_bound.bind_grammar("right", &dynamic_right).unwrap();
         for alternative in fully_bound.clone_constraints() {
             assert_eq!(leaf_backend_flags(&alternative), vec![true, false, true]);
@@ -3601,14 +3686,14 @@ mod tests {
             &vocab,
         )
         .unwrap();
-        let parent = DynamicConstraint::compile(
+        let parent = native_dynamic_fixture(
             Grammar::glrm(
                 "glrm 1; start start; extern grammar child; nt start = \"x\" child;",
             ),
             &vocab,
         )
         .unwrap();
-        let child = DynamicConstraint::compile(Grammar::ebnf(r#"start ::= "y""#), &vocab)
+        let child = native_dynamic_fixture(Grammar::ebnf(r#"start ::= "y""#), &vocab)
             .unwrap();
 
         for dynamic_boundary in [false, true] {
@@ -3904,6 +3989,7 @@ mod tests {
         .boundary_trigger_detail(crate::BoundaryTriggerDetail::Exact)
         .build()
         .unwrap();
+        let child = child_spec.compile_native_dynamic_fixture().unwrap();
         // Keep one child component so its local-LR -> composed-LR relation is
         // functional, while the parent also has an equivalent local lexical
         // lane. The outer lexer product can then coalesce parent + child lanes
@@ -3914,11 +4000,11 @@ mod tests {
         );
         let composed = ConstraintSpec::builder(parent, &vocab)
             .unwrap()
-            .bind_grammar("child", child_spec)
+            .bind_grammar("child", &child)
             .unwrap()
             .build()
             .unwrap()
-            .compile_dynamic()
+            .compile_native_dynamic_fixture()
             .unwrap();
         let alternatives = composed.clone_constraints();
         assert_eq!(alternatives.len(), 1);
@@ -3985,7 +4071,7 @@ mod tests {
             crate::runtime::BoundaryTrigger::Exact(_)
         ));
 
-        let dynamic_constraint = spec.compile_dynamic().unwrap();
+        let dynamic_constraint = spec.compile_native_dynamic_fixture().unwrap();
         assert!(dynamic_constraint.clone_constraints().iter().all(|constraint| {
             matches!(constraint.boundary_trigger, crate::runtime::BoundaryTrigger::Exact(_))
         }));
@@ -5460,11 +5546,11 @@ mod tests {
         let vocab = Vocab::new(vec![
             (0, b"x".to_vec()), (1, b"y".to_vec()), (2, b"xy".to_vec()),
         ]);
-        let parent = DynamicConstraint::compile(
+        let parent = native_dynamic_fixture(
             Grammar::glrm("glrm 1; start start; extern grammar child; nt start = \"x\" child;"),
             &vocab,
         ).unwrap();
-        let child = DynamicConstraint::compile(Grammar::ebnf(r#"start ::= "y""#), &vocab).unwrap();
+        let child = native_dynamic_fixture(Grammar::ebnf(r#"start ::= "y""#), &vocab).unwrap();
         let retained = parent.inner.late_bind_vocab.get().expect("retain supplied vocabulary");
         assert!(Arc::ptr_eq(&retained.entries_arc(), &vocab.entries_arc()));
 
@@ -5503,7 +5589,7 @@ mod tests {
         )
         .unwrap();
         let child =
-            DynamicConstraint::compile(Grammar::ebnf(r#"start ::= "y""#), &vocab).unwrap();
+            native_dynamic_fixture(Grammar::ebnf(r#"start ::= "y""#), &vocab).unwrap();
 
         assert!(
             parent.late_bind_vocab.get().is_some(),
@@ -5742,7 +5828,7 @@ mod cached_parent_main_tests {
     #[test]
     fn dynamic_compile_preserves_unbound_external_grammar() {
         let vocab = vocab();
-        let open = DynamicConstraint::compile(
+        let open = native_dynamic_fixture(
             Grammar::glrm(
                 "glrm 1; extern grammar payload; start document; nt document = payload;",
             ),

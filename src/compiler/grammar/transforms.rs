@@ -1496,7 +1496,7 @@ mod tests {
     fn dynamic_native_recursive_unary_preserves_full_masks_and_unbounded_completion() {
         let vocab = crate::Vocab::new((0..=255).map(|id| (id, vec![id as u8])).collect());
         let grammar = "start p; nt p ::= unary ';'; nt unary ::= 'x' | '!' unary;";
-        let constraint = crate::DynamicConstraint::compile(crate::Grammar::glrm(grammar), &vocab).unwrap();
+        let constraint = crate::DynamicConstraint::from_glrm_with_bounded_template_parser(grammar, &vocab).unwrap();
         let backend = crate::__private::dynamic_parser_backend_report(&constraint);
         assert!(backend.as_array().unwrap().iter().all(|v|
             v["backend"] == "acyclic-template-dfa" && v["lr_table_present"] == false));

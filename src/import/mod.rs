@@ -516,6 +516,33 @@ fn compile_bounded_template_from_source(
     })
 }
 
+
+/// Test-only explicit parser selection on the ordinary full-vocabulary import
+/// lane, including the real external-grammar placeholder lifecycle. This never
+/// mutates the process-wide Dynamic development override.
+#[cfg(test)]
+pub(crate) fn compile_dynamic_glrm_fixture(
+    source: &str, vocab: &crate::Vocab,
+    backend: crate::runtime::parser_backend::DynamicParserBackend,
+) -> crate::Result<DynamicConstraint> {
+    let parsed = crate::grammar::glrm::from_glrm_with_bindings_and_external_subgrammars(
+        source, first_external_placeholder_token_id(vocab)?, std::iter::empty(), &[],
+    )?;
+    let placeholders = parsed.placeholders.iter()
+        .map(|slot| (slot.token_id, slot.binding_name.clone())).collect::<Vec<_>>();
+    let alternatives = dynamic_named_alternatives_from_named(parsed.grammar, None, &[])?;
+    let compiled = alternatives.into_iter().map(|named| {
+        compile_dynamic_owned_with_backend(ast::lower(&named)?, vocab,
+            GlrTableConstruction::ExperimentalCoreMerged, backend)
+    }).collect::<crate::Result<Vec<_>>>()?;
+    let mut constraint = DynamicConstraint::from_alternatives(compiled);
+    constraint.attach_late_grammar_placeholders(&placeholders)?;
+    for body in constraint.constraints_mut() {
+        let _ = body.late_bind_vocab.set(vocab.clone());
+    }
+    Ok(constraint)
+}
+
 fn compile_dynamic_from_named(
     named: ast::NamedGrammar,
     vocab: &crate::Vocab,
