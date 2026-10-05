@@ -107,5 +107,8 @@ pub mod __private {
         pub mod compile_dfa {
             pub use crate::templates::compile_dfa::*;
         }
+        pub mod native {
+            pub use crate::templates::native::*;
+        }
     }
 }

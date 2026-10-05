@@ -57,7 +57,10 @@ pub fn commit_template_dfas_enabled() -> bool {
 /// template construction. Unit tests always run them; integration tests/CI
 /// opt in explicitly. Runtime admission and input validation are independent.
 pub(crate) fn compiler_template_validation_enabled() -> bool {
-    compiler_template_validation_policy(cfg!(test), env_flag("GLRMASK_VALIDATE_COMPILER_TEMPLATES"))
+    compiler_template_validation_policy(
+        cfg!(test),
+        env_flag("GLRMASK_VALIDATE_COMPILER_TEMPLATES"),
+    )
 }
 
 fn compiler_template_validation_policy(unit_test: bool, requested: Option<bool>) -> bool {
@@ -72,7 +75,9 @@ mod validation_policy_tests {
         assert!(!enabled(false, None));
         assert!(!enabled(false, Some(false)));
         assert!(enabled(false, Some(true)));
-        for flag in [None, Some(false), Some(true)] { assert!(enabled(true, flag)); }
+        for flag in [None, Some(false), Some(true)] {
+            assert!(enabled(true, flag));
+        }
     }
 }
 
@@ -81,5 +86,6 @@ pub(crate) mod characterize;
 pub(crate) mod compile_bundle;
 pub(crate) mod completion;
 pub(crate) mod compile_dfa;
+pub(crate) mod native;
 
 pub use compile_dfa::Templates;

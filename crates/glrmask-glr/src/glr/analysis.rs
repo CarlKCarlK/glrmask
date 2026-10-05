@@ -9,6 +9,10 @@ use crate::grammar::flat::{GrammarDef, NonterminalID, Rule, Symbol, Terminal, Te
 
 pub const EOF: TerminalID = u32::MAX;
 
+#[cfg(test)]
+#[path = "analysis/native_normalization_tests.rs"]
+mod native_normalization_tests;
+
 fn compile_profile_enabled() -> bool {
     std::env::var_os("GLRMASK_PROFILE_COMPILE").is_some()
         || std::env::var_os("GLRMASK_PROFILE_COMPILE_SUMMARY").is_some()
@@ -2747,7 +2751,7 @@ pub fn normalize_grammar(rules: &mut Vec<Rule>, start: NonterminalID) {
 
         let inline_rules_before = rules.len();
         let inline_started_at = profiling.then(Instant::now);
-        replace_rules_with_resync(rules, &next_nt, inline_null_productions);
+        inline_null_productions_in_place_if_needed(rules, &next_nt);
         // A -> A contributes no terminal derivation. Epsilon elimination can
         // expose it, and rewriting it as right recursion would manufacture a
         // fresh nullable self-cycle on every subsequent iteration.
@@ -2870,7 +2874,7 @@ pub fn normalize_grammar(rules: &mut Vec<Rule>, start: NonterminalID) {
     let post_inline_snapshot = (!nullable_eliminated_before_exit).then(|| rules.clone());
     let post_inline_started_at = profiling.then(Instant::now);
     if !nullable_eliminated_before_exit {
-        replace_rules_with_resync(rules, &next_nt, inline_null_productions);
+        inline_null_productions_in_place_if_needed(rules, &next_nt);
         rules.retain(|rule| !is_reflexive_unit_rule(rule));
     }
     let post_inline_changed = post_inline_snapshot
@@ -2938,6 +2942,21 @@ pub fn normalize_dynamic_glr_grammar(rules: &mut Vec<Rule>, start: NonterminalID
     dedup_rules(rules);
 }
 
+fn inline_null_productions_in_place_if_needed(
+    rules: &mut Vec<Rule>,
+    next_nt: &std::cell::Cell<u32>,
+) {
+    // In this CFG algebra terminals are nonnullable symbols. A nullable
+    // derivation must therefore have an empty production at a leaf.
+    // Without one, both existing epsilon helpers return exact input clones.
+    // Retain the original allocation instead, without changing rule order.
+    if rules.iter().any(|rule| rule.rhs.is_empty()) {
+        replace_rules_with_resync(rules, next_nt, inline_null_productions);
+    } else {
+        resync_next_nonterminal(rules, next_nt);
+    }
+}
+
 fn replace_rules_with_resync(
     rules: &mut Vec<Rule>,
     next_nt: &std::cell::Cell<u32>,
@@ -2963,6 +2982,12 @@ fn resync_next_nonterminal(rules: &[Rule], next_nt: &std::cell::Cell<u32>) {
 
 fn compute_nullable(rules: &[Rule], num_nt: u32) -> BTreeSet<NonterminalID> {
     use std::collections::VecDeque;
+
+    // Exact fixed-point seed test. Cycles of nonempty productions alone
+    // cannot derive epsilon, so avoid allocating the dependency graph.
+    if !rules.iter().any(|rule| rule.lhs < num_nt && rule.rhs.is_empty()) {
+        return BTreeSet::new();
+    }
 
     let n = num_nt as usize;
     let mut remaining = vec![usize::MAX; rules.len()];

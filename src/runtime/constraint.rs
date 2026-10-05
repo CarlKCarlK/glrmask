@@ -11729,13 +11729,33 @@ impl Constraint {
     }
 
     pub(crate) fn compute_fast_template_dfas(&self) -> FastTemplateDfasByTerminal {
+        let mut shared = rustc_hash::FxHashMap::<
+            usize, Arc<FastCommitTemplateDfas>,
+        >::default();
+        for (source, view) in self.template_dfas_by_terminal.iter()
+            .zip(&self.fast_template_dfas_by_terminal)
+        {
+            if let (Some(source), Some(view)) = (source, view)
+                && view.is_for_source(source)
+            {
+                shared.entry(Arc::as_ptr(source) as usize)
+                    .or_insert_with(|| Arc::clone(view));
+            }
+        }
         self.template_dfas_by_terminal
             .iter()
             .map(|template| {
-                template
-                    .as_deref()
-                    .map(FastCommitTemplateDfas::from_template)
-                    .map(Arc::new)
+                template.as_ref().map(|source| {
+                    let identity = Arc::as_ptr(source) as usize;
+                    if let Some(view) = shared.get(&identity) {
+                        return Arc::clone(view);
+                    }
+                    let view = Arc::new(
+                        FastCommitTemplateDfas::from_shared_source(Arc::clone(source))
+                    );
+                    shared.insert(identity, Arc::clone(&view));
+                    view
+                })
             })
             .collect()
     }

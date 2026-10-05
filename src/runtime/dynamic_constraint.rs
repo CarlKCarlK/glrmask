@@ -762,11 +762,11 @@ impl DynamicConstraint {
             &table, direct_regular_automaton.as_ref(), &[], ignore_terminal, true, false,
         ).expect("compiler must prepare a complete native parser before Constraint materialization");
         drop(table);
-        let mut inner = Self::from_template_runtime_parts_unfinalized(
+        let mut inner = Self::from_template_runtime_parts_unfinalized_with_views(
             tokenizer, terminal_display_names, ignore_terminal, prepared.templates,
             Arc::new(prepared.parser), vocab, dynamic_mask_vocab,
+            Some(prepared.runtime),
         );
-        inner.fast_template_dfas_by_terminal = prepared.runtime;
         inner.special_token_terminals = special_token_terminals;
         inner.direct_regular_automaton = direct_regular_automaton;
         Self { inner, alternatives: Vec::new(), composition_grammars: vec![None],
@@ -1040,6 +1040,22 @@ impl DynamicConstraint {
         vocab: &Vocab,
         dynamic_vocab: DynamicMaskVocab,
     ) -> Constraint {
+        Self::from_template_runtime_parts_unfinalized_with_views(
+            tokenizer, terminal_display_names, ignore_terminal,
+            templates, parser, vocab, dynamic_vocab, None,
+        )
+    }
+
+    pub(crate) fn from_template_runtime_parts_unfinalized_with_views(
+        tokenizer: Tokenizer,
+        terminal_display_names: Vec<String>,
+        ignore_terminal: Option<TerminalID>,
+        templates: Vec<Option<Arc<crate::runtime::CommitTemplateDfas>>>,
+        parser: Arc<crate::runtime::parser_backend::TemplateParser>,
+        vocab: &Vocab,
+        dynamic_vocab: DynamicMaskVocab,
+        prepared_views: Option<crate::runtime::artifact::FastTemplateDfasByTerminal>,
+    ) -> Constraint {
         let ignore_expr = ignore_terminal.and_then(|t|tokenizer.terminal_expr(t).cloned());
         let terminal_exprs = tokenizer.terminal_exprs().map(ToOwned::to_owned);
         let payload = DynamicConstraintPayloadV2 {
@@ -1055,8 +1071,23 @@ impl DynamicConstraint {
         inner.template_dfas_by_terminal = templates;
         inner.template_parser = Some(parser);
         inner.fast_template_dfas_by_terminal = if inner.template_parser.as_ref().unwrap().composition.is_some() {
+            assert!(prepared_views.as_ref().is_none_or(Vec::is_empty),
+                "scoped parser must not install an unrelated standalone view inventory");
             Vec::new() // Scoped providers borrow each component prepared view.
-        } else { inner.compute_fast_template_dfas() };
+        } else if let Some(views) = prepared_views {
+            assert_eq!(views.len(), inner.template_dfas_by_terminal.len(),
+                "prepared view inventory must cover every terminal");
+            assert!(inner.template_dfas_by_terminal.iter().zip(&views)
+                .all(|(source, view)| match (source, view) {
+                    (Some(source), Some(view)) => view.is_for_source(source),
+                    (None, None) => true,
+                    _ => false,
+                }),
+                "prepared views must retain their exact immutable source identities");
+            views
+        } else {
+            inner.compute_fast_template_dfas()
+        };
         let _ = inner.late_bind_vocab.set(vocab.clone());
         assert!(!inner.table.is_present(), "data-only constructor created an LR table");
         inner
@@ -2940,19 +2971,20 @@ impl DynamicConstraint {
     fn save_template_alternatives(&self, external_vocab: bool) -> Vec<u8> {
         let constraints = std::iter::once(&self.inner).chain(&self.alternatives);
         let count = self.alternatives.len().checked_add(1).expect("dynamic alternative count");
-        let mut payload = Vec::new();
-        payload.extend_from_slice(&u32::try_from(count).expect("dynamic alternative count fits u32").to_le_bytes());
-        for constraint in constraints {
-            assert!(constraint.has_template_parser(), "mixed LR/template dynamic artifacts are unsupported");
-            let bytes = if external_vocab { constraint.save_template_with_external_vocab() } else { constraint.save() };
-            payload.extend_from_slice(&(bytes.len() as u64).to_le_bytes());
-            payload.extend_from_slice(&bytes);
-        }
-        let mut bytes = Vec::with_capacity(DYNAMIC_CONSTRAINT_HEADER_LEN + payload.len());
+        let mut bytes = Vec::new();
         bytes.extend_from_slice(if external_vocab { &DYNAMIC_TRANSFER_MAGIC } else { &DYNAMIC_CONSTRAINT_MAGIC });
         bytes.extend_from_slice(&(if external_vocab { TEMPLATE_DYNAMIC_TRANSFER_VERSION } else { TEMPLATE_DYNAMIC_CONSTRAINT_VERSION }).to_le_bytes());
-        bytes.extend_from_slice(&(payload.len() as u64).to_le_bytes());
-        bytes.extend_from_slice(&payload);
+        bytes.extend_from_slice(&0u64.to_le_bytes());
+        bytes.extend_from_slice(&u32::try_from(count).expect("dynamic alternative count fits u32").to_le_bytes());
+        for constraint in constraints {
+            assert!(constraint.has_template_parser(), "mixed LR/template dynamic artifacts are unsupported");
+            let body = if external_vocab { constraint.save_template_with_external_vocab() } else { constraint.save() };
+            bytes.reserve(8usize.checked_add(body.len()).expect("dynamic alternative size overflow"));
+            bytes.extend_from_slice(&(body.len() as u64).to_le_bytes());
+            bytes.extend_from_slice(&body);
+        }
+        let payload_len = bytes.len() - DYNAMIC_CONSTRAINT_HEADER_LEN;
+        bytes[10..18].copy_from_slice(&(payload_len as u64).to_le_bytes());
         bytes
     }
 

@@ -3,14 +3,17 @@
 //! Completion is an input predicate, not a stack-return operation. Preserve
 //! the actual finite return relation before discarding the built-in LR table;
 //! a later linker must never reconstruct that table or guess a return depth.
-use std::{collections::{BTreeMap, BTreeSet}, sync::Arc};
+
+use std::{collections::BTreeSet, sync::Arc};
+
 use super::{CommitTemplateDfas, Constraint};
 use crate::compiler::glr::table::GLRTable;
 use glrmask_parser_dwa::__private::templates::characterize::{
-    characterize_finish_transfer, FinishEndpointPolicy,
+    FinishEndpointPolicy,
 };
-use glrmask_parser_dwa::__private::templates::compile_dfa::{Templates,
-    specialize_template_dfa_defaults_for_commit_split_input, try_split_commit_template_dfas};
+use glrmask_parser_dwa::__private::templates::native::{
+    NativeTableIndex, ProgramCompiler,
+};
 
 #[derive(Debug, Clone)]
 pub(crate) struct TemplateEmbedding {
@@ -22,16 +25,21 @@ pub(crate) struct TemplateEmbedding {
 }
 
 impl TemplateEmbedding {
-    pub(crate) fn new(nullable: bool, return_pop: u32, entries: BTreeSet<u32>,
-        finish: Arc<CommitTemplateDfas>, symbols: u32) -> Result<Self, String> {
-        let finish_view = super::scoped_program::ScopedProgram::prepare(Arc::clone(&finish), symbols)
-            .map_err(|error| error.to_string())?;
+    pub(crate) fn new(
+        nullable: bool,
+        return_pop: u32,
+        entries: BTreeSet<u32>,
+        finish: Arc<CommitTemplateDfas>,
+        symbols: u32,
+    ) -> Result<Self, String> {
+        let finish_view = super::scoped_program::ScopedProgram::prepare(
+            Arc::clone(&finish), symbols,
+        ).map_err(|error| error.to_string())?;
         Ok(Self { nullable, return_pop, entries, finish, finish_view })
     }
 
     /// Only for the built-in depth-one regular frontend: its generated EOF
     /// program has exactly the POP-one return semantics, not just a predicate.
-    /// Retain source nullability even when standalone preparation removed it.
     pub(crate) fn from_sparse_regular(
         completion: &Arc<CommitTemplateDfas>,
         symbols: u32,
@@ -45,30 +53,64 @@ impl TemplateEmbedding {
                 super::link_program::action_nfa(completion)?,
                 super::link_program::nullable_return(0),
             ])?)
-        } else { Arc::clone(completion) };
+        } else {
+            Arc::clone(completion)
+        };
         Self::new(nullable, 1, slots.into_iter().collect(), finish, symbols)
     }
 
-    pub(crate) fn from_table(table: &GLRTable, nullable: bool, return_pop: u32,
-        slots: impl IntoIterator<Item = u32>) -> Result<Self, String> {
-        let transfer = characterize_finish_transfer(table, &FinishEndpointPolicy {
-            return_pop, nullable_child_start: nullable.then_some(0),
+    /// Native compiler path: reuse the table index and the entry certificate
+    /// issued by that same immutable borrow. No second slot scan or discarded
+    /// completion/domain preparation is performed.
+    pub(crate) fn from_index(
+        index: &NativeTableIndex<'_>,
+        compiler: &ProgramCompiler,
+        nullable: bool,
+        return_pop: u32,
+    ) -> Result<Self, String> {
+        let transfer = index.finish(FinishEndpointPolicy {
+            return_pop,
+            nullable_child_start: nullable.then_some(0),
         })?;
-        let raw = Templates::from_characterizations(&BTreeMap::from([(0, transfer.characterization)]))
-            .by_terminal.remove(&0).ok_or("missing finite embedding return relation")?;
-        let raw = specialize_template_dfa_defaults_for_commit_split_input(&raw);
-        let finish = try_split_commit_template_dfas(&raw)
-            .ok_or("embedding return is not a finite POP/READ/PUSH relation")?;
-        super::compile_domain(&finish).map_err(|error| error.to_string())?;
+        let finish = compiler.compile(&transfer.characterization)?;
+        Self::new(
+            nullable,
+            return_pop,
+            index.valid_slot_entry_terminals().clone(),
+            Arc::new(finish),
+            index.table().num_states,
+        )
+    }
+
+    /// Existing selected-slot compiler API. Arbitrary requested slots retain
+    /// their mandatory shape checks; only the index-issued all-valid inventory
+    /// can use from_index without repeating those checks.
+    pub(crate) fn from_table(
+        table: &GLRTable,
+        nullable: bool,
+        return_pop: u32,
+        slots: impl IntoIterator<Item = u32>,
+    ) -> Result<Self, String> {
+        let selected = vec![false; table.num_terminals as usize];
+        let index = NativeTableIndex::new(table, &selected)?;
+        let transfer = index.finish(FinishEndpointPolicy {
+            return_pop,
+            nullable_child_start: nullable.then_some(0),
+        })?;
+        let finish = ProgramCompiler::new().compile(&transfer.characterization)?;
         let entries = slots.into_iter().collect::<BTreeSet<_>>();
-        // Identical complete logical slot checks, batched over table rows.
         crate::compiler::boundary_transfer::validate_slot_entry_shapes(table, &entries)?;
-        Self::new(nullable, return_pop, entries, Arc::new(finish), table.num_states)
+        Self::new(
+            nullable, return_pop, entries, Arc::new(finish), table.num_states,
+        )
     }
 
     pub(crate) fn from_constraint(constraint: &Constraint) -> Result<Self, String> {
-        Self::from_table(&constraint.table, constraint.composition_start_nullable()?,
+        Self::from_table(
+            &constraint.table,
+            constraint.composition_start_nullable()?,
             constraint.composition_child_return_pop()?,
-            constraint.late_grammar_slots.iter().map(|slot| slot.terminal_id))
+            constraint.late_grammar_slots.iter().map(|slot| slot.terminal_id),
+        )
     }
 }
