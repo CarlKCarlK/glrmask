@@ -166,6 +166,13 @@ pub struct VocabularyRepeatHorizonCache {
     horizons: Mutex<FxHashMap<RepeatBodyLanguageKey, Option<usize>>>,
 }
 
+#[derive(Debug)]
+struct RepeatHorizonLongestTokens {
+    tokens: Vec<Vec<u8>>,
+}
+
+impl glrmask_vocab::__private::VocabDerivedArtifact for RepeatHorizonLongestTokens {}
+
 #[doc(hidden)]
 pub fn build_bounded_code_mask_component_for_vocab(
     expr: &Expr,
@@ -397,6 +404,74 @@ fn max_repeat_translation_over_vocab_suffixes(
     automaton: &RepeatTranslationAutomaton,
     vocab: &Vocab,
 ) -> usize {
+    // Every byte contributes at most the largest live edge weight, including
+    // suffixes restarted at an arbitrary translation control state. A longest
+    // vocabulary token attaining that bound proves the exact global maximum.
+    // Common character bodies attain it on a long whitespace token; avoid
+    // rescanning every model token with the full control-state DP in that case.
+    let max_edge_weight = automaton.transitions.iter()
+        .flat_map(|row| row.iter())
+        .filter(|edge| edge.target != DEAD_REPEAT_TRANSLATION_STATE)
+        .map(|edge| usize::from(edge.completed))
+        .max().unwrap_or(0);
+    if max_edge_weight == 0 {
+        return 0;
+    }
+    let max_token_len = vocab.max_token_byte_len();
+    if let Some(upper_bound) = max_token_len.checked_mul(max_edge_weight) {
+        // This small witness set depends only on the immutable vocabulary.
+        // Prepare it on first use inside build and share it across schemas;
+        // avoid a vocabulary-length scan for each new repeat-body language.
+        let longest = vocab.vocab_derived_cache_get::<RepeatHorizonLongestTokens>()
+            .unwrap_or_else(|| {
+                let longest = std::sync::Arc::new(RepeatHorizonLongestTokens {
+                    tokens: vocab.entries_map().values()
+                        .filter(|token| token.len() == max_token_len).cloned().collect(),
+                });
+                vocab.vocab_derived_cache_set(std::sync::Arc::clone(&longest));
+                longest
+            });
+        let mut current = vec![i32::MIN; automaton.transitions.len()];
+        let mut next = current.clone();
+        for token in &longest.tokens {
+            if max_repeat_translation_over_token(automaton, token, &mut current, &mut next) == upper_bound {
+                return upper_bound;
+            }
+        }
+    }
+    max_repeat_translation_over_vocab_suffixes_exhaustive(automaton, vocab)
+}
+
+fn max_repeat_translation_over_token(
+    automaton: &RepeatTranslationAutomaton,
+    token: &[u8],
+    current: &mut Vec<i32>,
+    next: &mut Vec<i32>,
+) -> usize {
+    current.fill(i32::MIN);
+    let mut best = 0i32;
+    for &byte in token {
+        next.fill(i32::MIN);
+        for (state, row) in automaton.transitions.iter().enumerate() {
+            let score = current[state].max(0);
+            let edge = row[byte as usize];
+            if edge.target == DEAD_REPEAT_TRANSLATION_STATE {
+                continue;
+            }
+            let candidate = score.saturating_add(i32::from(edge.completed));
+            best = best.max(candidate);
+            let slot = &mut next[edge.target as usize];
+            *slot = (*slot).max(candidate);
+        }
+        std::mem::swap(current, next);
+    }
+    best.max(0) as usize
+}
+
+fn max_repeat_translation_over_vocab_suffixes_exhaustive(
+    automaton: &RepeatTranslationAutomaton,
+    vocab: &Vocab,
+) -> usize {
     let state_count = automaton.transitions.len();
     if state_count == 0 {
         return 0;
@@ -415,27 +490,7 @@ fn max_repeat_translation_over_vocab_suffixes(
                 )
             },
             |(current, next), token| {
-                current.fill(i32::MIN);
-                let mut best = 0i32;
-                for &byte in token.iter() {
-                    next.fill(i32::MIN);
-                    for (state, row) in automaton.transitions.iter().enumerate() {
-                        // Start a new suffix at this byte from any reachable
-                        // translation control state, or continue an earlier
-                        // suffix when that has accumulated more completions.
-                        let score = current[state].max(0);
-                        let edge = row[byte as usize];
-                        if edge.target == DEAD_REPEAT_TRANSLATION_STATE {
-                            continue;
-                        }
-                        let candidate = score.saturating_add(i32::from(edge.completed));
-                        best = best.max(candidate);
-                        let slot = &mut next[edge.target as usize];
-                        *slot = (*slot).max(candidate);
-                    }
-                    std::mem::swap(current, next);
-                }
-                best.max(0) as usize
+                max_repeat_translation_over_token(automaton, token, current, next)
             },
         )
         .max()
@@ -15953,6 +16008,90 @@ mod tests {
             super::vocabulary_repeat_boundary_horizon(&body, &vocab),
             Some(4),
         );
+    }
+
+    #[test]
+    fn vocabulary_repeat_horizon_longest_witness_matches_exhaustive() {
+        for pattern in ["[ab]", "ab", "a?b", "a+", "a{1,3}", "(ab|a)", "[a-z0-9]", "[^x]"] {
+            let body = super::compile_expr_to_dfa(&parse_regex(pattern, false));
+            for seed in 0..32u64 {
+                let mut generator = seed + 1;
+                let mut entries = vec![(0, b"aaaaaaaaaaaaaaaa".to_vec()), (1, b"xxxxxxxxxxxxxxxxx".to_vec())];
+                for id in 2..34 {
+                    let mut bytes = Vec::new();
+                    for _ in 0..(id % 15) {
+                        generator = generator.wrapping_mul(6364136223846793005).wrapping_add(1);
+                        bytes.push(b"abx01"[((generator >> 32) % 5) as usize]);
+                    }
+                    entries.push((id, bytes));
+                }
+                let vocab = Vocab::new(entries);
+                let Some(automaton) = super::build_repeat_translation_automaton(&body, &vocab.relevant_bytes()) else { continue; };
+                assert_eq!(super::max_repeat_translation_over_vocab_suffixes(&automaton, &vocab),
+                    super::max_repeat_translation_over_vocab_suffixes_exhaustive(&automaton, &vocab),
+                    "pattern={pattern} seed={seed}");
+            }
+        }
+        // Exercise the upper-bound witness as well as the exhaustive fallback.
+        let body = super::compile_expr_to_dfa(&parse_regex("[ab]", false));
+        for entries in [vec![(0, b"aaaaaaaa".to_vec()), (1, b"bbb".to_vec())],
+            vec![(0, b"xxxxxxxxx".to_vec()), (1, b"aaaa".to_vec())]] {
+            let vocab = Vocab::new(entries);
+            let automaton = super::build_repeat_translation_automaton(&body, &vocab.relevant_bytes()).unwrap();
+            assert_eq!(super::max_repeat_translation_over_vocab_suffixes(&automaton, &vocab),
+                super::max_repeat_translation_over_vocab_suffixes_exhaustive(&automaton, &vocab));
+        }
+    }
+
+    #[test]
+    fn vocabulary_repeat_horizon_weighted_witness_preserves_suffix_restarts() {
+        let mut first = Box::new([super::RepeatTranslationEdge::DEAD; 256]);
+        let mut second = first.clone();
+        first[b'a' as usize] = super::RepeatTranslationEdge { target: 1, completed: 3 };
+        second[b'b' as usize] = super::RepeatTranslationEdge { target: 1, completed: 2 };
+        let automaton = super::RepeatTranslationAutomaton { transitions: vec![first, second] };
+        for entries in [vec![(0, b"xabbb".to_vec()), (1, b"aaa".to_vec())],
+            vec![(0, b"xxxxxxxx".to_vec()), (1, b"bbb".to_vec())]] {
+            let vocab = Vocab::new(entries);
+            assert_eq!(super::max_repeat_translation_over_vocab_suffixes(&automaton, &vocab),
+                super::max_repeat_translation_over_vocab_suffixes_exhaustive(&automaton, &vocab));
+        }
+    }
+
+    #[test]
+    #[ignore = "requires the exact model vocabulary diagnostic byte fixture"]
+    fn vocabulary_repeat_horizon_model_diagnostic() {
+        let bytes = std::fs::read(std::env::var("GLRMASK_P90_DIAG_VOCAB_BYTES").unwrap()).unwrap();
+        let mut offset = 0usize;
+        let next_u32 = |bytes: &[u8], offset: &mut usize| {
+            let value = u32::from_le_bytes(bytes[*offset..*offset + 4].try_into().unwrap());
+            *offset += 4;
+            value
+        };
+        let count = next_u32(&bytes, &mut offset);
+        let mut entries = Vec::new();
+        for id in 0..count {
+            let length = next_u32(&bytes, &mut offset) as usize;
+            entries.push((id, bytes[offset..offset + length].to_vec()));
+            offset += length;
+        }
+        assert_eq!(offset, bytes.len());
+        let vocab = Vocab::new(entries);
+        let body = super::compile_expr_to_dfa(&parse_regex(r#"([^"\\\x00-\x1f]|\\["\\/bfnrt]|\\u[0-9a-fA-F]{4})"#, true));
+        let automaton = super::build_repeat_translation_automaton(&body, &vocab.relevant_bytes()).unwrap();
+        let mut original = Vec::new();
+        let mut optimized = Vec::new();
+        for pair in 0..8 {
+            for fast in if pair % 2 == 0 { [false, true] } else { [true, false] } {
+                let started = std::time::Instant::now();
+                let result = if fast { super::max_repeat_translation_over_vocab_suffixes(&automaton, &vocab) }
+                    else { super::max_repeat_translation_over_vocab_suffixes_exhaustive(&automaton, &vocab) };
+                let elapsed = started.elapsed().as_secs_f64() * 1e3;
+                assert_eq!(result, 128);
+                if fast { optimized.push(elapsed); } else { original.push(elapsed); }
+            }
+        }
+        eprintln!("model_horizon_diagnostic body_states={} translation_states={} original_ms={original:?} optimized_ms={optimized:?}", body.num_states(), automaton.transitions.len());
     }
 
     #[test]
