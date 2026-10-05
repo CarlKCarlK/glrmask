@@ -341,7 +341,31 @@ fn dedup_flattening_is_iterative_at_large_dependency_depth() {
 
     assert_eq!(rules[0], rule(0, vec![nt(1)]));
     assert_eq!(rules.len(), n as usize + 1);
-    assert!(earley_accepts(&rules, 0, &[7]));
+    // This fixture has only unit and single-terminal productions. An
+    // independent reachability recognizer establishes its complete language
+    // without the deliberately simple Earley oracle's cubic repeated scans.
+    let mut by_lhs = BTreeMap::<u32, Vec<&Rule>>::new();
+    for rule in &rules {
+        assert_eq!(rule.rhs.len(), 1);
+        by_lhs.entry(rule.lhs).or_default().push(rule);
+    }
+    let mut pending = vec![0u32];
+    let mut visited = BTreeSet::new();
+    let mut language = BTreeSet::new();
+    while let Some(nonterminal) = pending.pop() {
+        if !visited.insert(nonterminal) {
+            continue;
+        }
+        if let Some(alternatives) = by_lhs.get(&nonterminal) {
+            for rule in alternatives {
+                match rule.rhs[0] {
+                    Symbol::Nonterminal(next) => pending.push(next),
+                    Symbol::Terminal(terminal) => { language.insert(terminal); }
+                }
+            }
+        }
+    }
+    assert_eq!(language, BTreeSet::from([7]));
 }
 
 #[test]
