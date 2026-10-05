@@ -19,7 +19,13 @@ fn source() -> &'static str {
 }
 
 fn compile_dynamic(vocab: &Vocab) -> DynamicConstraint {
-    DynamicConstraint::compile(crate::Grammar::glrm(source()), vocab).unwrap()
+    // These fixtures exercise template ready views and the template envelope.
+    // Select that representation explicitly so restoring ordinary Dynamic LR
+    // does not change the subject or require a process-global environment switch.
+    let native = crate::Grammar::glrm(source()).compile_with(
+        vocab, crate::BuildOptions::default().optimization(crate::Optimization::FastBuild),
+    ).unwrap();
+    DynamicConstraint::from_constraints(vec![native])
 }
 
 fn old_envelope(dynamic: &DynamicConstraint, external: bool) -> Vec<u8> {
