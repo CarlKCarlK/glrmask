@@ -230,8 +230,8 @@ All three modes preserve accepted-language semantics and produce the same public
 
 ### Native template parser backend
 
-All constraints use the native acyclic template backend, independently of the
-build/runtime preference. Omitting the backend selects `TEMPLATE_DFA` /
+Public final-constraint APIs, O2/FastBuild and Static use the native acyclic
+template backend. Omitting the public backend selects `TEMPLATE_DFA` /
 `TemplateDfa`; it can also be stated explicitly:
 
 ```python
@@ -261,8 +261,9 @@ The selected runtime and its artifact contain the template relations, not an
 LR table. Mask generation and token commitment use the existing shared engines;
 parser advancement and admissibility use those relations. Built-in grammar
 compilation can use temporary LR analysis to derive the program, then discards
-the table before constructing a `Constraint`. Explicit LR-backed construction,
-loading or runtime access panics. Data-only
+the table before constructing a `Constraint`. Native runtime table access and implicit LR fallback panic. Ordinary internal
+Dynamic (O1) instead retains and executes its LR table for lower build latency.
+Data-only
 `ParserProgram` providers bypass that frontend and support both static and
 dynamic mask compilation.
 
@@ -276,6 +277,21 @@ examples, exact POP/READ/PUSH semantics, validation, and persistence.
 The [September 30 validation report](docs/template-parser-validation-2026-09-30.md)
 records historical measurements at its pinned revision. Those measurements do
 not qualify the current native replacement.
+
+### Ordinary Dynamic development backend
+
+Ordinary Dynamic (O1) defaults to the retained LR runtime. Its grammar, lexer,
+vocabulary, masking and commit code share the existing compiler/runtime pipeline;
+it skips native parser characterization, template construction and native runtime
+metadata. O2/FastBuild continues to build templates, and Static is unchanged.
+
+For internal development only, `GLRMASK_DYNAMIC_TEMPLATE_DFA=1` selects native
+parser templates for an ordinary Dynamic compilation (`true`, `yes` and `on`
+also enable it). An absent/disabled variable selects LR. This choice is resolved
+before compiler worker pools and does not affect O2, Static, existing objects or
+artifact loading. There is no new public backend configuration. Serialized
+artifacts preserve their built representation and external-vocabulary artifacts
+require the exact original mapping.
 
 ### End tokens are final-root policy
 

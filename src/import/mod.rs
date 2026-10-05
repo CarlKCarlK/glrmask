@@ -15,8 +15,8 @@ use crate::compiler::compile::{
     emit_compile_profile_summary,
 };
 use crate::compiler::pipeline::{
-    compile_dynamic_owned_unfinalized_with_table_construction,
-    compile_dynamic_owned_with_table_construction,
+    compile_dynamic_owned_unfinalized_with_backend,
+    compile_dynamic_owned_with_backend,
     compile_dynamic_owned_with_vocab_partition_unfinalized_with_table_construction,
     compile_dynamic_owned_with_vocab_partition_with_table_construction,
     compile_dynamic_owned_with_vocab_partition_for_parser_replacement,
@@ -522,14 +522,16 @@ fn compile_dynamic_from_named(
     default_table_construction: GlrTableConstruction,
     end_token_ids: &[u32],
 ) -> crate::Result<DynamicConstraint> {
+    let backend = crate::runtime::parser_backend::DynamicParserBackend::ordinary_dynamic();
     let alternatives = dynamic_named_alternatives_from_named(named, None, end_token_ids)?;
     let mut compiled = Vec::with_capacity(alternatives.len());
     for alternative in alternatives {
         let grammar = ast::lower(&alternative)?;
-        compiled.push(compile_dynamic_owned_with_table_construction(
+        compiled.push(compile_dynamic_owned_with_backend(
             grammar,
             vocab,
             default_table_construction,
+            backend,
         )?);
     }
     Ok(DynamicConstraint::from_alternatives(compiled))
@@ -543,6 +545,7 @@ fn compile_dynamic_from_source(
     transform: Option<NamedGrammarTransform>,
     end_token_ids: &[u32],
 ) -> crate::Result<DynamicConstraint> {
+    let backend = crate::runtime::parser_backend::DynamicParserBackend::ordinary_dynamic();
     let profile_top = std::env::var_os("GLRMASK_PROFILE_DYNAMIC_TOP").is_some();
     let total_started = profile_top.then(std::time::Instant::now);
     let import_started = profile_top.then(std::time::Instant::now);
@@ -558,10 +561,11 @@ fn compile_dynamic_from_source(
         lower_ms += lower_started
             .map_or(0.0, |started| started.elapsed().as_secs_f64() * 1000.0);
         let compile_started = profile_top.then(std::time::Instant::now);
-        compiled.push(compile_dynamic_owned_with_table_construction(
+        compiled.push(compile_dynamic_owned_with_backend(
             grammar,
             vocab,
             default_table_construction,
+            backend,
         )?);
         compile_ms += compile_started
             .map_or(0.0, |started| started.elapsed().as_secs_f64() * 1000.0);
@@ -615,6 +619,7 @@ fn compile_dynamic_serialized_from_source_profiled(
     end_token_ids: &[u32],
     vocab_partition: bool,
 ) -> crate::Result<(Vec<u8>, u64, u64)> {
+    let backend = crate::runtime::parser_backend::DynamicParserBackend::ordinary_dynamic();
     let wall_started = std::time::Instant::now();
     let profile = compile_profile_enabled() || compile_top_profile_enabled();
     let total_started = profile.then(std::time::Instant::now);
@@ -637,10 +642,11 @@ fn compile_dynamic_serialized_from_source_profiled(
                 default_table_construction,
             )?
         } else {
-            compile_dynamic_owned_unfinalized_with_table_construction(
+            compile_dynamic_owned_unfinalized_with_backend(
                 grammar,
                 vocab,
                 default_table_construction,
+                backend,
             )?
         };
         let direct_residual_master_provers_enabled = std::env::var(

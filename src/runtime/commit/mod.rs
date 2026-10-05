@@ -572,7 +572,7 @@ fn template_advance_enabled() -> bool {
 
 #[inline]
 fn template_advance_selected(constraint: &Constraint) -> bool {
-    constraint.has_template_parser() || template_advance_enabled()
+    constraint.has_template_parser()
 }
 
 fn validate_template_advance_enabled() -> bool {
@@ -1534,6 +1534,12 @@ fn commit_token_impl(
     let special_paths = has_special
         .then(|| advance_special_token_paths(constraint, state, token_id))
         .flatten();
+    // Native, dynamic and composed masks admit an empty-spelled ID only through its
+    // exact special-token action. Do not turn a rejected ordinary empty token
+    // into a successful no-op commit; live special paths are merged below.
+    let bytes = bytes.filter(|bytes| !bytes.is_empty()
+        || !(constraint.has_template_parser() || constraint.uses_dynamic_runtime()
+            || constraint.uses_compact_segmented_parser_runtime()));
     if let Some(bytes) = bytes {
         if commit_bytes_impl(constraint, state, bytes, buffers).is_err() {
             state.clear();

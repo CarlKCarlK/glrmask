@@ -764,19 +764,81 @@ impl DynamicConstraint {
         vocab: &Vocab,
         dynamic_mask_vocab: DynamicMaskVocab,
     ) -> Self {
-        let prepared = crate::runtime::parser_backend::PreparedTemplateParser::from_compiler_parts(
-            &table, direct_regular_automaton.as_ref(), &[], ignore_terminal, true, false,
-        ).expect("compiler must prepare a complete native parser before Constraint materialization");
-        drop(table);
-        let mut inner = Self::from_template_runtime_parts_unfinalized_with_views(
-            tokenizer, terminal_display_names, ignore_terminal, prepared.templates,
-            Arc::new(prepared.parser), vocab, dynamic_mask_vocab,
-            Some(prepared.runtime),
-        );
-        inner.special_token_terminals = special_token_terminals;
-        inner.direct_regular_automaton = direct_regular_automaton;
-        Self { inner, alternatives: Vec::new(), composition_grammars: vec![None],
-            external_vocab_artifact_cache: None }
+        Self::from_parts_with_dynamic_vocab_backend_unfinalized(
+            crate::runtime::parser_backend::DynamicParserBackend::Native,
+            table,
+            terminal_display_names,
+            tokenizer,
+            direct_regular_automaton,
+            ignore_terminal,
+            special_token_terminals,
+            vocab,
+            dynamic_mask_vocab,
+        )
+    }
+
+    /// Shared unfinalized ordinary-dynamic assembly. Native and retained-LR
+    /// construction differ only at the representation boundary: the native arm
+    /// derives the template parser and drops the table, while the LR arm keeps
+    /// the supplied table through [`ParserTableStorage::explicit`] and never
+    /// derives templates, embeddings, completion domains or stack metadata.
+    /// The grammar, tokenizer and dynamic mask vocabulary work is shared by the
+    /// callers before this point.
+    pub(crate) fn from_parts_with_dynamic_vocab_backend_unfinalized(
+        backend: crate::runtime::parser_backend::DynamicParserBackend,
+        table: GLRTable,
+        terminal_display_names: Vec<String>,
+        tokenizer: Tokenizer,
+        direct_regular_automaton: Option<DirectRegularAutomaton>,
+        ignore_terminal: Option<TerminalID>,
+        special_token_terminals: Vec<SpecialTokenTerminal>,
+        vocab: &Vocab,
+        dynamic_mask_vocab: DynamicMaskVocab,
+    ) -> Self {
+        match backend {
+            crate::runtime::parser_backend::DynamicParserBackend::Native => {
+                let prepared = crate::runtime::parser_backend::PreparedTemplateParser::from_compiler_parts(
+                    &table, direct_regular_automaton.as_ref(), &[], ignore_terminal, true, false,
+                ).expect("compiler must prepare a complete native parser before Constraint materialization");
+                drop(table);
+                let mut inner = Self::from_template_runtime_parts_unfinalized_with_views(
+                    tokenizer, terminal_display_names, ignore_terminal, prepared.templates,
+                    Arc::new(prepared.parser), vocab, dynamic_mask_vocab,
+                    Some(prepared.runtime),
+                );
+                inner.special_token_terminals = special_token_terminals;
+                inner.direct_regular_automaton = direct_regular_automaton;
+                Self { inner, alternatives: Vec::new(), composition_grammars: vec![None],
+                    external_vocab_artifact_cache: None }
+            }
+            crate::runtime::parser_backend::DynamicParserBackend::LrTable => {
+                let ignore_expr = ignore_terminal
+                    .and_then(|terminal| tokenizer.terminal_expr(terminal).cloned());
+                let terminal_exprs = tokenizer.terminal_exprs().map(ToOwned::to_owned);
+                let payload = DynamicConstraintPayloadV2 {
+                    v1: DynamicConstraintPayloadV1 {
+                        table: crate::runtime::parser_backend::ParserTableStorage::explicit(table),
+                        terminal_display_names,
+                        tokenizer,
+                        ignore_terminal,
+                        direct_regular_automaton,
+                        token_bytes: vocab.entries_arc(),
+                        ignore_expr,
+                        terminal_exprs,
+                    },
+                    special_token_terminals,
+                };
+                let inner = Self::constraint_from_runtime_parts(payload, dynamic_mask_vocab);
+                // Retain the supplied vocabulary so the external-vocabulary
+                // artifact can embed the exact canonical content digest for
+                // load validation.
+                let _ = inner.late_bind_vocab.set(vocab.clone());
+                assert!(inner.table.is_present(), "retained LR constructor must retain its LR table");
+                assert!(inner.template_parser.is_none(), "retained LR constructor must not install a template parser");
+                Self { inner, alternatives: Vec::new(), composition_grammars: vec![None],
+                    external_vocab_artifact_cache: None }
+            }
+        }
     }
 
     pub(crate) fn from_parts_with_possible_matches(
@@ -873,7 +935,13 @@ impl DynamicConstraint {
         let DynamicConstraintPayloadV1 { table, terminal_display_names, tokenizer,
             ignore_terminal, direct_regular_automaton, token_bytes, ignore_expr, terminal_exprs } = v1;
         Self::constraint_from_runtime_parts(DynamicConstraintPayloadV2 {
-            v1: DynamicConstraintPayloadV1 { table: table.into(), terminal_display_names, tokenizer,
+            v1: DynamicConstraintPayloadV1 {
+                // This constructor only ever receives real LR payloads (the
+                // native template path assembles through
+                // `constraint_from_runtime_parts` with an explicitly absent
+                // table), so restore the historic retained-table construction.
+                table: crate::runtime::parser_backend::ParserTableStorage::explicit(table),
+                terminal_display_names, tokenizer,
                 ignore_terminal, direct_regular_automaton, token_bytes, ignore_expr, terminal_exprs },
             special_token_terminals,
         }, dynamic_mask_vocab)

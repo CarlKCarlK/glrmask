@@ -25,8 +25,9 @@ paths.
 
 The built-in grammar compiler may derive action relations using temporary LR
 analysis. It discards those tables before constructing a `Constraint`. Native
-`TemplateDfa` is the default and the only permitted runtime backend; explicit
-LR-backed construction, loading or runtime access panics. An unsupported native
+`TemplateDfa` remains the public/O2/Static runtime. Ordinary internal Dynamic
+defaults to retained LR; `GLRMASK_DYNAMIC_TEMPLATE_DFA=1` selects templates for
+that compilation only. Native runtime table access and implicit fallback panic. An unsupported native
 composition request returns an error.
 
 The older experimental `GLRMASK_ENABLE_TEMPLATE_DFA_ADVANCE` environment switch

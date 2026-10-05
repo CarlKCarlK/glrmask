@@ -63,6 +63,10 @@ const CONSTRAINT_VERSION: u16 = 30;
 const TEMPLATE_CONSTRAINT_VERSION: u16 = 37;
 // V38 is the same native body bound to an external vocabulary (TPX1).
 const EXTERNAL_TEMPLATE_CONSTRAINT_VERSION: u16 = 38;
+/// Self-contained external-vocabulary envelope that retains an executable LR
+/// table for ordinary Dynamic's retained LR backend. Load with
+/// `Constraint::load_with_vocab` and the exact original vocabulary.
+const EXTERNAL_LR_CONSTRAINT_VERSION: u16 = 39;
 const CONSTRAINT_HEADER_LEN: usize = CONSTRAINT_MAGIC.len() + 2 + 8;
 const COMPRESSED_PAYLOAD_HEADER_LEN: usize = 8;
 const CONSTRAINT_COMPRESSION_LEVEL: i32 = 1;
@@ -119,6 +123,7 @@ fn uses_external_runtime_sections(version: u16) -> bool {
         CONSTRAINT_VERSION
             | TEMPLATE_CONSTRAINT_VERSION
             | EXTERNAL_TEMPLATE_CONSTRAINT_VERSION
+            | EXTERNAL_LR_CONSTRAINT_VERSION
             | PREVIOUS_BOUNDARY_SUMMARYLESS_CONSTRAINT_VERSION
             | PREVIOUS_STATIC_PROJECTION_CONSTRAINT_VERSION
             | PREVIOUS_STATIC_RESIDUAL_CONSTRAINT_VERSION
@@ -6071,16 +6076,17 @@ impl Constraint {
         *digest.finalize().as_bytes()
     }
 
-    /// Save a table-free constraint without duplicating its model vocabulary.
-    /// Load with `Constraint::load_with_vocab` and the exact original vocabulary;
-    /// an absent or incompatible binding is rejected. This mode is currently
-    /// available only for `ParserBackend::TemplateDfa` constraints.
+    /// Save a parser constraint without duplicating its model vocabulary.
+    /// Load with `Constraint::load_with_vocab` and the exact original
+    /// vocabulary; an absent or incompatible binding is rejected. Supported for
+    /// both the table-free template backend and a retained LR
+    /// backend with a retained table.
     pub fn save_with_external_vocab(&self) -> crate::Result<Vec<u8>> {
-        if !self.has_template_parser() {
+        if !self.has_template_parser() && !self.table.is_present() {
             return Err(crate::Error::Serialization(
-                "external-vocabulary Constraint artifacts currently require the template parser backend".into()));
+                "external-vocabulary Constraint artifacts require a template parser or a retained LR table".into()));
         }
-        Ok(self.save_template_with_external_vocab())
+        Ok(self.save_with_vocab_policy(true))
     }
 
     pub(crate) fn save_template_with_external_vocab(&self) -> Vec<u8> {
@@ -6117,8 +6123,14 @@ impl Constraint {
     fn save_body_with_vocab_policy(&self, external_vocab: bool) -> Vec<u8> {
         let _remainder_trace =
             crate::dynamic_constraint::remainder_trace::Session::new("constraint.snapshot_body");
-        let artifact_version = if external_vocab { EXTERNAL_TEMPLATE_CONSTRAINT_VERSION }
-            else if self.has_template_parser() { TEMPLATE_CONSTRAINT_VERSION } else { CONSTRAINT_VERSION };
+        let artifact_version = if external_vocab {
+            if self.has_template_parser() {
+                EXTERNAL_TEMPLATE_CONSTRAINT_VERSION
+            } else {
+                EXTERNAL_LR_CONSTRAINT_VERSION
+            }
+        }
+        else if self.has_template_parser() { TEMPLATE_CONSTRAINT_VERSION } else { CONSTRAINT_VERSION };
         if let Some(bytes) = &self.serialized_artifact_cache {
             // A loaded external body cannot be returned as a self-contained
             // save, or vice versa. Likewise, conversion between parser
@@ -6521,7 +6533,21 @@ impl Constraint {
                         } else {
                             let rules = self.retained_table_rules()
                                 .expect("validated retained grammar rules must remain readable");
-                            crate::compiler::glr::table::artifact_serde::to_compact_bytes_with_rules(&self.table, rules)
+                            let table = crate::compiler::glr::table::artifact_serde::to_compact_bytes_with_rules(&self.table, rules);
+                            if external_vocab {
+                                // The compact LR table wire has no vocabulary field,
+                                // so an external LR envelope frames it with the exact
+                                // canonical vocabulary content digest. Load validates
+                                // the supplied vocabulary against this before trusting
+                                // its token bytes.
+                                let digest = self.template_artifact_vocab_digest();
+                                let mut framed = Vec::with_capacity(digest.len() + table.len());
+                                framed.extend_from_slice(&digest);
+                                framed.extend_from_slice(&table);
+                                framed
+                            } else {
+                                table
+                            }
                         };
                         if let Some(started) = started {
                             eprintln!(
@@ -6557,7 +6583,16 @@ impl Constraint {
                                 dynamic_mask_vocab: self.uses_dynamic_runtime().then(|| {
                                     // The template-only artifact is also the self-contained
                                     // O2 persistence body; preserve its proven mask quotient.
-                                    if external_vocab { self.dynamic_mask_vocab.to_template_external_vocab_artifact() }
+                                    // An external LR body deliberately omits its vocabulary
+                                    // artifact and reconstructs the exact full-vocabulary
+                                    // mask coordinate from the supplied Vocab on load.
+                                    if external_vocab {
+                                        if self.has_template_parser() {
+                                            self.dynamic_mask_vocab.to_template_external_vocab_artifact()
+                                        } else {
+                                            None
+                                        }
+                                    }
                                     else if self.has_template_parser() { self.dynamic_mask_vocab.to_artifact() }
                                     else { self.dynamic_mask_vocab.to_vocab_artifact() }
                                 }).flatten(),
@@ -7290,6 +7325,31 @@ impl Constraint {
                                     } else { crate::runtime::parser_backend::wire::decode(table_section) };
                                     return seed.map(|seed| (crate::runtime::parser_backend::ParserTableStorage::absent(), None, Some(seed)));
                                 }
+                                // An external LR envelope frames the compact table
+                                // bytes with a leading canonical vocabulary content
+                                // digest. Validate it before trusting the supplied
+                                // vocabulary's token bytes.
+                                let table_section = if version == EXTERNAL_LR_CONSTRAINT_VERSION {
+                                    let vocab = match external_vocab {
+                                        Some(vocab) => vocab,
+                                        None => return Err(
+                                            "external LR artifact requires the exact external vocabulary".to_owned()
+                                        ),
+                                    };
+                                    if table_section.len() < 32 {
+                                        return Err("truncated external LR vocabulary digest".to_owned());
+                                    }
+                                    let (digest, table) = table_section.split_at(32);
+                                    let expected = crate::compiler::compile::vocab_content_digest(vocab);
+                                    if digest != expected.as_slice() {
+                                        return Err(
+                                            "external LR artifact vocabulary content digest mismatch".to_owned()
+                                        );
+                                    }
+                                    table
+                                } else {
+                                    table_section
+                                };
                                 let result = if uses_external_runtime_sections(version) {
                                     let backing = current_backing.as_ref().ok_or_else(|| {
                                         "current GLR table has no artifact backing".to_owned()
@@ -7320,14 +7380,20 @@ impl Constraint {
                                 if let Some(started) = started {
                                     eprintln!("[glrmask/profile][constraint_section] name=table ms={:.3}", started.elapsed().as_secs_f64() * 1000.0);
                                 }
-                                result.map(|decoded| (decoded.table.into(), decoded.deferred_rules, None))
+                                result.map(|decoded| (
+                                    crate::runtime::parser_backend::ParserTableStorage::explicit(
+                                        decoded.table,
+                                    ),
+                                    decoded.deferred_rules,
+                                    None,
+                                ))
                             },
                             || -> Result<Option<DecodedConstraintRuntime>, String> {
                                 let Some(runtime_section) = runtime_section else {
                                     return Ok(None);
                                 };
                                 let started = profile.then(std::time::Instant::now);
-                                let result = if matches!(version, CONSTRAINT_VERSION | TEMPLATE_CONSTRAINT_VERSION | EXTERNAL_TEMPLATE_CONSTRAINT_VERSION)
+                                let result = if matches!(version, CONSTRAINT_VERSION | TEMPLATE_CONSTRAINT_VERSION | EXTERNAL_TEMPLATE_CONSTRAINT_VERSION | EXTERNAL_LR_CONSTRAINT_VERSION)
                                     || version == PREVIOUS_BOUNDARY_SUMMARYLESS_CONSTRAINT_VERSION
                                 {
                                     current_backing
@@ -8173,15 +8239,23 @@ impl Constraint {
             ));
         }
         let version = u16::from_le_bytes([bytes[8], bytes[9]]);
-        let external_vocab = if version == EXTERNAL_TEMPLATE_CONSTRAINT_VERSION {
+        let external_vocab = if version == EXTERNAL_TEMPLATE_CONSTRAINT_VERSION
+            || version == EXTERNAL_LR_CONSTRAINT_VERSION
+        {
             Some(supplied_vocab.ok_or_else(|| crate::Error::Serialization(
-                "this table-free artifact requires the exact external vocabulary".into()))?)
+                "this external-vocabulary artifact requires the exact external vocabulary".into()))?)
         } else { None };
-        // Native-only pre-release persistence has no compatibility contract
-        // with historical LR or earlier template envelopes.
-        assert_ne!(version, CONSTRAINT_VERSION,
-            "LR-BACKED CONSTRAINT ARTIFACT LOADING IS FORBIDDEN: only native template artifacts may be loaded");
-        if !matches!(version, TEMPLATE_CONSTRAINT_VERSION | EXTERNAL_TEMPLATE_CONSTRAINT_VERSION) {
+        // Self-contained `CONSTRAINT_VERSION` envelopes legitimately retain an
+        // executable LR table for the ordinary Dynamic LR backend.
+        // Native template envelopes are table-free. Older historical parser
+        // envelopes are rejected predictably instead of panicking.
+        if !matches!(
+            version,
+            CONSTRAINT_VERSION
+                | TEMPLATE_CONSTRAINT_VERSION
+                | EXTERNAL_TEMPLATE_CONSTRAINT_VERSION
+                | EXTERNAL_LR_CONSTRAINT_VERSION
+        ) {
             return Err(crate::GlrMaskError::Serialization(format!(
                 "unsupported constraint artifact version {version}"
             )));
@@ -8214,8 +8288,9 @@ impl Constraint {
             .as_ref()
             .map_or(bytes, |backing| backing.as_slice());
         let payload = &section_bytes[CONSTRAINT_HEADER_LEN..];
-        // The native-only upfront version guard guarantees that only v35/v36
-        // are loaded, so unsupported historical compressed-envelope decoder
+        // The upfront version guard admits exactly the self-contained LR
+        // envelope (`CONSTRAINT_VERSION`) and the two native template
+        // envelopes, so unsupported historical compressed-envelope decoder
         // branches cannot occupy recursive loader frames.
         let serialized = payload;
         let deserialize_started = profile.then(std::time::Instant::now);
@@ -8280,6 +8355,15 @@ impl Constraint {
                     constraint.dynamic_mask_vocab =
                         crate::dynamic_constraint::DynamicConstraint::dynamic_vocab_from_transfer_artifact(
                             None, external_vocab.expect("checked external Vocab"),
+                        )?;
+                } else if version == EXTERNAL_LR_CONSTRAINT_VERSION {
+                    // The external LR envelope deliberately omits its mask
+                    // vocabulary artifact and reconstructs the exact
+                    // full-vocabulary mask coordinate from the supplied Vocab.
+                    // The table-section digest already validated the vocabulary.
+                    constraint.dynamic_mask_vocab =
+                        crate::dynamic_constraint::DynamicConstraint::dynamic_vocab_from_transfer_artifact(
+                            None, external_vocab.expect("external LR envelope requires its Vocab"),
                         )?;
                 }
                 if let Some(segmented_runtime) = runtime.segmented_runtime_v20 {
@@ -8357,6 +8441,11 @@ impl Constraint {
         };
         let deserialize_ms = deserialize_started
             .map_or(0.0, |started| started.elapsed().as_secs_f64() * 1000.0);
+        if constraint.table.is_present() && !constraint.uses_dynamic_runtime() {
+            return Err(crate::GlrMaskError::Serialization(
+                "retained LR artifacts are supported only for ordinary Dynamic runtimes".into(),
+            ));
+        }
         if constraint.has_template_parser() {
             constraint.validate_template_composition_layout().map_err(crate::GlrMaskError::Serialization)?;
         }
@@ -8439,7 +8528,7 @@ impl Constraint {
                 Some(owned_artifact.unwrap_or_else(|| std::sync::Arc::new(bytes.to_vec())))
             });
         }
-        if !matches!(version, CONSTRAINT_VERSION | TEMPLATE_CONSTRAINT_VERSION | EXTERNAL_TEMPLATE_CONSTRAINT_VERSION) && constraint.boundary_candidate_summary.get().is_none() {
+        if !matches!(version, CONSTRAINT_VERSION | TEMPLATE_CONSTRAINT_VERSION | EXTERNAL_TEMPLATE_CONSTRAINT_VERSION | EXTERNAL_LR_CONSTRAINT_VERSION) && constraint.boundary_candidate_summary.get().is_none() {
             let _ = constraint.boundary_candidate_summary.set(
                 crate::runtime::BoundaryCandidateSummary::Unknown {
                     reason: crate::runtime::SummaryUnavailable::LegacyArtifact,
@@ -9223,8 +9312,51 @@ mod tests {
 
         let mut lr_envelope = constraint.save();
         lr_envelope[8..10].copy_from_slice(&CONSTRAINT_VERSION.to_le_bytes());
-        assert!(std::panic::catch_unwind(|| Constraint::load(&lr_envelope)).is_err(),
-            "a request to load the known LR artifact format must panic loudly");
+        // The native (`TEMPLATE_CONSTRAINT_VERSION`) envelope's table section is
+        // a template program, not a compact LR table. Relabeling it as the
+        // self-contained LR version must be rejected predictably, never panic.
+        assert!(Constraint::load(&lr_envelope).is_err(),
+            "a template body mislabeled as the LR envelope must be rejected");
+    }
+
+    #[test]
+    fn explicit_lr_envelope_roundtrips_and_cross_backend_tamper_is_rejected() {
+        let vocab = Vocab::new(vec![(0, b"a".to_vec()), (1, b"b".to_vec())]);
+        let grammar = crate::Grammar::from_ebnf(r#"start ::= "a" "b""#);
+        let lr = crate::DynamicConstraint::from_ebnf(r#"start ::= "a" "b""#, &vocab)
+            .unwrap().into_constraint();
+        assert_eq!(lr.parser_backend(), crate::ParserBackend::LrTable);
+        let lr_bytes = lr.save();
+        assert_eq!(
+            u16::from_le_bytes([lr_bytes[8], lr_bytes[9]]),
+            CONSTRAINT_VERSION,
+            "explicit LR self-contained envelope uses the retained LR format",
+        );
+        let reloaded = Constraint::load(lr_bytes.clone()).unwrap();
+        assert_eq!(reloaded.parser_backend(), crate::ParserBackend::LrTable);
+        assert_eq!(reloaded.start().mask(), lr.start().mask());
+
+        // LR artifact relabeled as the native template envelope must be
+        // rejected predictably, not panic.
+        let mut lr_as_template = lr_bytes.clone();
+        lr_as_template[8..10].copy_from_slice(&TEMPLATE_CONSTRAINT_VERSION.to_le_bytes());
+        assert!(Constraint::load(lr_as_template).is_err());
+
+        // Native artifact relabeled as LR must also be rejected, not panic.
+        let native = grammar
+            .compile_with(
+                &vocab,
+                crate::BuildOptions::default().optimization(crate::Optimization::FastBuild),
+            )
+            .unwrap();
+        let mut native_as_lr = native.save();
+        native_as_lr[8..10].copy_from_slice(&CONSTRAINT_VERSION.to_le_bytes());
+        assert!(Constraint::load(native_as_lr).is_err());
+
+        // External LR requires the exact vocabulary and rejects a missing one.
+        let external = lr.save_with_external_vocab().unwrap();
+        assert!(Constraint::load(external.clone()).is_err());
+        assert!(Constraint::load_with_vocab(external, &vocab).is_ok());
     }
 
     #[test]

@@ -1,15 +1,24 @@
 # GLRMask development policy
 
-GLRMask is pre-release and has no existing consumers. Old artifact save/load
-formats, the LR runtime backend, and table-to-template conversion are not
-compatibility requirements. Do not add compatibility adapters or preserve
-obsolete formats solely for hypothetical users. A Constraint must never be
-materialized with an LR table. LR-backed Constraint construction, loading,
-runtime execution and fallback must panic loudly. Temporary LR tables inside
-compiler analysis are allowed: derive templates from compiler parts, discard
-the table, then construct the Constraint. Do not construct an LR-backed
-Constraint as an intermediate and convert it. Historical LR measurements are
-reference records. Reject unsupported old formats explicitly.
+GLRMask is pre-release and has no existing consumers. Historical artifact
+formats are not compatibility requirements. Reject unsupported old formats
+explicitly instead of preserving obsolete adapters for hypothetical consumers.
+
+Ordinary Dynamic (O1) retains and executes its LR table by default. O2 and the
+public FastBuild path use native template parsers; Static behavior is unchanged.
+`GLRMASK_DYNAMIC_TEMPLATE_DFA=1` is an internal development override for
+ordinary Dynamic only. Resolve this choice before worker pools, pass it through
+shared preparation and assembly, and never let it alter O2, Static, existing
+objects or loaded artifacts. There is no new public backend selector.
+
+Native construction derives templates from temporary compiler LR analysis,
+discards the table, and materializes only a table-free Constraint. Do not create
+an LR-backed intermediate for a native compile. Native runtime table access and
+implicit LR fallback must still panic. The controlled
+`ParserTableStorage::explicit` constructor is for retained Dynamic LR and its
+versioned artifact loaders; generic `From<GLRTable>` remains forbidden. Shared
+compiler, vocabulary, masks and commits must not become two forked pipelines.
+Backend selection only controls necessary normalization and representation work.
 
 Template components must link without retaining or reconstructing executable LR
 action/goto tables. Preserve grammar/interface analysis metadata needed by
@@ -17,11 +26,11 @@ root-CALL, follow and scoped-adjacency optimizations separately from execution
 tables. Share common lexical/query construction rather than silently omitting
 optimizations in a second backend pipeline.
 
-The source compiler, component compiler, linker, artifact loader and acceptance
-harness must materialize only native template Constraints. Do not weaken an LR
-materialization/runtime panic to make a test pass. Grammar rules,
-nullable/FIRST/FOLLOW information, interface metadata and temporary compiler LR
-analysis are permitted; executable LR tables must not enter a Constraint.
+Native component compilers, providers and linkers retain no executable LR
+action/goto tables. Preserve analysis/interface metadata separately. A native
+artifact stays native and a retained-LR artifact stays LR when loaded,
+independently of compilation environment. External artifacts validate the exact
+vocabulary digest. Never silently mix incompatible parser representations.
 
 Recognition, token masks, commit behavior and completion must remain exact.
 Preserve full lexer-state and vocabulary equivalence semantics. A pruning proof

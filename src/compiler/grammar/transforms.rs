@@ -6,7 +6,7 @@ use rustc_hash::FxHashSet;
 use crate::automata::regex::Expr;
 use crate::compiler::glr::analysis::{
     eliminate_right_recursion, has_indirect_left_recursion, merge_identical_nonterminals,
-    inline_null_productions, normalize_grammar,
+    inline_null_productions, normalize_dynamic_glr_grammar, normalize_grammar,
 };
 use crate::grammar::flat::{GrammarDef, NonterminalID, Terminal};
 use crate::grammar::flat::{Rule, Symbol, TerminalID};
@@ -1037,6 +1037,20 @@ pub(crate) fn prepare_dynamic_grammar_transforms_only(grammar: GrammarDef) -> Gr
 /// Right-recursive reductions can consume an arbitrarily long concrete stack;
 /// normalize them exactly before requiring an acyclic action characterization.
 pub(crate) fn prepare_dynamic_glr_transforms_only(grammar: GrammarDef) -> GrammarDef {
+    prepare_dynamic_glr_transforms_impl(grammar, false)
+}
+
+/// Dynamic-runtime preparation for the explicitly selected ordinary LR
+/// backend. LR execution consumes the historic dynamic normal form, which
+/// keeps right-recursive reductions as genuine GLR actions instead of
+/// rewriting them for an acyclic finite action characterization. Every other
+/// transform (nullable expansion, single-use inlining, reduction-length
+/// bounding, terminal compaction) is shared with the native path.
+pub(crate) fn prepare_dynamic_glr_transforms_only_lr(grammar: GrammarDef) -> GrammarDef {
+    prepare_dynamic_glr_transforms_impl(grammar, true)
+}
+
+fn prepare_dynamic_glr_transforms_impl(grammar: GrammarDef, use_lr_normalizer: bool) -> GrammarDef {
     let profiling = compile_profile_enabled();
     let nullable_terminals = nullable_terminals_for_grammar(&grammar);
     let mut normalized = grammar;
@@ -1048,10 +1062,14 @@ pub(crate) fn prepare_dynamic_glr_transforms_only(grammar: GrammarDef) -> Gramma
 
     let started = profiling.then(Instant::now);
     let before = normalized.rules.len();
-    normalize_grammar(&mut normalized.rules, normalized.start);
+    if use_lr_normalizer {
+        normalize_dynamic_glr_grammar(&mut normalized.rules, normalized.start);
+    } else {
+        normalize_grammar(&mut normalized.rules, normalized.start);
+    }
     if let Some(started) = started {
         emit_grammar_transform_profile(
-            "normalize_grammar",
+            if use_lr_normalizer { "normalize_dynamic_glr_grammar" } else { "normalize_grammar" },
             elapsed_ms(started),
             before,
             normalized.rules.len(),
@@ -1089,9 +1107,29 @@ pub(crate) fn prepare_dynamic_shared_terminal_domain(mut grammar: GrammarDef) ->
 
 /// Parser-only continuation after `prepare_dynamic_shared_terminal_domain`.
 pub(crate) fn prepare_dynamic_parser_after_terminal_domain(
-    mut normalized: GrammarDef,
+    normalized: GrammarDef,
 ) -> (GrammarDef, bool) {
-    normalize_grammar(&mut normalized.rules, normalized.start);
+    prepare_dynamic_parser_after_terminal_domain_impl(normalized, false)
+}
+
+/// Parser-only continuation for the explicitly selected ordinary LR backend.
+/// Uses the historic dynamic normalizer so right-recursive reductions remain
+/// executable GLR actions. The shared terminal-domain bookkeeping is identical.
+pub(crate) fn prepare_dynamic_parser_after_terminal_domain_lr(
+    normalized: GrammarDef,
+) -> (GrammarDef, bool) {
+    prepare_dynamic_parser_after_terminal_domain_impl(normalized, true)
+}
+
+fn prepare_dynamic_parser_after_terminal_domain_impl(
+    mut normalized: GrammarDef,
+    use_lr_normalizer: bool,
+) -> (GrammarDef, bool) {
+    if use_lr_normalizer {
+        normalize_dynamic_glr_grammar(&mut normalized.rules, normalized.start);
+    } else {
+        normalize_grammar(&mut normalized.rules, normalized.start);
+    }
     let protected_nonterminals = collect_protected_nonterminals(&normalized);
     inline_single_use_nonterminals(&mut normalized.rules, &protected_nonterminals, normalized.start);
     let max_reduction_len = std::env::var("GLRMASK_MAX_RUNTIME_REDUCTION_LEN")

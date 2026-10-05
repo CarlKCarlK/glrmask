@@ -1,6 +1,6 @@
 use std::collections::BTreeSet;
 use super::{CommitTemplateDfas, DFA, DEFAULT_LABEL, encode_negative_label, negative_to_positive_label};
-use super as link_program;
+use crate::runtime::parser_backend::link_program;
 
 // Deliberately independent, literal interpreter for small test graphs. No
 // production GSS, signed-word recombination or linker transformation is used.

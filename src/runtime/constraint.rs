@@ -1982,6 +1982,19 @@ impl Constraint {
     /// updates the executable EOF relation, interface metadata and the finite
     /// nullable return relation; it never reconstructs or materializes an LR table.
     pub(crate) fn set_composition_start_nullable(&mut self, nullable: bool) {
+        if self.template_parser.is_none() {
+            // Explicit retained-LR parser. The historic LR pipeline recorded
+            // source nullability directly on the table's embedded-start
+            // metadata, which `composition_start_nullable` reads back and the
+            // shared completion predicate consults for the exact singleton
+            // initial root. No template body exists to mutate.
+            assert!(
+                self.table.is_present(),
+                "source nullability cannot be set: constraint has neither a template parser nor a retained LR table",
+            );
+            self.table.set_embedded_start_nullable(nullable);
+            return;
+        }
         let parser = self.template_parser.as_mut()
             .and_then(Arc::get_mut).expect("source nullability must be set before sharing the native parser");
         if nullable {

@@ -103,8 +103,9 @@ Static template and weighted-automaton construction have representation and
 work limits. A successful dynamic build does not imply that a static build will
 fit those limits. A static build error never silently changes the request to
 dynamic masking. These limits are not a whole-process memory or elapsed-time
-guarantee. The native `TemplateDfa` backend is the default; explicit LR-backed
-construction, loading and runtime access are forbidden.
+guarantee. Native component/provider composition stays table-free. Ordinary Dynamic
+uses retained LR by default; its development template override does not change
+O2/Static or permit a native component to fall back to LR.
 
 ## Persistence and embedding
 

@@ -10362,5 +10362,19 @@ pub fn stacks_finished_control_closed(table: &GLRTable, stack: &ParserGSS) -> bo
         return false;
     }
 
+    // Exact singleton initial-root completion. A table whose source start was
+    // nullable records that fact in its existing embedded-start metadata,
+    // because the compiler-only normalization removes the empty derivation.
+    // This accepts only the precise empty frontier: exactly one stack level
+    // whose sole top state is the initial state 0. Every other EOF action and
+    // completion rule is unchanged, so a non-empty prefix (a deeper stack or a
+    // different top state) is never accepted here.
+    if table.embedded_start_nullable() && stack.max_depth() == 1 {
+        let tops = stack.peek_values();
+        if tops.len() == 1 && tops[0] == 0 {
+            return true;
+        }
+    }
+
     exact_admission_completes_on_eof(table, stack)
 }

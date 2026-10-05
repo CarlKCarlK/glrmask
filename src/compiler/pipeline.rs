@@ -51,8 +51,9 @@ use crate::compiler::constraint_possible_matches as cpm;
 use crate::compiler::glr::analysis::AnalyzedGrammar;
 use crate::compiler::glr::table::{GLRTable, GlrTableConstruction};
 use crate::compiler::grammar::transforms::{
-    prepare_dynamic_glr_transforms_only,
-    prepare_dynamic_parser_after_terminal_domain, prepare_dynamic_shared_terminal_domain,
+    prepare_dynamic_glr_transforms_only, prepare_dynamic_glr_transforms_only_lr,
+    prepare_dynamic_parser_after_terminal_domain,
+    prepare_dynamic_parser_after_terminal_domain_lr, prepare_dynamic_shared_terminal_domain,
     prepare_grammar_transforms_only,
 };
 use crate::compiler::stages::id_map_and_terminal_dwa::classify::{
@@ -6276,7 +6277,19 @@ pub(crate) fn compile_dynamic_owned_with_table_construction(
     vocab: &Vocab,
     default_table_construction: GlrTableConstruction,
 ) -> crate::Result<DynamicConstraint> {
-    compile_dynamic_owned_impl(grammar, vocab, default_table_construction, true)
+    compile_dynamic_owned_with_backend(grammar, vocab, default_table_construction,
+        crate::runtime::parser_backend::DynamicParserBackend::ordinary_dynamic())
+}
+
+/// Shared ordinary Dynamic entry with a choice resolved before worker launch.
+pub(crate) fn compile_dynamic_owned_with_backend(
+    grammar: GrammarDef,
+    vocab: &Vocab,
+    default_table_construction: GlrTableConstruction,
+    backend: crate::runtime::parser_backend::DynamicParserBackend,
+) -> crate::Result<DynamicConstraint> {
+    compile_dynamic_owned_impl(grammar, vocab, default_table_construction, true,
+        backend == crate::runtime::parser_backend::DynamicParserBackend::LrTable)
 }
 
 /// Compile the dynamic parser/lexer without constructing the ordinary full
@@ -6363,6 +6376,7 @@ fn compile_dynamic_owned_with_vocab_partition_impl(
                         grammar,
                         vocab,
                         default_table_construction,
+                        false,
                         false,
                     ).and_then(|mut constraint| {
                         let mut prepared_parsers = Vec::new();
@@ -6467,12 +6481,14 @@ fn compile_dynamic_owned_with_vocab_partition_impl(
     Ok(constraint)
 }
 
-pub(crate) fn compile_dynamic_owned_unfinalized_with_table_construction(
+pub(crate) fn compile_dynamic_owned_unfinalized_with_backend(
     grammar: GrammarDef,
     vocab: &Vocab,
     default_table_construction: GlrTableConstruction,
+    backend: crate::runtime::parser_backend::DynamicParserBackend,
 ) -> crate::Result<DynamicConstraint> {
-    compile_dynamic_owned_impl(grammar, vocab, default_table_construction, false)
+    compile_dynamic_owned_impl(grammar, vocab, default_table_construction, false,
+        backend == crate::runtime::parser_backend::DynamicParserBackend::LrTable)
 }
 
 
@@ -6596,6 +6612,7 @@ fn compile_dynamic_owned_early_overlap(
     default_table_construction: GlrTableConstruction,
     finalize_runtime: bool,
     start_nullable: bool,
+    use_lr: bool,
 ) -> crate::Result<DynamicConstraint> {
     let remainder_trace =
         crate::dynamic_constraint::remainder_trace::Session::new("dynamic.early_overlap");
@@ -6637,7 +6654,11 @@ fn compile_dynamic_owned_early_overlap(
                     "dynamic.early_parser.worker", remainder_parent);
                 let prepare_started = profile.then(Instant::now);
                 let (prepared_grammar, terminal_domain_changed) =
-                    prepare_dynamic_parser_after_terminal_domain(shared_grammar);
+                    if use_lr {
+                        prepare_dynamic_parser_after_terminal_domain_lr(shared_grammar)
+                    } else {
+                        prepare_dynamic_parser_after_terminal_domain(shared_grammar)
+                    };
                 let parser_prepare_ms = prepare_started.map_or(0.0, elapsed_ms);
                 let analysis_started = profile.then(Instant::now);
                 let analyzed = AnalyzedGrammar::from_grammar_def(&prepared_grammar);
@@ -6710,7 +6731,8 @@ fn compile_dynamic_owned_early_overlap(
             .map(|terminal| prepared_grammar.terminal_display_name(terminal))
             .collect::<Vec<_>>();
         let finalize_started = profile.then(Instant::now);
-        let mut constraint = DynamicConstraint::from_parts_with_dynamic_vocab_unfinalized(
+        let mut constraint = DynamicConstraint::from_parts_with_dynamic_vocab_backend_unfinalized(
+            crate::runtime::parser_backend::DynamicParserBackend::from_use_lr(use_lr),
             table,
             terminal_display_names,
             tokenizer,
@@ -6762,6 +6784,7 @@ fn compile_dynamic_owned_impl(
     vocab: &Vocab,
     default_table_construction: GlrTableConstruction,
     finalize_runtime: bool,
+    use_lr: bool,
 ) -> crate::Result<DynamicConstraint> {
     let remainder_trace =
         crate::dynamic_constraint::remainder_trace::Session::new("dynamic.core");
@@ -6793,6 +6816,7 @@ fn compile_dynamic_owned_impl(
             default_table_construction,
             finalize_runtime,
             start_nullable,
+            use_lr,
         );
     }
     let profile = compile_profile_enabled();
@@ -6818,7 +6842,11 @@ fn compile_dynamic_owned_impl(
         if force_cfg_runtime {
             grammar.direct_regular_automaton = None;
         }
-        prepare_dynamic_glr_transforms_only(grammar)
+        if use_lr {
+            prepare_dynamic_glr_transforms_only_lr(grammar)
+        } else {
+            prepare_dynamic_glr_transforms_only(grammar)
+        }
     };
     let prepare_ms = prepare_started_at.map_or(0.0, elapsed_ms);
     const TINY_DYNAMIC_MAX_TERMINALS: usize = 16;
@@ -6940,7 +6968,14 @@ fn compile_dynamic_owned_impl(
         // Move a complete direct automaton out of the grammar instead of
         // cloning its 20k-state graph into AnalyzedGrammar and cloning it again
         // into the runtime artifact. Generic grammars still use full analysis.
-        let direct_regular_automaton = prepared_grammar.direct_regular_automaton.take();
+        // Explicit LR keeps the automaton in `prepared_grammar` so the table
+        // builder selects its exact direct-regular LR table; the runtime
+        // shortcut coordinate is deliberately omitted.
+        let direct_regular_automaton = if use_lr {
+            None
+        } else {
+            prepared_grammar.direct_regular_automaton.take()
+        };
         let direct_state_count = direct_regular_automaton
             .as_ref()
             .map(|automaton| automaton.states.len());
@@ -7052,7 +7087,8 @@ fn compile_dynamic_owned_impl(
         // Build unfinalized so a mask-only finite-token quotient can be
         // attached before dynamic runtime caches/projections are constructed.
         // The exact full tokenizer above remains authoritative for commit.
-        let mut constraint = DynamicConstraint::from_parts_with_dynamic_vocab_unfinalized(
+        let mut constraint = DynamicConstraint::from_parts_with_dynamic_vocab_backend_unfinalized(
+            crate::runtime::parser_backend::DynamicParserBackend::from_use_lr(use_lr),
             table,
             terminal_display_names,
             tokenizer,

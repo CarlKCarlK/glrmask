@@ -230,8 +230,7 @@ fn malformed_external_template_binding_is_rejected() {
 fn obsolete_lr_and_template_artifacts_are_rejected() {
     let v = vocab();
     let lr = include_bytes!("fixtures/template_parser_v1/static-v30-lr.bin");
-    let rejected = std::panic::catch_unwind(|| Constraint::load(lr));
-    assert!(rejected.is_err(), "LR-backed artifact materialization must panic loudly");
+    assert!(Constraint::load(lr).is_err(), "obsolete Static LR artifacts remain unsupported");
     assert!(Constraint::load(include_bytes!("fixtures/template_parser_v1/static-v31-tpr1.bin")).is_err());
     assert!(DynamicConstraint::load(include_bytes!("fixtures/template_parser_v1/o2-v21-tpr1.bin")).is_err());
     assert!(<DynamicConstraint as DynamicConstraintExt>::load_with_vocab(

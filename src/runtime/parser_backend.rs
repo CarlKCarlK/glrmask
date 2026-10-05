@@ -8,6 +8,10 @@ pub(crate) mod composition;
 pub(crate) mod embedding;
 #[cfg(test)]
 mod sparse_composition_tests;
+#[cfg(test)]
+mod explicit_lr_tests;
+#[cfg(test)]
+mod dynamic_backend_tests;
 pub(crate) mod link;
 pub(crate) mod link_program;
 pub(crate) mod link_grammar;
@@ -36,13 +40,50 @@ use super::{CommitTemplateDfas, Constraint};
 
 use prepare::top_certificate_rows;
 
+/// Internal representation choice for the shared dynamic compiler. Ordinary
+/// Dynamic retains LR by default; O2 selects Native explicitly. Resolve the
+/// development override before entering compiler worker pools.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum DynamicParserBackend {
+    Native,
+    LrTable,
+}
+
+impl DynamicParserBackend {
+    /// Experimental ordinary-Dynamic templates only. This is a development
+    /// switch, not a public build option, runtime dispatcher or load policy.
+    pub(crate) fn ordinary_dynamic() -> Self {
+        if std::env::var("GLRMASK_DYNAMIC_TEMPLATE_DFA")
+            .is_ok_and(|value| matches!(value.trim(), "1" | "true" | "yes" | "on")) {
+            Self::Native
+        } else {
+            Self::LrTable
+        }
+    }
+    #[inline]
+    pub(crate) fn from_use_lr(use_lr: bool) -> Self {
+        if use_lr { Self::LrTable } else { Self::Native }
+    }
+}
+
 /// Compile-time / ordinary-LR storage. None really means no table remains.
 /// Deref is a migration guard, not a template-mode fallback implementation.
+///
+/// A backing table can only be installed through the explicit
+/// [`ParserTableStorage::explicit`] constructor, which is reachable only from
+/// ordinary Dynamic construction and serialized LR load paths. The
+/// generic `From<GLRTable>` conversion deliberately keeps panicking so the
+/// default native template path can never silently become LR-backed.
 #[derive(Debug, Clone)]
 pub(crate) struct ParserTableStorage(Option<GLRTable>);
 
 impl ParserTableStorage {
     pub(crate) fn absent() -> Self { Self(None) }
+    /// Install the ordinary Dynamic runtime's retained executable LR table.
+    /// This is the only supported
+    /// way to make `Deref`/`into_lr` readable; every native constructor must
+    /// keep using [`ParserTableStorage::absent`].
+    pub(crate) fn explicit(table: GLRTable) -> Self { Self(Some(table)) }
     pub(crate) fn is_present(&self) -> bool { self.0.is_some() }
     pub(crate) fn as_lr(&self) -> Option<&GLRTable> { self.0.as_ref() }
     pub(crate) fn clone_lr(&self) -> GLRTable { self.deref().clone() }
@@ -53,20 +94,24 @@ impl ParserTableStorage {
 impl From<GLRTable> for ParserTableStorage {
     #[track_caller]
     fn from(_table: GLRTable) -> Self {
-        panic!("LR-BACKED CONSTRAINT MATERIALIZATION IS FORBIDDEN: derive templates from compiler parts before constructing or loading a Constraint")
+        panic!("IMPLICIT LR-BACKED CONSTRAINT MATERIALIZATION IS FORBIDDEN: use the selected compiler representation boundary")
     }
 }
 impl Deref for ParserTableStorage {
     type Target = GLRTable;
     #[track_caller]
     fn deref(&self) -> &GLRTable {
-        panic!("LR CONSTRAINT RUNTIME ACCESS IS FORBIDDEN: route this operation through native parser programs")
+        self.0.as_ref().expect(
+            "LR CONSTRAINT RUNTIME ACCESS IS FORBIDDEN: this parser has no retained LR table; route this operation through native parser programs",
+        )
     }
 }
 impl DerefMut for ParserTableStorage {
     #[track_caller]
     fn deref_mut(&mut self) -> &mut GLRTable {
-        panic!("LR CONSTRAINT TABLE MUTATION IS FORBIDDEN")
+        self.0.as_mut().expect(
+            "LR CONSTRAINT TABLE MUTATION IS FORBIDDEN: this parser has no retained LR table",
+        )
     }
 }
 
@@ -98,7 +143,8 @@ pub(crate) mod table_serde {
             }
             return Ok(ParserTableStorage::absent());
         }
-        crate::compiler::glr::table::artifact_serde::deserialize(deserializer).map(Into::into)
+        crate::compiler::glr::table::artifact_serde::deserialize(deserializer)
+            .map(super::ParserTableStorage::explicit)
     }
 }
 
