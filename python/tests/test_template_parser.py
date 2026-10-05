@@ -98,10 +98,9 @@ def test_python_builtin_template_backend_is_default_and_survives_reload(mode):
             assert np.array_equal(left.mask(), right.mask())
             assert left.is_accepting() == right.is_accepting()
             depth = depth_after(prefix, ignore_whitespace=False)
-            # Built-in grammar normalization deliberately removes the root-only
-            # empty generation path; embedded source nullability is retained.
-            # Data-only ParserProgram completion below still accepts empty.
-            assert right.is_accepting() == (bool(prefix) and depth == 0)
+            # Source nullability must survive compilation and both artifact forms.
+            # The empty balanced prefix accepts; incomplete prefixes do not.
+            assert right.is_accepting() == (depth == 0)
             for token_id, word in enumerate(words):
                 expected = depth_after(word, depth, ignore_whitespace=False)
                 assert bool(right.mask()[token_id]) == (expected is not None), (prefix, word)
