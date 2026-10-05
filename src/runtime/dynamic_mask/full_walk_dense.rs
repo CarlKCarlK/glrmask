@@ -6535,7 +6535,38 @@ fn try_full_walk_mask_with_table_from_initial_in_output_scope<
     // the cheaper output polarity after the walk instead.  O1 retains the
     // existing singleton-positive policy.
     let quotient_adaptive_polarity = vocab.is_grammar_quotiented();
+    // A two-terminal physical scalar frontier can be dense (for example a
+    // nullable string). Deferred polarity blocks the already-exact dense hot
+    // walker, even though that walker can set endpoints without constructing
+    // both output sides. Select its positive output before walking substantial
+    // full-vocabulary tries. This changes only output scheduling: every token
+    // still follows the same lexer/parser transitions and failed hot attempts
+    // retain the ordinary exact fallback. Correlated guards, virtual sources,
+    // quotient vocabularies and profiled walks keep their existing policy.
+    static SCALAR_HOT_POSITIVE_REBUILD_ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    let scalar_hot_positive_rebuild = !quotient_adaptive_polarity
+        && !singleton_positive_rebuild && !effective_singleton_positive_rebuild
+        && llg_master_decision.is_none()
+        && state.constraint.ignore_terminal.is_none()
+        && !profile_walk && !profile_kernel
+        && *SCALAR_HOT_POSITIVE_REBUILD_ENABLED.get_or_init(|| {
+            std::env::var_os("GLRMASK_DISABLE_DENSE_HOT_LANE").is_none()
+        })
+        && HOT_SINGLE_ROOT && root_branches.len() == 1
+        && root_branches[0].initial_prune_guard.is_passed()
+        && root_branches[0].exact_tokenizer_state
+            == Some(root_branches[0].tokenizer_config)
+        && std::ptr::eq(lexer_scan_cache.tokenizer(), state.constraint.tokenizer.as_ref())
+        && trie.full_walk_ops().len() >= 4096
+        && {
+            let source = root_branches[0].tokenizer_config;
+            let tokenizer = lexer_scan_cache.tokenizer();
+            source < tokenizer.num_states()
+                && !tokenizer.state_is_virtual_runtime(source)
+                && parser_cache.admitted(state.constraint, root_parser_nodes[0]).count_ones() == 2
+        };
     let mut deferred_output = !force_positive_rebuild
+        && !scalar_hot_positive_rebuild
         && llg_master_decision.is_none()
         && (quotient_adaptive_polarity
             || (!singleton_positive_rebuild && !effective_singleton_positive_rebuild))
@@ -6558,6 +6589,7 @@ fn try_full_walk_mask_with_table_from_initial_in_output_scope<
     } else if !deferred_output
         && (singleton_positive_rebuild
             || effective_singleton_positive_rebuild
+            || scalar_hot_positive_rebuild
             || force_positive_rebuild)
     {
         buf.fill(0);
