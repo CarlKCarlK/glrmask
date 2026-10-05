@@ -8562,7 +8562,7 @@ mod tests {
             (1, b"a".to_vec()), (7, b"a".to_vec()), (11, b"b".to_vec()),
             (19, b"ab".to_vec()), (23, Vec::new()), (29, vec![0xc3, 0xa9]),
         ]);
-        let original = crate::DynamicConstraint::from_ebnf(
+        let original = crate::DynamicConstraint::from_ebnf_with_bounded_template_parser(
             "start ::= 'a' start? 'b'", &vocab,
         ).unwrap();
         assert!(original.inner.uses_dynamic_runtime());

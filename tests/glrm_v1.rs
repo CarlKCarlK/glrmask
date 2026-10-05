@@ -3,6 +3,20 @@ use glrmask::{
     Vocab,
 };
 
+// Composition fixtures explicitly materialize the native parser before binding.
+// The ordinary Dynamic default remains LR-backed and its rejection is checked.
+fn compile_native_dynamic_fixture(grammar: Grammar<'_>, vocab: &Vocab) -> glrmask::Result<DynamicConstraint> {
+    glrmask::__private::into_dynamic_template_parser(DynamicConstraint::compile(grammar, vocab)?)
+}
+
+fn assert_lr_composition_rejected<T>(result: glrmask::Result<T>) {
+    match result {
+        Err(glrmask::Error::Compilation(message)) => assert!(message.contains("LR-backed components"), "{message}"),
+        Err(error) => panic!("unexpected composition error: {error}"),
+        Ok(_) => panic!("LR-backed composition unexpectedly succeeded"),
+    }
+}
+
 fn allowed(mask: &[u32], token_id: u32) -> bool {
     let word = token_id as usize / 32;
     let bit = token_id % 32;
@@ -230,10 +244,16 @@ fn compiled_parent_late_binding_matches_monolithic_across_backend_matrix() {
     let reference = Constraint::compile(Grammar::ebnf(r#"start ::= "x" "y""#), &vocab)
         .unwrap();
     let static_child = Constraint::compile(child_grammar.clone(), &vocab).unwrap();
-    let dynamic_child = DynamicConstraint::compile(child_grammar, &vocab).unwrap();
+    let dynamic_child = compile_native_dynamic_fixture(child_grammar, &vocab).unwrap();
     let static_parent = Constraint::compile(Grammar::glrm(parent_source), &vocab).unwrap();
     let dynamic_parent =
-        DynamicConstraint::compile(Grammar::glrm(parent_source), &vocab).unwrap();
+        compile_native_dynamic_fixture(Grammar::glrm(parent_source), &vocab).unwrap();
+
+    let lr_child = DynamicConstraint::compile(Grammar::ebnf(r#"start ::= "y""#), &vocab).unwrap();
+    let lr_parent = DynamicConstraint::compile(Grammar::glrm(parent_source), &vocab).unwrap();
+    assert_lr_composition_rejected(static_parent.bind_grammar("child", &lr_child));
+    assert_lr_composition_rejected(lr_parent.bind_grammar("child", &static_child));
+    assert_lr_composition_rejected(lr_parent.bind_grammar_dynamic_boundary("child", &dynamic_child));
 
     assert_static_xy_matches(
         &reference,
@@ -374,7 +394,7 @@ fn late_binding_multiple_adjacent_slots_handles_internal_multi_boundary_tokens()
         Constraint::compile(Grammar::ebnf(r#"start ::= "x" "y" "z""#), &vocab).unwrap();
     let static_left = Constraint::compile(Grammar::ebnf(r#"start ::= "y""#), &vocab).unwrap();
     let dynamic_right =
-        DynamicConstraint::compile(Grammar::ebnf(r#"start ::= "z""#), &vocab).unwrap();
+        compile_native_dynamic_fixture(Grammar::ebnf(r#"start ::= "z""#), &vocab).unwrap();
 
     let open = Constraint::compile(parent, &vocab).unwrap();
     let partial = open.bind_grammar("left", &static_left).unwrap();
@@ -422,7 +442,7 @@ fn dynamic_boundary_cross_prefilter_preserves_scoped_ignore_paths() {
         &vocab,
     )
     .unwrap();
-    let child = DynamicConstraint::compile(
+    let child = compile_native_dynamic_fixture(
         Grammar::glrm(
             r#"
                 glrm 1;
@@ -487,7 +507,7 @@ fn compiled_children_are_authoritative_and_compose_both_directions() {
         .build()
         .unwrap();
     let static_child = child_spec.compile().unwrap();
-    let dynamic_child = child_spec.compile_dynamic().unwrap();
+    let dynamic_child = glrmask::__private::into_dynamic_template_parser(child_spec.compile_dynamic().unwrap()).unwrap();
     let loaded_dynamic_child = DynamicConstraint::load(&dynamic_child.save()).unwrap();
     let parent_source = r#"
 glrm 1;
@@ -496,6 +516,11 @@ extern token MARK;
 extern grammar payload;
 nt document = MARK payload;
 "#;
+
+    let open_parent_spec = ConstraintSpec::builder(Grammar::glrm(parent_source), &vocab)
+        .unwrap().bind_token("MARK", [0]).unwrap().build().unwrap();
+    let native_open_parent = glrmask::__private::into_dynamic_template_parser(
+        open_parent_spec.compile_dynamic().unwrap()).unwrap();
 
     for (static_parent, dynamic_parent) in [
         {
@@ -509,7 +534,7 @@ nt document = MARK payload;
                 .unwrap();
             (
                 spec.compile().unwrap(),
-                spec.compile_dynamic().unwrap(),
+                native_open_parent.bind_grammar("payload", &static_child).unwrap(),
             )
         },
         {
@@ -523,7 +548,7 @@ nt document = MARK payload;
                 .unwrap();
             (
                 spec.compile().unwrap(),
-                spec.compile_dynamic().unwrap(),
+                native_open_parent.bind_grammar("payload", &dynamic_child).unwrap(),
             )
         },
         {
@@ -537,7 +562,7 @@ nt document = MARK payload;
                 .unwrap();
             (
                 spec.compile().unwrap(),
-                spec.compile_dynamic().unwrap(),
+                native_open_parent.bind_grammar("payload", &loaded_dynamic_child).unwrap(),
             )
         },
     ] {
@@ -557,7 +582,7 @@ nt document = MARK payload;
 #[test]
 fn loaded_direct_regular_dynamic_child_remains_composable() {
     let vocab = Vocab::new(vec![(0, b"a".to_vec()), (1, b"aa".to_vec())]);
-    let dynamic_child = DynamicConstraint::compile(
+    let dynamic_child = compile_native_dynamic_fixture(
         Grammar::lark("start: /a+/"),
         &vocab,
     )
@@ -571,7 +596,8 @@ fn loaded_direct_regular_dynamic_child_remains_composable() {
         .build()
         .unwrap();
     let static_parent = spec.compile().unwrap();
-    let dynamic_parent = spec.compile_dynamic().unwrap();
+    let dynamic_parent = compile_native_dynamic_fixture(Grammar::glrm(parent_source), &vocab)
+        .unwrap().bind_grammar("payload", &loaded_child).unwrap();
     for token in [0, 1] {
         let mut static_state = static_parent.start();
         let mut dynamic_state = dynamic_parent.start();
@@ -593,8 +619,9 @@ fn grammar_can_bind_source_subgrammar_before_target_selection() {
 
     let static_constraint =
         Constraint::compile(parent.clone(), &vocab).unwrap();
+    assert_lr_composition_rejected(DynamicConstraint::compile(parent.clone(), &vocab));
     let dynamic_constraint =
-        DynamicConstraint::compile(parent, &vocab).unwrap();
+        parent.compile_with(&vocab, BuildOptions::default().optimization(Optimization::FastBuild)).unwrap();
 
     for token in [0, 1] {
         let mut static_state = static_constraint.start();
@@ -621,13 +648,15 @@ fn grammar_source_bindings_can_nest_and_mix_with_constraintspec_token_bindings()
     .bind_grammar("child", child)
     .unwrap();
 
-    let spec = ConstraintSpec::builder(parent, &vocab)
+    let spec = ConstraintSpec::builder(parent.clone(), &vocab)
         .unwrap()
         .bind_token("MARK", [7])
         .unwrap()
         .build()
         .unwrap();
-    let constraint = spec.compile_dynamic().unwrap();
+    assert_lr_composition_rejected(spec.compile_dynamic());
+    let constraint = parent.bind("MARK", vocab.token(7).unwrap()).unwrap()
+        .compile_with(&vocab, BuildOptions::default().optimization(Optimization::FastBuild)).unwrap();
     let mut state = constraint.start();
     state.commit_token(7).unwrap();
     state.commit_token(8).unwrap();

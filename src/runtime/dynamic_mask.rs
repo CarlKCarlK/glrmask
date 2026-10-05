@@ -10398,8 +10398,8 @@ mod tests {
                 r#"glrm 1; start root; extern grammar leaf; nt root = "P" leaf "Q";"#), &vocab).unwrap();
             let source = if nullable { r#"glrm 1; start leaf; nt leaf = ("ab" | "ac")?;"# }
                 else { r#"glrm 1; start leaf; nt leaf = "ab" | "ac";"# };
-            let child = crate::ConstraintSpec::builder(Grammar::glrm(source), &vocab).unwrap()
-                .build().unwrap().compile_dynamic().unwrap();
+            let child = crate::DynamicConstraint::from_glrm_with_bounded_template_parser(
+                source, &vocab).unwrap();
             let bound = parent.bind_grammar_dynamic_boundary("leaf", child).unwrap();
             let loaded = Constraint::load(bound.save()).unwrap();
             for c in [&bound, &loaded] {
@@ -10566,8 +10566,8 @@ mod tests {
                 r#"glrm 1; start root; extern grammar leaf; nt root = "P" leaf "Q";"#), &vocab).unwrap();
             let source = if nullable { r#"glrm 1; start x; nt x = ("ab" | "ac")?;"# }
                 else { r#"glrm 1; start x; nt x = "ab" | "ac";"# };
-            let child = crate::ConstraintSpec::builder(Grammar::glrm(source), &vocab).unwrap()
-                .build().unwrap().compile_dynamic().unwrap();
+            let child = crate::DynamicConstraint::from_glrm_with_bounded_template_parser(
+                source, &vocab).unwrap();
             let bound = parent.bind_grammar_dynamic_boundary("leaf", child).unwrap();
             for prefix in [b"".as_slice(),b"P",b"Pa",b"Pab",b"Pac",b"PabQ"] {
                 let mut state = bound.start(); state.commit_bytes(prefix).unwrap();
