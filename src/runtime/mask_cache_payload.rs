@@ -36,6 +36,23 @@ fn sparse_counts(mask: &[u32], baseline: &[u32]) -> (usize, usize) {
     (nonzero, different)
 }
 
+/// A narrow result does not need the Llama-sized payload allocation that
+/// motivates first-use probation. Bound either sparse encoding to 256 bytes;
+/// stop as soon as both exceed that bound. Admission still uses the complete
+/// exact state key, and the existing encoder determines the stored words.
+pub(super) fn small_first_use_sparse(mask: &[u32], baseline: &[u32]) -> bool {
+    const MAX_ENTRIES: usize = 256 / std::mem::size_of::<(u32, u32)>();
+    let (mut nonzero, mut different) = (0, 0);
+    for (index, &word) in mask.iter().enumerate() {
+        nonzero += usize::from(word != 0);
+        different += usize::from(word != baseline.get(index).copied().unwrap_or(0));
+        if nonzero > MAX_ENTRIES && different > MAX_ENTRIES {
+            return false;
+        }
+    }
+    true
+}
+
 /// Preserve the existing representation, tie-breaking and sparse allocation
 /// sequence. Only the classification scans are fused: exact pre-reservation
 /// changed allocation history and regressed a loaded JavaScript warm tail.
@@ -71,6 +88,41 @@ pub(super) fn from_words(mask: &[u32], baseline: &[u32]) -> DynamicMaskCachePayl
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn first_use_sparse_bound_matches_complete_counts_and_encoder() {
+        let mut seed = 0x586543u64;
+        for len in [0, 1, 31, 32, 33, 64, 129, 4008] {
+            for baseline_len in [0, 1, len / 2, len, len + 1] {
+                for shape in 0..8 {
+                    let baseline = (0..baseline_len).map(|_| {
+                        seed ^= seed << 13; seed ^= seed >> 7; seed ^= seed << 17;
+                        seed as u32
+                    }).collect::<Vec<_>>();
+                    let mask = (0..len).map(|i| match shape {
+                        0 => 0,
+                        1 => baseline.get(i).copied().unwrap_or(0),
+                        2..=5 if i < [0, 0, 31, 32, 33, 64][shape] => 1,
+                        2..=5 => 0,
+                        _ => (i as u32).wrapping_mul(0x9e3779b1) ^ shape as u32,
+                    }).collect::<Vec<_>>();
+                    let nonzero = mask.iter().filter(|&&word| word != 0).count();
+                    let different = mask.iter().enumerate()
+                        .filter(|&(i, &word)| word != baseline.get(i).copied().unwrap_or(0)).count();
+                    assert_eq!(small_first_use_sparse(&mask, &baseline), nonzero.min(different) <= 32);
+                    if small_first_use_sparse(&mask, &baseline) {
+                        let bytes = match from_words(&mask, &baseline) {
+                            DynamicMaskCachePayload::Dense(words) => words.len() * 4,
+                            DynamicMaskCachePayload::SparseZero(words)
+                            | DynamicMaskCachePayload::SparseAllOriginal(words) => words.len() * 8,
+                            DynamicMaskCachePayload::Probation => unreachable!(),
+                        };
+                        assert!(bytes <= 256);
+                    }
+                }
+            }
+        }
+    }
 
     // Deliberately retain the original independent two-pass implementation as
     // an oracle for representation, tie-breaking and sparse entry ordering.

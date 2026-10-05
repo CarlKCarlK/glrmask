@@ -8250,7 +8250,9 @@ impl DynamicMaskVocab {
         }
         let payload = if let Some(existing) = cache.values.get(value_hash, mask, self.all_original_token_words()) {
             Some(existing)
-        } else if probation_if_absent {
+        } else if probation_if_absent
+            && !super::mask_cache_payload::small_first_use_sparse(mask, self.all_original_token_words())
+        {
             None
         } else {
             let payload = Arc::new(self.dynamic_mask_cache_payload(mask));
