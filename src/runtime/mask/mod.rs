@@ -6549,23 +6549,15 @@ impl<'a> ConstraintState<'a> {
         self.enforce_empty_byte_token_domain(buf);
     }
 
-    /// A zero-byte model ID is not an ordinary byte transition of a composed
-    /// parser. Component A may admit it as an accepting-prefix artefact; an
-    /// OR-only boundary addition cannot remove that false positive. Enforce
-    /// the same endpoint policy as the exact shared walker at final output,
-    /// retaining an empty-spelled special ID only via its exact live action.
-    /// The byte walker and ordinary non-composed language are unchanged.
+    /// A zero-byte model ID is not an ordinary byte transition. Enforce the
+    /// shared commit endpoint policy at final output, retaining an
+    /// empty-spelled special ID only via its exact live action. Root end IDs
+    /// are applied separately after this body-domain filter.
     fn enforce_empty_byte_token_domain(&self, buf: &mut [u32]) {
-        // Composed runtimes have always applied this endpoint policy. The
-        // explicitly retained LR runtime carries the same zero-byte alias
-        // artefact as a composed component, so it must apply the identical
-        // endpoint policy to match the native ordinary language. Native
-        // template and ordinary byte-walker behavior are untouched.
-        let retained_lr_runtime = !self.constraint.has_template_parser()
-            && self.constraint.table.is_present();
         if self.constraint.empty_byte_token_ids.is_empty()
-            || !(self.constraint.uses_compact_segmented_parser_runtime()
-                || retained_lr_runtime)
+            || !(self.constraint.has_template_parser()
+                || self.constraint.uses_dynamic_runtime()
+                || self.constraint.uses_compact_segmented_parser_runtime())
         { return; }
         for &id in self.constraint.empty_byte_token_ids.iter() {
             let Some(word) = buf.get_mut(id as usize / 32) else { continue; };
@@ -8841,6 +8833,9 @@ impl<'a> ConstraintState<'a> {
             return;
         }
         self.fill_body_mask(buf);
+        // Also finalize cached and ordinary dynamic masks: internal body paths
+        // may return before their composed-mask endpoint filter runs.
+        self.enforce_empty_byte_token_domain(buf);
         if !self.constraint.end_tokens.is_empty() {
             let accepting = self.is_accepting();
             for &id in self.constraint.end_tokens.iter() {

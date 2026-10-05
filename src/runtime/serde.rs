@@ -6061,7 +6061,7 @@ impl Constraint {
         self.save_with_vocab_policy(false)
     }
 
-    fn template_artifact_vocab_digest(&self) -> [u8; 32] {
+    pub(crate) fn artifact_vocab_digest(&self) -> [u8; 32] {
         if let Some(vocab) = self.late_bind_vocab.get() {
             return crate::compiler::compile::vocab_content_digest(vocab);
         }
@@ -6526,7 +6526,7 @@ impl Constraint {
                         let started = profile.then(std::time::Instant::now);
                         let bytes = if let Some(parser) = &self.template_parser {
                             if external_vocab {
-                                crate::runtime::parser_backend::wire::encode_external(parser, &self.template_dfas_by_terminal, self.template_artifact_vocab_digest())
+                                crate::runtime::parser_backend::wire::encode_external(parser, &self.template_dfas_by_terminal, self.artifact_vocab_digest())
                             } else {
                                 crate::runtime::parser_backend::wire::encode(parser, &self.template_dfas_by_terminal)
                             }
@@ -6540,7 +6540,7 @@ impl Constraint {
                                 // canonical vocabulary content digest. Load validates
                                 // the supplied vocabulary against this before trusting
                                 // its token bytes.
-                                let digest = self.template_artifact_vocab_digest();
+                                let digest = self.artifact_vocab_digest();
                                 let mut framed = Vec::with_capacity(digest.len() + table.len());
                                 framed.extend_from_slice(&digest);
                                 framed.extend_from_slice(&table);

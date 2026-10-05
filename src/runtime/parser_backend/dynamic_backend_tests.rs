@@ -420,3 +420,113 @@ fn empty_special_id_is_exact_and_ordinary_empty_alias_is_rejected() {
         assert!(rejected.is_rejected());
     }
 }
+
+#[test]
+fn focused_dynamic_empty_token_and_external_identity_regression() {
+    let vocab = Vocab::new(vec![(0, b"(".to_vec()), (2, b")".to_vec()),
+        (7, b"()".to_vec()), (15, b"(".to_vec()), (20, b"x".to_vec()),
+        (25, Vec::new()), (26, Vec::new())]);
+    let source = r#"start ::= "(" start ")" start | """#;
+    for dynamic in [crate::DynamicConstraint::from_ebnf(source, &vocab).unwrap(),
+        crate::DynamicConstraint::from_ebnf_with_vocab_partition(source, &vocab).unwrap()] {
+        let backend = dynamic.clone().into_constraint().parser_backend();
+        let transfer = dynamic.save_with_external_vocab();
+        let version = u16::from_le_bytes(transfer[8..10].try_into().unwrap());
+        assert_eq!(version, if backend == ParserBackend::LrTable { 15 } else { 14 });
+        let self_loaded = crate::DynamicConstraint::load(&dynamic.save()).unwrap();
+        let external_loaded = crate::DynamicConstraint::load_with_vocab(&transfer, &vocab).unwrap();
+        assert_eq!(external_loaded.save_with_external_vocab(), transfer);
+        for compiled in [&dynamic, &self_loaded, &external_loaded] {
+            for prefix in [b"".as_slice(), b"(", b"()", b"()("] {
+                let mut state = compiled.start();
+                state.commit_bytes(prefix).unwrap();
+                for _ in 0..2 { // Repeat the query to exercise the mask cache.
+                    assert!(!allowed(&state.mask(), 25), "{backend:?} {prefix:?}");
+                    assert!(!allowed(&state.mask(), 26));
+                }
+                assert!(state.commit_token(25).is_err());
+                assert!(state.is_rejected());
+            }
+        }
+        for changed in [
+            Vocab::new(vec![(0,b"[".to_vec()),(2,b")".to_vec()),(7,b"()".to_vec()),
+                (15,b"(".to_vec()),(20,b"x".to_vec()),(25,Vec::new()),(26,Vec::new())]),
+            Vocab::new(vec![(0,b"(".to_vec()),(2,b")".to_vec()),(7,b"()".to_vec()),
+                (15,b"(".to_vec()),(20,b"y".to_vec()),(25,Vec::new()),(26,Vec::new())]),
+            Vocab::new(vec![(0,b"(".to_vec()),(2,b")".to_vec()),(7,b"()".to_vec()),
+                (16,b"(".to_vec()),(20,b"x".to_vec()),(25,Vec::new()),(26,Vec::new())]),
+        ] {
+            assert!(crate::DynamicConstraint::load_with_vocab(&transfer, &changed).is_err());
+            assert!(crate::DynamicConstraint::load_with_vocab(&dynamic.save(), &changed).is_err());
+        }
+        if backend == ParserBackend::LrTable {
+            let mut corrupt = transfer.clone();
+            corrupt[26] ^= 1; // First byte of the mandatory envelope digest.
+            assert!(crate::DynamicConstraint::load_with_vocab(&corrupt, &vocab).is_err());
+            for version in 1u16..=13 {
+                let mut old = transfer.clone();
+                old[8..10].copy_from_slice(&version.to_le_bytes());
+                let error = crate::DynamicConstraint::load_with_vocab(&old, &vocab).unwrap_err();
+                assert!(error.to_string().contains("lacks mandatory exact vocabulary identity"));
+            }
+        }
+    }
+}
+
+#[test]
+fn focused_public_empty_token_policy_preserves_empty_eos_across_reload() {
+    let vocab = Vocab::new(vec![(0,b"(".to_vec()),(2,b")".to_vec()),
+        (25,Vec::new()),(26,Vec::new())]);
+    let source = r#"start ::= "(" start ")" start | """#;
+    let lr = crate::DynamicConstraint::from_ebnf(source, &vocab).unwrap()
+        .into_constraint().with_end_tokens(&[26]).unwrap();
+    let mut constraints = vec![lr];
+    for mode in [Optimization::Auto, Optimization::FastBuild, Optimization::FastRuntime] {
+        constraints.push(Grammar::from_ebnf(source).compile_with(&vocab,
+            BuildOptions::default().optimization(mode).end_tokens([26])).unwrap());
+    }
+    for compiled in constraints {
+        for constraint in [&compiled,
+            &Constraint::load(compiled.save()).unwrap(),
+            &Constraint::load_with_vocab(compiled.save_with_external_vocab().unwrap(), &vocab).unwrap()] {
+            for (prefix, accepting) in [(b"".as_slice(),true),(b"(",false),(b"()",true)] {
+                let mut state = constraint.start();state.commit_bytes(prefix).unwrap();
+                for _ in 0..2 {
+                    assert!(!allowed(&state.mask(),25));
+                    assert_eq!(allowed(&state.mask(),26),accepting);
+                }
+                if accepting {
+                    state.commit_token(26).unwrap();assert!(state.is_terminated());
+                    assert!(state.mask().iter().all(|&word| word==0));
+                } else {
+                    // Established root EOS API returns Ok while rejecting an
+                    // early end token; the mask and resulting state are exact.
+                    state.commit_token(26).unwrap();
+                    assert!(state.is_rejected());assert!(!state.is_terminated());
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn focused_empty_special_token_is_live_after_prefix_across_reload() {
+    let vocab = Vocab::new(vec![(0,b"a".to_vec()),(25,Vec::new()),(26,Vec::new())]);
+    let source = "glrm 1; start root; extern token MARK; nt root = \"a\" MARK;";
+    let lr = crate::DynamicConstraint::from_glrm_grammar_with_bindings_and_end_tokens(
+        source,&vocab,&[("MARK",&[25])],&[]).unwrap().into_constraint();
+    let mut constraints = vec![lr];
+    for mode in [Optimization::Auto,Optimization::FastBuild,Optimization::FastRuntime] {
+        constraints.push(Grammar::from_glrm(source).bind("MARK",vocab.token(25).unwrap()).unwrap()
+            .compile_with(&vocab,BuildOptions::default().optimization(mode)).unwrap());
+    }
+    for compiled in constraints {
+        for constraint in [&compiled,&Constraint::load(compiled.save()).unwrap(),
+            &Constraint::load_with_vocab(compiled.save_with_external_vocab().unwrap(),&vocab).unwrap()] {
+            let mut state=constraint.start();assert!(!allowed(&state.mask(),25));
+            state.commit_token(0).unwrap();assert!(allowed(&state.mask(),25));
+            assert!(!allowed(&state.mask(),26));state.commit_token(25).unwrap();
+            assert!(state.is_accepting());
+        }
+    }
+}

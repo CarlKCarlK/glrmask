@@ -24,7 +24,13 @@ enter the documented fail state; unknown IDs error without mutating it.
 
 Self-contained retained-LR Constraints use v30; external-vocabulary LR uses v39
 with a canonical exact-vocabulary digest. Native v37/v38 are unchanged. Dynamic
-transfer artifacts use their existing self/external codecs. Load preserves the
+self-contained LR remains v20; native Dynamic remains v21/v14. Retained-LR
+Dynamic external transfer is v15: the existing six sections and v13 metadata
+follow a 40-byte payload header containing the canonical 32-byte vocabulary
+digest. Transfer v1-v13 had no mandatory exact identity and are explicitly
+unsupported; recompile those pre-release artifacts. The public save/load API
+is unchanged. Load validates the digest before decoding runtime sections and
+independently of compiler validation settings. Load preserves the
 built backend; mislabeled/mixed representations and mismatched vocabularies are
 rejected. Native components/providers remain table-free, and native table access
 cannot become a fallback.

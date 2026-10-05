@@ -123,9 +123,13 @@ const LEGACY_DYNAMIC_TRANSFER_VERSION_V12: u16 = 12;
 // v13 keeps the same six-section framing and wraps the v12 metadata with exact
 // compact master-slice proof/coverage/radius rows. This replaces giant
 // projected-terminal quotient payloads for the dynamic master proof fast path.
-const DYNAMIC_TRANSFER_VERSION: u16 = 13;
+// v15 retains the six raw sections and v13 metadata, but binds the envelope to
+// the exact canonical model vocabulary. v1-v13 lacked a mandatory identity
+// field and cannot safely validate an external vocabulary; recompile them.
+const DYNAMIC_TRANSFER_VERSION: u16 = 15;
 const TEMPLATE_DYNAMIC_TRANSFER_VERSION: u16 = 14;
 const DYNAMIC_TRANSFER_V12_PAYLOAD_HEADER_LEN: usize = 8;
+const DYNAMIC_TRANSFER_V15_PAYLOAD_HEADER_LEN: usize = 8 + 32;
 const DYNAMIC_TRANSFER_V12_ALT_DESCRIPTOR_LEN: usize = 6 * 8;
 
 mod compressed_terminal_exprs_serde {
@@ -1854,7 +1858,7 @@ impl DynamicConstraint {
                 .and_then(|total| total.checked_add(alternative.virtual_residual_wire.len()))
                 .expect("dynamic transfer section size overflow")
         });
-        let payload_capacity = DYNAMIC_TRANSFER_V12_PAYLOAD_HEADER_LEN
+        let payload_capacity = DYNAMIC_TRANSFER_V15_PAYLOAD_HEADER_LEN
             .checked_add(descriptor_bytes)
             .and_then(|total| total.checked_add(section_bytes))
             .expect("dynamic transfer payload size overflow");
@@ -1864,6 +1868,11 @@ impl DynamicConstraint {
         bytes.extend_from_slice(&0u64.to_le_bytes());
         bytes.extend_from_slice(&alternative_count.to_le_bytes());
         bytes.extend_from_slice(&0u32.to_le_bytes());
+        let vocab_digest = self.inner.artifact_vocab_digest();
+        assert!(self.alternatives.iter().all(|alternative|
+            alternative.artifact_vocab_digest() == vocab_digest),
+            "dynamic transfer alternatives have different vocabularies");
+        bytes.extend_from_slice(&vocab_digest);
         let descriptor_start = bytes.len();
         bytes.resize(descriptor_start + descriptor_bytes, 0);
         for (index, alternative) in alternatives.into_iter().enumerate() {
@@ -2234,6 +2243,17 @@ impl DynamicConstraint {
         let profile = std::env::var_os("GLRMASK_PROFILE_DYNAMIC_LOAD").is_some();
         let total_started = profile.then(std::time::Instant::now);
         let version = u16::from_le_bytes([bytes[8], bytes[9]]);
+        let payload_header_len = if version == DYNAMIC_TRANSFER_VERSION {
+            let digest = bytes.get(DYNAMIC_CONSTRAINT_HEADER_LEN + 8
+                ..DYNAMIC_CONSTRAINT_HEADER_LEN + DYNAMIC_TRANSFER_V15_PAYLOAD_HEADER_LEN)
+                .ok_or_else(|| crate::GlrMaskError::Serialization(
+                    "truncated dynamic v15 vocabulary digest".to_owned()))?;
+            if digest != crate::compiler::compile::vocab_content_digest(vocab) {
+                return Err(crate::GlrMaskError::Serialization(
+                    "dynamic transfer artifact does not match supplied vocabulary".to_owned()));
+            }
+            DYNAMIC_TRANSFER_V15_PAYLOAD_HEADER_LEN
+        } else { DYNAMIC_TRANSFER_V12_PAYLOAD_HEADER_LEN };
 
         let backing_started = profile.then(std::time::Instant::now);
         let backing = Arc::new(bytes.to_vec());
@@ -2244,7 +2264,7 @@ impl DynamicConstraint {
         let payload = backing.get(payload_start..).ok_or_else(|| {
             crate::GlrMaskError::Serialization("missing dynamic v12 transfer payload".to_owned())
         })?;
-        if payload.len() < DYNAMIC_TRANSFER_V12_PAYLOAD_HEADER_LEN {
+        if payload.len() < payload_header_len {
             return Err(crate::GlrMaskError::Serialization(
                 "truncated dynamic v12 transfer payload header".to_owned(),
             ));
@@ -2278,7 +2298,7 @@ impl DynamicConstraint {
                 )
             })?;
         let descriptor_end = payload_start
-            .checked_add(DYNAMIC_TRANSFER_V12_PAYLOAD_HEADER_LEN)
+            .checked_add(payload_header_len)
             .and_then(|value| value.checked_add(descriptor_bytes))
             .ok_or_else(|| {
                 crate::GlrMaskError::Serialization(
@@ -2292,7 +2312,7 @@ impl DynamicConstraint {
         }
 
         let mut descriptors = Vec::<[usize; 6]>::with_capacity(alternative_count);
-        let descriptor_start = payload_start + DYNAMIC_TRANSFER_V12_PAYLOAD_HEADER_LEN;
+        let descriptor_start = payload_start + payload_header_len;
         for index in 0..alternative_count {
             let mut pos = descriptor_start + index * DYNAMIC_TRANSFER_V12_ALT_DESCRIPTOR_LEN;
             let mut lengths = [0usize; 6];
@@ -3225,6 +3245,10 @@ impl DynamicConstraint {
             ));
         }
         let version = u16::from_le_bytes([bytes[8], bytes[9]]);
+        if version <= 13 {
+            return Err(crate::GlrMaskError::Serialization(format!(
+                "unsupported dynamic transfer artifact version {version}: lacks mandatory exact vocabulary identity; recompile the pre-release artifact")));
+        }
         if !matches!(
             version,
             DYNAMIC_TRANSFER_VERSION_V1
