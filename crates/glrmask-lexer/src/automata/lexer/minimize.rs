@@ -21,6 +21,103 @@ use super::dfa::DFA;
 /// Hash-map equality checks the complete signature; a hash collision is never
 /// an equivalence certificate. Cycles decline before any source mutation.
 fn acyclic_single_group_partition(dfa: &DFA) -> Option<(Vec<Vec<u32>>, Vec<bool>)> {
+    acyclic_single_group_partition_impl::<{ u64::MAX }>(dfa)
+}
+
+// A zero hash mask in tests forces every distinct signature into one bucket;
+// production equality must still be exact even under total hash collision.
+fn acyclic_single_group_partition_impl<const HASH_MASK: u64>(dfa: &DFA) -> Option<(Vec<Vec<u32>>, Vec<bool>)> {
+    if dfa.num_groups() != 1 || dfa.has_epsilon_transitions() || dfa.has_self_loops() {
+        return None;
+    }
+    let n = dfa.num_states();
+    let mut visited = vec![0u8; n];
+    let mut order = Vec::with_capacity(n);
+    // Iterative DFS avoids a call-stack dependency on the repeat bound.
+    let mut stack = Vec::new();
+    for root in 0..n {
+        if visited[root] != 0 { continue; }
+        visited[root] = 1;
+        stack.push((root, dfa.states()[root].transitions.iter()));
+        while let Some((state, edges)) = stack.last_mut() {
+            if let Some((_, &target)) = edges.next() {
+                let target = target as usize;
+                match *visited.get(target)? {
+                    0 => {
+                        visited[target] = 1;
+                        stack.push((target, dfa.states()[target].transitions.iter()));
+                    }
+                    1 => return None,
+                    _ => {}
+                }
+            } else {
+                visited[*state] = 2;
+                order.push(*state);
+                stack.pop();
+            }
+        }
+    }
+
+    let mut classes = vec![u32::MAX; n];
+    let mut bucket_heads = FxHashMap::<u64, u32>::default();
+    bucket_heads.reserve(n);
+    let mut representatives = Vec::<u32>::with_capacity(n);
+    let mut collision_next = Vec::<u32>::with_capacity(n);
+    let mut can_reach_accepting = vec![false; n];
+    for state in order {
+        let accepting = !dfa.finalizers(state as u32).is_empty();
+        let transitions = &dfa.states()[state].transitions;
+        let mut signature = rustc_hash::FxHasher::default();
+        accepting.hash(&mut signature);
+        transitions.len().hash(&mut signature);
+        let mut reaches_accepting = accepting;
+        for (byte, &target) in transitions.iter() {
+            debug_assert_ne!(classes[target as usize], u32::MAX);
+            byte.hash(&mut signature);
+            classes[target as usize].hash(&mut signature);
+            reaches_accepting |= can_reach_accepting[target as usize];
+        }
+        can_reach_accepting[state] = reaches_accepting;
+        let hash = signature.finish() & HASH_MASK;
+        let bucket = bucket_heads.entry(hash).or_insert(u32::MAX);
+        let mut class = *bucket;
+        while class != u32::MAX {
+            let representative = representatives[class as usize];
+            let other = &dfa.states()[representative as usize];
+            // The immutable representative graph IS the exact signature. The
+            // hash is never a certificate, even when every hash collides.
+            if accepting == !other.finalizers.is_empty()
+                && transitions.len() == other.transitions.len()
+                && transitions.iter().zip(other.transitions.iter()).all(
+                    |((byte, &target), (other_byte, &other_target))| {
+                        byte == other_byte && classes[target as usize] == classes[other_target as usize]
+                    },
+                )
+            {
+                break;
+            }
+            class = collision_next[class as usize];
+        }
+        if class == u32::MAX {
+            class = u32::try_from(representatives.len()).ok()?;
+            representatives.push(u32::try_from(state).ok()?);
+            collision_next.push(*bucket);
+            *bucket = class;
+        }
+        classes[state] = class;
+    }
+    let mut blocks = vec![Vec::new(); representatives.len()];
+    for (state, &class) in classes.iter().enumerate() {
+        blocks[class as usize].push(u32::try_from(state).ok()?);
+    }
+    // Match the original preserve-unreachable Hopcroft numbering exactly.
+    // Members were inserted in ascending source-state order already.
+    blocks.sort_unstable_by_key(|block| block[0]);
+    Some((blocks, can_reach_accepting))
+}
+
+#[cfg(test)]
+fn acyclic_single_group_partition_reference(dfa: &DFA) -> Option<(Vec<Vec<u32>>, Vec<bool>)> {
     if dfa.num_groups() != 1 || dfa.has_epsilon_transitions() || dfa.has_self_loops() {
         return None;
     }
@@ -1495,6 +1592,11 @@ mod tests {
 
     fn assert_acyclic_matches_original(source: DFA) {
         let (blocks, reach) = acyclic_single_group_partition(&source).expect("generated DAG");
+        let expected_partition = acyclic_single_group_partition_reference(&source).unwrap();
+        assert_eq!((&blocks, &reach), (&expected_partition.0, &expected_partition.1));
+        // Deliberately put ALL signatures into one collision chain, including
+        // unequal accepting bits, edge labels and successor classes.
+        assert_eq!(acyclic_single_group_partition_impl::<0>(&source).unwrap(), expected_partition);
         let actual = source.clone().rebuild_owned_from_blocks_with_mapping_impl(blocks, Some(&reach));
         let expected = original_preserve_hopcroft(source.clone());
         assert_eq!(actual.1, expected.1, "source-coordinate map changed");
@@ -1576,9 +1678,48 @@ mod tests {
         self_loop.add_transition(0,b'x',0);
         for dfa in [cycle,epsilon,multigroup,self_loop] {
             assert!(acyclic_single_group_partition(&dfa).is_none());
+            assert!(acyclic_single_group_partition_reference(&dfa).is_none());
+            assert!(acyclic_single_group_partition_impl::<0>(&dfa).is_none());
             let actual = dfa.clone().minimize_with_state_mapping_preserve_unreachable();
             let expected = original_preserve_hopcroft(dfa);
             assert_eq!(actual.1,expected.1); assert!(actual.0==expected.0);
+        }
+    }
+
+    #[test]
+    #[ignore = "manual exact partition diagnostic; not whole-engine BUILD qualification"]
+    fn acyclic_representative_signature_microbenchmark() {
+        use std::time::Instant;
+        let fixtures = [("tiny", 12, 4, false), ("chain", 20_000, 1, false),
+            ("layered_sparse", 392, 96, false), ("layered_wide", 256, 96, true)];
+        for (name, layers, width, wide) in fixtures {
+            let n = layers * width;
+            let mut dfa = DFA::new(n); dfa.ensure_group_capacity(1);
+            for layer in 0..layers {
+                for local in 0..width {
+                    let state = (layer * width + local) as u32;
+                    let mut accepting = BitSet::new(1);
+                    if layer == layers-1 && local % 7 == 0 { accepting.set(0); }
+                    dfa.overwrite_state_metadata(state, accepting, BitSet::new(1));
+                    if layer+1 == layers { continue; }
+                    let classes = if width == 1 { 1 } else if wide || local % 7 == 0 { 54 } else { 2 };
+                    for class in 0..classes {
+                        let target = ((layer+1)*width + (local*31 + class*17 + 3)%width) as u32;
+                        dfa.add_transition(state, class as u8, target);
+                    }
+                }
+            }
+            assert_eq!(acyclic_single_group_partition(&dfa), acyclic_single_group_partition_reference(&dfa));
+            for repeat in 0..8 {
+                for optimized in if repeat%2 == 0 { [false,true] } else { [true,false] } {
+                    let started = Instant::now();
+                    let result = if optimized { acyclic_single_group_partition(&dfa) }
+                        else { acyclic_single_group_partition_reference(&dfa) }.unwrap();
+                    std::hint::black_box(&result);
+                    let ns = started.elapsed().as_nanos();
+                    eprintln!("[acyclic-signature-benchmark] fixture={name} states={n} repeat={repeat} optimized={optimized} ns={ns} classes={}",result.0.len());
+                }
+            }
         }
     }
 
