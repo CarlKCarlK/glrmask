@@ -3146,12 +3146,466 @@ impl FiniteMaskClassTransitions {
     }
 }
 
+/// Count-independent part of one exact pattern/body byte-class transition.
+/// A suffix candidate and a body candidate may coexist; the original suffix
+/// priority and min/max checks are applied at every concrete counter layer.
+#[derive(Clone, Copy, Debug)]
+struct FiniteMaskBodyTransition {
+    class: u8,
+    pattern_state: u32,
+    body_state: u32,
+    completes_body: bool,
+    starts_suffix: bool,
+}
+
+impl FiniteMaskBodyTransition {
+    #[inline]
+    fn next_coordinate(
+        &self,
+        completed: usize,
+        min: usize,
+        max: usize,
+        suffix_len: usize,
+    ) -> Option<BoundedCodeOracleCoordinate> {
+        let envelope = if self.starts_suffix && completed >= min {
+            if suffix_len == 1 {
+                BoundedCodeEnvelopeState::Done
+            } else {
+                BoundedCodeEnvelopeState::Suffix { next: 1 }
+            }
+        } else {
+            if completed >= max || self.body_state == u32::MAX {
+                return None;
+            }
+            BoundedCodeEnvelopeState::Body {
+                completed: completed.checked_add(usize::from(self.completes_body))?,
+                body_state: self.body_state,
+            }
+        };
+        Some(BoundedCodeOracleCoordinate { pattern_state: self.pattern_state, envelope })
+    }
+}
+
 impl BoundedCodeIntersectionOracle {
+    fn finite_mask_body_row(
+        &self,
+        pattern_state: u32,
+        body_state: u32,
+        byte_classes: &[Vec<u8>],
+        transitions: &FiniteMaskClassTransitions,
+    ) -> Vec<FiniteMaskBodyTransition> {
+        let mut row = Vec::new();
+        for (class, members) in byte_classes.iter().enumerate() {
+            let byte = members[0];
+            let Some(next_pattern) = transitions.pattern_step(pattern_state, class) else {
+                continue;
+            };
+            let starts_suffix = body_state == 0 && self.suffix[0] == byte;
+            let body_target = transitions.body_step(&self.body, body_state, byte, class);
+            let completes_body = body_target.is_some_and(|target| !self.body.finalizers(target).is_empty());
+            let next_body = if completes_body {
+                0
+            } else {
+                body_target.filter(|&target| self.body_productive[target as usize]).unwrap_or(u32::MAX)
+            };
+            if starts_suffix || next_body != u32::MAX {
+                row.push(FiniteMaskBodyTransition {
+                    class: class as u8,
+                    pattern_state: next_pattern,
+                    body_state: next_body,
+                    completes_body,
+                    starts_suffix,
+                });
+            }
+        }
+        row
+    }
+
     fn finite_mask_dense_state_count(&self, mask_max: usize) -> Option<usize> {
         FiniteMaskLayout::new(self, mask_max).map(|layout| layout.dense_state_count)
     }
 
     fn finite_mask_dfa(
+        &self,
+        mask_max: usize,
+    ) -> Option<(DFA, CompressedTransitionSegment, u32, Vec<u32>)> {
+        let profile = std::env::var_os("GLRMASK_PROFILE_TOKENIZER_TIMING").is_some();
+        let total_started = std::time::Instant::now();
+        let pattern_states = self.pattern.num_states();
+        let layout = FiniteMaskLayout::new(self, mask_max)?;
+        let dense_state_count = layout.dense_state_count;
+        if dense_state_count == 0 || dense_state_count > MAX_FINITE_MASK_DENSE_STATES {
+            return None;
+        }
+
+
+        let byte_classes = bounded_code_byte_classes(
+            &self.pattern,
+            &self.body,
+            &self.prefix,
+            &self.suffix,
+        );
+
+        // The finite envelope deliberately identifies the huge exact count
+        // interval with a small one-token stencil. A state that is a valid
+        // projection source after a long exact input need not be reachable from
+        // the finite root at the corresponding small count, because the format
+        // DFA can be in a state only reachable after many code words. Seed the
+        // finite graph with every *actually possible* projected code-word
+        // boundary, then retain the transition closure of those roots. This
+        // avoids the full count x body x pattern Cartesian product while still
+        // covering every exact token-boundary state.
+        // `mask_max` can equal `min` when the declared interval is fixed
+        // (or otherwise narrower than the one-token stencil). In that case
+        // there is no collapsed interior layer, but the exact lower/upper
+        // boundary is still a perfectly valid finite projection root.
+        let crossed_boundaries = mask_max.saturating_sub(self.min).saturating_sub(1);
+        let after_prefix = step_fixed_bytes(&self.pattern, 0, &self.prefix)?;
+        let mut pattern_start = BitSet::new(pattern_states);
+        pattern_start.set(after_prefix as usize);
+        let mut boundary_classes = Vec::<(usize, BitSet)>::new();
+
+        // Counts below min are observed exactly.
+        for completed in 0..self.min {
+            let states = self.apply_exact_count(pattern_start.clone(), completed);
+            if !states.is_empty() {
+                boundary_classes.push((completed, states));
+            }
+        }
+
+        // The deep interior collapses to the first accepting count. Compute the
+        // exact union of format states reachable at any full count represented
+        // by that interior layer using the existing relation-doubling oracle.
+        let interior_high = self
+            .max
+            .checked_sub(crossed_boundaries.saturating_add(1));
+        if let Some(interior_high) = interior_high.filter(|&high| high >= self.min) {
+            let after_low = self.apply_exact_count(pattern_start.clone(), self.min);
+            if !after_low.is_empty() {
+                let states = self.apply_up_to(after_low, interior_high - self.min);
+                if !states.is_empty() {
+                    boundary_classes.push((self.min, states));
+                }
+            }
+        }
+
+        // Near the true upper bound, preserve distance-to-upper exactly.
+        let upper_start = self.max.saturating_sub(crossed_boundaries).max(self.min);
+        for completed in upper_start..=self.max {
+            let distance_to_upper = self.max - completed;
+            let mapped_completed = mask_max.checked_sub(distance_to_upper)?;
+            let states = self.apply_exact_count(pattern_start.clone(), completed);
+            if !states.is_empty() {
+                boundary_classes.push((mapped_completed, states));
+            }
+        }
+
+        let seeds_started = std::time::Instant::now();
+        let mut dense_to_sparse = vec![u32::MAX; dense_state_count];
+        let mut coordinates = Vec::<BoundedCodeOracleCoordinate>::new();
+        let mut seed_count = 0usize;
+        let mut add_seed = |coordinate: BoundedCodeOracleCoordinate| -> Option<()> {
+            let dense = layout.coordinate_local_state(coordinate)? as usize;
+            if dense_to_sparse[dense] == u32::MAX {
+                dense_to_sparse[dense] = u32::try_from(coordinates.len()).ok()?;
+                coordinates.push(coordinate);
+                seed_count += 1;
+            }
+            Some(())
+        };
+        add_seed(self.root_coordinate())?;
+        for (mapped_completed, states) in boundary_classes {
+            for pattern_state in states.iter_ones() {
+                add_seed(BoundedCodeOracleCoordinate {
+                    pattern_state: u32::try_from(pattern_state).ok()?,
+                    envelope: BoundedCodeEnvelopeState::Body {
+                        completed: mapped_completed,
+                        body_state: 0,
+                    },
+                })?;
+            }
+        }
+        drop(add_seed);
+        let seeds_ms = seeds_started.elapsed().as_secs_f64() * 1000.0;
+
+        let expand_started = std::time::Instant::now();
+        let class_transitions = FiniteMaskClassTransitions::new(self, &byte_classes)?;
+        let mut dfa = DFA::new(coordinates.len());
+        dfa.ensure_group_capacity(1);
+        dfa.set_group_u8set(0, crate::ds::u8set::U8Set::all());
+        let mut source = 0usize;
+        const EXPANSION_BATCH: usize = 1_024;
+        // A collapsed interval or a one-code pattern loop can visit the same
+        // pattern/body pair at many exact count layers. Reuse those byte-class
+        // rows. Acyclic full-bound patterns retain their original expansion,
+        // avoiding cache allocations when code count already fixes the pattern
+        // state. Admission affects construction work only, never recognition.
+        let repeats_pattern_state = self.exact_powers.first().is_some_and(|one_code| {
+            (0..one_code.state_count()).any(|state| {
+                let mut self_loop = false;
+                let _ = one_code.for_each_target(state, |target| self_loop |= target == state);
+                self_loop
+            })
+        });
+        let mut cached_body_pairs = 0;
+        if self.max > mask_max || repeats_pattern_state {
+            let mut accepting_rows = Vec::<u8>::new();
+            // Retain the exact next coordinate (no dense-coordinate decoding), but
+            // only store present transitions. Most body-interior states admit very
+            // few classes, so clearing/scanning a dense Option matrix is dead work.
+            let mut transition_rows = Vec::<Vec<(u8, BoundedCodeOracleCoordinate, usize)>>::new();
+            // The layout already bounds body_states * pattern_states inside the
+            // finite dense-state budget. Cache only rows actually encountered; the
+            // dense index costs four bytes per possible pattern/body pair, not per
+            // count layer, and never contains parser state or model-token results.
+            let mut body_row_by_pair = vec![u32::MAX; layout.body_layer];
+            let mut body_rows = Vec::<Vec<FiniteMaskBodyTransition>>::new();
+            while source < coordinates.len() {
+                while dfa.num_states() < coordinates.len() {
+                    dfa.add_state();
+                }
+                let batch_end = coordinates.len().min(source.saturating_add(EXPANSION_BATCH));
+                let batch_len = batch_end - source;
+                accepting_rows.clear();
+                accepting_rows.resize(batch_len, 0);
+                for coordinate in &coordinates[source..batch_end] {
+                    let BoundedCodeEnvelopeState::Body { body_state, .. } = coordinate.envelope else {
+                        continue;
+                    };
+                    let pair = body_state as usize * pattern_states + coordinate.pattern_state as usize;
+                    if body_row_by_pair[pair] == u32::MAX {
+                        body_row_by_pair[pair] = u32::try_from(body_rows.len()).ok()?;
+                        body_rows.push(self.finite_mask_body_row(
+                            coordinate.pattern_state, body_state, &byte_classes, &class_transitions,
+                        ));
+                    }
+                }
+                if transition_rows.len() < batch_len {
+                    transition_rows.resize_with(batch_len, Vec::new);
+                }
+                transition_rows[..batch_len]
+                    .par_iter_mut()
+                    .zip(accepting_rows.par_iter_mut())
+                    .enumerate()
+                    .for_each(|(row_offset, (row, accepting_slot))| {
+                        let coordinate = coordinates[source + row_offset];
+                        let accepting = matches!(coordinate.envelope, BoundedCodeEnvelopeState::Done)
+                            && !self.pattern.finalizers(coordinate.pattern_state).is_empty();
+                        *accepting_slot = u8::from(accepting);
+                        row.clear();
+                        if let BoundedCodeEnvelopeState::Body { completed, body_state } = coordinate.envelope {
+                            let pair = body_state as usize * pattern_states + coordinate.pattern_state as usize;
+                            for edge in &body_rows[body_row_by_pair[pair] as usize] {
+                                let Some(next) = edge.next_coordinate(completed, self.min, mask_max, self.suffix.len()) else {
+                                    continue;
+                                };
+                                let Some(dense) = layout.coordinate_local_state(next) else { continue; };
+                                row.push((edge.class, next, dense as usize));
+                            }
+                        } else {
+                            // Prefix, suffix and done coordinates occur only once
+                            // per pattern state. Keep their original exact step.
+                            for (class, members) in byte_classes.iter().enumerate() {
+                                let Some(next) = self.step_coordinate_class(
+                                    coordinate, members[0], class, mask_max, &class_transitions,
+                                ) else { continue; };
+                                let Some(dense) = layout.coordinate_local_state(next) else { continue; };
+                                row.push((class as u8, next, dense as usize));
+                            }
+                        }
+                    });
+
+                for row_offset in 0..batch_len {
+                    let source_state = (source + row_offset) as u32;
+                    let mut finalizers = BitSet::new(1);
+                    if accepting_rows[row_offset] != 0 {
+                        finalizers.set(0);
+                    }
+                    dfa.overwrite_state_metadata(source_state, finalizers, BitSet::new(1));
+                    // Both cached and ordinary rows retain ascending class order,
+                    // so sparse-state discovery is identical to the reference BFS.
+                    for &(class, next, dense) in &transition_rows[row_offset] {
+                        let target = if dense_to_sparse[dense] == u32::MAX {
+                            let target = u32::try_from(coordinates.len()).ok()?;
+                            dense_to_sparse[dense] = target;
+                            coordinates.push(next);
+                            target
+                        } else {
+                            dense_to_sparse[dense]
+                        };
+                        while dfa.num_states() <= target as usize {
+                            dfa.add_state();
+                        }
+                        dfa.add_transition(source_state, class, target);
+                    }
+                }
+                source = batch_end;
+            }
+            cached_body_pairs = body_rows.len();
+        } else {
+            let class_count = byte_classes.len();
+            let slot_width = class_count.max(1);
+            let mut accepting_rows = Vec::<u8>::new();
+            let mut transition_slots =
+                Vec::<Option<(BoundedCodeOracleCoordinate, usize)>>::new();
+            while source < coordinates.len() {
+                while dfa.num_states() < coordinates.len() {
+                    dfa.add_state();
+                }
+                let batch_end = coordinates.len().min(source.saturating_add(EXPANSION_BATCH));
+                let batch_len = batch_end - source;
+                accepting_rows.clear();
+                accepting_rows.resize(batch_len, 0);
+                transition_slots.clear();
+                transition_slots.resize(batch_len.saturating_mul(slot_width), None);
+                transition_slots
+                    .par_chunks_mut(slot_width)
+                    .zip(accepting_rows.par_iter_mut())
+                    .enumerate()
+                    .for_each(|(row_offset, (row, accepting_slot))| {
+                        let coordinate = coordinates[source + row_offset];
+                        let accepting = matches!(coordinate.envelope, BoundedCodeEnvelopeState::Done)
+                            && !self.pattern.finalizers(coordinate.pattern_state).is_empty();
+                        *accepting_slot = u8::from(accepting);
+                        for (class, members) in byte_classes.iter().enumerate() {
+                            let Some(next) = self.step_coordinate_class(
+                                coordinate,
+                                members[0],
+                                class,
+                                mask_max,
+                                &class_transitions,
+                            ) else {
+                                continue;
+                            };
+                            let Some(dense) = layout.coordinate_local_state(next) else {
+                                continue;
+                            };
+                            row[class] = Some((next, dense as usize));
+                        }
+                    });
+
+                for row_offset in 0..batch_len {
+                    let source_state = (source + row_offset) as u32;
+                    let mut finalizers = BitSet::new(1);
+                    if accepting_rows[row_offset] != 0 {
+                        finalizers.set(0);
+                    }
+                    dfa.overwrite_state_metadata(source_state, finalizers, BitSet::new(1));
+                    let row_start = row_offset * slot_width;
+                    for (class, slot) in transition_slots[row_start..row_start + class_count]
+                        .iter()
+                        .enumerate()
+                    {
+                        let Some((next, dense)) = *slot else {
+                            continue;
+                        };
+                        let target = if dense_to_sparse[dense] == u32::MAX {
+                            let target = u32::try_from(coordinates.len()).ok()?;
+                            dense_to_sparse[dense] = target;
+                            coordinates.push(next);
+                            target
+                        } else {
+                            dense_to_sparse[dense]
+                        };
+                        while dfa.num_states() <= target as usize {
+                            dfa.add_state();
+                        }
+                        dfa.add_transition(source_state, class as u8, target);
+                    }
+                }
+                source = batch_end;
+            }
+        }
+        // Minimization immediately clears possible-future metadata before
+        // partitioning and recomputes it on the minimized DFA. Computing the
+        // full sparse DFA's futures here would therefore be pure dead work.
+        let expand_ms = expand_started.elapsed().as_secs_f64() * 1000.0;
+
+        let sparse_state_count = dfa.num_states();
+        let root_dense = layout.coordinate_local_state(self.root_coordinate())? as usize;
+        let root_sparse = dense_to_sparse[root_dense];
+        if root_sparse == u32::MAX {
+            return None;
+        }
+        // Every sparse state is reachable from at least one exact projection
+        // seed, but many seeds are intentionally disconnected from state 0.
+        // Preserve those roots while quotienting language-equivalent states.
+        let minimize_started = std::time::Instant::now();
+        let (mut dfa, sparse_to_minimized) =
+            dfa.minimize_with_state_mapping_preserve_unreachable();
+        let minimize_ms = minimize_started.elapsed().as_secs_f64() * 1000.0;
+        let root = *sparse_to_minimized.get(root_sparse as usize)?;
+        if root == u32::MAX {
+            return None;
+        }
+        // Keep the minimized transition graph in its native byte-class
+        // alphabet instead of eagerly expanding every class back to its member
+        // bytes. The projection tokenizer already supports exact compressed
+        // transition segments, and the compact TKS3 wire can persist them
+        // directly. State IDs and metadata are unchanged; only transition
+        // storage differs from the expanded representation.
+        let mut byte_to_class = [0u8; 256];
+        let class_members = byte_classes
+            .iter()
+            .enumerate()
+            .map(|(class, members)| {
+                let class = u8::try_from(class).ok()?;
+                for &byte in members {
+                    byte_to_class[byte as usize] = class;
+                }
+                Some(members.clone().into_boxed_slice())
+            })
+            .collect::<Option<Vec<_>>>()?;
+        let mut row_offsets = Vec::<u32>::with_capacity(dfa.num_states() + 1);
+        let mut classes = Vec::<u8>::new();
+        let mut targets = Vec::<u32>::new();
+        let mut expanded_transition_count = 0usize;
+        row_offsets.push(0);
+        for state in dfa.states() {
+            for (class, &target) in state.transitions.iter() {
+                let members = class_members.get(class as usize)?;
+                classes.push(class);
+                targets.push(target);
+                expanded_transition_count = expanded_transition_count.checked_add(members.len())?;
+            }
+            row_offsets.push(u32::try_from(classes.len()).ok()?);
+        }
+        for state in dfa.states_mut() {
+            state.transitions.clear();
+        }
+        let segment = CompressedTransitionSegment {
+            state_offset: 0,
+            state_count: u32::try_from(dfa.num_states()).ok()?,
+            byte_to_class: Arc::from(byte_to_class.to_vec().into_boxed_slice()),
+            class_members: Arc::from(class_members.into_boxed_slice()),
+            row_offsets: Arc::from(row_offsets.into_boxed_slice()),
+            entries: CompressedTransitionEntries::from_parts(classes, targets),
+            expanded_transition_count,
+        };
+        let remap_started = std::time::Instant::now();
+        let dense_to_minimized = dense_to_sparse
+            .into_iter()
+            .map(|sparse| {
+                if sparse == u32::MAX {
+                    u32::MAX
+                } else {
+                    sparse_to_minimized[sparse as usize]
+                }
+            })
+            .collect::<Vec<_>>();
+        let remap_ms = remap_started.elapsed().as_secs_f64() * 1000.0;
+        if profile {
+            eprintln!(
+                "[glrmask/profile][residual_mask_symbolic_sources] dense_states={} seeds={} sparse_states={} minimized_states={} byte_classes={} full_max={} mask_max={} cached_body_pairs={} seeds_ms={:.3} expand_ms={:.3} minimize_ms={:.3} remap_ms={:.3} total_ms={:.3}",
+                dense_state_count, seed_count, sparse_state_count, dfa.num_states(), byte_classes.len(),
+                self.max, mask_max, cached_body_pairs, seeds_ms, expand_ms, minimize_ms, remap_ms, total_started.elapsed().as_secs_f64() * 1000.0,
+            );
+        }
+        Some((dfa, segment, root, dense_to_minimized))
+    }
+
+    #[cfg(test)]
+    fn finite_mask_dfa_reference(
         &self,
         mask_max: usize,
     ) -> Option<(DFA, CompressedTransitionSegment, u32, Vec<u32>)> {
@@ -6728,6 +7182,153 @@ mod tests {
         parts.extend((0..count).map(|_| bounded_code_body()));
         parts.push(bytes(b">"));
         Expr::Seq(parts)
+    }
+
+    fn finite_mask_row_fixtures() -> Vec<BoundedCodeIntersectionOracle> {
+        let bodies = [
+            bounded_code_body(),
+            // Infinite but prefix-free code: every word ends at its first b.
+            // This retains cycles and exercises the non-DAG minimizer too.
+            Expr::Seq(vec![Expr::Repeat { expr: Box::new(bytes(b"a")), min: 0, max: None }, bytes(b"b")]),
+            Expr::Choice(vec![bytes(b"a"), bytes("β".as_bytes()), bytes("猫".as_bytes()),
+                bytes("🙂".as_bytes()), bytes(b"\\n")]),
+        ];
+        let mut fixtures = Vec::new();
+        for body in bodies {
+            for (min, max) in [(0, 17), (2, 17), (3, 3)] {
+                for (prefix, suffix) in [(b"<".as_slice(), b">".as_slice()), (b"<<", b">>")] {
+                    let pattern = Expr::Seq(vec![
+                        bytes(prefix),
+                        Expr::Repeat { expr: Box::new(Expr::Seq(vec![body.clone(); 3])), min: 0, max: None },
+                        Expr::Repeat { expr: Box::new(body.clone()), min: 0, max: Some(1) },
+                        bytes(suffix),
+                    ]);
+                    let envelope = Expr::Seq(vec![bytes(prefix),
+                        Expr::Repeat { expr: Box::new(body.clone()), min, max: Some(max) }, bytes(suffix)]);
+                    fixtures.push(BoundedCodeIntersectionOracle::from_expr(&Expr::Intersect {
+                        expr: Box::new(pattern), intersect: Box::new(envelope),
+                    }).expect("prefix-free finite-mask row fixture"));
+                }
+            }
+            let unbounded = Expr::Seq(vec![bytes(b"<"),
+                Expr::Repeat { expr: Box::new(body.clone()), min: 0, max: None }, bytes(b">")]);
+            fixtures.push(BoundedCodeIntersectionOracle::from_expr(&Expr::Intersect {
+                expr: Box::new(unbounded),
+                intersect: Box::new(bounded_code_envelope_with_body(body, 1, 17)),
+            }).expect("one-code loop with a full finite bound"));
+        }
+        fixtures
+    }
+
+    #[test]
+    fn finite_mask_cached_body_rows_match_every_old_coordinate_class_step() {
+        for (case, mut oracle) in finite_mask_row_fixtures().into_iter().enumerate() {
+            // Also stress the original suffix-priority rule when both a suffix
+            // and a body transition exist. This mutated test-only oracle does
+            // not claim the frontend would certify such a language skeleton.
+            for overlapping_suffix in [false, true] {
+                if overlapping_suffix { oracle.suffix = Arc::from(b"a".as_slice()); }
+                let classes = bounded_code_byte_classes(&oracle.pattern, &oracle.body, &oracle.prefix, &oracle.suffix);
+                let transitions = FiniteMaskClassTransitions::new(&oracle, &classes).unwrap();
+                for p in 0..oracle.pattern.num_states() as u32 {
+                    for b in 0..oracle.body.num_states() as u32 {
+                        let row = oracle.finite_mask_body_row(p, b, &classes, &transitions);
+                        assert!(row.windows(2).all(|pair| pair[0].class < pair[1].class));
+                        for max in [oracle.min, oracle.max, usize::MAX] {
+                            for completed in [0, oracle.min.saturating_sub(1), oracle.min,
+                                max.saturating_sub(1), max, max.saturating_add(1)] {
+                                let source = BoundedCodeOracleCoordinate { pattern_state: p,
+                                    envelope: BoundedCodeEnvelopeState::Body { completed, body_state: b } };
+                                for (class, members) in classes.iter().enumerate() {
+                                    let expected = oracle.step_coordinate_class(source, members[0], class, max, &transitions);
+                                    let cached = row.iter().find(|edge| edge.class as usize == class)
+                                        .and_then(|edge| edge.next_coordinate(completed, oracle.min, max, oracle.suffix.len()));
+                                    assert_eq!(cached, expected,
+                                        "case={case} overlap={overlapping_suffix} p={p} b={b} completed={completed} max={max} class={class}");
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn finite_mask_cached_rows_preserve_complete_dfa_wire_and_every_coordinate_mapping() {
+        for (case, oracle) in finite_mask_row_fixtures().into_iter().enumerate() {
+            for mask_max in [oracle.min, oracle.min.saturating_add(1).min(oracle.max), oracle.max] {
+                let reference = oracle.finite_mask_dfa_reference(mask_max).expect("reference finite graph");
+                let cached = oracle.finite_mask_dfa(mask_max).expect("cached finite graph");
+                assert_eq!(cached.2, reference.2, "root case={case} max={mask_max}");
+                assert_eq!(cached.3, reference.3, "all dense mappings case={case} max={mask_max}");
+                assert_eq!(bincode::serialize(&cached.0).unwrap(), bincode::serialize(&reference.0).unwrap(),
+                    "all DFA metadata case={case} max={mask_max}");
+                assert_eq!(bincode::serialize(&cached.1).unwrap(), bincode::serialize(&reference.1).unwrap(),
+                    "all compressed transitions case={case} max={mask_max}");
+            }
+        }
+    }
+
+    #[test]
+    #[ignore = "manual paired finite-mask construction diagnostic; not whole-engine BUILD acceptance"]
+    fn finite_mask_body_row_microbenchmark() {
+        use std::time::Instant;
+        let body = Expr::Choice(vec![
+            Expr::U8Class(U8Set::from_bytes(b"abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_:/?&%=-")),
+            bytes("β".as_bytes()), bytes("猫".as_bytes()), bytes("🙂".as_bytes()), bytes(b"\\n"),
+        ]);
+        let mut fixtures = [
+            ("wide_count_format", Expr::Seq(vec![bytes(b"<"),
+                Expr::Repeat { expr: Box::new(body.clone()), min: 0, max: Some(96) }, bytes(b"bcdef>")]), 0, 128, 128),
+            ("minimum_and_long_suffix", Expr::Seq(vec![bytes(b"<"),
+                Expr::Repeat { expr: Box::new(body.clone()), min: 0, max: Some(40) }, bytes(b"abcabc>")]), 3, 128, 128),
+            ("tiny", Expr::Seq(vec![bytes(b"<"),
+                Expr::Repeat { expr: Box::new(body.clone()), min: 0, max: None }, bytes(b">")]), 0, 4, 4),
+            ("collapsed_count_format", Expr::Seq(vec![bytes(b"<"),
+                Expr::Repeat { expr: Box::new(body.clone()), min: 0, max: Some(96) }, bytes(b"bcdef>")]), 0, 1_000_000, 128),
+            ("collapsed_minimum_and_suffix", Expr::Seq(vec![bytes(b"<"),
+                Expr::Repeat { expr: Box::new(body.clone()), min: 0, max: Some(40) }, bytes(b"abcabc>")]), 3, 1_000_000, 128),
+        ].into_iter().map(|(name, pattern, min, max, mask_max)| {
+            // The first bounded envelope selects the oracle coordinate. The
+            // independent format also contains a bounded repeat, but its tail
+            // begins with a body character and is not a prefix-code envelope.
+            let oracle = BoundedCodeIntersectionOracle::from_expr(&Expr::Intersect {
+                expr: Box::new(bounded_code_envelope_with_body(body.clone(), min, max)),
+                intersect: Box::new(pattern),
+            }).unwrap_or_else(|| panic!("microbenchmark oracle admission: {name}"));
+            (name, oracle, mask_max)
+        }).collect::<Vec<_>>();
+        // A real slow schema has a cyclic address pattern and a full254-code
+        // stencil, not a collapsed bound. This is a shape diagnostic rather
+        // than a claim to reproduce the frontend's JSON-escape transduction.
+        let address_body = Expr::Choice(vec![body.clone(), bytes(b"@")]);
+        let address_pattern = Expr::Seq(vec![bytes(b"<"),
+            crate::parse_regex(r"[^@^\s]+@[^@^\.^\s]+(\.[^@^\.^\s]*)*.gov.uk", true), bytes(b">")]);
+        let address = BoundedCodeIntersectionOracle::from_expr(&Expr::Intersect {
+            expr: Box::new(bounded_code_envelope_with_body(address_body, 5, 254)),
+            intersect: Box::new(address_pattern),
+        }).expect("cyclic full-bound address shape");
+        fixtures.push(("cyclic_address_full_bound", address, 254));
+        for threads in [2, 10] {
+            rayon::ThreadPoolBuilder::new().num_threads(threads).build().unwrap().install(|| {
+                for (name, oracle, mask_max) in &fixtures {
+                    let a = oracle.finite_mask_dfa_reference(*mask_max).unwrap();
+                    let b = oracle.finite_mask_dfa(*mask_max).unwrap();
+                    assert_eq!(bincode::serialize(&a).unwrap(), bincode::serialize(&b).unwrap());
+                    for repeat in 0..8 {
+                        for cached in if repeat % 2 == 0 { [false, true] } else { [true, false] } {
+                            let started = Instant::now();
+                            let result = if cached { oracle.finite_mask_dfa(*mask_max) }
+                                else { oracle.finite_mask_dfa_reference(*mask_max) }.unwrap();
+                            std::hint::black_box(&result);
+                            let ns = started.elapsed().as_nanos();
+                            eprintln!("[finite-body-row-benchmark] fixture={name} threads={threads} repeat={repeat} cached={cached} ns={ns} states={}", result.0.num_states());
+                        }
+                    }
+                }
+            });
+        }
     }
 
     #[test]
