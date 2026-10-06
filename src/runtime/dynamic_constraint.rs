@@ -832,7 +832,7 @@ impl DynamicConstraint {
                     },
                     special_token_terminals,
                 };
-                let inner = Self::constraint_from_runtime_parts(payload, dynamic_mask_vocab);
+                let inner = Self::constraint_from_runtime_parts(payload, dynamic_mask_vocab, Some(vocab));
                 // Retain the supplied vocabulary so the external-vocabulary
                 // artifact can embed the exact canonical content digest for
                 // load validation.
@@ -948,7 +948,7 @@ impl DynamicConstraint {
                 terminal_display_names, tokenizer,
                 ignore_terminal, direct_regular_automaton, token_bytes, ignore_expr, terminal_exprs },
             special_token_terminals,
-        }, dynamic_mask_vocab)
+        }, dynamic_mask_vocab, None)
     }
 
     /// Shared assembly accepts an absent parser store. A data-only constructor
@@ -957,6 +957,7 @@ impl DynamicConstraint {
     fn constraint_from_runtime_parts(
         payload: DynamicConstraintPayloadV2<crate::runtime::parser_backend::ParserTableStorage>,
         dynamic_mask_vocab: DynamicMaskVocab,
+        source_vocab: Option<&Vocab>,
     ) -> Constraint {
         let DynamicConstraintPayloadV2 {
             v1: mut payload,
@@ -975,6 +976,18 @@ impl DynamicConstraint {
             .chain(special_token_terminals.iter().map(|special| special.token_id))
             .max()
             .unwrap_or(0);
+        // Compile callers own precisely this Vocab's immutable byte inventory.
+        // Loaded payloads have no such identity witness and must derive the
+        // summary from their authoritative decoded bytes instead.
+        let empty_byte_token_ids = if let Some(vocab) = source_vocab {
+            assert!(Arc::ptr_eq(&payload.token_bytes, &vocab.entries_arc()),
+                "compiled dynamic payload must retain its source vocabulary byte inventory");
+            crate::compiler::compile::vocab_empty_byte_token_ids(vocab)
+        } else {
+            payload.token_bytes.iter()
+                .filter_map(|(&id, bytes)| bytes.is_empty().then_some(id))
+                .collect::<Vec<u32>>().into()
+        };
         let inner = Constraint {
             end_tokens: std::sync::Arc::from([]),
             runtime_backend: crate::runtime::ConstraintRuntimeBackend::Dynamic,
@@ -1005,9 +1018,7 @@ impl DynamicConstraint {
             special_token_terminals,
             dynamic_mask_vocab,
             lazy_dynamic_mask_vocab: std::sync::OnceLock::new(),
-            empty_byte_token_ids: payload.token_bytes.iter()
-                .filter_map(|(&id, bytes)| bytes.is_empty().then_some(id))
-                .collect::<Vec<u32>>().into(),
+            empty_byte_token_ids,
             possible_matches: BTreeMap::new(),
             possible_matches_complete: false,
             state_to_internal_tsid: Vec::new(),
@@ -1145,7 +1156,7 @@ impl DynamicConstraint {
             },
             special_token_terminals: Vec::new(),
         };
-        let mut inner = Self::constraint_from_runtime_parts(payload, dynamic_vocab);
+        let mut inner = Self::constraint_from_runtime_parts(payload, dynamic_vocab, Some(vocab));
         inner.template_dfas_by_terminal = templates;
         inner.template_parser = Some(parser);
         inner.fast_template_dfas_by_terminal = if inner.template_parser.as_ref().unwrap().composition.is_some() {

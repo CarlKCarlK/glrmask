@@ -530,3 +530,38 @@ fn focused_empty_special_token_is_live_after_prefix_across_reload() {
         }
     }
 }
+
+#[test]
+fn focused_empty_byte_summary_is_shared_by_compilers_and_rebuilt_by_loaders() {
+    let vocab = Vocab::new_with_exact_token_ids(vec![
+        (0, b"a".to_vec()), (2, b"b".to_vec()), (7, Vec::new()),
+        (31, Vec::new()), (42, vec![0]), (512, Vec::new()),
+    ], [1000]);
+    let source = r#"start ::= "a""#;
+    let expected = crate::compiler::compile::vocab_empty_byte_token_ids(&vocab);
+    let mut compiled = vec![crate::DynamicConstraint::from_ebnf(source, &vocab)
+        .unwrap().into_constraint()];
+    for mode in [Optimization::Auto, Optimization::FastBuild, Optimization::FastRuntime] {
+        compiled.push(Grammar::from_ebnf(source).compile_with(&vocab,
+            BuildOptions::default().optimization(mode)).unwrap());
+    }
+    for constraint in &compiled {
+        assert!(std::sync::Arc::ptr_eq(&constraint.empty_byte_token_ids, &expected));
+        let self_loaded = Constraint::load(constraint.save()).unwrap();
+        let external_loaded = Constraint::load_with_vocab(
+            constraint.save_with_external_vocab().unwrap(), &vocab,
+        ).unwrap();
+        for current in [constraint, &self_loaded, &external_loaded] {
+            assert_eq!(current.empty_byte_token_ids.as_ref(), &[7, 31, 512]);
+            let mut state = current.start();
+            for _ in 0..2 {
+                let mask = state.mask();
+                assert!(allowed(&mask, 0));
+                for id in [7, 31, 512] { assert!(!allowed(&mask, id)); }
+            }
+            state.commit_token(0).unwrap();
+            assert!(state.is_accepting());
+            for id in [7, 31, 512] { assert!(!allowed(&state.mask(), id)); }
+        }
+    }
+}

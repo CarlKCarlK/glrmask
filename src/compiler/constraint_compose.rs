@@ -19203,9 +19203,7 @@ fn build_composed_constraint_unfinalized(
         special_token_terminals,
         dynamic_mask_vocab,
         lazy_dynamic_mask_vocab: OnceLock::new(),
-        empty_byte_token_ids: vocab.entries_map().iter()
-            .filter_map(|(&id, bytes)| bytes.is_empty().then_some(id))
-            .collect::<Vec<u32>>().into(),
+        empty_byte_token_ids: crate::compiler::compile::vocab_empty_byte_token_ids(vocab),
         // Constraint composition is not allowed to rely on the legacy dynamic
         // possible-matches fallback. This is the exact transported and
         // reconciled table from every compiled component.
