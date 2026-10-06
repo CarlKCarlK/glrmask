@@ -1,7 +1,7 @@
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::time::Instant;
 
-use rustc_hash::FxHashSet;
+use rustc_hash::{FxHashMap, FxHashSet};
 
 use crate::automata::regex::Expr;
 use crate::compiler::glr::analysis::{
@@ -573,6 +573,105 @@ pub(crate) fn inline_single_use_nonterminals(
 }
 
 fn remove_cyclic_inline_candidates(
+    inline_candidates: &mut BTreeMap<NonterminalID, (usize, Vec<Symbol>)>,
+) {
+    if std::env::var_os("GLRMASK_DISABLE_INLINE_CANDIDATE_SCC").is_some() {
+        remove_cyclic_inline_candidates_by_reachability(inline_candidates);
+        return;
+    }
+    let mut reference = std::env::var_os("GLRMASK_VALIDATE_INLINE_CANDIDATE_SCC")
+        .is_some()
+        .then(|| inline_candidates.clone());
+    remove_cyclic_inline_candidates_scc(inline_candidates);
+    if let Some(reference) = reference.as_mut() {
+        remove_cyclic_inline_candidates_by_reachability(reference);
+        assert_eq!(inline_candidates, reference, "SCC pruning changed exact inline candidates");
+    }
+}
+
+/// A candidate is cyclic iff it belongs to a nontrivial strongly connected
+/// component, or has a self edge. Two iterative DFS passes compute exactly
+/// that set in O(vertices + RHS symbols), rather than traversing a long shared
+/// suffix again from every candidate. Do not use an acyclic-node peel here:
+/// ancestors of a cycle must remain eligible for the later substitution pass.
+/// The compact graph uses candidate indices, not sparse grammar IDs; terminal
+/// and noncandidate references remain unchanged in the original ordered map.
+fn remove_cyclic_inline_candidates_scc(
+    inline_candidates: &mut BTreeMap<NonterminalID, (usize, Vec<Symbol>)>,
+) {
+    let ids: Vec<NonterminalID> = inline_candidates.keys().copied().collect();
+    if ids.is_empty() {
+        return;
+    }
+    let index: FxHashMap<NonterminalID, usize> = ids.iter().copied().enumerate()
+        .map(|(index, id)| (id, index)).collect();
+    let mut edges = vec![Vec::<usize>::new(); ids.len()];
+    let mut reversed = vec![Vec::<usize>::new(); ids.len()];
+    for (source, (_, (_, rhs))) in inline_candidates.iter().enumerate() {
+        for symbol in rhs {
+            if let Symbol::Nonterminal(id) = symbol
+                && let Some(&target) = index.get(id)
+            {
+                edges[source].push(target);
+                reversed[target].push(source);
+            }
+        }
+    }
+
+    let mut visited = vec![false; ids.len()];
+    let mut finished = Vec::with_capacity(ids.len());
+    let mut dfs = Vec::<(usize, usize)>::new();
+    for root in 0..ids.len() {
+        if visited[root] {
+            continue;
+        }
+        visited[root] = true;
+        dfs.push((root, 0));
+        while let Some((node, next_edge)) = dfs.last_mut() {
+            if let Some(&target) = edges[*node].get(*next_edge) {
+                *next_edge += 1;
+                if !visited[target] {
+                    visited[target] = true;
+                    dfs.push((target, 0));
+                }
+            } else {
+                finished.push(*node);
+                dfs.pop();
+            }
+        }
+    }
+
+    visited.fill(false);
+    let mut work = Vec::new();
+    let mut members = Vec::new();
+    for &root in finished.iter().rev() {
+        if visited[root] {
+            continue;
+        }
+        visited[root] = true;
+        work.push(root);
+        members.clear();
+        while let Some(node) = work.pop() {
+            members.push(node);
+            for &source in &reversed[node] {
+                if !visited[source] {
+                    visited[source] = true;
+                    work.push(source);
+                }
+            }
+        }
+        if members.len() > 1 || edges[root].contains(&root) {
+            for &member in &members {
+                inline_candidates.remove(&ids[member]);
+            }
+        }
+    }
+}
+
+// Retain the exact previous algorithm for same-binary enable/disable evidence
+// and diagnostic equality checks. Never enable the equality check in quiet
+// timing runs: both complete computations are deliberately charged there.
+fn remove_cyclic_inline_candidates_by_reachability(
     inline_candidates: &mut BTreeMap<NonterminalID, (usize, Vec<Symbol>)>,
 ) {
     if inline_candidates.is_empty() {
@@ -1887,6 +1986,64 @@ mod tests {
             remove_cyclic_inline_candidates(&mut candidates);
             assert_eq!(candidates, expected, "case_index={case_index}");
         }
+    }
+
+    #[test]
+    fn inline_scc_matches_reference_for_every_four_vertex_graph() {
+        // Include self edges, disjoint SCCs, duplicate edges, terminals and
+        // absent candidate references. Compare the complete map, not its size.
+        let ids = [3, 71, 503, 997];
+        for bits in 0u32..(1 << 16) {
+            let mut candidates = BTreeMap::new();
+            for (source, &id) in ids.iter().enumerate() {
+                let mut rhs = vec![Symbol::Terminal(source as u32), Symbol::Nonterminal(1200)];
+                for (target, &other) in ids.iter().enumerate() {
+                    if bits & (1 << (source * 4 + target)) != 0 {
+                        rhs.push(Symbol::Nonterminal(other));
+                        rhs.push(Symbol::Nonterminal(other));
+                    }
+                }
+                candidates.insert(id, (source * 11, rhs));
+            }
+            let mut expected = candidates.clone();
+            remove_cyclic_inline_candidates_reference(&mut expected);
+            remove_cyclic_inline_candidates_scc(&mut candidates);
+            assert_eq!(candidates, expected, "graph bits={bits:016b}");
+        }
+    }
+
+    #[test]
+    fn inline_scc_keeps_cycle_ancestors_and_descendants_with_sparse_ids() {
+        let mut candidates = BTreeMap::from([
+            (3, (0, vec![Symbol::Nonterminal(4_000_000_000)])),
+            (71, (1, vec![Symbol::Nonterminal(4_000_000_000), Symbol::Nonterminal(503)])),
+            (503, (2, vec![Symbol::Terminal(1), Symbol::Nonterminal(u32::MAX)])),
+            (4_000_000_000, (3, vec![Symbol::Nonterminal(71)])),
+        ]);
+        let mut expected = candidates.clone();
+        remove_cyclic_inline_candidates_reference(&mut expected);
+        remove_cyclic_inline_candidates_scc(&mut candidates);
+        assert_eq!(candidates, expected);
+        assert_eq!(candidates.keys().copied().collect::<Vec<_>>(), vec![3, 503]);
+    }
+
+    #[test]
+    fn inline_scc_handles_long_chain_and_cycle_without_recursive_stack() {
+        const N: u32 = 30_000;
+        let mut candidates = (0..N).map(|id| {
+            let symbol = if id + 1 < N {
+                Symbol::Nonterminal(id + 1)
+            } else {
+                Symbol::Terminal(7)
+            };
+            (id, (id as usize, vec![symbol]))
+        }).collect::<BTreeMap<_, _>>();
+        let expected = candidates.clone();
+        remove_cyclic_inline_candidates_scc(&mut candidates);
+        assert_eq!(candidates, expected);
+        candidates.get_mut(&(N - 1)).unwrap().1 = vec![Symbol::Nonterminal(0)];
+        remove_cyclic_inline_candidates_scc(&mut candidates);
+        assert!(candidates.is_empty());
     }
 
     #[test]
