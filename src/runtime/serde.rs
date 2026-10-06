@@ -8562,12 +8562,17 @@ mod tests {
             (1, b"a".to_vec()), (7, b"a".to_vec()), (11, b"b".to_vec()),
             (19, b"ab".to_vec()), (23, Vec::new()), (29, vec![0xc3, 0xa9]),
         ]);
-        let original = crate::DynamicConstraint::from_ebnf_with_bounded_template_parser(
-            "start ::= 'a' start? 'b'", &vocab,
+        // This test exercises OMITTED full-vocabulary transfer, not O2's
+        // persisted grammar quotient. Select Native on the ordinary compiler
+        // lane explicitly; the bounded-template frontend always partitions.
+        let original = crate::import::compile_dynamic_glrm_fixture(
+            "start start; nt start ::= 'a' start? 'b';", &vocab,
+            crate::runtime::parser_backend::DynamicParserBackend::Native,
         ).unwrap();
         assert!(original.inner.uses_dynamic_runtime());
         assert!(original.inner.has_template_parser());
         assert!(original.inner.direct_regular_automaton.is_none());
+        assert!(!original.inner.dynamic_mask_vocab.is_grammar_quotiented());
         (original, vocab)
     }
 
@@ -8643,6 +8648,42 @@ mod tests {
         assert!(crate::DynamicConstraint::load_with_vocab(&transfer, &mismatch).is_err());
         assert!(!loaded.inner.table.is_present());
         assert!(loaded.inner.has_template_parser());
+    }
+
+    #[test]
+    fn partitioned_external_dynamic_vocab_preserves_its_own_coordinate() {
+        let (ordinary, vocab) = omitted_dynamic_vocab_fixture();
+        let partitioned = crate::DynamicConstraint::from_ebnf_with_bounded_template_parser(
+            "start ::= 'a' start? 'b'", &vocab,
+        ).unwrap();
+        assert!(partitioned.inner.dynamic_mask_vocab.is_grammar_quotiented());
+        assert!(partitioned.inner.dynamic_mask_vocab.to_template_external_vocab_artifact().is_some());
+        let transfer = partitioned.save_with_external_vocab();
+        let loaded = crate::DynamicConstraint::load_with_vocab(&transfer, &vocab).unwrap();
+        assert!(loaded.inner.dynamic_mask_vocab.is_grammar_quotiented());
+        let prepared = crate::compiler::constraint_possible_matches::prepared_runtime_dynamic_vocab_for_vocab(&vocab);
+        assert!(!Arc::ptr_eq(&prepared.trie, &loaded.inner.dynamic_mask_vocab.trie),
+            "an O2 quotient must not be replaced by the omitted full-vocabulary handoff");
+        for tokens in [vec![1, 7, 11, 11], vec![19]] {
+            let mut expected = ordinary.start();
+            let mut actual = loaded.start();
+            assert_eq!(expected.mask(), actual.mask());
+            assert_eq!(expected.is_accepting(), actual.is_accepting());
+            for token in tokens {
+                expected.commit_token(token).unwrap();
+                actual.commit_token(token).unwrap();
+                assert_eq!(expected.mask(), actual.mask());
+                assert_eq!(expected.is_accepting(), actual.is_accepting());
+            }
+            assert!(actual.is_accepting());
+        }
+        assert_eq!(loaded.save_with_external_vocab(), transfer);
+        let reloaded = crate::DynamicConstraint::load_with_vocab(&loaded.save(), &vocab).unwrap();
+        assert!(reloaded.inner.dynamic_mask_vocab.is_grammar_quotiented());
+        assert_eq!(loaded.start().mask(), reloaded.start().mask());
+        assert!(!loaded.inner.table.is_present());
+        let mismatch = Vocab::new(vec![(1, b"x".to_vec()), (7, b"a".to_vec()), (11, b"b".to_vec())]);
+        assert!(crate::DynamicConstraint::load_with_vocab(&transfer, &mismatch).is_err());
     }
 
     #[test]
