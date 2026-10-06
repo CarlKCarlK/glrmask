@@ -3349,11 +3349,6 @@ impl BoundedCodeIntersectionOracle {
         });
         let mut cached_body_pairs = 0;
         if self.max > mask_max || repeats_pattern_state {
-            let mut accepting_rows = Vec::<u8>::new();
-            // Retain the exact next coordinate (no dense-coordinate decoding), but
-            // only store present transitions. Most body-interior states admit very
-            // few classes, so clearing/scanning a dense Option matrix is dead work.
-            let mut transition_rows = Vec::<Vec<(u8, BoundedCodeOracleCoordinate, usize)>>::new();
             // The layout already bounds body_states * pattern_states inside the
             // finite dense-state budget. Cache only rows actually encountered; the
             // dense index costs four bytes per possible pattern/body pair, not per
@@ -3364,14 +3359,40 @@ impl BoundedCodeIntersectionOracle {
                 while dfa.num_states() < coordinates.len() {
                     dfa.add_state();
                 }
-                let batch_end = coordinates.len().min(source.saturating_add(EXPANSION_BATCH));
-                let batch_len = batch_end - source;
-                accepting_rows.clear();
-                accepting_rows.resize(batch_len, 0);
-                for coordinate in &coordinates[source..batch_end] {
-                    let BoundedCodeEnvelopeState::Body { body_state, .. } = coordinate.envelope else {
-                        continue;
+                let coordinate = coordinates[source];
+                let mut finalizers = BitSet::new(1);
+                if matches!(coordinate.envelope, BoundedCodeEnvelopeState::Done)
+                    && !self.pattern.finalizers(coordinate.pattern_state).is_empty()
+                {
+                    finalizers.set(0);
+                }
+                let source_state = u32::try_from(source).ok()?;
+                dfa.overwrite_state_metadata(source_state, finalizers, BitSet::new(1));
+
+                // Cached edges only need cheap count arithmetic. Materialize
+                // them directly in the same serial source/class order in which
+                // the former parallel batches were consumed. This keeps exact
+                // BFS discovery IDs without staging a second per-source row.
+                let mut add_next = |class: u8, next: BoundedCodeOracleCoordinate| -> Option<()> {
+                    let Some(dense) = layout.coordinate_local_state(next) else {
+                        return Some(());
                     };
+                    let dense = dense as usize;
+                    let target = if dense_to_sparse[dense] == u32::MAX {
+                        let target = u32::try_from(coordinates.len()).ok()?;
+                        dense_to_sparse[dense] = target;
+                        coordinates.push(next);
+                        target
+                    } else {
+                        dense_to_sparse[dense]
+                    };
+                    while dfa.num_states() <= target as usize {
+                        dfa.add_state();
+                    }
+                    dfa.add_transition(source_state, class, target);
+                    Some(())
+                };
+                if let BoundedCodeEnvelopeState::Body { completed, body_state } = coordinate.envelope {
                     let pair = body_state as usize * pattern_states + coordinate.pattern_state as usize;
                     if body_row_by_pair[pair] == u32::MAX {
                         body_row_by_pair[pair] = u32::try_from(body_rows.len()).ok()?;
@@ -3379,67 +3400,23 @@ impl BoundedCodeIntersectionOracle {
                             coordinate.pattern_state, body_state, &byte_classes, &class_transitions,
                         ));
                     }
-                }
-                if transition_rows.len() < batch_len {
-                    transition_rows.resize_with(batch_len, Vec::new);
-                }
-                transition_rows[..batch_len]
-                    .par_iter_mut()
-                    .zip(accepting_rows.par_iter_mut())
-                    .enumerate()
-                    .for_each(|(row_offset, (row, accepting_slot))| {
-                        let coordinate = coordinates[source + row_offset];
-                        let accepting = matches!(coordinate.envelope, BoundedCodeEnvelopeState::Done)
-                            && !self.pattern.finalizers(coordinate.pattern_state).is_empty();
-                        *accepting_slot = u8::from(accepting);
-                        row.clear();
-                        if let BoundedCodeEnvelopeState::Body { completed, body_state } = coordinate.envelope {
-                            let pair = body_state as usize * pattern_states + coordinate.pattern_state as usize;
-                            for edge in &body_rows[body_row_by_pair[pair] as usize] {
-                                let Some(next) = edge.next_coordinate(completed, self.min, mask_max, self.suffix.len()) else {
-                                    continue;
-                                };
-                                let Some(dense) = layout.coordinate_local_state(next) else { continue; };
-                                row.push((edge.class, next, dense as usize));
-                            }
-                        } else {
-                            // Prefix, suffix and done coordinates occur only once
-                            // per pattern state. Keep their original exact step.
-                            for (class, members) in byte_classes.iter().enumerate() {
-                                let Some(next) = self.step_coordinate_class(
-                                    coordinate, members[0], class, mask_max, &class_transitions,
-                                ) else { continue; };
-                                let Some(dense) = layout.coordinate_local_state(next) else { continue; };
-                                row.push((class as u8, next, dense as usize));
-                            }
+                    for edge in &body_rows[body_row_by_pair[pair] as usize] {
+                        if let Some(next) = edge.next_coordinate(completed, self.min, mask_max, self.suffix.len()) {
+                            add_next(edge.class, next)?;
                         }
-                    });
-
-                for row_offset in 0..batch_len {
-                    let source_state = (source + row_offset) as u32;
-                    let mut finalizers = BitSet::new(1);
-                    if accepting_rows[row_offset] != 0 {
-                        finalizers.set(0);
                     }
-                    dfa.overwrite_state_metadata(source_state, finalizers, BitSet::new(1));
-                    // Both cached and ordinary rows retain ascending class order,
-                    // so sparse-state discovery is identical to the reference BFS.
-                    for &(class, next, dense) in &transition_rows[row_offset] {
-                        let target = if dense_to_sparse[dense] == u32::MAX {
-                            let target = u32::try_from(coordinates.len()).ok()?;
-                            dense_to_sparse[dense] = target;
-                            coordinates.push(next);
-                            target
-                        } else {
-                            dense_to_sparse[dense]
-                        };
-                        while dfa.num_states() <= target as usize {
-                            dfa.add_state();
+                } else {
+                    // Prefix, suffix and done coordinates occur only once per
+                    // pattern state. Keep their original exact class step.
+                    for (class, members) in byte_classes.iter().enumerate() {
+                        if let Some(next) = self.step_coordinate_class(
+                            coordinate, members[0], class, mask_max, &class_transitions,
+                        ) {
+                            add_next(class as u8, next)?;
                         }
-                        dfa.add_transition(source_state, class, target);
                     }
                 }
-                source = batch_end;
+                source += 1;
             }
             cached_body_pairs = body_rows.len();
         } else {
@@ -7267,6 +7244,39 @@ mod tests {
                 assert_eq!(bincode::serialize(&cached.1).unwrap(), bincode::serialize(&reference.1).unwrap(),
                     "all compressed transitions case={case} max={mask_max}");
             }
+        }
+    }
+
+    #[test]
+    fn finite_mask_cached_fusion_preserves_large_breadth_first_boundaries() {
+        // A cyclic full-bound pattern activates cached body rows and creates
+        // many more than the former 1024-source batch. Compare the complete
+        // coordinate map and wire, not merely language samples from state zero.
+        let body = Expr::Choice(vec![
+            Expr::U8Class(U8Set::from_bytes(b"abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_:/?&%=-@.")),
+            bytes("β".as_bytes()), bytes("猫".as_bytes()), bytes("🙂".as_bytes()), bytes(b"\\n"),
+        ]);
+        let pattern = Expr::Seq(vec![bytes(b"<"),
+            crate::parse_regex(r"[^@^\s]+@[^@^\.^\s]+(\.[^@^\.^\s]*)*.gov.uk", true), bytes(b">")]);
+        let oracle = BoundedCodeIntersectionOracle::from_expr(&Expr::Intersect {
+            expr: Box::new(bounded_code_envelope_with_body(body, 5, 254)),
+            intersect: Box::new(pattern),
+        }).expect("large cyclic full-bound cached-row fixture");
+        assert!(oracle.exact_powers.first().is_some_and(|one_code| {
+            (0..one_code.state_count()).any(|state| {
+                let mut repeats = false;
+                let _ = one_code.for_each_target(state, |target| repeats |= state == target);
+                repeats
+            })
+        }), "fixture must exercise the cached branch without collapsing the bound");
+        let reference = oracle.finite_mask_dfa_reference(254).unwrap();
+        assert!(reference.0.num_states() > 1024, "fixture no longer crosses a former expansion batch");
+        let reference_wire = bincode::serialize(&reference).unwrap();
+        for threads in [2, 10] {
+            let actual = rayon::ThreadPoolBuilder::new().num_threads(threads).build().unwrap()
+                .install(|| oracle.finite_mask_dfa(254).unwrap());
+            assert_eq!(bincode::serialize(&actual).unwrap(), reference_wire,
+                "all states, metadata, compressed transitions, root and dense coordinates; threads={threads}");
         }
     }
 
