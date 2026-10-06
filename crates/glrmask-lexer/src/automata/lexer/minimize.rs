@@ -20,13 +20,35 @@ use super::dfa::DFA;
 /// A signature includes the finalizer and every byte-labelled successor class.
 /// Hash-map equality checks the complete signature; a hash collision is never
 /// an equivalence certificate. Cycles decline before any source mutation.
+struct AcyclicSingleGroupPartition {
+    // Canonical IDs are ordered by each class's smallest original state. This
+    // is the same order as sorted Hopcroft blocks, with old state zero first.
+    state_mapping: Vec<u32>,
+    representatives: Vec<u32>,
+    can_reach_accepting: Vec<bool>,
+}
+
+#[cfg(test)]
 fn acyclic_single_group_partition(dfa: &DFA) -> Option<(Vec<Vec<u32>>, Vec<bool>)> {
     acyclic_single_group_partition_impl::<{ u64::MAX }>(dfa)
 }
 
+// Keep the block-shaped test API so the independent original partition and
+// Hopcroft rebuild remain useful oracles. Production never materializes these
+// per-class member vectors.
+#[cfg(test)]
+fn acyclic_single_group_partition_impl<const HASH_MASK: u64>(dfa: &DFA) -> Option<(Vec<Vec<u32>>, Vec<bool>)> {
+    let flat = acyclic_single_group_flat_partition_impl::<HASH_MASK>(dfa)?;
+    let mut blocks = vec![Vec::new(); flat.representatives.len()];
+    for (state, &class) in flat.state_mapping.iter().enumerate() {
+        blocks[class as usize].push(u32::try_from(state).ok()?);
+    }
+    Some((blocks, flat.can_reach_accepting))
+}
+
 // A zero hash mask in tests forces every distinct signature into one bucket;
 // production equality must still be exact even under total hash collision.
-fn acyclic_single_group_partition_impl<const HASH_MASK: u64>(dfa: &DFA) -> Option<(Vec<Vec<u32>>, Vec<bool>)> {
+fn acyclic_single_group_flat_partition_impl<const HASH_MASK: u64>(dfa: &DFA) -> Option<AcyclicSingleGroupPartition> {
     if dfa.num_groups() != 1 || dfa.has_epsilon_transitions() || dfa.has_self_loops() {
         return None;
     }
@@ -106,14 +128,23 @@ fn acyclic_single_group_partition_impl<const HASH_MASK: u64>(dfa: &DFA) -> Optio
         }
         classes[state] = class;
     }
-    let mut blocks = vec![Vec::new(); representatives.len()];
-    for (state, &class) in classes.iter().enumerate() {
-        blocks[class as usize].push(u32::try_from(state).ok()?);
+    let mut canonical_classes = vec![u32::MAX; representatives.len()];
+    representatives.clear();
+    // A class's first occurrence is its smallest source state, so this one
+    // ordered scan exactly replaces allocating and sorting member blocks.
+    for (state, class) in classes.iter_mut().enumerate() {
+        let canonical = &mut canonical_classes[*class as usize];
+        if *canonical == u32::MAX {
+            *canonical = u32::try_from(representatives.len()).ok()?;
+            representatives.push(u32::try_from(state).ok()?);
+        }
+        *class = *canonical;
     }
-    // Match the original preserve-unreachable Hopcroft numbering exactly.
-    // Members were inserted in ascending source-state order already.
-    blocks.sort_unstable_by_key(|block| block[0]);
-    Some((blocks, can_reach_accepting))
+    Some(AcyclicSingleGroupPartition {
+        state_mapping: classes,
+        representatives,
+        can_reach_accepting,
+    })
 }
 
 #[cfg(test)]
@@ -995,11 +1026,10 @@ impl DFA {
         // cyclic or multi-terminal automata retain the established path.
         let acyclic_started = std::time::Instant::now();
         if std::env::var_os("GLRMASK_DISABLE_FINITE_MASK_ACYCLIC_MINIMIZE").is_none()
-            && let Some((blocks, can_reach_accepting)) = acyclic_single_group_partition(&self)
+            && let Some(partition) = acyclic_single_group_flat_partition_impl::<{ u64::MAX }>(&self)
         {
             let partition_ms = acyclic_started.elapsed().as_secs_f64() * 1000.0;
-            let result = self.rebuild_owned_from_blocks_with_mapping_impl(
-                blocks, Some(&can_reach_accepting));
+            let result = self.rebuild_owned_from_flat_acyclic_partition(partition);
             if profile {
                 eprintln!("[glrmask/profile][lexer_minimize_preserve_acyclic] states={} partition_ms={partition_ms:.3} total_ms={:.3}",
                     orig_n, total_started.elapsed().as_secs_f64() * 1000.0);
@@ -1416,6 +1446,46 @@ impl DFA {
         }
     }
 
+    fn rebuild_owned_from_flat_acyclic_partition(
+        mut self,
+        partition: AcyclicSingleGroupPartition,
+    ) -> (DFA, Vec<u32>) {
+        let AcyclicSingleGroupPartition {
+            state_mapping, representatives, can_reach_accepting,
+        } = partition;
+        debug_assert_eq!(self.num_groups(), 1);
+        debug_assert_eq!(self.num_states(), state_mapping.len());
+        let mut old_index = 0usize;
+        let mut next_representative = 0usize;
+        // Canonical representatives are already ordered in the owned source
+        // vector. Retain/move them in place rather than allocating a second
+        // state vector and a separate old-representative-to-new map.
+        self.states_mut().retain_mut(|state| {
+            let source = old_index;
+            old_index += 1;
+            if representatives.get(next_representative).map(|&state| state as usize) != Some(source) {
+                return false;
+            }
+            debug_assert_eq!(state_mapping[source] as usize, next_representative);
+            next_representative += 1;
+            // Inclusive successor reachability means STRICT nonempty futures:
+            // an accepting sink does not become its own future witness.
+            let has_future = state.transitions.iter()
+                .any(|(_, &target)| can_reach_accepting[target as usize]);
+            state.possible_future_group_ids = BitSet::new(1);
+            if has_future {
+                state.possible_future_group_ids.set(0);
+            }
+            for (_, target) in state.transitions.iter_mut() {
+                *target = state_mapping[*target as usize];
+            }
+            debug_assert!(state.epsilon_transitions.is_empty());
+            true
+        });
+        debug_assert_eq!(next_representative, representatives.len());
+        (self, state_mapping)
+    }
+
     fn rebuild_owned_from_blocks(self, partition_blocks: Vec<Vec<u32>>) -> DFA {
         self.rebuild_owned_from_blocks_with_mapping(partition_blocks).0
     }
@@ -1601,6 +1671,14 @@ mod tests {
         let expected = original_preserve_hopcroft(source.clone());
         assert_eq!(actual.1, expected.1, "source-coordinate map changed");
         assert!(actual.0 == expected.0, "canonical DFA/strict future metadata changed");
+        let flat = acyclic_single_group_flat_partition_impl::<0>(&source).unwrap();
+        let flat_expected_representatives = expected_partition.0.iter()
+            .map(|block| block[0]).collect::<Vec<_>>();
+        assert_eq!(flat.representatives, flat_expected_representatives);
+        assert_eq!(flat.state_mapping, expected.1);
+        let flat_actual = source.clone().rebuild_owned_from_flat_acyclic_partition(flat);
+        assert_eq!(flat_actual.1, expected.1);
+        assert!(flat_actual.0 == expected.0, "flat rebuild under total hash collision changed DFA");
         let integrated = source.clone().minimize_with_state_mapping_preserve_unreachable();
         assert_eq!(integrated.1, expected.1);
         assert!(integrated.0 == expected.0);
@@ -1661,6 +1739,36 @@ mod tests {
             let mut tiny = DFA::new(n); tiny.ensure_group_capacity(1);
             assert_acyclic_matches_original(tiny);
         }
+    }
+
+    #[test]
+    fn flat_acyclic_rebuild_retains_owned_storage_and_canonical_representatives() {
+        // DFS discovery is deliberately different from source-state order, and
+        // equivalent states are interleaved with disconnected/dead components.
+        let mut dfa = DFA::new(12);
+        dfa.ensure_group_capacity(1);
+        for (source, byte, target) in [
+            (0,b'a',8),(1,b'b',10),(2,b'a',9),(3,b'b',11),
+            (4,b'c',1),(5,b'c',3),(6,b'd',7),
+        ] {
+            dfa.add_transition(source, byte, target);
+        }
+        let mut accepting = BitSet::new(1); accepting.set(0);
+        for state in [8,9,10,11] {
+            dfa.overwrite_state_metadata(state, accepting.clone(), accepting.clone());
+        }
+        let expected = original_preserve_hopcroft(dfa.clone());
+        let flat = acyclic_single_group_flat_partition_impl::<{ u64::MAX }>(&dfa).unwrap();
+        assert!(flat.representatives.windows(2).all(|pair| pair[0] < pair[1]));
+        assert_eq!(flat.representatives[0], 0);
+        assert!(flat.representatives.len() < dfa.num_states());
+        let allocation = dfa.states().as_ptr();
+        let (actual, mapping) = dfa.rebuild_owned_from_flat_acyclic_partition(flat);
+        assert_eq!(actual.states().as_ptr(), allocation, "owned state storage was reallocated");
+        assert_eq!(mapping, expected.1);
+        assert!(actual == expected.0);
+        assert!(actual.possible_future_group_ids(mapping[8]).is_empty(), "accepting sink is not a future");
+        assert!(actual.possible_future_group_ids(mapping[6]).is_empty(), "dead continuation is not accepting");
     }
 
     #[test]
@@ -1732,7 +1840,10 @@ mod tests {
         dfa.overwrite_state_metadata(n as u32-1,accepting,BitSet::new(1));
         let (blocks, reach) = acyclic_single_group_partition(&dfa).unwrap();
         assert_eq!(blocks.len(),n); assert!(reach.iter().all(|&v|v));
-        let (result,map) = dfa.rebuild_owned_from_blocks_with_mapping_impl(blocks,Some(&reach));
+        let expected = dfa.clone().rebuild_owned_from_blocks_with_mapping_impl(blocks,Some(&reach));
+        let (result,map) = dfa.minimize_with_state_mapping_preserve_unreachable();
+        assert_eq!(map, expected.1);
+        assert!(result == expected.0);
         assert_eq!(map,(0..n as u32).collect::<Vec<_>>());
         assert!(result.possible_future_group_ids(n as u32-1).is_empty());
         assert!(!result.possible_future_group_ids(0).is_empty());
