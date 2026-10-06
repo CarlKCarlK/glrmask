@@ -13,6 +13,72 @@ use crate::ds::char_transitions::CharTransitions;
 
 use super::dfa::DFA;
 
+/// Exact reverse-topological partition for finite, one-terminal components.
+///
+/// Every state is a root for this operation, including states disconnected from
+/// state zero: they can be reached through the symbolic-to-finite projection.
+/// A signature includes the finalizer and every byte-labelled successor class.
+/// Hash-map equality checks the complete signature; a hash collision is never
+/// an equivalence certificate. Cycles decline before any source mutation.
+fn acyclic_single_group_partition(dfa: &DFA) -> Option<(Vec<Vec<u32>>, Vec<bool>)> {
+    if dfa.num_groups() != 1 || dfa.has_epsilon_transitions() || dfa.has_self_loops() {
+        return None;
+    }
+    let n = dfa.num_states();
+    let mut visited = vec![0u8; n];
+    let mut order = Vec::with_capacity(n);
+    // Iterative DFS avoids a call-stack dependency on the repeat bound.
+    let mut stack = Vec::new();
+    for root in 0..n {
+        if visited[root] != 0 { continue; }
+        visited[root] = 1;
+        stack.push((root, dfa.states()[root].transitions.iter()));
+        while let Some((state, edges)) = stack.last_mut() {
+            if let Some((_, &target)) = edges.next() {
+                let target = target as usize;
+                match *visited.get(target)? {
+                    0 => {
+                        visited[target] = 1;
+                        stack.push((target, dfa.states()[target].transitions.iter()));
+                    }
+                    1 => return None,
+                    _ => {}
+                }
+            } else {
+                visited[*state] = 2;
+                order.push(*state);
+                stack.pop();
+            }
+        }
+    }
+
+    let mut classes = vec![u32::MAX; n];
+    let mut signatures = FxHashMap::<(bool, Vec<(u8, u32)>), u32>::default();
+    let mut can_reach_accepting = vec![false; n];
+    for state in order {
+        let accepting = !dfa.finalizers(state as u32).is_empty();
+        let edges = dfa.states()[state].transitions.iter()
+            .map(|(byte, &target)| {
+                debug_assert_ne!(classes[target as usize], u32::MAX);
+                (byte, classes[target as usize])
+            }).collect::<Vec<_>>();
+        // Inclusive reachability is passed to the existing rebuilder, which
+        // computes STRICT futures via at least one outgoing byte transition.
+        can_reach_accepting[state] = accepting || dfa.states()[state].transitions.iter()
+            .any(|(_, &target)| can_reach_accepting[target as usize]);
+        let next_class = u32::try_from(signatures.len()).ok()?;
+        classes[state] = *signatures.entry((accepting, edges)).or_insert(next_class);
+    }
+    let mut blocks = vec![Vec::new(); signatures.len()];
+    for (state, &class) in classes.iter().enumerate() {
+        blocks[class as usize].push(u32::try_from(state).ok()?);
+    }
+    // Match the original preserve-unreachable Hopcroft numbering exactly.
+    // Members were inserted in ascending source-state order already.
+    blocks.sort_unstable_by_key(|block| block[0]);
+    Some((blocks, can_reach_accepting))
+}
+
 enum TopologyPrerefine {
     AlreadyMinimal(Vec<Vec<u32>>),
     Refined {
@@ -826,6 +892,24 @@ impl DFA {
             return (self, (0..orig_n as u32).collect());
         }
 
+        // Finite repeat projections are commonly DAGs. Their exact partition
+        // follows in one reverse-topological pass; avoid constructing inverse
+        // edges and running repeated Hopcroft splitters in that case. General
+        // cyclic or multi-terminal automata retain the established path.
+        let acyclic_started = std::time::Instant::now();
+        if std::env::var_os("GLRMASK_DISABLE_FINITE_MASK_ACYCLIC_MINIMIZE").is_none()
+            && let Some((blocks, can_reach_accepting)) = acyclic_single_group_partition(&self)
+        {
+            let partition_ms = acyclic_started.elapsed().as_secs_f64() * 1000.0;
+            let result = self.rebuild_owned_from_blocks_with_mapping_impl(
+                blocks, Some(&can_reach_accepting));
+            if profile {
+                eprintln!("[glrmask/profile][lexer_minimize_preserve_acyclic] states={} partition_ms={partition_ms:.3} total_ms={:.3}",
+                    orig_n, total_started.elapsed().as_secs_f64() * 1000.0);
+            }
+            return result;
+        }
+
         let partition_started = std::time::Instant::now();
         let (partition, blocks) = partition_by_finalizers(&self);
         let partition_ms = partition_started.elapsed().as_secs_f64() * 1000.0;
@@ -1393,6 +1477,125 @@ fn compose_mappings(first: &[u32], second: &[u32]) -> Vec<u32> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // Deliberately bypass the new path: this is the original canonical
+    // preserve-unreachable Hopcroft implementation, not a self-comparison.
+    fn original_preserve_hopcroft(mut dfa: DFA) -> (DFA, Vec<u32>) {
+        let n = dfa.states().len();
+        if dfa.has_epsilon_transitions() { return (dfa, (0..n as u32).collect()); }
+        clear_possible_futures_for_minimization(&mut dfa);
+        if n <= 1 { dfa.recompute_possible_futures(); return (dfa, (0..n as u32).collect()); }
+        let (partition, blocks) = partition_by_finalizers(&dfa);
+        let inverse = InverseTransitions::build(&dfa);
+        let mut blocks = hopcroft_refine_partition_impl::<true>(&dfa, partition, blocks, &inverse);
+        canonicalize_partition_blocks(&mut blocks);
+        let reach = (dfa.num_groups() == 1).then(|| can_reach_accepting_from_inverse(&dfa, &inverse));
+        dfa.rebuild_owned_from_blocks_with_mapping_impl(blocks, reach.as_deref())
+    }
+
+    fn assert_acyclic_matches_original(source: DFA) {
+        let (blocks, reach) = acyclic_single_group_partition(&source).expect("generated DAG");
+        let actual = source.clone().rebuild_owned_from_blocks_with_mapping_impl(blocks, Some(&reach));
+        let expected = original_preserve_hopcroft(source.clone());
+        assert_eq!(actual.1, expected.1, "source-coordinate map changed");
+        assert!(actual.0 == expected.0, "canonical DFA/strict future metadata changed");
+        let integrated = source.clone().minimize_with_state_mapping_preserve_unreachable();
+        assert_eq!(integrated.1, expected.1);
+        assert!(integrated.0 == expected.0);
+        let mut recomputed = actual.0.clone();
+        recomputed.recompute_possible_futures();
+        assert!(actual.0 == recomputed, "strict futures must equal independent reachability");
+        for old in 0..source.num_states() as u32 {
+            let new = actual.1[old as usize];
+            assert_ne!(new, u32::MAX, "unreachable projection roots must remain mapped");
+            assert_eq!(source.finalizers(old), actual.0.finalizers(new));
+            for byte in 0..=255u8 {
+                assert_eq!(source.step(old, byte).map(|q| actual.1[q as usize]), actual.0.step(new, byte));
+            }
+        }
+    }
+
+    #[test]
+    fn acyclic_preserve_matches_original_on_shuffled_generated_dags() {
+        use rand::{Rng, SeedableRng};
+        use rand::seq::SliceRandom;
+        let mut rng = rand::rngs::StdRng::seed_from_u64(0x109174_da6);
+        for _case in 0..256 {
+            let n = rng.gen_range(2..85);
+            let mut order = (0..n as u32).collect::<Vec<_>>();
+            order.shuffle(&mut rng);
+            let mut dfa = DFA::new(n);
+            dfa.ensure_group_capacity(1);
+            for (position, &state) in order.iter().enumerate() {
+                let mut finalizers = BitSet::new(1);
+                if rng.gen_bool(0.3) { finalizers.set(0); }
+                // Stale future bits are intentionally ignored by minimization.
+                let mut future = BitSet::new(1);
+                if rng.gen_bool(0.5) { future.set(0); }
+                dfa.overwrite_state_metadata(state, finalizers, future);
+                if position + 1 < n {
+                    for byte in 0..8u8 {
+                        if rng.gen_bool(0.35) {
+                            dfa.add_transition(state, byte, order[rng.gen_range(position+1..n)]);
+                        }
+                    }
+                }
+            }
+            assert_acyclic_matches_original(dfa);
+        }
+    }
+
+    #[test]
+    fn acyclic_preserve_retains_disconnected_roots_and_strict_future() {
+        let mut dfa = DFA::new(8);
+        dfa.ensure_group_capacity(1);
+        for (source, byte, target) in [(0,b'a',1),(1,b'b',2),(3,b'a',4),(4,b'b',5),(6,b'x',7)] {
+            dfa.add_transition(source, byte, target);
+        }
+        let mut accepting = BitSet::new(1); accepting.set(0);
+        for state in [2,5,7] { dfa.overwrite_state_metadata(state, accepting.clone(), accepting.clone()); }
+        assert_acyclic_matches_original(dfa);
+        for n in 0..2 {
+            let mut tiny = DFA::new(n); tiny.ensure_group_capacity(1);
+            assert_acyclic_matches_original(tiny);
+        }
+    }
+
+    #[test]
+    fn acyclic_preserve_declines_cycles_epsilon_and_multiple_groups() {
+        let mut cycle = DFA::new(5); cycle.ensure_group_capacity(1);
+        cycle.add_transition(0,b'a',1);
+        // Unreachable cycles must also be detected before classifying states.
+        cycle.add_transition(3,b'b',4); cycle.add_transition(4,b'c',3);
+        assert!(acyclic_single_group_partition(&cycle).is_none());
+        let mut epsilon = DFA::new(2); epsilon.ensure_group_capacity(1);
+        epsilon.add_epsilon_transition(0,1);
+        let mut multigroup = DFA::new(2); multigroup.ensure_group_capacity(2);
+        multigroup.add_transition(0,b'x',1);
+        let mut self_loop = DFA::new(1); self_loop.ensure_group_capacity(1);
+        self_loop.add_transition(0,b'x',0);
+        for dfa in [cycle,epsilon,multigroup,self_loop] {
+            assert!(acyclic_single_group_partition(&dfa).is_none());
+            let actual = dfa.clone().minimize_with_state_mapping_preserve_unreachable();
+            let expected = original_preserve_hopcroft(dfa);
+            assert_eq!(actual.1,expected.1); assert!(actual.0==expected.0);
+        }
+    }
+
+    #[test]
+    fn acyclic_preserve_deep_chain_uses_no_recursive_walk() {
+        let n = 20_000;
+        let mut dfa = DFA::new(n); dfa.ensure_group_capacity(1);
+        for state in 0..n as u32-1 { dfa.add_transition(state,b'a',state+1); }
+        let mut accepting = BitSet::new(1); accepting.set(0);
+        dfa.overwrite_state_metadata(n as u32-1,accepting,BitSet::new(1));
+        let (blocks, reach) = acyclic_single_group_partition(&dfa).unwrap();
+        assert_eq!(blocks.len(),n); assert!(reach.iter().all(|&v|v));
+        let (result,map) = dfa.rebuild_owned_from_blocks_with_mapping_impl(blocks,Some(&reach));
+        assert_eq!(map,(0..n as u32).collect::<Vec<_>>());
+        assert!(result.possible_future_group_ids(n as u32-1).is_empty());
+        assert!(!result.possible_future_group_ids(0).is_empty());
+    }
 
     #[test]
     fn preserve_unreachable_single_group_future_carry_matches_recompute() {
