@@ -574,6 +574,33 @@ fn get_ordered_vocab_trie_artifacts_for_vocab(
     )
 }
 
+/// Exact proper-prefix ANY-byte query over vocabulary artifacts that ALREADY
+/// exist. Do not construct a trie/index here or change vocabulary preparation:
+/// cold callers keep the established scan and its accounting boundary.
+pub(crate) fn prepared_proper_prefix_byte_candidates(
+    vocab: &Vocab, bytes: &[u64; 4],
+) -> Option<Vec<u32>> {
+    if !ordered_vocab_cache_enabled() || ordered_vocab_cache_capacity() == 0 { return None; }
+    let artifacts = vocab.vocab_derived_cache_get::<OrderedVocabTrieArtifacts>()?;
+    // Sparse interface-exit queries benefit; avoid spending a complete scan's
+    // worth of tree work and then sorting a dense result on broad queries.
+    let limit = (vocab.len() / 4).max(64);
+    let ordered_ids = artifacts.trie.token_ids_with_proper_prefix_byte(bytes, limit)?;
+    // Byte-spelling aliases can make a sparse canonical query dense in the
+    // original token domain. Preflight the full expansion before allocating.
+    let mut count = 0usize;
+    for &ordered_id in &ordered_ids {
+        count = count.checked_add(artifacts.ordered_vocab.ordered_to_originals.get(ordered_id)?.len())?;
+        if count > limit { return None; }
+    }
+    let mut ids = Vec::with_capacity(count);
+    for ordered_id in ordered_ids {
+        ids.extend_from_slice(&artifacts.ordered_vocab.ordered_to_originals[ordered_id]);
+    }
+    ids.sort_unstable(); ids.dedup();
+    Some(ids)
+}
+
 #[allow(dead_code)]
 pub(crate) fn dense_word_count(token_slots: u32) -> usize { (token_slots as usize + 63) / 64 }
 
@@ -4237,6 +4264,42 @@ mod tests {
     use rand::rngs::StdRng;
     use rand::{Rng, SeedableRng};
     use std::collections::BTreeSet;
+
+    #[test]
+    fn prepared_prefix_byte_query_preserves_aliases_and_never_builds_a_missing_cache() {
+        let vocab=Vocab::new_with_exact_token_ids(vec![
+            (2,Vec::new()),(7,b"ab".to_vec()),(19,b"ab".to_vec()),(41,b"b".to_vec()),
+            (1_003,b"abx".to_vec()),(9_000_001,b"abxy".to_vec()),(99,b"z\xfft".to_vec())], [800]);
+        let mut query=[0u64;4];query[b'b' as usize>>6]|=1u64<<(b'b'&63);
+        let before=vocab.compiler_cache_entry_count();
+        assert!(prepared_proper_prefix_byte_candidates(&vocab,&query).is_none());
+        assert_eq!(vocab.compiler_cache_entry_count(),before,"query must not shift cold work into preparation");
+        let ordered=Arc::new(build_ordered_vocab(vocab.entries_map()));
+        let trie=Arc::new(build_ordered_vocab_prefix_tree(&ordered));
+        vocab.vocab_derived_cache_set(Arc::new(OrderedVocabTrieArtifacts::new(ordered,trie)));
+        assert_eq!(prepared_proper_prefix_byte_candidates(&vocab,&query),Some(vec![1_003,9_000_001]));
+        assert_eq!(prepared_proper_prefix_byte_candidates(&vocab.clone(),&query),Some(vec![1_003,9_000_001]));
+        query=[0;4];query[b'a' as usize>>6]|=1u64<<(b'a'&63);
+        assert_eq!(prepared_proper_prefix_byte_candidates(&vocab,&query),Some(vec![7,19,1_003,9_000_001]));
+        let other=Vocab::new(vec![(7,b"xy".to_vec()),(1_003,b"ax".to_vec())]);
+        assert!(prepared_proper_prefix_byte_candidates(&other,&query).is_none());
+        assert_eq!(other.compiler_cache_entry_count(),0);
+    }
+
+    #[test]
+    fn prepared_prefix_byte_query_declines_dense_original_alias_expansion() {
+        let entries=(0..130u32).map(|i|(i*97+3,b"ab".to_vec())).collect::<Vec<_>>();
+        let vocab=Vocab::new_with_exact_token_ids(entries, []);
+        let ordered=Arc::new(build_ordered_vocab(vocab.entries_map()));
+        let trie=Arc::new(build_ordered_vocab_prefix_tree(&ordered));
+        vocab.vocab_derived_cache_set(Arc::new(OrderedVocabTrieArtifacts::new(ordered,trie)));
+        let mut query=[0u64;4];query[b'a' as usize>>6]|=1u64<<(b'a'&63);
+        assert!(prepared_proper_prefix_byte_candidates(&vocab,&query).is_none(),
+            "one canonical spelling must not hide an over-budget original-ID expansion");
+        query=[0;4];query[b'b' as usize>>6]|=1u64<<(b'b'&63);
+        assert_eq!(prepared_proper_prefix_byte_candidates(&vocab,&query),Some(Vec::new()),
+            "a byte occurring only at the endpoint is still not a witness");
+    }
 
     #[test]
     fn possible_match_configs_report_table_completeness() {

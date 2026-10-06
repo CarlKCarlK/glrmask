@@ -761,6 +761,19 @@ fn summarize_root_r1(constraint: &Constraint, vocab: &crate::Vocab,
 }
 
 fn candidate_ids_for_r1(vocab: &crate::Vocab, language: ByteLanguage) -> Vec<u32> {
+    if language.bytes.count() == 0 { return Vec::new(); }
+    if std::env::var_os("GLRMASK_DISABLE_BOUNDARY_R1_TRIE_MAP").is_none()
+        && let Some(ids) = super::constraint_possible_matches::prepared_proper_prefix_byte_candidates(
+            vocab, &language.bytes.0)
+    {
+        return ids;
+    }
+    candidate_ids_for_r1_reference(vocab, language)
+}
+
+// Keep the original full scan as an independent predicate and cold/dense
+// fallback. In particular, ANY byte before the final byte is sufficient.
+fn candidate_ids_for_r1_reference(vocab: &crate::Vocab, language: ByteLanguage) -> Vec<u32> {
     let mut ids = Vec::new();
     for (id, bytes) in vocab.iter() {
         if bytes.len() < 2 {
@@ -777,6 +790,31 @@ fn candidate_ids_for_r1(vocab: &crate::Vocab, language: ByteLanguage) -> Vec<u32
     ids.sort_unstable();
     ids.dedup();
     ids
+}
+
+#[cfg(test)]
+#[test]
+fn r1_trie_and_reference_match_for_every_byte_without_changing_preparation() {
+    let mut entries=Vec::new();
+    for byte in 0..=255u8 {
+        let id=byte as u32*19;
+        entries.extend([(id,vec![byte]),(id+1,vec![byte,b'x']),
+            (id+2,vec![b'x',byte]),(id+3,vec![byte,b'x'])]);
+    }
+    entries.push((10_000,Vec::new()));
+    let vocab=crate::Vocab::new_with_exact_token_ids(entries,[10_001]);
+    for prepared in [false,true] {
+        if prepared { super::constraint_possible_matches::prepare_vocab_for_possible_matches(&vocab); }
+        let count=vocab.compiler_cache_entry_count();
+        for byte in 0..=255u8 {
+            let mut language=ByteLanguage::empty();language.bytes.insert(byte);
+            assert_eq!(candidate_ids_for_r1(&vocab,language),candidate_ids_for_r1_reference(&vocab,language));
+        }
+        for language in [ByteLanguage::empty(),ByteLanguage::top()] {
+            assert_eq!(candidate_ids_for_r1(&vocab,language),candidate_ids_for_r1_reference(&vocab,language));
+        }
+        assert_eq!(vocab.compiler_cache_entry_count(),count,"R1 must not create any vocabulary artifact");
+    }
 }
 
 #[cfg(test)]
