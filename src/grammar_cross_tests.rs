@@ -1,6 +1,103 @@
 use crate::grammar::ast::lower;
 
 #[test]
+fn hash_collision_merge_keeps_exact_masks_commits_and_loaded_language() {
+    use std::collections::{BTreeSet, HashSet};
+    use crate::compiler::glr::analysis::merge_identical_nonterminals;
+    use crate::compiler::glr::table::GlrTableConstruction;
+    use crate::grammar::flat::{GrammarDef, Rule, Symbol, Terminal};
+    use crate::runtime::parser_backend::DynamicParserBackend;
+
+    let left = [[10, 122], [163, 97], [271, 586], [443, 404]];
+    let right = [[549, 362], [683, 617], [791, 48], [900, 749]];
+    let mut rules = vec![
+        Rule { lhs: 0, rhs: vec![Symbol::Nonterminal(1)] },
+        Rule { lhs: 0, rhs: vec![Symbol::Terminal(1024), Symbol::Nonterminal(2)] },
+    ];
+    let literal = |id: u32| format!("{id:04x}").into_bytes();
+    let mut words: HashSet<Vec<u8>> = (0..=1024).map(literal).collect();
+    for id in 0..=1024 {
+        rules.push(Rule { lhs: 0, rhs: vec![Symbol::Terminal(id)] });
+    }
+    for (lhs, alternatives) in [(1, left), (2, right)] {
+        for pair in alternatives {
+            rules.push(Rule { lhs, rhs: pair.into_iter().map(Symbol::Terminal).collect() });
+            let mut word = if lhs == 2 { literal(1024) } else { Vec::new() };
+            word.extend(literal(pair[0])); word.extend(literal(pair[1]));
+            words.insert(word);
+        }
+    }
+    assert_eq!(words.len(), 1033);
+    let invalid = right.into_iter().map(|pair| {
+        let mut word = literal(pair[0]); word.extend(literal(pair[1])); word
+    }).chain(left.into_iter().map(|pair| {
+        let mut word = literal(1024); word.extend(literal(pair[0]));
+        word.extend(literal(pair[1])); word
+    })).collect::<Vec<_>>();
+    assert!(invalid.iter().all(|word| !words.contains(word)));
+
+    // Keep exact witness IDs at the merge boundary. Frontend terminal
+    // renumbering is deliberately not assumed to preserve a hash collision.
+    // The downstream compiler and matcher paths are the real implementations.
+    let grammar = GrammarDef {
+        rules: merge_identical_nonterminals(&rules, 0), start: 0,
+        terminals: (0..=1024).map(|id| Terminal::Literal { id, bytes: literal(id) }).collect(),
+        ..GrammarDef::default()
+    };
+    let mut token_bytes = b"0123456789abcdef".iter().map(|&byte| vec![byte]).collect::<Vec<_>>();
+    token_bytes.extend((0..=1024).map(literal));
+    token_bytes.extend(invalid.iter().cloned());
+    let vocab = crate::Vocab::new(token_bytes.iter().enumerate()
+        .map(|(id, bytes)| (id as u32, bytes.clone())).collect());
+    let prefixes: BTreeSet<Vec<u8>> = words.iter().flat_map(|word|
+        (0..=word.len()).map(|end| word[..end].to_vec())).collect();
+    let prefix_lookup: HashSet<_> = prefixes.iter().cloned().collect();
+    // Independently precompute complete model-token masks from the finite
+    // language, including byte tokens, whole terminals and invalid cross-token
+    // words. Never use another engine's masks as this regression's oracle.
+    let expected_masks = prefixes.iter().map(|prefix| {
+        let mut mask = vec![0u32; token_bytes.len().div_ceil(32)];
+        for (token, bytes) in token_bytes.iter().enumerate() {
+            let mut extended = prefix.clone(); extended.extend(bytes);
+            if prefix_lookup.contains(&extended) { mask[token / 32] |= 1 << (token % 32); }
+        }
+        mask
+    }).collect::<Vec<_>>();
+
+    for mode in ["dynamic", "o2", "static"] {
+        let constraint = match mode {
+            "dynamic" => crate::compiler::pipeline::compile_dynamic_owned_with_backend(
+                grammar.clone(), &vocab, GlrTableConstruction::Lalr,
+                DynamicParserBackend::LrTable).unwrap().inner,
+            "o2" => crate::compiler::pipeline::compile_dynamic_owned_with_vocab_partition_for_parser_replacement(
+                grammar.clone(), &vocab, GlrTableConstruction::Lalr).unwrap().inner,
+            _ => crate::compiler::pipeline::compile_owned(grammar.clone(), &vocab),
+        };
+        if mode == "o2" { assert!(constraint.has_template_parser() && !constraint.table.is_present()); }
+        let loaded = crate::Constraint::load(constraint.save()).unwrap();
+        for (variant, c) in [("built", &constraint), ("loaded", &loaded)] {
+            for (prefix, expected) in prefixes.iter().zip(&expected_masks) {
+                let mut state = c.start(); state.commit_bytes(prefix).unwrap();
+                assert_eq!(state.is_accepting(), words.contains(prefix), "{mode}/{variant} EOF {prefix:?}");
+                assert_eq!(&state.mask(), expected, "{mode}/{variant} mask {prefix:?}");
+                for (token, bytes) in token_bytes.iter().enumerate() {
+                    if expected[token / 32] & (1 << (token % 32)) == 0 { continue; }
+                    let mut branch = state.clone(); branch.commit_token(token as u32).unwrap();
+                    let mut extended = prefix.clone(); extended.extend(bytes);
+                    assert_eq!(branch.is_accepting(), words.contains(&extended),
+                        "{mode}/{variant} token commit {prefix:?}+{bytes:?}");
+                }
+            }
+            for word in &invalid {
+                let mut state = c.start();
+                assert!(state.commit_bytes(word).is_err() || !state.is_accepting(),
+                    "{mode}/{variant} false acceptance {word:?}");
+            }
+        }
+    }
+}
+
+#[test]
 fn direct_regular_metadata_survives_compile_preparation() {
     let mut source = String::from("start: s0\n");
     for index in 0..40 {

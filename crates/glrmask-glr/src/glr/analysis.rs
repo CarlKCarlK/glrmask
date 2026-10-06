@@ -2334,6 +2334,64 @@ fn is_reflexive_unit_rule(rule: &Rule) -> bool {
     matches!(rule.rhs.as_slice(), [Symbol::Nonterminal(nonterminal)] if *nonterminal == rule.lhs)
 }
 
+/// Check the proposed quotient with structural equality, never with hashes.
+///
+/// Flattening only unfolds acyclic single-production rules. Equal flattened
+/// RHS sets under the complete proposed quotient therefore establish equal
+/// languages for class members, including recursive references. This must
+/// hold for EVERY nontrivial class: otherwise a parent class may rely on a
+/// false child equivalence, so the caller must reject the whole merge.
+fn merge_partition_has_exact_rhs_sets(
+    nts: &[NonterminalID],
+    flattened_rhs_by_idx: &[Vec<Vec<Symbol>>],
+    nt_to_idx: &[u32],
+    representative_by_idx: &[NonterminalID],
+) -> bool {
+    let canonical_rhs_set = |idx: usize| {
+        let mut alternatives: Vec<Vec<Symbol>> = flattened_rhs_by_idx[idx]
+            .iter()
+            .map(|rhs| {
+                rhs.iter()
+                    .map(|symbol| match symbol {
+                        Symbol::Nonterminal(nt) => {
+                            // Undefined nonterminals keep their real identity.
+                            // Self references use the actual representative,
+                            // not the hash refinement's generic self sentinel.
+                            let representative = nt_to_idx
+                                .get(*nt as usize)
+                                .filter(|&&i| i != u32::MAX)
+                                .map(|&i| representative_by_idx[i as usize])
+                                .unwrap_or(*nt);
+                            Symbol::Nonterminal(representative)
+                        }
+                        Symbol::Terminal(terminal) => Symbol::Terminal(*terminal),
+                    })
+                    .collect()
+            })
+            .collect();
+        alternatives.sort_unstable();
+        alternatives.dedup();
+        alternatives
+    };
+
+    // Singleton classes need no check. Materialize each nontrivial class's
+    // representative once, then compare every other member's entire RHS set.
+    let mut rhs_by_representative = HashMap::new();
+    for (idx, &nt) in nts.iter().enumerate() {
+        let representative = representative_by_idx[idx];
+        if nt == representative {
+            continue;
+        }
+        let expected = rhs_by_representative.entry(representative).or_insert_with(|| {
+            canonical_rhs_set(nt_to_idx[representative as usize] as usize)
+        });
+        if *expected != canonical_rhs_set(idx) {
+            return false;
+        }
+    }
+    true
+}
+
 pub fn merge_identical_nonterminals(
     rules: &[Rule],
     start: NonterminalID,
@@ -2656,14 +2714,28 @@ pub fn merge_identical_nonterminals(
     }
 
     let mut merge_map: BTreeMap<NonterminalID, NonterminalID> = BTreeMap::new();
+    let mut representative_by_idx = Vec::with_capacity(nts.len());
     for (idx, &nt) in nts.iter().enumerate() {
         let rep = class_to_rep[&class_of[idx]];
+        representative_by_idx.push(rep);
         if nt != rep {
             merge_map.insert(nt, rep);
         }
     }
 
     if merge_map.is_empty() {
+        return rules.to_vec();
+    }
+
+    // The additive 64-bit signatures above only nominate a partition. A
+    // collision must not union different languages (nor justify parent merges
+    // that relied on that collision). Preserve the original grammar on failure.
+    if !merge_partition_has_exact_rhs_sets(
+        &nts,
+        &flattened_rhs_by_idx,
+        &nt_to_idx_fast,
+        &representative_by_idx,
+    ) {
         return rules.to_vec();
     }
 
@@ -3309,6 +3381,155 @@ mod tests {
             }
         }
         languages[start as usize].clone()
+    }
+
+    #[test]
+    fn merge_hash_collision_preserves_complete_finite_language() {
+        // These disjoint alternative sets have the same additive 64-bit
+        // signature under Rust 1.95's DefaultHasher. Hashes may nominate a
+        // merge, but must never establish grammar-language equivalence.
+        let left = [[10, 122], [163, 97], [271, 586], [443, 404]];
+        let right = [[549, 362], [683, 617], [791, 48], [900, 749]];
+        let mut rules = vec![
+            Rule { lhs: 0, rhs: vec![Symbol::Nonterminal(1)] },
+            Rule {
+                lhs: 0,
+                rhs: vec![Symbol::Terminal(1024), Symbol::Nonterminal(2)],
+            },
+        ];
+        for terminal in 0..=1024 {
+            rules.push(Rule { lhs: 0, rhs: vec![Symbol::Terminal(terminal)] });
+        }
+        for (lhs, alternatives) in [(1, left), (2, right)] {
+            for pair in alternatives {
+                rules.push(Rule {
+                    lhs,
+                    rhs: pair.into_iter().map(Symbol::Terminal).collect(),
+                });
+            }
+        }
+
+        // This grammar is acyclic, with maximum word length exactly three;
+        // the bounded fixed point therefore enumerates its ENTIRE language.
+        // Check the original against an independent closed-form oracle too.
+        let mut expected: BTreeSet<Vec<TerminalID>> =
+            (0..=1024).map(|terminal| vec![terminal]).collect();
+        expected.extend(left.into_iter().map(|pair| pair.to_vec()));
+        expected.extend(right.into_iter().map(|pair| vec![1024, pair[0], pair[1]]));
+        let before = bounded_language(&rules, 0, 3, 3);
+        assert_eq!(before, expected);
+        assert_eq!(before.len(), 1033);
+        assert!(!before.contains(&vec![549, 362]));
+
+        let merged = merge_identical_nonterminals(&rules, 0);
+        let after = bounded_language(&merged, 0, 3, 3);
+        let added: Vec<_> = after.difference(&before).cloned().collect();
+        assert!(
+            added.is_empty(),
+            "hash-only merge widened language {} -> {}: {added:?}",
+            before.len(),
+            after.len(),
+        );
+        assert_eq!(after, before, "merge must not lose valid words either");
+    }
+
+    fn exact_merge_partition_for_test(
+        rules: &[Rule],
+        merges: &[(NonterminalID, NonterminalID)],
+    ) -> bool {
+        let rhs_by_lhs = build_rhs_by_lhs(rules);
+        let nts: Vec<_> = rhs_by_lhs.keys().copied().collect();
+        let mut nt_to_idx = vec![u32::MAX; *nts.last().unwrap() as usize + 1];
+        for (idx, &nt) in nts.iter().enumerate() {
+            nt_to_idx[nt as usize] = idx as u32;
+        }
+        let representatives: Vec<_> = nts.iter().map(|&nt| {
+            merges.iter().find(|&&(from, _)| from == nt).map(|&(_, to)| to).unwrap_or(nt)
+        }).collect();
+        let (unique, expandable) = compute_expandable_single_productions(&rhs_by_lhs);
+        let mut cache = HashMap::new();
+        let flattened: Vec<_> = nts.iter().map(|nt| {
+            rhs_by_lhs[nt].iter().map(|rhs| {
+                flatten_rhs_symbols(rhs, &unique, &expandable, &mut cache)
+            }).collect()
+        }).collect();
+        merge_partition_has_exact_rhs_sets(&nts, &flattened, &nt_to_idx, &representatives)
+    }
+
+    #[test]
+    fn merge_partition_guard_rejects_different_terminal_order_and_undefined_refs() {
+        use Symbol::{Nonterminal as N, Terminal as T};
+        for (left, right) in [
+            (vec![T(1), T(2)], vec![T(2), T(1)]),
+            (vec![T(0), N(90)], vec![T(0), N(91)]),
+            (vec![T(90)], vec![N(90)]),
+        ] {
+            let rules = vec![
+                Rule { lhs: 0, rhs: left }, Rule { lhs: 0, rhs: vec![T(9)] },
+                Rule { lhs: 1, rhs: right }, Rule { lhs: 1, rhs: vec![T(9)] },
+            ];
+            // Force a candidate class without relying on a particular hasher.
+            assert!(!exact_merge_partition_for_test(&rules, &[(1, 0)]));
+        }
+    }
+
+    #[test]
+    fn merge_partition_guard_rejects_false_child_equivalence_even_when_parents_match() {
+        use Symbol::{Nonterminal as N, Terminal as T};
+        let rules = vec![
+            Rule { lhs: 0, rhs: vec![N(2), T(2)] }, Rule { lhs: 0, rhs: vec![T(3)] },
+            Rule { lhs: 1, rhs: vec![N(3), T(2)] }, Rule { lhs: 1, rhs: vec![T(3)] },
+            Rule { lhs: 2, rhs: vec![T(4)] }, Rule { lhs: 2, rhs: vec![T(5)] },
+            Rule { lhs: 3, rhs: vec![T(4)] }, Rule { lhs: 3, rhs: vec![T(6)] },
+        ];
+        assert!(!exact_merge_partition_for_test(&rules, &[(1, 0), (3, 2)]));
+    }
+
+    #[test]
+    fn merge_partition_guard_accepts_self_and_mutual_class_references() {
+        use Symbol::{Nonterminal as N, Terminal as T};
+        let mut rules = Vec::new();
+        for (lhs, recursive) in [(0, 0), (1, 1), (2, 3), (3, 2)] {
+            rules.push(Rule { lhs, rhs: vec![T(0), N(recursive)] });
+            rules.push(Rule { lhs, rhs: vec![T(1)] });
+        }
+        assert!(exact_merge_partition_for_test(&rules, &[(1, 0), (2, 0), (3, 0)]));
+    }
+
+    #[test]
+    fn merge_partition_guard_preserves_flattened_alias_and_alternative_set_semantics() {
+        use Symbol::{Nonterminal as N, Terminal as T};
+        let rules = vec![
+            Rule { lhs: 0, rhs: vec![N(2)] },
+            Rule { lhs: 0, rhs: vec![T(0)] },
+            Rule { lhs: 1, rhs: vec![T(0)] },
+            Rule { lhs: 2, rhs: vec![T(0)] },
+        ];
+        // Two distinct original alternatives flatten to the same RHS. They
+        // form a set, not a multiset; the guard must still permit this class.
+        assert!(exact_merge_partition_for_test(&rules, &[(1, 0), (2, 0)]));
+    }
+
+    #[test]
+    fn merge_preserves_valid_flattened_aliases_and_start_representative() {
+        use Symbol::{Nonterminal as N, Terminal as T};
+        let rules = vec![
+            Rule { lhs: 0, rhs: vec![N(2), T(1)] }, Rule { lhs: 0, rhs: vec![T(2)] },
+            Rule { lhs: 1, rhs: vec![T(0), T(1)] }, Rule { lhs: 1, rhs: vec![T(2)] },
+            Rule { lhs: 2, rhs: vec![T(0)] },
+        ];
+        let merged = merge_identical_nonterminals(&rules, 1);
+        assert!(!merged.iter().any(|rule| rule.lhs == 0));
+        assert!(merged.iter().any(|rule| rule.lhs == 1));
+        assert_eq!(bounded_language(&merged, 1, 3, 2), bounded_language(&rules, 1, 3, 2));
+
+        let recursive = vec![
+            Rule { lhs: 0, rhs: vec![T(0), N(0)] }, Rule { lhs: 0, rhs: vec![T(1)] },
+            Rule { lhs: 1, rhs: vec![T(0), N(1)] }, Rule { lhs: 1, rhs: vec![T(1)] },
+        ];
+        let merged = merge_identical_nonterminals(&recursive, 1);
+        assert!(merged.iter().all(|rule| rule.lhs == 1));
+        assert_eq!(bounded_language(&merged, 1, 2, 8), bounded_language(&recursive, 1, 2, 8));
     }
 
     #[test]
