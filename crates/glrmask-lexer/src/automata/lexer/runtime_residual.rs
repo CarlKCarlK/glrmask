@@ -1181,6 +1181,9 @@ pub(super) struct BoundedCodeIntersectionOracle {
     /// closed subset, not observed mask equality.
     #[serde(skip)]
     mask_result_future_headroom: FxHashMap<(u32, u32), usize>,
+    // Derived from the complete-body relation; wire shape/history unchanged.
+    #[serde(skip)]
+    compact_finite_mask_future_headroom: Option<usize>,
     exact_powers: Vec<BoolRelation>,
     prefix_sums: Vec<BoolRelation>,
 }
@@ -1272,6 +1275,7 @@ impl SparseBoundedCodeOracleWire {
             completion_relations,
             completion_row_cache: FxHashMap::default(),
             mask_result_future_headroom: FxHashMap::default(),
+            compact_finite_mask_future_headroom: None,
             exact_powers,
             prefix_sums,
         })
@@ -1447,6 +1451,63 @@ impl BoundedCodeIntersectionOracle {
 
     fn finite_mask_stencil_crossings(&self, token_crossings: usize) -> Option<usize> {
         token_crossings.checked_add(self.finite_mask_future_repeat_headroom()?)
+    }
+
+    /// Universal shortest witness over ALL pattern states, not a mask-history
+    /// quotient. For any accepted body-code walk of length at least L, keep
+    /// its first L edges and replace the suffix by a shortest path to a suffix
+    /// accepting state. D=max(finite shortest distance) therefore supplies a
+    /// witness in [L,L+D]. Two extra codes cover an initial partial body and
+    /// a strictly positive continuation. Dead states add no finite witness.
+    ///
+    /// Keep the historical P+1 method above for conservative coordinate keys
+    /// and legacy dimensions. Only newly built observation views use this
+    /// tighter bound; a committed state always remains the full exact runtime.
+    fn compact_finite_mask_future_repeat_headroom(&mut self) -> Option<usize> {
+        if let Some(bound) = self.compact_finite_mask_future_headroom {
+            return Some(bound);
+        }
+        let count = self.pattern.num_states();
+        if count == 0 {
+            return None;
+        }
+        let conservative_headroom = self.finite_mask_future_repeat_headroom()?;
+        if conservative_headroom == 2 {
+            // One pattern state has finite shortest distance zero (or no
+            // witness). D+2 capped by P+1 is therefore exactly two, without
+            // constructing/transposing a relation that cannot tighten it.
+            self.compact_finite_mask_future_headroom = Some(2);
+            return Some(2);
+        }
+        // Fresh oracles already contain this relation. A transferred compact
+        // oracle reconstructs it only when a smaller descriptor requires the
+        // precise validation floor; old conservative artifacts avoid this work.
+        let reverse = self.completion_relation(0).transpose()?;
+        if !reverse.valid_for(count) {
+            return None;
+        }
+        let mut distance = vec![usize::MAX; count];
+        let mut queue = VecDeque::new();
+        for target in self.suffix_accepting.iter_ones() {
+            distance[target] = 0;
+            queue.push_back(target);
+        }
+        let mut maximum_distance = 0usize;
+        while let Some(target) = queue.pop_front() {
+            let next = distance[target].checked_add(1)?;
+            reverse.for_each_target(target, |source| {
+                if distance[source] == usize::MAX {
+                    distance[source] = next;
+                    maximum_distance = maximum_distance.max(next);
+                    queue.push_back(source);
+                }
+            })?;
+        }
+        let bound = maximum_distance
+            .checked_add(2)?
+            .min(conservative_headroom);
+        self.compact_finite_mask_future_headroom = Some(bound);
+        Some(bound)
     }
 
     /// Close all completions of the current partial body under whole body-code
@@ -1694,6 +1755,7 @@ impl BoundedCodeIntersectionOracle {
             completion_relations: vec![None; body_states],
             completion_row_cache: FxHashMap::default(),
             mask_result_future_headroom: FxHashMap::default(),
+            compact_finite_mask_future_headroom: None,
             exact_powers: Vec::new(),
             prefix_sums: Vec::new(),
         };
@@ -4420,6 +4482,7 @@ impl VirtualResidualRuntime {
             completion_relations: vec![None; body_states],
             completion_row_cache: FxHashMap::default(),
             mask_result_future_headroom: FxHashMap::default(),
+            compact_finite_mask_future_headroom: None,
             // The transferred backward-future table is the exact dynamic-
             // programming replacement for these relation powers. Loaded
             // runtimes route future queries through that table below.
@@ -6451,8 +6514,8 @@ impl VirtualResidualRuntime {
         if !self.preserve_oracle_coordinate {
             return Err("compiled virtual residual projection requires coordinate-preserving runtime".to_owned());
         }
-        let store = self.store.lock().map_err(|_| "virtual residual runtime lock poisoned".to_owned())?;
-        let oracle = store.liveness_oracle.as_ref().ok_or_else(|| "compiled virtual residual projection has no bounded-code oracle".to_owned())?;
+        let mut store = self.store.lock().map_err(|_| "virtual residual runtime lock poisoned".to_owned())?;
+        let oracle = store.liveness_oracle.as_mut().ok_or_else(|| "compiled virtual residual projection has no bounded-code oracle".to_owned())?;
         let mask_max = artifact.compiled_mask_max;
         let crossed_boundaries = artifact.compiled_crossed_boundaries;
         let desired_mask_max = oracle
@@ -6462,7 +6525,14 @@ impl VirtualResidualRuntime {
             .ok_or_else(|| "compiled virtual residual projection stencil overflow".to_owned())?;
         let future_headroom = oracle.finite_mask_future_repeat_headroom()
             .ok_or_else(|| "compiled virtual residual projection future stencil overflow".to_owned())?;
-        if crossed_boundaries < future_headroom || mask_max != oracle.max.min(desired_mask_max) {
+        if crossed_boundaries < future_headroom {
+            let compact_headroom = oracle.compact_finite_mask_future_repeat_headroom()
+                .ok_or_else(|| "compiled residual compact witness is unavailable".to_owned())?;
+            if crossed_boundaries < compact_headroom {
+                return Err("compiled virtual residual projection stencil is inconsistent".to_owned());
+            }
+        }
+        if mask_max != oracle.max.min(desired_mask_max) {
             return Err("compiled virtual residual projection stencil is inconsistent".to_owned());
         }
         let expected_dense_states = oracle
@@ -6516,13 +6586,13 @@ impl VirtualResidualRuntime {
                     .to_owned(),
             );
         }
-        let store = self
+        let mut store = self
             .store
             .lock()
             .map_err(|_| "virtual residual runtime lock poisoned".to_owned())?;
         let oracle = store
             .liveness_oracle
-            .as_ref()
+            .as_mut()
             .ok_or_else(|| "virtual residual projection has no bounded-code oracle".to_owned())?;
         let minimum_body_width = oracle
             .body
@@ -6532,27 +6602,47 @@ impl VirtualResidualRuntime {
         let crossed_boundaries = max_token_len
             .div_ceil(minimum_body_width)
             .saturating_add(1);
-        let crossed_boundaries = oracle.finite_mask_stencil_crossings(crossed_boundaries)
+        let token_crossings = crossed_boundaries;
+        let mut crossed_boundaries = oracle.finite_mask_stencil_crossings(token_crossings)
             .ok_or_else(|| "virtual residual projection future stencil overflow".to_owned())?;
         if oracle.min > crossed_boundaries.saturating_add(1) {
             return Err("virtual residual projection lower bound exceeds finite stencil".to_owned());
         }
-        let desired_mask_max = oracle
-            .min
-            .checked_add(crossed_boundaries)
+        let desired_mask_max = oracle.min.checked_add(crossed_boundaries)
             .and_then(|value| value.checked_add(1))
             .ok_or_else(|| "virtual residual projection stencil overflow".to_owned())?;
-        let mask_max = oracle.max.min(desired_mask_max);
-        let expected_dense_states = oracle
-            .finite_mask_dense_state_count(mask_max)
+        let mut mask_max = oracle.max.min(desired_mask_max);
+        let mut expected_dense_states = oracle.finite_mask_dense_state_count(mask_max)
             .filter(|&states| states <= MAX_FINITE_MASK_DENSE_STATES)
             .ok_or_else(|| "virtual residual projection dense coordinate is invalid".to_owned())?;
         if artifact.local_to_mask_state.len() != expected_dense_states {
-            return Err(format!(
-                "virtual residual projection map has {} entries, expected {}",
-                artifact.local_to_mask_state.len(), expected_dense_states,
-            ));
+            // The descriptor omits dimensions. Recognize only the exact new
+            // compact formula for the same known token horizon, not an
+            // arbitrary upper bound inferred from attacker-controlled length.
+            let compact = oracle.compact_finite_mask_future_repeat_headroom()
+                .and_then(|headroom| token_crossings.checked_add(headroom))
+                .ok_or_else(|| "virtual residual compact projection stencil overflow".to_owned())?;
+            if oracle.min > compact.saturating_add(1) {
+                return Err("virtual residual projection lower bound exceeds finite stencil".to_owned());
+            }
+            let compact_max = oracle.max.min(
+                oracle.min.checked_add(compact).and_then(|value| value.checked_add(1))
+                    .ok_or_else(|| "virtual residual compact projection stencil overflow".to_owned())?,
+            );
+            let compact_dense = oracle.finite_mask_dense_state_count(compact_max)
+                .filter(|&states| states <= MAX_FINITE_MASK_DENSE_STATES)
+                .ok_or_else(|| "virtual residual compact projection dense coordinate is invalid".to_owned())?;
+            if artifact.local_to_mask_state.len() != compact_dense {
+                return Err(format!(
+                    "virtual residual projection map has {} entries, expected {} or {}",
+                    artifact.local_to_mask_state.len(), expected_dense_states, compact_dense,
+                ));
+            }
+            crossed_boundaries = compact;
+            mask_max = compact_max;
+            expected_dense_states = compact_dense;
         }
+        debug_assert_eq!(artifact.local_to_mask_state.len(), expected_dense_states);
         if artifact.local_to_mask_state.iter().any(|&state| {
             state != u32::MAX && state >= component_state_count
         }) {
@@ -6608,11 +6698,35 @@ impl VirtualResidualRuntime {
         u32,
         VirtualResidualMaskProjection,
     )> {
-        let store = self.store.lock().unwrap();
-        let oracle = store.liveness_oracle.as_ref()?;
+        let mut store = self.store.lock().unwrap();
+        let oracle = store.liveness_oracle.as_mut()?;
         // Preserve token crossings and a complete future witness. Distinguish
         // distance to the real upper bound with the same extended stencil.
-        let crossed_boundaries = oracle.finite_mask_stencil_crossings(crossed_boundaries)?;
+        let conservative = std::env::var("GLRMASK_DISABLE_COMPACT_FINITE_FUTURE_WITNESS")
+            .ok().is_some_and(|value| matches!(value.trim(), "1" | "true" | "yes" | "on"));
+        let conservative_crossings = oracle.finite_mask_stencil_crossings(crossed_boundaries)?;
+        let crossed_boundaries = if conservative {
+            conservative_crossings
+        } else {
+            let compact = crossed_boundaries.checked_add(oracle.compact_finite_mask_future_repeat_headroom()?)?;
+            // Preserve the established admission envelope for large minima.
+            // Compaction must not disable a previously supported finite lane.
+            if oracle.min > compact.saturating_add(1) {
+                conservative_crossings
+            } else {
+                let compact_max = oracle.max.min(oracle.min.checked_add(compact)?.checked_add(1)?);
+                let conservative_max = oracle.max.min(
+                    oracle.min.checked_add(conservative_crossings)?.checked_add(1)?,
+                );
+                // Equal dimensions mean the same finite graph. Retain its
+                // historical count metadata as well, rather than making cold
+                // loaders rebuild a witness proof for no state-space saving.
+                // If only the full upper bound clamps the two stencils, every
+                // count maps identically: below min it is unchanged; above min
+                // the upper-distance map is the exact original count.
+                if compact_max == conservative_max { conservative_crossings } else { compact }
+            }
+        };
         // Large lower minima need their own lower-bound abstraction; decline
         // rather than making this first exact lane scale with minLength.
         if oracle.min > crossed_boundaries.saturating_add(1) {
@@ -8452,5 +8566,209 @@ mod tests {
             None,
             "certified bounded-code liveness must not invoke generic Boolean reachability",
         );
+    }
+}
+
+#[cfg(test)]
+mod compact_future_stencil_tests {
+    use super::*;
+    use std::collections::BTreeSet;
+
+    fn literal(value: &[u8]) -> Expr { Expr::U8Seq(value.to_vec()) }
+
+    fn envelope(body: Expr, min: usize, max: usize) -> Expr {
+        Expr::Seq(vec![
+            literal(b"<"),
+            Expr::Repeat { expr: Box::new(body), min, max: Some(max) },
+            literal(b">"),
+        ])
+    }
+
+    fn inflate_with_unreachable_branch(pattern: Expr) -> Expr {
+        let mut unreachable = vec![b'<'];
+        unreachable.extend(std::iter::repeat_n(b'z', 96));
+        unreachable.push(b'>');
+        Expr::Choice(vec![pattern, literal(&unreachable)])
+    }
+
+    fn ascii_expression(min: usize, max: usize) -> Expr {
+        let body = Expr::Choice(b"abcdef".iter().map(|byte| literal(&[*byte])).collect());
+        let pattern = Expr::Seq(vec![
+            literal(b"<"),
+            Expr::Repeat { expr: Box::new(literal(b"a")), min: 0, max: None },
+            literal(b"bcdef>"),
+        ]);
+        Expr::Intersect {
+            expr: Box::new(inflate_with_unreachable_branch(pattern)),
+            intersect: Box::new(envelope(body, min, max)),
+        }
+    }
+
+    fn runtime(expr: &Expr) -> Arc<VirtualResidualRuntime> {
+        Arc::new(VirtualResidualRuntime::new_dynamic(
+            expr, 0, 0, 1, 2, 1,
+            Arc::new(VirtualStateAllocator::new(2).unwrap()),
+            Arc::new(VirtualRuntimeStateOwners::new(2, &[1]).unwrap()),
+        ).unwrap())
+    }
+
+    fn step(segment: &CompressedTransitionSegment, state: u32, byte: u8) -> Option<u32> {
+        let class = segment.byte_to_class[byte as usize];
+        segment.entries.iter_range(
+            segment.row_offsets[state as usize] as usize,
+            segment.row_offsets[state as usize + 1] as usize,
+        ).find_map(|(candidate_class, target)| (candidate_class == class).then_some(target))
+    }
+
+    fn assert_word_language(
+        expr: Expr, words: Vec<Vec<u8>>, tokens: Vec<Vec<u8>>, expect_shrink: bool,
+    ) {
+        let words: BTreeSet<_> = words.into_iter().collect();
+        let tokens: BTreeSet<_> = tokens.into_iter().collect();
+        let mut prefixes = BTreeSet::new();
+        let mut strict_prefixes = BTreeSet::new();
+        for word in &words {
+            for end in 0..=word.len() {
+                prefixes.insert(word[..end].to_vec());
+                if end < word.len() { strict_prefixes.insert(word[..end].to_vec()); }
+            }
+        }
+        let horizon = tokens.iter().map(Vec::len).max().unwrap();
+        let runtime = runtime(&expr);
+        let sparse_before = runtime.serialized_bounded_code_oracle();
+        let (legacy_before, old_max) = {
+            let store = runtime.store.lock().unwrap();
+            let oracle = store.liveness_oracle.as_ref().unwrap();
+            let token_crossings = horizon.div_ceil(oracle.body.min_match_byte_len().unwrap().max(1)) + 1;
+            let old_crossings = oracle.finite_mask_stencil_crossings(token_crossings).unwrap();
+            (bincode::serialize(oracle).unwrap(), oracle.max.min(oracle.min + old_crossings + 1))
+        };
+        let (dfa, segment, _, view) = runtime.build_finite_mask_projection(horizon, 0).unwrap();
+        assert_eq!(view.mask_max < old_max, expect_shrink);
+        assert_eq!(runtime.serialized_bounded_code_oracle(), sparse_before);
+        assert_eq!(
+            bincode::serialize(runtime.store.lock().unwrap().liveness_oracle.as_ref().unwrap()).unwrap(),
+            legacy_before,
+            "the derived witness must not change legacy oracle bytes",
+        );
+
+        for prefix in &prefixes {
+            let source = prefix.iter().try_fold(1, |state, byte| runtime.step(state, *byte)).unwrap();
+            let projected = view.project(source).unwrap();
+            for token in &tokens {
+                let mut candidate = prefix.clone();
+                candidate.extend(token);
+                let expected = (words.contains(&candidate), strict_prefixes.contains(&candidate));
+                let exact = token.iter().try_fold(source, |state, byte| runtime.step(state, *byte))
+                    .and_then(|state| runtime.observation(state)).unwrap_or((false, false));
+                let observed = token.iter().try_fold(projected, |state, byte| step(&segment, state, *byte))
+                    .map(|state| (!dfa.finalizers(state).is_empty(), !dfa.possible_future_group_ids(state).is_empty()))
+                    .unwrap_or((false, false));
+                assert_eq!(exact, expected, "full runtime: prefix={prefix:?} token={token:?}");
+                assert_eq!(observed, expected, "finite view: prefix={prefix:?} token={token:?}");
+            }
+        }
+
+        // Exercise actual current compiled transport without filesystem fixtures.
+        let wire = bincode::serialize(&view.artifact_ref()).unwrap();
+        let artifact = || {
+            let legacy: VirtualResidualMaskProjectionArtifact = bincode::deserialize(&wire).unwrap();
+            VirtualResidualMaskProjectionArtifact::from_wire(
+                legacy.terminal, legacy.state_offset, legacy.local_to_mask_state,
+                legacy.oracle_bytes, bincode::serialize(&expr).unwrap(), view.mask_max, view.crossed_boundaries,
+            )
+        };
+        let loaded = Arc::new(VirtualResidualRuntime::new_preserving_oracle_coordinate_from_oracle_bytes(
+            &expr, &sparse_before, 0, 0, 1, 2, 1,
+            Arc::new(VirtualStateAllocator::new(2).unwrap()),
+            Arc::new(VirtualRuntimeStateOwners::new(2, &[1]).unwrap()),
+        ).unwrap());
+        let restored = loaded.restore_compiled_finite_mask_projection(dfa.num_states() as u32, artifact()).unwrap();
+        assert_eq!(restored.observation_descriptor(), view.observation_descriptor());
+        let mut malformed = artifact();
+        malformed.local_to_mask_state.push(u32::MAX);
+        assert!(loaded.restore_compiled_finite_mask_projection(dfa.num_states() as u32, malformed).is_err());
+    }
+
+    #[test]
+    fn compact_future_view_matches_all_one_byte_observations_and_roundtrips() {
+        let words = (0..=75).map(|count| {
+            let mut word = vec![b'<'];
+            word.extend(std::iter::repeat_n(b'a', count));
+            word.extend_from_slice(b"bcdef>");
+            word
+        }).collect();
+        let tokens = std::iter::once(Vec::new()).chain((0u16..=255).map(|byte| vec![byte as u8])).collect();
+        assert_word_language(ascii_expression(0, 80), words, tokens, true);
+    }
+
+    #[test]
+    fn compact_future_view_preserves_utf8_escape_partials_and_large_minimum_fallback() {
+        let body = Expr::Choice(vec![literal(b"a"), literal("é".as_bytes()), literal(b"\\u0062")]);
+        let pattern = Expr::Seq(vec![
+            literal(b"<"),
+            Expr::Repeat { expr: Box::new(literal(b"a")), min: 0, max: None },
+            literal("é".as_bytes()), literal(b"\\u0062>"),
+        ]);
+        for min in [0, 60] {
+            let expr = Expr::Intersect {
+                expr: Box::new(inflate_with_unreachable_branch(pattern.clone())),
+                intersect: Box::new(envelope(body.clone(), min, 80)),
+            };
+            let words = (0..=78).filter(|count| count + 2 >= min).map(|count| {
+                let mut word = vec![b'<'];
+                word.extend(std::iter::repeat_n(b'a', count));
+                word.extend_from_slice("é".as_bytes());
+                word.extend_from_slice(b"\\u0062>");
+                word
+            }).collect();
+            let mut tokens = vec![
+                Vec::new(), b"aaaaaa".to_vec(), b"\\u0062".to_vec(), b"\\u".to_vec(),
+                b"0062>".to_vec(), "é".as_bytes().to_vec(), vec![0xff], vec![0xc3], vec![0xa9],
+            ];
+            tokens.extend(b"<a\\u062>z".iter().map(|byte| vec![*byte]));
+            assert_word_language(expr, words, tokens, min == 0);
+        }
+    }
+
+    #[test]
+    fn unchanged_finite_dimensions_retain_conservative_crossing_metadata() {
+        for (min, max) in [(0, 6), (60, 80)] {
+            let runtime = runtime(&ascii_expression(min, max));
+            let old_crossings = runtime.store.lock().unwrap().liveness_oracle.as_ref().unwrap()
+                .finite_mask_stencil_crossings(2).unwrap();
+            let (_, _, _, view) = runtime.build_finite_mask_projection(1, 0).unwrap();
+            assert_eq!(view.mask_max, max);
+            assert_eq!(view.crossed_boundaries, old_crossings);
+        }
+    }
+
+    #[test]
+    fn one_pattern_state_future_bound_needs_no_relation_or_wire_change() {
+        let body = Expr::Choice(vec![literal(b"a"), literal(b"bc")]);
+        let unbounded = Expr::Seq(vec![
+            literal(b"<"),
+            Expr::Repeat { expr: Box::new(body.clone()), min: 0, max: None },
+            literal(b">"),
+        ]);
+        // The dynamic oracle recognizes an explicit intersection. Its exact
+        // redundant-envelope rule removes this unbounded operand, leaving the
+        // one-state universal pattern used by standalone bounded strings.
+        let expr = Expr::Intersect {
+            expr: Box::new(unbounded),
+            intersect: Box::new(envelope(body, 0, 80)),
+        };
+        let mut oracle = BoundedCodeIntersectionOracle::from_dynamic_expr(&expr).unwrap();
+        assert_eq!(oracle.pattern.num_states(), 1);
+        // Match the intentionally omitted proof data of a compact transfer.
+        oracle.completion_relations.iter_mut().for_each(|relation| *relation = None);
+        oracle.exact_powers.clear();
+        oracle.prefix_sums.clear();
+        let before = bincode::serialize(&oracle).unwrap();
+        assert_eq!(oracle.compact_finite_mask_future_repeat_headroom(), Some(2));
+        assert_eq!(oracle.compact_finite_mask_future_repeat_headroom(), Some(2));
+        assert!(oracle.completion_relations.iter().all(Option::is_none));
+        assert!(oracle.exact_powers.is_empty() && oracle.prefix_sums.is_empty());
+        assert_eq!(bincode::serialize(&oracle).unwrap(), before);
     }
 }
