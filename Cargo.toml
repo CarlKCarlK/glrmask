@@ -44,7 +44,7 @@ rustc-hash = "1"
 ahash = "0.8"
 smallvec = { version = "1", features = ["serde"] }
 im = "15"
-range-set-blaze = "0.3.0"
+range-set-blaze = { path = "../range-set-blaze" }
 hashbrown = "0.15"
 once_cell = "1"
 blake3 = "1"

@@ -20,7 +20,7 @@ glrmask-lexer = { version = "=0.1.1", path = "../glrmask-lexer", features = ["in
 glrmask-vocab = { version = "=0.1.1", path = "../glrmask-vocab", features = ["internal-api"] }
 glrmask-weight = { version = "=0.1.1", path = "../glrmask-weight", features = ["internal-api"] }
 glrmask-weighted-automata = { version = "=0.1.1", path = "../glrmask-weighted-automata" }
-range-set-blaze = "0.3.0"
+range-set-blaze = { path = "../../../range-set-blaze" }
 rayon = "1"
 rustc-hash = "1"
 serde = { version = "1", features = ["derive"] }
