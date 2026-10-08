@@ -1796,10 +1796,37 @@ fn union_all_multiway_impl_with_token_cache(
     coalesce_repeated_token_ranges: bool,
     token_union_cache: &mut FxHashMap<Vec<usize>, SharedTokenSet>,
 ) -> Weight {
-    // Coalescing merges same-token-set ranges across weights before the sweep, which discards
-    // which weight each range came from, so that path keeps the original event sweep.
+    // Coalescing pools every weight's ranges, groups them by token set (interned pointer), and
+    // merges each group's overlapping or touching ranges. When that shrinks the input enough to be
+    // selected, each group is a sorted, disjoint stream with a single token set, so the groups
+    // become the join's inputs instead of the weights.
     if coalesce_repeated_token_ranges {
-        return union_all_multiway_sweep_with_token_cache(weights, true, token_union_cache);
+        let total_entry_hint: usize = weights.iter().map(|w| w.0.range_values_len()).sum();
+        let mut all_entries: Vec<WeightRangeEntry> = Vec::with_capacity(total_entry_hint);
+        for weight in weights {
+            for (range, tokens) in weight.0.range_values() {
+                all_entries.push(WeightRangeEntry {
+                    start: *range.start(),
+                    end: *range.end(),
+                    tokens: Arc::clone(tokens),
+                });
+            }
+        }
+        let input_entries = all_entries.len();
+        let coalesced = coalesce_repeated_token_body_ranges(all_entries);
+        if coalesced.len() < input_entries {
+            // The coalesced entries are laid out group by group, each group sorted and disjoint.
+            let groups = coalesced
+                .chunk_by(|a, b| Arc::ptr_eq(&a.tokens, &b.tokens))
+                .map(|group| {
+                    CheckSortedDisjointMap::new(
+                        group
+                            .iter()
+                            .map(|entry| (entry.start..=entry.end, &entry.tokens)),
+                    )
+                });
+            return union_token_set_streams(groups, token_union_cache);
+        }
     }
     union_all_multiway_outer_join(weights, token_union_cache)
 }
@@ -1812,16 +1839,30 @@ fn union_all_multiway_outer_join(
     weights: &[&Weight],
     token_union_cache: &mut FxHashMap<Vec<usize>, SharedTokenSet>,
 ) -> Weight {
-    // Active distinct token sets (by pointer) with how many weights currently carry each. Many
-    // weights share the same interned token set, so the union depends only on this set, which
+    union_token_set_streams(
+        weights.iter().map(|weight| weight.0.range_values()),
+        token_union_cache,
+    )
+}
+
+// Unions token-set streams (weights' range values, or coalesced token-set groups) with one
+// `outer_join_incremental` sweep.
+fn union_token_set_streams<'a, I>(
+    streams: impl IntoIterator<Item = I>,
+    token_union_cache: &mut FxHashMap<Vec<usize>, SharedTokenSet>,
+) -> Weight
+where
+    I: SortedDisjointMap<u32, &'a SharedTokenSet>,
+{
+    // Active distinct token sets (by pointer) with how many streams currently carry each. Many
+    // streams share the same interned token set, so the union depends only on this set, which
     // `outer_join_incremental` lets us update in O(changes) per range.
     let mut active: FxHashMap<usize, (usize, SharedTokenSet)> = FxHashMap::default();
     let mut result: Option<SharedTokenSet> = None;
     let mut key: Vec<usize> = Vec::new();
     let mut builder = CompactRangeBuilder::new();
-    let joined = weights
-        .iter()
-        .map(|weight| weight.0.range_values())
+    let joined = streams
+        .into_iter()
         .outer_join_incremental(|values, changed_from| {
             let mut distinct_changed = false;
             for (index, previous) in changed_from {
@@ -1884,6 +1925,7 @@ fn union_all_multiway_outer_join(
     builder.finish()
 }
 
+#[cfg(test)] // Original event sweep, kept as a reference for differential tests.
 fn union_all_multiway_sweep_with_token_cache(
     weights: &[&Weight],
     coalesce_repeated_token_ranges: bool,
@@ -1938,11 +1980,13 @@ fn union_all_multiway(weights: &[&Weight]) -> Weight {
     union_all_multiway_impl(weights, false)
 }
 
+#[cfg(test)] // Original event sweep, kept as a reference for differential tests.
 fn union_all_multiway_rescan(all_entries: Vec<WeightRangeEntry>) -> Weight {
     let mut token_union_cache = FxHashMap::default();
     union_all_multiway_rescan_with_cache(all_entries, &mut token_union_cache)
 }
 
+#[cfg(test)] // Original event sweep, kept as a reference for differential tests.
 fn union_all_multiway_rescan_with_cache(
     all_entries: Vec<WeightRangeEntry>,
     token_union_cache: &mut FxHashMap<Vec<usize>, SharedTokenSet>,
@@ -1995,11 +2039,13 @@ fn union_all_multiway_rescan_with_cache(
     builder.finish()
 }
 
+#[cfg(test)] // Original event sweep, kept as a reference for differential tests.
 fn union_all_multiway_incremental(all_entries: Vec<WeightRangeEntry>) -> Weight {
     let mut token_union_cache = FxHashMap::default();
     union_all_multiway_incremental_with_cache(all_entries, &mut token_union_cache)
 }
 
+#[cfg(test)] // Original event sweep, kept as a reference for differential tests.
 fn union_all_multiway_incremental_with_cache(
     all_entries: Vec<WeightRangeEntry>,
     token_union_cache: &mut FxHashMap<Vec<usize>, SharedTokenSet>,
@@ -2088,6 +2134,7 @@ fn union_all_multiway_incremental_with_cache(
     builder.finish()
 }
 
+#[cfg(test)] // Original event sweep, kept as a reference for differential tests.
 fn union_active_token_sets(
     active_tokens: &[SharedTokenSet],
     token_union_cache: &mut FxHashMap<Vec<usize>, SharedTokenSet>,
@@ -4466,6 +4513,63 @@ mod tests {
         }
         assert!(checked_large > 100, "too few cases reached the incremental path");
     }
+
+    #[test]
+    fn coalesced_union_matches_sweep() {
+        // Inputs big and repetitive enough that coalescing is selected (2,048 or more entries,
+        // at least 32x fewer after merging same-token-set ranges across weights).
+        let pool: Vec<SharedTokenSet> = (0..4u32)
+            .map(|i| shared_rangeset(RangeSetBlaze::from_iter([i * 3..=i * 3 + 5, 100 + i..=120])))
+            .collect();
+        let mut state = 0x853c_49e6_748f_ea9b_u64;
+        let mut next = || {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            state
+        };
+        let mut selected_cases = 0;
+        for _ in 0..20 {
+            let weights: Vec<Weight> = (0..64)
+                .map(|_| {
+                    let mut builder = CompactRangeBuilder::new();
+                    let mut tsid = (next() % 4) as u32;
+                    for _ in 0..64 {
+                        let run = 1 + (next() % 6) as u32;
+                        let tokens = Arc::clone(&pool[(next() % pool.len() as u64) as usize]);
+                        builder.push(tsid, tsid + run - 1, tokens);
+                        builder.flush();
+                        tsid += run + 1 + (next() % 3) as u32;
+                    }
+                    builder.finish()
+                })
+                .collect();
+            let chosen: Vec<&Weight> = weights.iter().collect();
+            let entries: Vec<WeightRangeEntry> = chosen
+                .iter()
+                .flat_map(|weight| {
+                    weight.0.range_values().map(|(range, tokens)| WeightRangeEntry {
+                        start: *range.start(),
+                        end: *range.end(),
+                        tokens: Arc::clone(tokens),
+                    })
+                })
+                .collect();
+            let input_entries = entries.len();
+            if coalesce_repeated_token_body_ranges(entries).len() < input_entries {
+                selected_cases += 1;
+            }
+            let mut cache_new = FxHashMap::default();
+            let mut cache_old = FxHashMap::default();
+            assert_eq!(
+                union_all_multiway_impl_with_token_cache(&chosen, true, &mut cache_new),
+                union_all_multiway_sweep_with_token_cache(&chosen, true, &mut cache_old),
+            );
+        }
+        assert!(selected_cases > 10, "coalescing was rarely selected ({selected_cases} of 20)");
+    }
+
+
 
     #[test]
     fn join_predicates_match_handwritten_exhaustively() {
