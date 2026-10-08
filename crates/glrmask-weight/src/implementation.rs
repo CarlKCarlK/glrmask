@@ -3471,6 +3471,26 @@ impl Weight {
         if self.is_full() || other.is_full() {
             return false;
         }
+        // Disjoint unless some tsid range in both weights has overlapping token sets.
+        self.0
+            .range_values()
+            .inner_join(other.0.range_values())
+            .all(|(_, (left_tokens, right_tokens))| {
+                left_tokens.as_ref().is_disjoint(right_tokens.as_ref())
+            })
+    }
+
+    #[cfg(test)]
+    fn is_disjoint_handwritten(&self, other: &Self) -> bool {
+        if self.is_empty() || other.is_empty() {
+            return true;
+        }
+        if Arc::ptr_eq(&self.0, &other.0) {
+            return false; // Same non-empty weight → not disjoint
+        }
+        if self.is_full() || other.is_full() {
+            return false;
+        }
         let mut left_iter = self.0.range_values();
         let mut right_iter = other.0.range_values();
         let mut left_entry = left_iter.next();
@@ -3492,6 +3512,27 @@ impl Weight {
     }
 
     pub fn is_subset(&self, other: &Self) -> bool {
+        if self.is_empty() || other.is_full() {
+            return true;
+        }
+        if other.is_empty() || self.is_full() {
+            return false;
+        }
+        // Every tsid range of `self` must be covered by `other` with a token superset.
+        self.0
+            .range_values()
+            .outer_join(other.0.range_values())
+            .all(|(_, (self_tokens, other_tokens))| match (self_tokens, other_tokens) {
+                (None, _) => true,
+                (Some(_), None) => false,
+                (Some(self_tokens), Some(other_tokens)) => {
+                    self_tokens.as_ref().is_subset(other_tokens.as_ref())
+                }
+            })
+    }
+
+    #[cfg(test)]
+    fn is_subset_handwritten(&self, other: &Self) -> bool {
         if self.is_empty() || other.is_full() {
             return true;
         }
@@ -4254,6 +4295,26 @@ mod tests {
                 }))
             })
             .collect()
+    }
+
+    #[test]
+    fn join_predicates_match_handwritten_exhaustively() {
+        let mut weights = small_exhaustive_weights();
+        weights.push(Weight::all());
+        for left in &weights {
+            for right in &weights {
+                assert_eq!(
+                    left.is_disjoint(right),
+                    left.is_disjoint_handwritten(right),
+                    "inner_join is_disjoint differs for left={left} right={right}",
+                );
+                assert_eq!(
+                    left.is_subset(right),
+                    left.is_subset_handwritten(right),
+                    "outer_join is_subset differs for left={left} right={right}",
+                );
+            }
+        }
     }
 
     #[test]
