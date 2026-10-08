@@ -6305,6 +6305,7 @@ pub(crate) fn compile_dynamic_owned_with_vocab_partition_with_table_construction
         vocab,
         default_table_construction,
         DynamicPartitionFinalization::Lr,
+        None,
     )
 }
 
@@ -6316,11 +6317,26 @@ pub(crate) fn compile_dynamic_owned_with_vocab_partition_for_parser_replacement(
     vocab: &Vocab,
     default_table_construction: GlrTableConstruction,
 ) -> crate::Result<DynamicConstraint> {
+    let source_start_nullable = grammar.start_is_nullable();
+    compile_dynamic_owned_with_vocab_partition_for_parser_replacement_with_source_nullable(
+        grammar, vocab, default_table_construction, source_start_nullable,
+    )
+}
+
+/// The bounded frontend knows original source nullability before normalization.
+/// Preserve that exact value before preparing a reusable boundary certificate.
+pub(crate) fn compile_dynamic_owned_with_vocab_partition_for_parser_replacement_with_source_nullable(
+    grammar: GrammarDef,
+    vocab: &Vocab,
+    default_table_construction: GlrTableConstruction,
+    source_start_nullable: bool,
+) -> crate::Result<DynamicConstraint> {
     compile_dynamic_owned_with_vocab_partition_impl(
         grammar,
         vocab,
         default_table_construction,
         DynamicPartitionFinalization::Template,
+        Some(source_start_nullable),
     )
 }
 
@@ -6334,6 +6350,7 @@ pub(crate) fn compile_dynamic_owned_with_vocab_partition_unfinalized_with_table_
         vocab,
         default_table_construction,
         DynamicPartitionFinalization::Deferred,
+        None,
     )
 }
 
@@ -6349,6 +6366,7 @@ fn compile_dynamic_owned_with_vocab_partition_impl(
     vocab: &Vocab,
     default_table_construction: GlrTableConstruction,
     finalization: DynamicPartitionFinalization,
+    source_start_nullable: Option<bool>,
 ) -> crate::Result<DynamicConstraint> {
     let remainder_trace =
         crate::dynamic_constraint::remainder_trace::Session::new("o2.outer");
@@ -6385,6 +6403,28 @@ fn compile_dynamic_owned_with_vocab_partition_impl(
                             // after the quotient lane has already completed.
                             for alternative in constraint.constraints_mut() {
                                 prepared_parsers.push(alternative.prepare_template_parser()?);
+                            }
+                        }
+                        if finalization == DynamicPartitionFinalization::Template
+                            && std::env::var_os("GLRMASK_DISABLE_O2_BOUNDARY_OVERLAP").is_none()
+                            && let Some(nullable) = source_start_nullable
+                        {
+                            let _span = crate::dynamic_constraint::remainder_trace::Span::new(
+                                "o2.boundary_summary.worker", remainder_parent);
+                            for alternative in constraint.constraints_mut() {
+                                // The native core already installed its parser and exact
+                                // LinkGrammar. Quotient attachment changes mask caches,
+                                // not these lexical/grammar/interface inputs. Keep the
+                                // frontend's original nullability, not its normalized value.
+                                // Compute once its native parser and grammar inputs are ready.
+                                // Quotient completion and grammar size are not dependencies.
+                                if alternative.has_template_parser()
+                                {
+                                    alternative.set_composition_start_nullable(nullable);
+                                    crate::compiler::boundary_candidates::persist_boundary_candidate_summary(
+                                        alternative, vocab,
+                                    );
+                                }
                             }
                         }
                         Ok((constraint, prepared_parsers))

@@ -2376,3 +2376,55 @@ fn pure_cut_postings_preserve_binary_sparse_same_cut_predicates() {
         assert_eq!(cached.select(left, &ranges, 0), if expected.is_empty() { Some(vec![]) } else { None });
     }
 }
+
+
+#[cfg(test)]
+#[test]
+fn o2_dependency_ready_summary_matches_final_rules_and_nullable_source() {
+    use crate::{BuildOptions, Grammar, Optimization, Vocab};
+    use crate::runtime::BoundaryCandidateSummary;
+    let vocab = Vocab::new_with_exact_token_ids(vec![
+        (0, b"a".to_vec()), (7, b"aa".to_vec()), (19, b"aa".to_vec()),
+        (23, b"ab".to_vec()), (51, b"ba".to_vec()), (99, Vec::new()),
+    ], [127]);
+    let large_body = (0..70).map(|i| {
+        if i == 69 { format!("r{i} ::= 'a' | 'b'\n") }
+        else { format!("r{i} ::= 'a' r{} | 'b' r{}\n", i + 1, i + 1) }
+    }).collect::<String>();
+    let cases = [("start ::= 'a'+".to_owned(), false, false),
+        ("start ::= 'a'*".to_owned(), true, false),
+        (format!("start ::= r0\n{large_body}"), false, true),
+        (format!("start ::= r0?\n{large_body}"), true, true)];
+    for (source, nullable, large) in cases {
+        let constraint = Grammar::ebnf(&source).compile_with(&vocab,
+            BuildOptions::default().optimization(Optimization::FastBuild)).unwrap();
+        assert!(constraint.has_template_parser());
+        assert!(!constraint.table.is_present());
+        let rules = constraint.template_parser.as_ref().unwrap().link_grammar.as_ref().unwrap().rules().len();
+        assert_eq!(rules > 64, large, "test must cover small and large grammar inputs: {rules}");
+        assert_eq!(constraint.composition_start_nullable().unwrap(), nullable);
+        // This independent evaluator bypasses the FlatBoundaryTailR1 proof cache:
+        // it uses the actual final retained rules and restored source nullability.
+        let (summary, _, widened) = summarize_rules_module_r1(
+            &constraint, &BTreeMap::new(), &BTreeSet::new()).unwrap();
+        let mut exits = summary.tail_to_return;
+        exits.union_with(summary.tail_to_event);
+        let expected_ids = candidate_ids_for_r1_reference(&vocab, exits);
+        let BoundaryCandidateSummary::Known { fingerprint, tokens, precision } =
+            constraint.boundary_candidate_summary.get().unwrap() else { panic!("missing certificate") };
+        assert_eq!(tokens.canonical_ids(vocab.iter()), expected_ids);
+        assert_eq!(*fingerprint, crate::compiler::boundary_candidates::fingerprint_for_constraint(
+            &constraint, &vocab).unwrap());
+        assert_eq!(*precision, if widened { crate::runtime::SummaryPrecision::BudgetWidenedUpperBound }
+            else { crate::runtime::SummaryPrecision::RegularUpperBound });
+        let loaded = crate::Constraint::load_with_vocab(constraint.save(), &vocab).unwrap();
+        assert_eq!(loaded.composition_start_nullable().unwrap(), nullable);
+        let loaded_summary = loaded.retained_boundary_candidate_summary_for_compilation().unwrap().unwrap();
+        let BoundaryCandidateSummary::Known { fingerprint: loaded_fp, tokens: loaded_ids,
+            precision: loaded_precision } = &loaded_summary
+            else { panic!("loaded certificate missing") };
+        assert_eq!(loaded_fp, fingerprint);
+        assert_eq!(loaded_ids.canonical_ids(vocab.iter()), expected_ids);
+        assert_eq!(loaded_precision, precision);
+    }
+}

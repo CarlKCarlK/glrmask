@@ -19,7 +19,7 @@ use crate::compiler::pipeline::{
     compile_dynamic_owned_with_backend,
     compile_dynamic_owned_with_vocab_partition_unfinalized_with_table_construction,
     compile_dynamic_owned_with_vocab_partition_with_table_construction,
-    compile_dynamic_owned_with_vocab_partition_for_parser_replacement,
+    compile_dynamic_owned_with_vocab_partition_for_parser_replacement_with_source_nullable,
 };
 use crate::grammar::factoring::factor_named_grammar;
 use crate::grammar::flat::GrammarDef;
@@ -488,8 +488,8 @@ fn compile_bounded_template_from_source(
             // artifacts. Keep complete runtime finalization, but do not build
             // a Dynamic-only snapshot that constraints_mut() immediately
             // invalidates below and into_constraints() subsequently discards.
-            let mut component = compile_dynamic_owned_with_vocab_partition_for_parser_replacement(
-                prepared, vocab, table_construction,
+            let mut component = compile_dynamic_owned_with_vocab_partition_for_parser_replacement_with_source_nullable(
+                prepared, vocab, table_construction, source_start_nullable,
             )?;
             let set_nullable_started = emit_import_phase_start("bounded_set_start_nullable");
             for body in component.constraints_mut() {
