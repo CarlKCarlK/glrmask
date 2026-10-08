@@ -1678,19 +1678,27 @@ fn append_weight_entries(builder: &mut CompactRangeBuilder, weight: &Weight) {
     }
 }
 
-fn coalesce_repeated_token_body_ranges(
-    all_entries: Vec<WeightRangeEntry>,
-) -> Vec<WeightRangeEntry> {
+/// Ranges that all carry the same interned token set, merged so they are sorted, disjoint, and
+/// non-touching.
+struct TokenBodyGroup {
+    tokens: SharedTokenSet,
+    ranges: Vec<(u32, u32)>,
+}
+
+/// Pools ranges by token set (interned pointer) and merges each group's overlapping or touching
+/// ranges, across weights. Returns `None` when that is not worth it: fewer than 2,048 entries, or
+/// less than 32x compression.
+fn group_repeated_token_bodies(all_entries: &[WeightRangeEntry]) -> Option<Vec<TokenBodyGroup>> {
     const MIN_ENTRIES: usize = 2_048;
     const MIN_OUTPUT_COMPRESSION: usize = 32;
 
     let input_entries = all_entries.len();
     if input_entries < MIN_ENTRIES {
-        return all_entries;
+        return None;
     }
 
     let mut token_body_ids = FxHashSet::default();
-    for entry in &all_entries {
+    for entry in all_entries {
         token_body_ids.insert(Arc::as_ptr(&entry.tokens) as usize);
     }
     if token_body_ids
@@ -1698,17 +1706,12 @@ fn coalesce_repeated_token_body_ranges(
         .saturating_mul(MIN_OUTPUT_COMPRESSION)
         > input_entries
     {
-        return all_entries;
-    }
-
-    struct TokenBodyGroup {
-        tokens: SharedTokenSet,
-        ranges: Vec<(u32, u32)>,
+        return None;
     }
 
     let mut group_by_token_body = FxHashMap::<usize, usize>::default();
     let mut groups = Vec::<TokenBodyGroup>::with_capacity(token_body_ids.len());
-    for range_entry in &all_entries {
+    for range_entry in all_entries {
         let token_body = Arc::as_ptr(&range_entry.tokens) as usize;
         let group_id = match group_by_token_body.entry(token_body) {
             std::collections::hash_map::Entry::Occupied(entry) => *entry.get(),
@@ -1725,11 +1728,11 @@ fn coalesce_repeated_token_body_ranges(
         groups[group_id].ranges.push((range_entry.start, range_entry.end));
     }
 
-    let mut coalesced = Vec::new();
-    for mut group in groups {
+    let mut merged_ranges = 0usize;
+    for group in &mut groups {
         group.ranges.sort_unstable_by_key(|&(start, end)| (start, end));
         let mut merged = Vec::<(u32, u32)>::with_capacity(group.ranges.len());
-        for (start, end) in group.ranges {
+        for &(start, end) in &group.ranges {
             if let Some((_, previous_end)) = merged.last_mut()
                 && start <= previous_end.saturating_add(1)
             {
@@ -1738,17 +1741,48 @@ fn coalesce_repeated_token_body_ranges(
                 merged.push((start, end));
             }
         }
-        coalesced.extend(merged.into_iter().map(|(start, end)| WeightRangeEntry {
-            start,
-            end,
-            tokens: Arc::clone(&group.tokens),
-        }));
+        merged_ranges += merged.len();
+        group.ranges = merged;
     }
-    let selected = coalesced
-        .len()
-        .saturating_mul(MIN_OUTPUT_COMPRESSION)
-        <= input_entries;
-    if selected { coalesced } else { all_entries }
+    let selected = merged_ranges.saturating_mul(MIN_OUTPUT_COMPRESSION) <= input_entries;
+    selected.then_some(groups)
+}
+
+/// [`group_repeated_token_bodies`], flattened back into entries (or the input unchanged).
+#[cfg(test)]
+fn coalesce_repeated_token_body_ranges(
+    all_entries: Vec<WeightRangeEntry>,
+) -> Vec<WeightRangeEntry> {
+    let Some(groups) = group_repeated_token_bodies(&all_entries) else {
+        return all_entries;
+    };
+    groups
+        .into_iter()
+        .flat_map(|group| {
+            let tokens = group.tokens;
+            group.ranges.into_iter().map(move |(start, end)| WeightRangeEntry {
+                start,
+                end,
+                tokens: Arc::clone(&tokens),
+            })
+        })
+        .collect()
+}
+
+/// Every weight's ranges, pooled into one list.
+fn pooled_entries(weights: &[&Weight]) -> Vec<WeightRangeEntry> {
+    let total_entry_hint: usize = weights.iter().map(|w| w.0.range_values_len()).sum();
+    let mut all_entries: Vec<WeightRangeEntry> = Vec::with_capacity(total_entry_hint);
+    for weight in weights {
+        for (range, tokens) in weight.0.range_values() {
+            all_entries.push(WeightRangeEntry {
+                start: *range.start(),
+                end: *range.end(),
+                tokens: Arc::clone(tokens),
+            });
+        }
+    }
+    all_entries
 }
 
 fn union_disjoint_tsid_ranges(left: &Weight, right: &Weight) -> Option<Weight> {
@@ -1796,57 +1830,30 @@ fn union_all_multiway_impl_with_token_cache(
     coalesce_repeated_token_ranges: bool,
     token_union_cache: &mut FxHashMap<Vec<usize>, SharedTokenSet>,
 ) -> Weight {
-    // Coalescing pools every weight's ranges, groups them by token set (interned pointer), and
-    // merges each group's overlapping or touching ranges. When that shrinks the input enough to be
-    // selected, each group is a sorted, disjoint stream with a single token set, so the groups
-    // become the join's inputs instead of the weights.
-    if coalesce_repeated_token_ranges {
-        let total_entry_hint: usize = weights.iter().map(|w| w.0.range_values_len()).sum();
-        let mut all_entries: Vec<WeightRangeEntry> = Vec::with_capacity(total_entry_hint);
-        for weight in weights {
-            for (range, tokens) in weight.0.range_values() {
-                all_entries.push(WeightRangeEntry {
-                    start: *range.start(),
-                    end: *range.end(),
-                    tokens: Arc::clone(tokens),
-                });
-            }
-        }
-        let input_entries = all_entries.len();
-        let coalesced = coalesce_repeated_token_body_ranges(all_entries);
-        if coalesced.len() < input_entries {
-            // The coalesced entries are laid out group by group, each group sorted and disjoint.
-            let groups = coalesced
-                .chunk_by(|a, b| Arc::ptr_eq(&a.tokens, &b.tokens))
-                .map(|group| {
-                    CheckSortedDisjointMap::new(
-                        group
-                            .iter()
-                            .map(|entry| (entry.start..=entry.end, &entry.tokens)),
-                    )
-                });
-            return union_token_set_streams(groups, token_union_cache);
-        }
+    // The reconstruction path may first regroup all weights' ranges by token set; each group is a
+    // sorted, disjoint stream with one token set, so the groups can be joined like weights.
+    if coalesce_repeated_token_ranges
+        && let Some(groups) = group_repeated_token_bodies(&pooled_entries(weights))
+    {
+        let streams = groups.iter().map(|group| {
+            CheckSortedDisjointMap::new(
+                group
+                    .ranges
+                    .iter()
+                    .map(|&(start, end)| (start..=end, &group.tokens)),
+            )
+        });
+        return union_token_set_streams(streams, token_union_cache);
     }
-    union_all_multiway_outer_join(weights, token_union_cache)
-}
-
-// k-way union via range-set-blaze's multiway `outer_join_incremental`: one heap-based sweep over
-// the weights' ranges, maintaining the active distinct token sets in O(changes) per range and
-// recomputing the union (with the same pointer-keyed cache as the original sweep, kept below as
-// `union_all_multiway_sweep_with_token_cache`) only when that set changes.
-fn union_all_multiway_outer_join(
-    weights: &[&Weight],
-    token_union_cache: &mut FxHashMap<Vec<usize>, SharedTokenSet>,
-) -> Weight {
     union_token_set_streams(
         weights.iter().map(|weight| weight.0.range_values()),
         token_union_cache,
     )
 }
 
-// Unions token-set streams (weights' range values, or coalesced token-set groups) with one
-// `outer_join_incremental` sweep.
+/// k-way union of token-set streams (weights' range values, or token-set groups), in one
+/// `outer_join_incremental` sweep: the active distinct token sets are updated per change, and the
+/// union is recomputed only when they change.
 fn union_token_set_streams<'a, I>(
     streams: impl IntoIterator<Item = I>,
     token_union_cache: &mut FxHashMap<Vec<usize>, SharedTokenSet>,
@@ -1854,68 +1861,20 @@ fn union_token_set_streams<'a, I>(
 where
     I: SortedDisjointMap<u32, &'a SharedTokenSet>,
 {
-    // Active distinct token sets (by pointer) with how many streams currently carry each. Many
-    // streams share the same interned token set, so the union depends only on this set, which
-    // `outer_join_incremental` lets us update in O(changes) per range.
-    let mut active: FxHashMap<usize, (usize, SharedTokenSet)> = FxHashMap::default();
-    let mut result: Option<SharedTokenSet> = None;
-    let mut key: Vec<usize> = Vec::new();
-    let mut builder = CompactRangeBuilder::new();
+    let mut active = ActiveTokenSets::default();
+    let mut union: Option<SharedTokenSet> = None;
     let joined = streams
         .into_iter()
         .outer_join_incremental(|values, changed_from| {
-            let mut distinct_changed = false;
-            for (index, previous) in changed_from {
-                if let Some(previous) = previous {
-                    let pointer = Arc::as_ptr(previous) as usize;
-                    if let Some((count, _)) = active.get_mut(&pointer) {
-                        *count -= 1;
-                        if *count == 0 {
-                            active.remove(&pointer);
-                            distinct_changed = true;
-                        }
-                    }
-                }
-                if let Some(current) = values[*index] {
-                    let entry = active
-                        .entry(Arc::as_ptr(current) as usize)
-                        .or_insert_with(|| {
-                            distinct_changed = true;
-                            (0, Arc::clone(current))
-                        });
-                    entry.0 += 1;
-                }
+            if active.apply(values, changed_from) {
+                union = active.union(token_union_cache);
             }
-            if distinct_changed {
-                let mut distinct: SmallVec<[&SharedTokenSet; 16]> =
-                    active.values().map(|(_, tokens)| tokens).collect();
-                distinct.sort_unstable_by_key(|tokens| Arc::as_ptr(tokens) as usize);
-                result = match distinct.as_slice() {
-                    [] => None,
-                    [only] => Some(Arc::clone(only)),
-                    [left, right] => Some(shared_token_union(left, right)),
-                    _ => {
-                        key.clear();
-                        key.extend(distinct.iter().map(|tokens| Arc::as_ptr(tokens) as usize));
-                        if let Some(cached) = token_union_cache.get(key.as_slice()) {
-                            Some(Arc::clone(cached))
-                        } else {
-                            let owned: Vec<SharedTokenSet> =
-                                distinct.iter().map(|tokens| Arc::clone(tokens)).collect();
-                            let tokens = shared_token_union_many(&owned);
-                            if let Some(tokens) = &tokens {
-                                token_union_cache.insert(key.clone(), Arc::clone(tokens));
-                            }
-                            tokens
-                        }
-                    }
-                };
-            }
-            result.clone()
+            union.clone()
         });
+
+    let mut builder = CompactRangeBuilder::new();
     for (range, Owned(tokens)) in joined {
-        // The join never calls the closure with every weight absent, so `tokens` is `None` only
-        // if the union itself is empty.
+        // `tokens` is `None` only if every active token set is empty.
         if let Some(tokens) = tokens {
             builder.push(*range.start(), *range.end(), tokens);
         } else {
@@ -1925,24 +1884,113 @@ where
     builder.finish()
 }
 
+/// The distinct token sets carried by the active streams of a k-way union, with how many streams
+/// carry each. Many streams share the same interned token set, so the union depends only on this
+/// set.
+#[derive(Default)]
+struct ActiveTokenSets {
+    // Keyed by `Arc` pointer: (number of active streams carrying it, the token set).
+    counts: FxHashMap<usize, (usize, SharedTokenSet)>,
+}
+
+impl ActiveTokenSets {
+    /// Applies one `outer_join_incremental` step; returns whether the distinct token sets changed.
+    fn apply(
+        &mut self,
+        values: &[Option<&SharedTokenSet>],
+        changed_from: &[(usize, Option<&SharedTokenSet>)],
+    ) -> bool {
+        let mut changed = false;
+        for (index, previous) in changed_from {
+            if let Some(previous) = previous {
+                changed |= self.remove(previous);
+            }
+            if let Some(current) = values[*index] {
+                changed |= self.add(current);
+            }
+        }
+        changed
+    }
+
+    /// Returns whether `tokens` is newly active.
+    fn add(&mut self, tokens: &SharedTokenSet) -> bool {
+        match self.counts.entry(Arc::as_ptr(tokens) as usize) {
+            std::collections::hash_map::Entry::Occupied(mut entry) => {
+                entry.get_mut().0 += 1;
+                false
+            }
+            std::collections::hash_map::Entry::Vacant(entry) => {
+                entry.insert((1, Arc::clone(tokens)));
+                true
+            }
+        }
+    }
+
+    /// Returns whether `tokens` is no longer active.
+    fn remove(&mut self, tokens: &SharedTokenSet) -> bool {
+        let pointer = Arc::as_ptr(tokens) as usize;
+        let Some((count, _)) = self.counts.get_mut(&pointer) else {
+            debug_assert!(false, "removed a token set that was not active");
+            return false;
+        };
+        *count -= 1;
+        if *count == 0 {
+            self.counts.remove(&pointer);
+            true
+        } else {
+            false
+        }
+    }
+
+    /// The union of the active token sets.
+    fn union(
+        &self,
+        token_union_cache: &mut FxHashMap<Vec<usize>, SharedTokenSet>,
+    ) -> Option<SharedTokenSet> {
+        let mut distinct: SmallVec<[&SharedTokenSet; 16]> =
+            self.counts.values().map(|(_, tokens)| tokens).collect();
+        // Sorting by pointer gives the same cache key for the same set.
+        distinct.sort_unstable_by_key(|tokens| Arc::as_ptr(tokens) as usize);
+        union_token_sets_cached(&distinct, token_union_cache)
+    }
+}
+
+/// Unions token sets, memoizing results for three or more sets, keyed by their pointers in the
+/// order given (callers pass a canonical order to get cache hits).
+fn union_token_sets_cached(
+    token_sets: &[&SharedTokenSet],
+    token_union_cache: &mut FxHashMap<Vec<usize>, SharedTokenSet>,
+) -> Option<SharedTokenSet> {
+    match token_sets {
+        [] => None,
+        [only] => Some(Arc::clone(only)),
+        [left, right] => Some(shared_token_union(left, right)),
+        _ => {
+            let key: Vec<usize> = token_sets
+                .iter()
+                .map(|tokens| Arc::as_ptr(tokens) as usize)
+                .collect();
+            if let Some(cached) = token_union_cache.get(&key) {
+                return Some(Arc::clone(cached));
+            }
+            let owned: Vec<SharedTokenSet> =
+                token_sets.iter().map(|tokens| Arc::clone(tokens)).collect();
+            let tokens = shared_token_union_many(&owned);
+            if let Some(tokens) = &tokens {
+                token_union_cache.insert(key, Arc::clone(tokens));
+            }
+            tokens
+        }
+    }
+}
+
 #[cfg(test)] // Original event sweep, kept as a reference for differential tests.
 fn union_all_multiway_sweep_with_token_cache(
     weights: &[&Weight],
     coalesce_repeated_token_ranges: bool,
     token_union_cache: &mut FxHashMap<Vec<usize>, SharedTokenSet>,
 ) -> Weight {
-    let total_entry_hint: usize = weights.iter().map(|w| w.0.range_values_len()).sum();
-    let mut all_entries: Vec<WeightRangeEntry> = Vec::with_capacity(total_entry_hint);
-    for weight in weights {
-        for (range, tokens) in weight.0.range_values() {
-            all_entries.push(WeightRangeEntry {
-                start: *range.start(),
-                end: *range.end(),
-                tokens: Arc::clone(tokens),
-            });
-        }
-    }
-
+    let mut all_entries = pooled_entries(weights);
     if all_entries.is_empty() {
         return Weight::empty();
     }
@@ -2139,26 +2187,8 @@ fn union_active_token_sets(
     active_tokens: &[SharedTokenSet],
     token_union_cache: &mut FxHashMap<Vec<usize>, SharedTokenSet>,
 ) -> Option<SharedTokenSet> {
-    match active_tokens.len() {
-        0 => None,
-        1 => Some(Arc::clone(&active_tokens[0])),
-        2 => Some(shared_token_union(&active_tokens[0], &active_tokens[1])),
-        _ => {
-            let key: Vec<usize> = active_tokens
-                .iter()
-                .map(|tokens| Arc::as_ptr(tokens) as usize)
-                .collect();
-            if let Some(cached) = token_union_cache.get(&key) {
-                Some(Arc::clone(cached))
-            } else {
-                let tokens = shared_token_union_many(active_tokens);
-                if let Some(tokens) = &tokens {
-                    token_union_cache.insert(key, Arc::clone(tokens));
-                }
-                tokens
-            }
-        }
-    }
+    let token_sets: SmallVec<[&SharedTokenSet; 16]> = active_tokens.iter().collect();
+    union_token_sets_cached(&token_sets, token_union_cache)
 }
 
 fn union_all_single_tsid_entries(weights: &[&Weight]) -> Option<Weight> {
@@ -4457,7 +4487,7 @@ mod tests {
             let mut cache_new = FxHashMap::default();
             let mut cache_old = FxHashMap::default();
             assert_eq!(
-                union_all_multiway_outer_join(&chosen, &mut cache_new),
+                union_all_multiway_impl_with_token_cache(&chosen, false, &mut cache_new),
                 union_all_multiway_sweep_with_token_cache(&chosen, false, &mut cache_old),
                 "multiway union differs for {chosen:?}",
             );
@@ -4507,7 +4537,7 @@ mod tests {
             let mut cache_new = FxHashMap::default();
             let mut cache_old = FxHashMap::default();
             assert_eq!(
-                union_all_multiway_outer_join(&chosen, &mut cache_new),
+                union_all_multiway_impl_with_token_cache(&chosen, false, &mut cache_new),
                 union_all_multiway_sweep_with_token_cache(&chosen, false, &mut cache_old),
             );
         }
