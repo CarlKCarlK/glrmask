@@ -1733,7 +1733,7 @@ enum PackedRuntimeBytes {
 }
 
 impl PackedRuntimeBytes {
-    #[inline]
+    #[inline(always)]
     fn as_slice(&self) -> &[u8] {
         match self {
             Self::Owned(values) => values,
@@ -1781,7 +1781,7 @@ impl PackedRuntimeTargetSlice<'_> {
         }
     }
 
-    #[inline]
+    #[inline(always)]
     fn get(self, index: usize) -> Option<u32> {
         match self {
             Self::U16(values) => values.get(index).map(|&value| value as u32),
@@ -1801,7 +1801,7 @@ impl PackedRuntimeTargetSlice<'_> {
 }
 
 impl PackedRuntimeTransitions {
-    #[inline]
+    #[inline(always)]
     fn row(&self, state: u32) -> Option<(&[u8], PackedRuntimeTargetSlice<'_>)> {
         let state = state as usize;
         let byte_start = *self.byte_offsets.get(state)? as usize;
@@ -1838,7 +1838,7 @@ impl PackedRuntimeTransitions {
         (bytes.len() == targets.len()).then_some((bytes, targets))
     }
 
-    #[inline]
+    #[inline(always)]
     fn transition(&self, state: u32, byte: u8) -> Option<u32> {
         let (bytes, targets) = self.row(state)?;
         // Dense regex rows are frequently one contiguous byte interval. Avoid
