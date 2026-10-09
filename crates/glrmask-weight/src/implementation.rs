@@ -1,7 +1,7 @@
 use once_cell::sync::Lazy;
 use range_set_blaze::{
-    CheckSortedDisjoint, CheckSortedDisjointMap, MultiwaySortedDisjointMap, Owned, RangeMapBlaze,
-    RangeSetBlaze, SortedDisjointMap,
+    CheckSortedDisjoint, CheckSortedDisjointMap, RangeMapBlaze, RangeSetBlaze,
+    SortedDisjointMap,
 };
 use serde::{Deserialize, Serialize};
 use smallvec::SmallVec;
@@ -1792,99 +1792,6 @@ fn union_all_multiway_with_token_cache(
 }
 
 fn union_all_multiway_impl_with_token_cache(
-    weights: &[&Weight],
-    coalesce_repeated_token_ranges: bool,
-    token_union_cache: &mut FxHashMap<Vec<usize>, SharedTokenSet>,
-) -> Weight {
-    // Coalescing merges same-token-set ranges across weights before the sweep, which discards
-    // which weight each range came from, so that path keeps the original event sweep.
-    if coalesce_repeated_token_ranges {
-        return union_all_multiway_sweep_with_token_cache(weights, true, token_union_cache);
-    }
-    union_all_multiway_outer_join(weights, token_union_cache)
-}
-
-// k-way union via range-set-blaze's multiway `outer_join_incremental`: one heap-based sweep over
-// the weights' ranges, maintaining the active distinct token sets in O(changes) per range and
-// recomputing the union (with the same pointer-keyed cache as the original sweep, kept below as
-// `union_all_multiway_sweep_with_token_cache`) only when that set changes.
-fn union_all_multiway_outer_join(
-    weights: &[&Weight],
-    token_union_cache: &mut FxHashMap<Vec<usize>, SharedTokenSet>,
-) -> Weight {
-    // Active distinct token sets (by pointer) with how many weights currently carry each. Many
-    // weights share the same interned token set, so the union depends only on this set, which
-    // `outer_join_incremental` lets us update in O(changes) per range.
-    let mut active: FxHashMap<usize, (usize, SharedTokenSet)> = FxHashMap::default();
-    let mut result: Option<SharedTokenSet> = None;
-    let mut key: Vec<usize> = Vec::new();
-    let mut builder = CompactRangeBuilder::new();
-    let joined = weights
-        .iter()
-        .map(|weight| weight.0.range_values())
-        .outer_join_incremental(|values, changed_from| {
-            let mut distinct_changed = false;
-            for (index, previous) in changed_from {
-                if let Some(previous) = previous {
-                    let pointer = Arc::as_ptr(previous) as usize;
-                    if let Some((count, _)) = active.get_mut(&pointer) {
-                        *count -= 1;
-                        if *count == 0 {
-                            active.remove(&pointer);
-                            distinct_changed = true;
-                        }
-                    }
-                }
-                if let Some(current) = values[*index] {
-                    let entry = active
-                        .entry(Arc::as_ptr(current) as usize)
-                        .or_insert_with(|| {
-                            distinct_changed = true;
-                            (0, Arc::clone(current))
-                        });
-                    entry.0 += 1;
-                }
-            }
-            if distinct_changed {
-                let mut distinct: SmallVec<[&SharedTokenSet; 16]> =
-                    active.values().map(|(_, tokens)| tokens).collect();
-                distinct.sort_unstable_by_key(|tokens| Arc::as_ptr(tokens) as usize);
-                result = match distinct.as_slice() {
-                    [] => None,
-                    [only] => Some(Arc::clone(only)),
-                    [left, right] => Some(shared_token_union(left, right)),
-                    _ => {
-                        key.clear();
-                        key.extend(distinct.iter().map(|tokens| Arc::as_ptr(tokens) as usize));
-                        if let Some(cached) = token_union_cache.get(key.as_slice()) {
-                            Some(Arc::clone(cached))
-                        } else {
-                            let owned: Vec<SharedTokenSet> =
-                                distinct.iter().map(|tokens| Arc::clone(tokens)).collect();
-                            let tokens = shared_token_union_many(&owned);
-                            if let Some(tokens) = &tokens {
-                                token_union_cache.insert(key.clone(), Arc::clone(tokens));
-                            }
-                            tokens
-                        }
-                    }
-                };
-            }
-            result.clone()
-        });
-    for (range, Owned(tokens)) in joined {
-        // The join never calls the closure with every weight absent, so `tokens` is `None` only
-        // if the union itself is empty.
-        if let Some(tokens) = tokens {
-            builder.push(*range.start(), *range.end(), tokens);
-        } else {
-            builder.flush();
-        }
-    }
-    builder.finish()
-}
-
-fn union_all_multiway_sweep_with_token_cache(
     weights: &[&Weight],
     coalesce_repeated_token_ranges: bool,
     token_union_cache: &mut FxHashMap<Vec<usize>, SharedTokenSet>,
@@ -4388,83 +4295,6 @@ mod tests {
                 }))
             })
             .collect()
-    }
-
-    #[test]
-    fn outer_join_multiway_union_matches_sweep() {
-        // Many small multi-weight unions (more than 4 weights, so they take the multiway path)
-        // drawn from the exhaustive small weights, plus some with every TSID range.
-        let weights = small_exhaustive_weights();
-        let mut state = 0x9e37_79b9_u64;
-        let mut next = || {
-            state ^= state << 13;
-            state ^= state >> 7;
-            state ^= state << 17;
-            state
-        };
-        for _ in 0..4_000 {
-            let count = 2 + (next() % 9) as usize;
-            let chosen: Vec<&Weight> = (0..count)
-                .map(|_| &weights[(next() % weights.len() as u64) as usize])
-                .collect();
-            let mut cache_new = FxHashMap::default();
-            let mut cache_old = FxHashMap::default();
-            assert_eq!(
-                union_all_multiway_outer_join(&chosen, &mut cache_new),
-                union_all_multiway_sweep_with_token_cache(&chosen, false, &mut cache_old),
-                "multiway union differs for {chosen:?}",
-            );
-        }
-    }
-
-    #[test]
-    fn outer_join_multiway_union_matches_sweep_on_large_weights() {
-        // Larger weights (runs over 200 TSIDs, tokens from a small pool) so the original takes its
-        // incremental event-sweep path (64 or more entries in total).
-        let pool: Vec<RangeSetBlaze<u32>> = vec![
-            RangeSetBlaze::from_iter([0..=3]),
-            RangeSetBlaze::from_iter([2..=9, 20..=21]),
-            RangeSetBlaze::from_iter([5..=5]),
-            RangeSetBlaze::from_iter([0..=40]),
-        ];
-        let mut state = 0x2545_f491_4f6c_dd1d_u64;
-        let mut next = || {
-            state ^= state << 13;
-            state ^= state >> 7;
-            state ^= state << 17;
-            state
-        };
-        let mut checked_large = 0;
-        for _ in 0..300 {
-            let count = 2 + (next() % 12) as usize;
-            let weights: Vec<Weight> = (0..count)
-                .map(|_| {
-                    let mut entries = Vec::new();
-                    let mut tsid = (next() % 20) as u32;
-                    while tsid < 200 {
-                        let run = 1 + (next() % 15) as u32;
-                        let tokens = &pool[(next() % pool.len() as u64) as usize];
-                        for t in tsid..(tsid + run).min(200) {
-                            entries.push((t, tokens.clone()));
-                        }
-                        tsid += run + (next() % 10) as u32;
-                    }
-                    Weight::from_per_tsid_token_sets(entries)
-                })
-                .collect();
-            let chosen: Vec<&Weight> = weights.iter().collect();
-            let total_entries: usize = chosen.iter().map(|w| w.0.range_values_len()).sum();
-            if total_entries >= 64 {
-                checked_large += 1;
-            }
-            let mut cache_new = FxHashMap::default();
-            let mut cache_old = FxHashMap::default();
-            assert_eq!(
-                union_all_multiway_outer_join(&chosen, &mut cache_new),
-                union_all_multiway_sweep_with_token_cache(&chosen, false, &mut cache_old),
-            );
-        }
-        assert!(checked_large > 100, "too few cases reached the incremental path");
     }
 
     #[test]
