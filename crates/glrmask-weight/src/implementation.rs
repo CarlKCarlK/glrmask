@@ -2043,7 +2043,7 @@ fn union_all_single_tsid_entries(weights: &[&Weight]) -> Option<Weight> {
     Some(builder.finish())
 }
 
-// Two-way union via range-set-blaze's `outer_join`. The original hand-written merge is kept
+// Two-way union via range-set-blaze's `full_join`. The original hand-written merge is kept
 // below as `union_compact_entries_handwritten` (test-only) for differential testing.
 fn union_compact_entries(left: &Weight, right: &Weight) -> Weight {
     if left.0.is_empty() {
@@ -2175,7 +2175,7 @@ fn active_tokens<'a>(
     })
 }
 
-// Two-way combine via range-set-blaze's `outer_join`: one merge pass over both weights, calling
+// Two-way combine via range-set-blaze's `full_join`: one merge pass over both weights, calling
 // `combine` with each side's token set (or `None`) on every range covered by either side. The
 // original boundary-sweep version is kept below as `combine_compact_entries_boundary` (test-only).
 fn combine_compact_entries<F>(left: &Weight, right: &Weight, mut combine: F) -> Weight
@@ -2187,7 +2187,7 @@ where
 {
     let mut builder = CompactRangeBuilder::new();
     for (range, (left_tokens, right_tokens)) in
-        left.0.range_values().outer_join(right.0.range_values())
+        left.0.range_values().full_join(right.0.range_values())
     {
         let Some(tokens) = combine(left_tokens, right_tokens) else {
             builder.flush();
@@ -3511,25 +3511,6 @@ impl Weight {
         true
     }
 
-    // The joined stretches of `self` and `other` that can affect `is_subset`. The join yields
-    // stretches in key order, and every stretch after `self`'s last key belongs to `other` alone
-    // (which always passes), so stop there instead of walking the rest of `other`.
-    fn subset_stretches<'a>(
-        &'a self,
-        other: &'a Self,
-    ) -> impl Iterator<
-        Item = (
-            std::ops::RangeInclusive<u32>,
-            (Option<&'a SharedTokenSet>, Option<&'a SharedTokenSet>),
-        ),
-    > + 'a {
-        let self_last = self.0.last_key_value().map(|(last, _)| last);
-        self.0
-            .range_values()
-            .outer_join(other.0.range_values())
-            .take_while(move |(range, _)| self_last.is_some_and(|last| *range.start() <= last))
-    }
-
     pub fn is_subset(&self, other: &Self) -> bool {
         if self.is_empty() || other.is_full() {
             return true;
@@ -3537,14 +3518,15 @@ impl Weight {
         if other.is_empty() || self.is_full() {
             return false;
         }
-        // Every tsid range of `self` must be covered by `other` with a token superset.
-        self.subset_stretches(other)
-            .all(|(_, (self_tokens, other_tokens))| match (self_tokens, other_tokens) {
-                (None, _) => true,
-                (Some(_), None) => false,
-                (Some(self_tokens), Some(other_tokens)) => {
+        // Every tsid range of `self` must be covered by `other` with a token superset. The left join
+        // visits only `self`'s ranges and stops when they end, without reading the rest of `other`.
+        self.0
+            .range_values()
+            .left_join(other.0.range_values())
+            .all(|(_, (self_tokens, other_tokens))| {
+                other_tokens.is_some_and(|other_tokens| {
                     self_tokens.as_ref().is_subset(other_tokens.as_ref())
-                }
+                })
             })
     }
 
@@ -4316,8 +4298,9 @@ mod tests {
 
     #[test]
     fn is_subset_stops_after_self() {
-        // A small weight near the start of a large one: the check must not walk the rest of
-        // `other` (one point range at every even TSID below 20,000).
+        // A small weight near the start of a large one (one point range at every even TSID below
+        // 20,000). `left_join` stops after `self`'s ranges; its early stop is tested in
+        // range-set-blaze.
         let tokens = RangeSetBlaze::from_iter([0..=9u32]);
         let small = Weight::from_per_tsid_token_sets([(0, RangeSetBlaze::from_iter([2..=3u32]))]);
         let large =
@@ -4325,7 +4308,6 @@ mod tests {
         assert!(large.0.range_values_len() >= 10_000);
         assert!(small.is_subset(&large));
         assert!(!large.is_subset(&small));
-        assert!(small.subset_stretches(&large).count() <= 2);
     }
 
     #[test]
@@ -4342,28 +4324,28 @@ mod tests {
                 assert_eq!(
                     left.is_subset(right),
                     left.is_subset_handwritten(right),
-                    "outer_join is_subset differs for left={left} right={right}",
+                    "full_join is_subset differs for left={left} right={right}",
                 );
             }
         }
     }
 
     #[test]
-    fn outer_join_union_matches_handwritten_exhaustively() {
+    fn full_join_union_matches_handwritten_exhaustively() {
         let weights = small_exhaustive_weights();
         for left in &weights {
             for right in &weights {
                 assert_eq!(
                     union_compact_entries(left, right),
                     union_compact_entries_handwritten(left, right),
-                    "outer_join union differs for left={left} right={right}",
+                    "full_join union differs for left={left} right={right}",
                 );
             }
         }
     }
 
     #[test]
-    fn outer_join_combine_matches_boundary_sweep_exhaustively() {
+    fn full_join_combine_matches_boundary_sweep_exhaustively() {
         type Combine =
             fn(Option<&SharedTokenSet>, Option<&SharedTokenSet>) -> Option<SharedTokenSet>;
         let combines: [(&str, Combine); 3] = [
@@ -4378,7 +4360,7 @@ mod tests {
                     assert_eq!(
                         combine_compact_entries(left, right, combine),
                         combine_compact_entries_boundary(left, right, combine),
-                        "outer_join {name} differs for left={left} right={right}",
+                        "full_join {name} differs for left={left} right={right}",
                     );
                 }
                 assert_eq!(
