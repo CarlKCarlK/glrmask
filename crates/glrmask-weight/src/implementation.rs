@@ -1864,9 +1864,28 @@ where
 {
     let sweep = streams.into_iter().sweep();
     let mut values: Vec<Option<&SharedTokenSet>> = vec![None; sweep.input_count()];
-    let mut stretches = UnionStretches::new();
+    let mut active = ActiveTokenSets::default();
+    let mut active_count = 0usize;
+    let mut union: Option<SharedTokenSet> = None;
+    let mut union_stale = false;
     // Start of the current stretch, while at least one range is active.
     let mut stretch_start: Option<u32> = None;
+    let mut builder = CompactRangeBuilder::new();
+    let mut emit = |start: u32,
+                    end: u32,
+                    active: &ActiveTokenSets,
+                    union: &mut Option<SharedTokenSet>,
+                    union_stale: &mut bool| {
+        if *union_stale {
+            *union = active.union(token_union_cache);
+            *union_stale = false;
+        }
+        if let Some(tokens) = union {
+            builder.push(start, end, Arc::clone(tokens));
+        } else {
+            builder.flush();
+        }
+    };
     for event in sweep {
         match event {
             SweepEvent::Start { range, input, value } => {
@@ -1874,84 +1893,28 @@ where
                 if let Some(stretch) = stretch_start
                     && stretch < start
                 {
-                    stretches.emit(stretch, start - 1, token_union_cache);
+                    emit(stretch, start - 1, &active, &mut union, &mut union_stale);
                 }
-                stretches.add(value);
+                union_stale |= active.add(value);
                 values[input] = Some(value);
+                active_count += 1;
                 stretch_start = Some(start);
             }
             SweepEvent::End { at, input } => {
                 if let Some(stretch) = stretch_start
                     && stretch <= at
                 {
-                    stretches.emit(stretch, at, token_union_cache);
+                    emit(stretch, at, &active, &mut union, &mut union_stale);
                 }
                 if let Some(previous) = values[input].take() {
-                    stretches.remove(previous);
+                    union_stale |= active.remove(previous);
                 }
-                stretch_start = if stretches.is_empty() { None } else { at.checked_add(1) };
+                active_count -= 1;
+                stretch_start = if active_count == 0 { None } else { at.checked_add(1) };
             }
         }
     }
-    stretches.finish()
-}
-
-/// The running state of a sweep-based union: the active token sets, their current union
-/// (recomputed lazily, only after the distinct set changes), and the output being built.
-struct UnionStretches {
-    active: ActiveTokenSets,
-    active_count: usize,
-    union: Option<SharedTokenSet>,
-    union_stale: bool,
-    builder: CompactRangeBuilder,
-}
-
-impl UnionStretches {
-    fn new() -> Self {
-        Self {
-            active: ActiveTokenSets::default(),
-            active_count: 0,
-            union: None,
-            union_stale: false,
-            builder: CompactRangeBuilder::new(),
-        }
-    }
-
-    fn add(&mut self, tokens: &SharedTokenSet) {
-        self.union_stale |= self.active.add(tokens);
-        self.active_count += 1;
-    }
-
-    fn remove(&mut self, tokens: &SharedTokenSet) {
-        self.union_stale |= self.active.remove(tokens);
-        self.active_count -= 1;
-    }
-
-    const fn is_empty(&self) -> bool {
-        self.active_count == 0
-    }
-
-    /// Emits `start..=end` with the union of the active token sets.
-    fn emit(
-        &mut self,
-        start: u32,
-        end: u32,
-        token_union_cache: &mut FxHashMap<Vec<usize>, SharedTokenSet>,
-    ) {
-        if self.union_stale {
-            self.union = self.active.union(token_union_cache);
-            self.union_stale = false;
-        }
-        if let Some(tokens) = &self.union {
-            self.builder.push(start, end, Arc::clone(tokens));
-        } else {
-            self.builder.flush();
-        }
-    }
-
-    fn finish(self) -> Weight {
-        self.builder.finish()
-    }
+    builder.finish()
 }
 
 /// The distinct token sets carried by the active streams of a k-way union, with how many streams
