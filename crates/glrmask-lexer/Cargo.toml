@@ -15,7 +15,7 @@ bincode = "1"
 glrmask-finite-automata = { version = "=0.1.1", path = "../glrmask-finite-automata" }
 glrmask-vocab = { version = "=0.1.1", path = "../glrmask-vocab", features = ["internal-api"] }
 rayon = "1"
-range-set-blaze = { path = "../../../range-set-blaze" }
+range-set-blaze = "0.8.0"
 regex-syntax = "0.8"
 rustc-hash = "1"
 serde = { version = "1", features = ["derive", "rc"] }

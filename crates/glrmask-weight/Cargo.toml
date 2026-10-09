@@ -13,7 +13,7 @@ internal-api = []
 [dependencies]
 dashmap = "6"
 once_cell = "1"
-range-set-blaze = { path = "../../../range-set-blaze" }
+range-set-blaze = "0.8.0"
 rayon = "1"
 rustc-hash = "1"
 serde = { version = "1", features = ["derive", "rc"] }

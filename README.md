@@ -1,7 +1,7 @@
 > **This fork is only for testing new [range-set-blaze](https://github.com/CarlKCarlK/range-set-blaze) features against a real user of the crate.**
 > It is not maintained as a version of GLRMask. For the project itself, use the original:
 > **[IsaacBreen/glrmask](https://github.com/IsaacBreen/glrmask)**.
-> Work here lives on the `local-rsb` branch, which builds against a local `range-set-blaze` checkout.
+> Work here lives on the `local-rsb` branch. It builds against `range-set-blaze` 0.8.0 from crates.io; point the dependencies back at a local checkout (`path = "../range-set-blaze"`) to test unreleased features.
 
 # GLRMask
 

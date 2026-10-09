@@ -27,7 +27,7 @@ glrmask-weight = { version = "=0.1.1", path = "../glrmask-weight", features = ["
 glrmask-weighted-automata = { version = "=0.1.1", path = "../glrmask-weighted-automata" }
 hashbrown = "0.15"
 once_cell = "1"
-range-set-blaze = { path = "../../../range-set-blaze" }
+range-set-blaze = "0.8.0"
 rayon = "1"
 regex-syntax = "0.8"
 rustc-hash = "1"

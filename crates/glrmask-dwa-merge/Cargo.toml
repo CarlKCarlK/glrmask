@@ -15,6 +15,6 @@ glrmask-artifact = { version = "=0.1.1", path = "../glrmask-artifact", features 
 glrmask-glr = { version = "=0.1.1", path = "../glrmask-glr", features = ["internal-api"] }
 glrmask-weight = { version = "=0.1.1", path = "../glrmask-weight", features = ["internal-api"] }
 glrmask-weighted-automata = { version = "=0.1.1", path = "../glrmask-weighted-automata" }
-range-set-blaze = { path = "../../../range-set-blaze" }
+range-set-blaze = "0.8.0"
 rustc-hash = "1"
 smallvec = { version = "1", features = ["serde"] }

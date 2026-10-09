@@ -8,7 +8,7 @@ repository = "https://github.com/IsaacBreen/glrmask"
 
 [dependencies]
 glrmask-weight = { version = "=0.1.1", path = "../glrmask-weight", features = ["internal-api"] }
-range-set-blaze = { path = "../../../range-set-blaze" }
+range-set-blaze = "0.8.0"
 rayon = "1"
 rustc-hash = "1"
 serde = { version = "1", features = ["derive", "rc"] }
