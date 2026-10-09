@@ -1,7 +1,7 @@
 use once_cell::sync::Lazy;
 use range_set_blaze::{
-    CheckSortedDisjoint, CheckSortedDisjointMap, MultiwaySortedDisjointMap, RangeMapBlaze,
-    RangeSetBlaze, SortedDisjointMap, SweepEvent,
+    CheckSortedDisjoint, CheckSortedDisjointMap, MultiwaySortedDisjointMap, Owned, RangeMapBlaze,
+    RangeSetBlaze, SortedDisjointMap,
 };
 use serde::{Deserialize, Serialize};
 use smallvec::SmallVec;
@@ -1851,10 +1851,9 @@ fn union_all_multiway_impl_with_token_cache(
     )
 }
 
-/// k-way union of token-set streams (weights' range values, or token-set groups) using
-/// range-set-blaze's multiway `sweep`: apply each range start or end to the active token sets, and
-/// emit the previous stretch's union, recomputed only when the distinct token sets changed,
-/// whenever the position moves on.
+/// k-way union of token-set streams (weights' range values, or token-set groups), in one
+/// `outer_join_incremental` sweep: the active distinct token sets are updated per change, and the
+/// union is recomputed only when they change.
 fn union_token_set_streams<'a, I>(
     streams: impl IntoIterator<Item = I>,
     token_union_cache: &mut FxHashMap<Vec<usize>, SharedTokenSet>,
@@ -1862,56 +1861,24 @@ fn union_token_set_streams<'a, I>(
 where
     I: SortedDisjointMap<u32, &'a SharedTokenSet>,
 {
-    let sweep = streams.into_iter().sweep();
-    let mut values: Vec<Option<&SharedTokenSet>> = vec![None; sweep.input_count()];
     let mut active = ActiveTokenSets::default();
-    let mut active_count = 0usize;
     let mut union: Option<SharedTokenSet> = None;
-    let mut union_stale = false;
-    // Start of the current stretch, while at least one range is active.
-    let mut stretch_start: Option<u32> = None;
+    let joined = streams
+        .into_iter()
+        .outer_join_incremental(|values, changed_from| {
+            if active.apply(values, changed_from) {
+                union = active.union(token_union_cache);
+            }
+            union.clone()
+        });
+
     let mut builder = CompactRangeBuilder::new();
-    let mut emit = |start: u32,
-                    end: u32,
-                    active: &ActiveTokenSets,
-                    union: &mut Option<SharedTokenSet>,
-                    union_stale: &mut bool| {
-        if *union_stale {
-            *union = active.union(token_union_cache);
-            *union_stale = false;
-        }
-        if let Some(tokens) = union {
-            builder.push(start, end, Arc::clone(tokens));
+    for (range, Owned(tokens)) in joined {
+        // `tokens` is `None` only if every active token set is empty.
+        if let Some(tokens) = tokens {
+            builder.push(*range.start(), *range.end(), tokens);
         } else {
             builder.flush();
-        }
-    };
-    for event in sweep {
-        match event {
-            SweepEvent::Start { range, input, value } => {
-                let start = *range.start();
-                if let Some(stretch) = stretch_start
-                    && stretch < start
-                {
-                    emit(stretch, start - 1, &active, &mut union, &mut union_stale);
-                }
-                union_stale |= active.add(value);
-                values[input] = Some(value);
-                active_count += 1;
-                stretch_start = Some(start);
-            }
-            SweepEvent::End { at, input } => {
-                if let Some(stretch) = stretch_start
-                    && stretch <= at
-                {
-                    emit(stretch, at, &active, &mut union, &mut union_stale);
-                }
-                if let Some(previous) = values[input].take() {
-                    union_stale |= active.remove(previous);
-                }
-                active_count -= 1;
-                stretch_start = if active_count == 0 { None } else { at.checked_add(1) };
-            }
         }
     }
     builder.finish()
@@ -1927,6 +1894,24 @@ struct ActiveTokenSets {
 }
 
 impl ActiveTokenSets {
+    /// Applies one `outer_join_incremental` step; returns whether the distinct token sets changed.
+    fn apply(
+        &mut self,
+        values: &[Option<&SharedTokenSet>],
+        changed_from: &[(usize, Option<&SharedTokenSet>)],
+    ) -> bool {
+        let mut changed = false;
+        for (index, previous) in changed_from {
+            if let Some(previous) = previous {
+                changed |= self.remove(previous);
+            }
+            if let Some(current) = values[*index] {
+                changed |= self.add(current);
+            }
+        }
+        changed
+    }
+
     /// Returns whether `tokens` is newly active.
     fn add(&mut self, tokens: &SharedTokenSet) -> bool {
         match self.counts.entry(Arc::as_ptr(tokens) as usize) {
