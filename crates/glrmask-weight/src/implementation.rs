@@ -3511,6 +3511,25 @@ impl Weight {
         true
     }
 
+    // The joined stretches of `self` and `other` that can affect `is_subset`. The join yields
+    // stretches in key order, and every stretch after `self`'s last key belongs to `other` alone
+    // (which always passes), so stop there instead of walking the rest of `other`.
+    fn subset_stretches<'a>(
+        &'a self,
+        other: &'a Self,
+    ) -> impl Iterator<
+        Item = (
+            std::ops::RangeInclusive<u32>,
+            (Option<&'a SharedTokenSet>, Option<&'a SharedTokenSet>),
+        ),
+    > + 'a {
+        let self_last = self.0.last_key_value().map(|(last, _)| last);
+        self.0
+            .range_values()
+            .outer_join(other.0.range_values())
+            .take_while(move |(range, _)| self_last.is_some_and(|last| *range.start() <= last))
+    }
+
     pub fn is_subset(&self, other: &Self) -> bool {
         if self.is_empty() || other.is_full() {
             return true;
@@ -3519,9 +3538,7 @@ impl Weight {
             return false;
         }
         // Every tsid range of `self` must be covered by `other` with a token superset.
-        self.0
-            .range_values()
-            .outer_join(other.0.range_values())
+        self.subset_stretches(other)
             .all(|(_, (self_tokens, other_tokens))| match (self_tokens, other_tokens) {
                 (None, _) => true,
                 (Some(_), None) => false,
@@ -4295,6 +4312,20 @@ mod tests {
                 }))
             })
             .collect()
+    }
+
+    #[test]
+    fn is_subset_stops_after_self() {
+        // A small weight near the start of a large one: the check must not walk the rest of
+        // `other` (one point range at every even TSID below 20,000).
+        let tokens = RangeSetBlaze::from_iter([0..=9u32]);
+        let small = Weight::from_per_tsid_token_sets([(0, RangeSetBlaze::from_iter([2..=3u32]))]);
+        let large =
+            Weight::from_per_tsid_token_sets((0..20_000u32).step_by(2).map(|tsid| (tsid, tokens.clone())));
+        assert!(large.0.range_values_len() >= 10_000);
+        assert!(small.is_subset(&large));
+        assert!(!large.is_subset(&small));
+        assert!(small.subset_stretches(&large).count() <= 2);
     }
 
     #[test]
